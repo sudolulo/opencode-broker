@@ -735,7 +735,14 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (!session) {
         try { session = await getSession(sessionID); } catch {}
       }
-      const agent = typeof input?.agent === "string" && input.agent ? input.agent : session?.agent;
+      // ☠️ input.agent is the agent the CALLER named, which a headless `opencode run` without
+      // --agent leaves undefined: opencode resolves its default agent onto the user message
+      // (output.message.agent) only after this input is built. A fresh session's record may not
+      // carry the agent yet either, so without the message's own field the lease fell through
+      // to the default tier -- measured 2026-09-21: four headless `smart` runs, all leased
+      // `worker`, with no smart-tier request ever reaching the broker.
+      const messageAgent = typeof output?.message?.agent === "string" && output.message.agent ? output.message.agent : null;
+      const agent = typeof input?.agent === "string" && input.agent ? input.agent : messageAgent ?? session?.agent;
       // Detect high-risk content in THIS user message and set the tier floor
       // before routing. A raised floor forces a re-lease (drop the cached
       // route) so an in-progress low-tier session escalates immediately.

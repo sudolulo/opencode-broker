@@ -115,6 +115,7 @@ so nothing is ever spent on a provider you did not list.
 | `burstFence` | How full a short window must be before it counts as a balancing input (default 0.9). |
 | `watch.notifyCommand` | argv that `opencode-broker-watch` runs when the catalog changes. `{title}`, `{body}` and `{kind}` in it are replaced; a command naming neither `{title}` nor `{body}` gets the title and body appended. No shell is involved. |
 | `burnWatch` | The [burn watch](#the-burn-watch): `enabled` (default `true`), `notifyCommand` (argv like `watch.notifyCommand`, which it defaults to; `[]` only logs) and the thresholds listed there. |
+| `slotWatch` | The [slot watch](#the-slot-watch): `enabled` (default `true`), `intervalMs` (60000), `deferredSamples` (2), `notifyCooldownMs` (1800000). Notifies through `burnWatch.notifyCommand`. |
 | `hud` | The HUD's options; see [The HUD](#the-hud). |
 
 Environment:
@@ -180,6 +181,17 @@ priority and a tag after the message:
   "notifyCommand": ["/usr/local/bin/notify", "{title}", "{body}", "high", "{kind}"]
 }
 ```
+
+## The slot watch
+
+`capacity` and `modelCapacity` cap what the broker leases on a local model, but services
+pointed straight at the model server reach it without a lease, and the broker never sees
+them. Once a minute the broker reads llama.cpp's own `requests_deferred` for each resident
+model a local target names (from `/metrics?model=` on `localModelsUrl`'s origin). That
+count includes every caller. Two non-zero readings in a row mean every slot is busy and
+requests are queueing, so it runs `burnWatch.notifyCommand` with `{kind}` =
+`slot-deferred`, at most once per model per `notifyCooldownMs`. It only notifies: what to
+move off a saturated model is a routing decision.
 
 ## The gateway
 

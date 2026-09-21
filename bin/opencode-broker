@@ -42,6 +42,7 @@ import {
 } from "../lib/routing.js";
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
+import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
 import { notifyArgv } from "../lib/notify.js";
 import { DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
@@ -373,6 +374,29 @@ const localModels = async () => {
     return new Set(rows.filter(loaded).map((row) => row?.id).filter((id) => typeof id === "string"));
   } finally {
     clearTimeout(timeout);
+  }
+};
+
+// The slot watch (lib/slot-watch.js): once per interval, ask the model server how many
+// requests are waiting for a slot on each resident model a local target names. It reads the
+// server's own count, so callers the broker never leases for are in it too.
+const slotWatch = CONFIG.slotWatch.enabled && LOCAL_MODELS_URL ? createSlotWatch({ config: CONFIG.slotWatch }) : null;
+const pollSlots = async () => {
+  if (!slotWatch) return;
+  let resident;
+  try { resident = await localModels(); } catch { return; }
+  const watched = new Set(Object.values(TARGETS)
+    .filter((target) => target?.kind === "local" && resident.has(target.modelID))
+    .map((target) => target.modelID));
+  for (const modelID of watched) {
+    try {
+      const url = new URL("/metrics", LOCAL_MODELS_URL);
+      url.searchParams.set("model", modelID);
+      const response = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (!response.ok) continue;
+      const { processing, deferred } = parseLlamaMetrics(await response.text());
+      for (const alert of slotWatch.record({ modelID, processing, deferred })) notifyBurn(alert);
+    } catch { /* a missed poll is a missed sample, never a broker fault */ }
   }
 };
 
@@ -1340,6 +1364,7 @@ const serve = async () => {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(socketPath, resolve);
+    if (slotWatch) setInterval(() => { pollSlots().catch(() => {}); }, CONFIG.slotWatch.intervalMs).unref();
   });
   process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
   for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);

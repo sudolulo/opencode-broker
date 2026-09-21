@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-09-21
+
+### Added
+
+- **Slot watch** (`lib/slot-watch.js`, config `slotWatch`). Once a minute the broker reads
+  llama.cpp's `requests_deferred` for each resident model a local target names. That count
+  includes services that call the model server without a lease, which the broker's own caps
+  cannot see. Two non-zero readings in a row notify through `burnWatch.notifyCommand` with
+  `{kind}` = `slot-deferred`. This is the check that `capacity` and `modelCapacity` actually
+  keep a shared model from queueing.
+
+### Fixed
+
+- **A headless `opencode run` without `--agent` leased the default tier, whatever its default
+  agent was.** `chat.message` receives the agent the caller named, and a run that names none
+  leaves it unset: opencode resolves its default agent onto the user message only after that
+  input is built, and a fresh session's record may not carry the agent yet. The router now
+  reads the agent from the message itself before falling back to the session. Measured before
+  the fix: four headless runs of a `smart` default agent, all leased `worker`, with no
+  smart-tier request ever reaching the broker.
+
+### Changed
+
+- The example config's classifier and coder share one model through `modelCapacity`, the
+  way the burn-watch and slot-limit work was measured.
+
 ## [1.1.0] — 2026-09-21
 
 ### Added

@@ -65,24 +65,26 @@
         "fast-build": 1.3
       }
     },
-    // A classifier rung must be SMALL and NON-THINKING. Measured over 14 labelled
-    // commands, 3 runs each: qwen3.5-4b scored 13/14, was
-    // identical across every run, and answered in ~200ms (1.4s worst). The 9b coder
-    // scored 12/14 in 10-54s because it THINKS -- 654 reasoning tokens for `ls -la`,
-    // and on one command it hit the token cap and returned an EMPTY verdict, which
-    // the caller can only treat as a denial.
+    // A classifier rung must be NON-THINKING, and when it shares a model with a coder lane
+    // it needs a slot the coder cannot take. The caller turns thinking off per request (a
+    // thinking verdict on a small model was measured at hundreds of reasoning tokens for
+    // `ls -la`, and an EMPTY verdict once it hit the token cap). `modelCapacity` counts
+    // leases across both targets on the model: the coder stops at 3 of 4 slots and the
+    // classifier keeps the fourth.
     "local-classifier": {
       "providerID": "llamacpp",
-      "modelID": "qwen3.5-4b",
+      "modelID": "qwen3.5-9b",
       "kind": "local",
       "capacity": 2,
+      "modelCapacity": 4,
       "context": 32768
     },
     "local-coder": {
       "providerID": "llamacpp",
-      "modelID": "qwen3.5-9b-coder",
+      "modelID": "qwen3.5-9b",
       "kind": "local",
-      "capacity": 1,
+      "capacity": 4,
+      "modelCapacity": 3,
       "context": 32768
     },
     // ☠️ THE SAME MODEL AS A LANE ABOVE, DECLARED AGAIN ON PURPOSE, and the differences are
