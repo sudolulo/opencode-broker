@@ -13,6 +13,22 @@ All notable changes to this project are documented here. The format is based on
   stands. A lane whose `bodyExtras` turn thinking off for every local model can now serve one
   name with that model's default (`"chat_template_kwargs": null`) without moving any other name.
 
+## [1.3.0] — 2026-09-21
+
+### Added
+
+- **Usage log** (`lib/usage-log.js`, `usage.jsonl` in the routing state directory) and an
+  `opencode-broker usage [days]` report. Every `/usage` report now also appends one line: session,
+  model, the lease's target/profile/tier, `prompt` (input + cache read + cache write) and `output`
+  tokens. Tuning a local model's window and slot count needs the real size distribution, and
+  nothing kept it. opencode deletes subagent and workflow child sessions, and their token history
+  with them, so the database keeps a small, biased sample: 15 sessions on a local model over two
+  weeks, where the broker had leased it for hundreds. The lease-time `contextTokens` in
+  `decisions.jsonl` misses each session's peak, because a subagent's single long turn grows past
+  its starting size. The report gives per-model request and session-peak percentiles, and for
+  each local target the share of session peaks that fit what it routes. Rotated at 8 MB with one
+  previous generation kept, so the history outlives a busy week.
+
 ## [1.2.0] — 2026-09-21
 
 ### Added

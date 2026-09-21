@@ -373,6 +373,24 @@ test("a disabled burn watch never stops a session", async () => withTempHome(asy
   }
 }));
 
+// The usage log end to end: a /usage report becomes a line with the lease's lane on it, and
+// `opencode-broker usage` summarises the file without needing the broker.
+test("every /usage report is logged with its prompt size, and the usage command summarises it", async () => withBroker(async ({ home, socketPath }) => {
+  for (const [sessionID, input] of [["ses-a", 1_000], ["ses-a", 40_000], ["ses-b", 5_000]]) {
+    await request(socketPath, "/usage", {
+      sessionID, providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1,
+      tokens: { input, output: 100, cacheRead: 0, cacheWrite: 0 },
+    });
+  }
+  const lines = readFileSync(join(home, ".local/share/opencode/model-routing/usage.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => [line.sessionID, line.prompt, line.local]), [["ses-a", 1_000, false], ["ses-a", 40_000, false], ["ses-b", 5_000, false]]);
+  const { spawnSync } = await import("node:child_process");
+  const report = spawnSync(process.execPath, [brokerScript, "usage", "1"], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(report.status, 0, report.stderr);
+  assert.match(report.stdout, /cloud {2}openai\/gpt-5\.6-luna/);
+  assert.match(report.stdout, /session peaks \(2 sessions\): p50 \d+K? {2}p90 40K/);
+}));
+
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

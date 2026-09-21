@@ -43,6 +43,7 @@ import {
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
+import { summarizeUsage, usageRecord } from "../lib/usage-log.js";
 import { notifyArgv } from "../lib/notify.js";
 import { DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
@@ -95,6 +96,19 @@ const logDecision = (record) => {
       writeFileSync(DECISION_LOG, JSON.stringify({ at: Date.now(), event: "truncated" }) + "\n");
     }
     appendFileSync(DECISION_LOG, JSON.stringify(record) + "\n");
+  } catch {}
+};
+// The usage log (lib/usage-log.js): one line per provider request with the prompt size it
+// actually carried, for tuning local windows. ROTATED rather than truncated, unlike the
+// decision trace: a size distribution is only worth anything with history behind it, so the
+// previous generation is kept as usage.jsonl.1 (~2 x 8 MB, several weeks of a busy host).
+const USAGE_LOG = join(routingStateDir(), "usage.jsonl");
+const USAGE_LOG_MAX = 8 * 1024 * 1024;
+const logUsage = (record) => {
+  try {
+    ensureRoutingStateDir();
+    if (statSync(USAGE_LOG, { throwIfNoEntry: false })?.size > USAGE_LOG_MAX) renameSync(USAGE_LOG, `${USAGE_LOG}.1`);
+    appendFileSync(USAGE_LOG, JSON.stringify(record) + "\n");
   } catch {}
 };
 const recordDecision = (state, decision) => {
@@ -1185,6 +1199,13 @@ const serve = async () => {
           }
         }
         const assignment = sessionID ? (state.leases[sessionID] ?? state.assignments[sessionID]) : null;
+        logUsage(usageRecord({
+          at: Date.now(), sessionID, providerID,
+          modelID: typeof body.modelID === "string" ? body.modelID : null,
+          lease: assignment,
+          tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
+          local: localProviderIDs(allTargets(state)).has(providerID),
+        }));
         const target = targetForID(assignment?.targetID, allTargets(state));
         if (Number.isFinite(rawObservedAt) && rawObservedAt <= Date.now() &&
           target && target.providerID === providerID && target.modelID === body.modelID) {
@@ -1390,6 +1411,45 @@ const main = async () => {
     process.stdout.write(JSON.stringify(await brokerRequest("/decisions", { limit: Number(targetID) || 50 }), null, 2) + "\n");
     return;
   }
+  if (command === "usage") {
+    // Read straight from the log: a report needs no running broker.
+    const days = Number(targetID) > 0 ? Number(targetID) : 7;
+    const records = [];
+    for (const file of [`${USAGE_LOG}.1`, USAGE_LOG]) {
+      let text = "";
+      try { text = readFileSync(file, "utf8"); } catch { continue; }
+      for (const line of text.split("\n")) {
+        if (!line) continue;
+        try { records.push(JSON.parse(line)); } catch {}
+      }
+    }
+    // The largest prompt the broker leases onto a local target: the same rule as
+    // localContextEligible -- context minus an absolute outputReserve, else the headroom fraction.
+    const ceilingOf = (target) => {
+      const declared = Number(targetContext(target, {}));
+      if (!(declared > 0)) return null;
+      const reserve = Number(target.outputReserve);
+      return reserve > 0 && reserve < declared ? declared - reserve : Math.floor(declared * targetContextHeadroom(target));
+    };
+    const rows = summarizeUsage(records, { since: Date.now() - days * 86_400_000, targets: TARGETS, ceilingOf });
+    if (!rows.length) {
+      process.stdout.write(`no usage recorded in the last ${days} day(s) (${USAGE_LOG})\n`);
+      return;
+    }
+    const k = (n) => (n >= 1000 ? `${Math.round(n / 1000)}K` : String(n));
+    process.stdout.write(`prompt tokens per request and per session peak, last ${days} day(s)\n\n`);
+    for (const row of rows) {
+      const r = row.requests; const p = row.sessionPeaks;
+      process.stdout.write(`${row.local ? "local" : "cloud"}  ${row.model}\n`);
+      process.stdout.write(`  requests ${r.count}: p50 ${k(r.p50)}  p90 ${k(r.p90)}  p99 ${k(r.p99)}  max ${k(r.max)}\n`);
+      process.stdout.write(`  session peaks (${p.count} sessions): p50 ${k(p.p50)}  p90 ${k(p.p90)}  p99 ${k(p.p99)}  max ${k(p.max)}\n`);
+      for (const window of row.windows) {
+        const share = p.count ? ((window.sessionsFit / p.count) * 100).toFixed(1) : "0.0";
+        process.stdout.write(`  ${window.targetID} routes up to ${k(window.ceiling)}: ${share}% of session peaks fit\n`);
+      }
+    }
+    return;
+  }
   if (command === "rearm") {
     process.stdout.write(JSON.stringify(await brokerRequest("/rearm", { targetID }), null, 2) + "\n");
     return;
@@ -1408,7 +1468,7 @@ const main = async () => {
     }), null, 2) + "\n");
     return;
   }
-  throw new Error("usage: opencode-broker serve | status | selection | decisions [n] | rearm [target-or-provider] | quarantine provider:<id> [reason-code]");
+  throw new Error("usage: opencode-broker serve | status | selection | decisions [n] | usage [days] | rearm [target-or-provider] | quarantine provider:<id> [reason-code]");
 };
 
 main().catch((error) => {

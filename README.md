@@ -193,6 +193,18 @@ requests are queueing, so it runs `burnWatch.notifyCommand` with `{kind}` =
 `slot-deferred`, at most once per model per `notifyCooldownMs`. It only notifies: what to
 move off a saturated model is a routing decision.
 
+## Tuning local windows: the usage log
+
+Every provider request's size lands in `usage.jsonl` in the routing state directory:
+session, model, the lease's target and lane, and `prompt` (everything the model read) and
+`output` tokens. opencode deletes subagent and workflow child sessions when their work is
+done, and their token history goes with them, so this is the record that survives. It is
+also the only one with each session's real PEAK: a lease records a session's size when its
+turn starts, and a subagent's long turn grows well past that. `opencode-broker usage [days]`
+(default 7) prints, per model, request and session-peak percentiles, and for each local target
+how many session peaks fit what it routes (`context` minus `outputReserve`, else the headroom
+fraction). That is the number to size a slot's context and a server's slot count by.
+
 ## The gateway
 
 Services that only speak `OPENAI_BASE_URL + key + model` (a chat UI, a voice
