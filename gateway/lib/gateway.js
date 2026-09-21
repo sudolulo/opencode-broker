@@ -664,6 +664,23 @@ export const createGatewayHandler = ({
         for (const key of Array.isArray(providerConfig.dropBodyKeys) ? providerConfig.dropBodyKeys : []) {
           if (typeof key === "string" && key in forwardBody) delete forwardBody[key];
         }
+        // ☠️ llama.cpp SERVES /responses BUT IGNORES ITS `text.format`: a strict json_schema comes
+        // back as prose, or as fenced JSON with keys the schema never named (measured 2026-09-21,
+        // firecrawl's extraction). The same server enforces chat's `response_format` on that
+        // endpoint, so a lane marked `mirrorTextFormat` gets the format copied across. Never
+        // over a response_format the client set itself.
+        if (api === RESPONSES && providerConfig.mirrorTextFormat === true && !forwardBody.response_format) {
+          const format = forwardBody.text?.format;
+          if (format?.type === "json_schema" && format.schema && typeof format.schema === "object") {
+            forwardBody.response_format = { type: "json_schema", json_schema: {
+              name: typeof format.name === "string" ? format.name : "response",
+              schema: format.schema,
+              ...(typeof format.strict === "boolean" ? { strict: format.strict } : {}),
+            } };
+          } else if (format?.type === "json_object") {
+            forwardBody.response_format = { type: "json_object" };
+          }
+        }
         if (streaming) {
           // ☠️ HOW USAGE SURVIVES STREAMING. A buffered response hands us
           // `usage` for free; a stream only carries it when include_usage is

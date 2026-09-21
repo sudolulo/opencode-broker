@@ -241,8 +241,9 @@ It listens on 127.0.0.1 unless `HOST` says otherwise.
 `authRef` names an entry in opencode's `auth.json`; provider keys are read per
 request and never logged. Per provider you can also set `headers`,
 `bodyExtras`, `dropBodyKeys` (for a lane that rejects a parameter the client
-sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"` and
-`responsesApi: true`.
+sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"`, `responsesApi: true` and
+`mirrorTextFormat: true` (copy a /responses `text.format` into `response_format`,
+for llama.cpp, which enforces only the latter).
 
 It serves `POST /v1/chat/completions` and `POST /v1/responses` (the OpenAI
 Responses API, which the Vercel AI SDK's OpenAI provider uses by default).

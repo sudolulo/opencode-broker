@@ -1464,3 +1464,39 @@ test("any other name still fails at once when the broker is unreachable", async 
   });
   assert.equal(leases, 1);
 });
+
+test("mirrorTextFormat copies a /responses text.format into response_format, and only there", async () => {
+  // llama.cpp ignores Responses' text.format but enforces chat's response_format on the same
+  // endpoint; without the mirror a strict schema came back as prose.
+  const seen = [];
+  const make = (providerExtra) => createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      llamacpp: { baseUrl: "http://local.example/v1", responsesApi: true, ...providerExtra },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => (route === "/lease" ? { target: { model: { providerID: "llamacpp", id: "m" } } } : { ok: true }),
+    fetchImpl: async (url, options) => {
+      seen.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ output: [], usage: { input_tokens: 1, output_tokens: 1 } }) };
+    },
+  });
+  const schema = { type: "object", properties: { heading: { type: "string" } }, required: ["heading"] };
+  await withServer(make({ mirrorTextFormat: true }), async (base) => {
+    await askResponses(base, { text: { format: { type: "json_schema", name: "page", strict: true, schema } } });
+    await askResponses(base, { text: { format: { type: "json_object" } } });
+    await askResponses(base, { text: { format: { type: "text" } } });
+    await askResponses(base, { text: { format: { type: "json_object" } }, response_format: { type: "text" } });
+    await askModel(base, { response_format: { type: "json_object" } });
+  });
+  await withServer(make({}), async (base) => {
+    await askResponses(base, { text: { format: { type: "json_schema", name: "page", schema } } });
+  });
+  const [schemaReq, objectReq, textReq, clientsOwn, chatReq, unmarked] = seen;
+  assert.deepEqual(schemaReq.response_format, { type: "json_schema", json_schema: { name: "page", schema, strict: true } });
+  assert.deepEqual(schemaReq.text.format.schema, schema, "text.format itself is left in place");
+  assert.deepEqual(objectReq.response_format, { type: "json_object" });
+  assert.equal(textReq.response_format, undefined, "plain text asks for no format");
+  assert.deepEqual(clientsOwn.response_format, { type: "text" }, "a client's own response_format is never overwritten");
+  assert.deepEqual(chatReq.response_format, { type: "json_object" }, "chat requests are untouched");
+  assert.equal(unmarked.response_format, undefined, "a lane without the flag gets exactly what the client sent");
+});

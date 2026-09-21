@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] — 2026-09-21
+
+### Added
+
+- **`mirrorTextFormat: true` copies a /responses `text.format` into chat's `response_format`.**
+  llama.cpp serves /responses but ignores `text.format`: a strict JSON schema came back as prose,
+  or as fenced JSON with keys the schema never named. The same endpoint enforces
+  `response_format`, so a lane with this flag gets the format mirrored (json_schema and
+  json_object; never over a `response_format` the client set itself).
+
 ## [1.5.2] — 2026-09-21
 
 ### Fixed
