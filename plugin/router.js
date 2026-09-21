@@ -108,6 +108,9 @@ const contextTokensOf = (message) => {
   return Number.isFinite(total) && total > 0 ? Math.floor(total) : null;
 };
 
+// opencode's internal agents that run on `small_model` rather than the session's model.
+const SMALL_MODEL_AGENTS = new Set(["title"]);
+
 export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const routes = new Map();
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
@@ -809,6 +812,14 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     "chat.params": async (input) => {
       const sessionID = input?.sessionID;
       if (!sessionID) return;
+      // ☠️ opencode's own small-model calls are not the conversation's turn. Title generation
+      // runs on the configured `small_model`, fires chat.params with agent "title" and the
+      // session's id, and never passes through chat.message -- so it has no route of its own,
+      // and checking it against the CONVERSATION's route rejected it as a mismatch whenever
+      // the session was on any other model. Measured: 60 of 69 root sessions in a week kept
+      // opencode's placeholder title. The small model is the deployment's explicit choice
+      // (point it at the gateway to have it leased and counted), so it passes untouched.
+      if (SMALL_MODEL_AGENTS.has(input?.agent)) return;
       const routed = routes.get(sessionID);
       if (!routed) throw new Error("[opencode-broker] route unavailable; resend the prompt");
       const providerID = routed?.target?.model?.providerID;

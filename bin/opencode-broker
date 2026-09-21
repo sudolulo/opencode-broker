@@ -36,6 +36,7 @@ import {
   targetForID,
   targetFull,
   modelSlotKey,
+  profileReachesCloud,
   targetEligibleIDsFor,
   targetIDsFor,
   modelRefForTier,
@@ -972,7 +973,11 @@ const serve = async () => {
       if (request.url === "/lease") {
         // Admission must see the provider's latest plan window. A background refresh let
         // the first request after Anthropic reached 100% lease Opus before its circuit opened.
-        await planRefresh;
+        // ☠️ ONLY WHERE A PLAN CAN MATTER. A lane that can never reach a cloud target has no plan
+        // window to admit against, and a due refresh can take seconds (one provider's usage API
+        // is allowed 20 s) -- time a latency-critical local caller, such as a command classifier
+        // with a 25 s budget that fails closed, cannot spare. LAN-only leases go straight on.
+        if (profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto")) await planRefresh;
         const caller = sanitizeCaller(body.caller);
         leaseCaller = caller && typeof body.sessionID === "string" ? { sessionID: body.sessionID, caller } : null;
         let lease;

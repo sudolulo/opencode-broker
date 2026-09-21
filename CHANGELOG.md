@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] — 2026-09-21
+
+### Fixed
+
+- **opencode's session titles.** Title generation runs on `small_model` and only fires
+  `chat.params` (agent `title`), never `chat.message`, so it has no route of its own. The plugin
+  checked it against the conversation's route and rejected it as a model mismatch whenever the
+  session was on any other model. 60 of 69 root sessions in a week kept opencode's placeholder
+  title. The `title` agent now passes untouched. Point `small_model` at the gateway to have it
+  leased and counted like everything else.
+- **A LAN-only lease no longer waits for a plan-usage refresh.** Every `/lease` awaited a due
+  refresh of the providers' plan windows, which can take seconds (one usage API is allowed 20 s),
+  even for a lane that can never reach a cloud target and so has no plan to admit against. For a
+  latency-critical local caller, such as a command classifier with a 25 s budget that fails
+  closed, that wait was pure risk. Leases on profiles that cannot reach the cloud now skip it.
+
 ## [1.6.0] — 2026-09-21
 
 ### Added
