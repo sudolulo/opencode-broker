@@ -4,14 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0] — 2026-09-21
 
 ### Added
 
-- **A mapped model name can carry its own `bodyExtras`**, layered over the provider's key by
-  key. A key set to `null` injects nothing, so the client's own value, or the model's default,
-  stands. A lane whose `bodyExtras` turn thinking off for every local model can now serve one
-  name with that model's default (`"chat_template_kwargs": null`) without moving any other name.
+- **`POST /v1/responses`, the OpenAI Responses API.** The Vercel AI SDK's OpenAI provider calls
+  it by default, so clients built on it (firecrawl's extraction, for one) got a 404 from the
+  gateway and had to point at llama.cpp directly, where the broker could not see them. It rides
+  the same leasing, lane and name `bodyExtras`, `dropBodyKeys`, failover and accounting as chat.
+  What differs: it goes to the lane's `/responses`; usage is read from `input_tokens` and
+  `output_tokens` (on `response.completed` when streamed); and a stream gets neither
+  `stream_options` nor a `[DONE]`, and fails with the API's own `error` event.
+- **`responsesApi: true` marks a provider that serves `/responses`**, and only those are offered a
+  /responses lease. llama.cpp serves it natively; Anthropic's compat endpoint and most
+  OpenAI-compatible clouds do not, and a 404 there would score as a provider fault until the
+  lane's circuit opened, taking it away from chat as well. With no such lane configured the
+  gateway answers 502 and says so, without asking the broker.
 
 ## [1.4.0] — 2026-09-21
 
@@ -29,6 +37,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **A mapped model name can carry its own `bodyExtras`**, layered over the provider's key by
+  key. A key set to `null` injects nothing, so the client's own value, or the model's default,
+  stands. A lane whose `bodyExtras` turn thinking off for every local model can now serve one
+  name with that model's default (`"chat_template_kwargs": null`) without moving any other name.
 - **Usage log** (`lib/usage-log.js`, `usage.jsonl` in the routing state directory) and an
   `opencode-broker usage [days]` report. Every `/usage` report now also appends one line: session,
   model, the lease's target/profile/tier, `prompt` (input + cache read + cache write) and `output`

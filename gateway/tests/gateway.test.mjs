@@ -1268,3 +1268,164 @@ test("without waitForLocal, a missing local model is still reported at once", as
   });
   assert.equal(leases, 1, "no wait, no re-lease");
 });
+
+// ── /v1/responses ────────────────────────────────────────────────────────────
+// The Responses API rides the same leasing, extras, failover and accounting as chat. What
+// differs: the upstream path, which lanes may serve it, where usage lives, and how a stream ends.
+
+const askResponses = (base, body) => fetch(`${base}/v1/responses`, {
+  method: "POST",
+  headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+  body: JSON.stringify({ input: "hi", ...body }),
+});
+
+const RESP_CREATED = 'event: response.created\ndata: {"type":"response.created","response":{"id":"r1","status":"in_progress","usage":null}}\n\n';
+const RESP_DELTA = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n';
+const RESP_DONE = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","status":"completed","usage":{"input_tokens":13,"output_tokens":5,"total_tokens":18}}}\n\n';
+const RESP_ERROR = 'event: error\ndata: {"type":"error","code":"server_error","message":"slot died"}\n\n';
+
+test("a /v1/responses request goes to the lane's /responses with its extras, and is accounted", async () => {
+  const seen = [];
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      llamacpp: { baseUrl: "http://local.example/v1", responsesApi: true,
+        bodyExtras: { chat_template_kwargs: { enable_thinking: false } } },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease" ? { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } } : { ok: true };
+    },
+    fetchImpl: async (url, options) => {
+      seen.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => ({ id: "r1", object: "response", status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+        usage: { input_tokens: 13, output_tokens: 5, total_tokens: 18 } }) };
+    },
+  });
+  let payload;
+  await withServer(handler, async (base) => {
+    const response = await askResponses(base, { model: "whatever", text: { format: { type: "json_object" } } });
+    assert.equal(response.status, 200);
+    payload = await response.json();
+  });
+  assert.equal(seen[0].url, "http://local.example/v1/responses", "the Responses path, not chat");
+  assert.equal(seen[0].body.model, "qwen3.5-9b", "model rewritten to the leased one, as for chat");
+  assert.deepEqual(seen[0].body.chat_template_kwargs, { enable_thinking: false }, "lane extras apply here too");
+  assert.deepEqual(seen[0].body.text, { format: { type: "json_object" } }, "the Responses fields ride through untouched");
+  assert.equal(payload.output[0].content[0].text, "ok", "the upstream's payload is the client's, verbatim");
+  const usage = brokerCalls.find((call) => call.route === "/usage");
+  assert.deepEqual(usage.body.tokens, { input: 13, output: 5 }, "input_tokens/output_tokens are read, not zero");
+});
+
+test("only a lane that declares responsesApi is offered a /responses lease", async () => {
+  const leases = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      llamacpp: { baseUrl: "http://local.example/v1", responsesApi: true },
+      anthropic: { baseUrl: "http://claude.example/v1" },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      if (route === "/lease") { leases.push(body); return { target: { model: { providerID: "llamacpp", id: "m" } } }; }
+      return { ok: true };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ output: [], usage: { input_tokens: 1, output_tokens: 1 } }) }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askResponses(base)).status, 200);
+    assert.equal((await askModel(base, {})).status, 200, "chat still offers every lane");
+  });
+  assert.deepEqual(leases[0].providers, ["llamacpp"], "a lane that would 404 /responses is never offered it");
+  assert.deepEqual(leases[1].providers, ["llamacpp", "anthropic"]);
+
+  // With no capable lane there is nothing to lease: say why, and never touch the broker.
+  let brokerTouched = false;
+  const none = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { anthropic: { baseUrl: "http://claude.example/v1" } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => { if (route === "/lease") brokerTouched = true; return { ok: true }; },
+    fetchImpl: async () => { throw new Error("must not forward"); },
+  });
+  await withServer(none, async (base) => {
+    const response = await askResponses(base);
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error.message, /no configured lane serves \/v1\/responses/);
+  });
+  assert.equal(brokerTouched, false);
+});
+
+test("a streamed /responses request is relayed verbatim, accounted off response.completed, with no [DONE]", async () => {
+  const seen = [];
+  const upstream = await sseUpstream([RESP_CREATED, RESP_DELTA, RESP_DONE], { seen });
+  const brokerCalls = [];
+  const handler = streamingHandler({
+    providers: { llamacpp: { baseUrl: upstream.base, responsesApi: true } },
+    brokerCalls,
+    leases: [{ target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } }],
+  });
+  let text;
+  await withServer(handler, async (base) => {
+    const response = await askResponses(base, { stream: true });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+    text = await drain(response);
+  });
+  await upstream.close();
+  assert.equal(text, RESP_CREATED + RESP_DELTA + RESP_DONE, "typed events pass through byte for byte");
+  assert.doesNotMatch(text, /\[DONE\]/, "a Responses stream has no [DONE], and must not be handed one");
+  assert.equal(seen[0].stream, true);
+  assert.equal(seen[0].stream_options, undefined, "stream_options is a chat option; it is not injected here");
+  const usage = brokerCalls.find((call) => call.route === "/usage");
+  assert.deepEqual(usage.body.tokens, { input: 13, output: 5 }, "measured off response.completed, not estimated");
+  assert.equal(usage.body.estimated, undefined);
+});
+
+test("a /responses error event before any output fails over; after output it ends the stream in kind", async () => {
+  // Before the first frame: a dead lane, not a dead request -- swallow it and try the next lane.
+  const dead = await sseUpstream([RESP_ERROR]);
+  const live = await sseUpstream([RESP_CREATED, RESP_DELTA, RESP_DONE]);
+  const brokerCalls = [];
+  const handler = streamingHandler({
+    providers: { dead: { baseUrl: dead.base, responsesApi: true }, live: { baseUrl: live.base, responsesApi: true } },
+    brokerCalls,
+    leases: [
+      { target: { model: { providerID: "dead", id: "m" } } },
+      { target: { model: { providerID: "live", id: "m" } } },
+    ],
+  });
+  let text;
+  await withServer(handler, async (base) => { text = await drain(await askResponses(base, { stream: true })); });
+  await dead.close(); await live.close();
+  assert.equal(text, RESP_CREATED + RESP_DELTA + RESP_DONE, "the client never learns the first attempt happened");
+  assert.ok(brokerCalls.some((call) => call.route === "/failure"), "the lane that errored is indicted");
+
+  // After output: committed. End with the Responses API's own error event, never a chat
+  // error envelope or a [DONE] its parser would choke on.
+  const dying = await sseUpstream([RESP_CREATED, RESP_DELTA, RESP_ERROR]);
+  const calls = [];
+  const committed = streamingHandler({
+    providers: { llamacpp: { baseUrl: dying.base, responsesApi: true } },
+    brokerCalls: calls,
+    leases: [{ target: { model: { providerID: "llamacpp", id: "m" } } }],
+  });
+  await withServer(committed, async (base) => { text = await drain(await askResponses(base, { stream: true })); });
+  await dying.close();
+  assert.ok(text.startsWith(RESP_CREATED + RESP_DELTA), "what was relayed stays relayed");
+  assert.match(text, /event: error\ndata: \{"type":"error","code":"upstream_error","message":"gateway: slot died"/);
+  assert.doesNotMatch(text, /\[DONE\]/);
+  assert.ok(calls.some((call) => call.route === "/failure"));
+});
+
+test("an unknown path is a 404 that names both endpoints", async () => {
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://x/v1" } } },
+    gatewayKey: "gw-secret", brokerRequest: async () => ({ ok: true }),
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/embeddings`, { method: "POST", headers: { Authorization: "Bearer gw-secret" }, body: "{}" });
+    assert.equal(response.status, 404);
+    assert.match((await response.json()).error.message, /POST \/v1\/chat\/completions, POST \/v1\/responses/);
+  });
+});

@@ -235,6 +235,11 @@ const errorFrame = (message) => `data: ${JSON.stringify({
   error: { message: `gateway: ${message}`, type: "upstream_error", param: null, code: null },
 })}\n\n`;
 
+// The Responses API's own terminal failure: an `error` event. Its streams have no [DONE].
+const responsesErrorFrame = (message) => `event: error\ndata: ${JSON.stringify({
+  type: "error", code: "upstream_error", message: `gateway: ${message}`, param: null,
+})}\n\n`;
+
 // ☠️ NEVER REPORT ZERO USAGE. A stream still spent tokens even when the
 // upstream ignored stream_options and told us nothing: a 0/0 report teaches the
 // budget ledger that this lane is free, and the depletion balancer then pours
@@ -243,6 +248,23 @@ const errorFrame = (message) => `data: ${JSON.stringify({
 // estimate leaseOnce() already uses for context sizing; `estimated` rides along
 // so a reader of the ledger can tell a measurement from a guess (the broker
 // ignores fields it does not know).
+// ── the two request shapes ──────────────────────────────────────────────────
+// The gateway forwards OpenAI's Chat Completions API and its Responses API. Leasing, lane
+// extras, failover and accounting are the same for both; what differs is the upstream path,
+// who may serve it, where usage lives, and how a stream ends.
+// ☠️ A LANE SERVES /responses ONLY WHEN ITS CONFIG SAYS SO (`responsesApi: true`). llama.cpp
+// serves it natively; Anthropic's compat endpoint and most OpenAI-compatible clouds do not.
+// Offering them a /responses lease would get a 404 scored as a provider fault, and every such
+// request would indict the lane until its circuit opened -- taking it away from chat traffic too.
+const CHAT = { name: "chat", path: "/chat/completions" };
+const RESPONSES = { name: "responses", path: "/responses" };
+
+// Usage in either dialect: chat says prompt/completion, responses says input/output.
+const readUsage = (usage) => ({
+  input: Number(usage?.prompt_tokens ?? usage?.input_tokens) || 0,
+  output: Number(usage?.completion_tokens ?? usage?.output_tokens) || 0,
+});
+
 const estimateUsage = (requestBody, outputChars) => ({
   input: Math.ceil(JSON.stringify(requestBody ?? {}).length / 4),
   output: Math.ceil(outputChars / 4),
@@ -258,7 +280,7 @@ const estimateUsage = (requestBody, outputChars) => ({
 // for: the usage tail we asked for ourselves, and error frames.
 //
 // `relayed` is the whole ballgame -- see THE FAILOVER BOUNDARY below.
-const relayStream = async ({ stream, sink, keepUsageFrames, touch }) => {
+const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT }) => {
   const decoder = new TextDecoder();
   let buffer = "";
   let relayed = false;
@@ -284,24 +306,28 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch }) => {
     if (data.trim() === "[DONE]") { sawDone = true; emit(raw); return true; }
     let event = null;
     try { event = JSON.parse(data); } catch { emit(raw); return true; }
-    if (event?.error) {
-      streamError = new Error(String(event.error?.message ?? JSON.stringify(event.error)).slice(0, 400));
+    // A responses stream fails with an `error` event or a `response.failed` whose
+    // response carries the error; a chat stream with an error envelope.
+    const failure = event?.error
+      ?? (api === RESPONSES && event?.type === "error" ? event : null)
+      ?? (api === RESPONSES && event?.type === "response.failed" ? (event.response?.error ?? event) : null);
+    if (failure) {
+      streamError = new Error(String(failure?.message ?? JSON.stringify(failure)).slice(0, 400));
       // An error frame with the wire still clean is a dead lane, not a dead
       // request: swallow it so the caller can fail over and the client never
       // learns this attempt happened.
       if (relayed) emit(raw);
       return false;
     }
-    if (event?.usage && typeof event.usage === "object") {
-      usage = {
-        input: Number(event.usage.prompt_tokens) || 0,
-        output: Number(event.usage.completion_tokens) || 0,
-      };
-    }
+    // Chat puts usage on the tail chunk; responses on the response that
+    // `response.completed` carries (earlier events carry `usage: null`).
+    const reported = event?.usage ?? event?.response?.usage;
+    if (reported && typeof reported === "object") usage = readUsage(reported);
     for (const choice of Array.isArray(event?.choices) ? event.choices : []) {
       const piece = choice?.delta?.content;
       if (typeof piece === "string") outputChars += piece.length;
     }
+    if (event?.type === "response.output_text.delta" && typeof event.delta === "string") outputChars += event.delta.length;
     // ☠️ The usage tail frame exists because WE asked for it, so it must not
     // reach a client that did not. Its `choices` is an empty array, and client
     // code written against a stream it configured itself reads
@@ -356,9 +382,7 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
     frames.push({ ...head, choices: [{ index, delta: { role: choice?.message?.role ?? "assistant", content }, finish_reason: null }] });
     frames.push({ ...head, choices: [{ index, delta: {}, finish_reason: choice?.finish_reason ?? "stop" }] });
   });
-  const usage = payload?.usage && typeof payload.usage === "object"
-    ? { input: Number(payload.usage.prompt_tokens) || 0, output: Number(payload.usage.completion_tokens) || 0 }
-    : null;
+  const usage = payload?.usage && typeof payload.usage === "object" ? readUsage(payload.usage) : null;
   if (usage && keepUsageFrames) frames.push({ ...head, choices: [], usage: payload.usage });
   for (const frame of frames) sink.write(`data: ${JSON.stringify(frame)}\n\n`);
   sink.write(DONE_FRAME);
@@ -375,7 +399,7 @@ export const createGatewayHandler = ({
 }) => {
   const allowedProviders = Object.keys(config.providers);
 
-  const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null) => {
+  const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null, api = CHAT) => {
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. chars/4 is the usual
     // serviceable estimate for OpenAI-shaped payloads.
@@ -393,10 +417,15 @@ export const createGatewayHandler = ({
     const routeCap = Number.isFinite(override) && override > 0 ? override : null;
     const providers = allowedProviders.filter((id) => {
       if (excludeProviders.includes(id)) return false;
+      if (api === RESPONSES && config.providers[id]?.responsesApi !== true) return false;
       const cap = routeCap ?? Number(config.providers[id]?.maxContextTokens);
       return !(Number.isFinite(cap) && cap > 0 && contextTokens > cap);
     });
-    if (!providers.length) throw new Error("every forwardable provider was excluded this attempt");
+    if (!providers.length) {
+      throw new Error(api === RESPONSES && !allowedProviders.some((id) => config.providers[id]?.responsesApi === true)
+        ? "no configured lane serves /v1/responses (set responsesApi: true on one that does)"
+        : "every forwardable provider was excluded this attempt");
+    }
     const lease = await brokerRequest("/lease", {
       sessionID,
       // A mapped name leases THAT profile; everything else leases the
@@ -451,9 +480,9 @@ export const createGatewayHandler = ({
     ? route.prepareWaitMs
     : prepareWaitMs);
 
-  const leaseWithPrepare = async (sessionID, requestBody, excluded, route, clientAbort, deadline) => {
+  const leaseWithPrepare = async (sessionID, requestBody, excluded, route, clientAbort, deadline, api = CHAT) => {
     for (;;) {
-      try { return await leaseOnce(sessionID, requestBody, excluded, route); } catch (refusal) {
+      try { return await leaseOnce(sessionID, requestBody, excluded, route, api); } catch (refusal) {
         // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
         // out for everyone. The deadline is the request's own either way.
         const absentLocal = route?.waitForLocal === true && refusal?.code === ABSENT_LOCAL;
@@ -488,7 +517,7 @@ export const createGatewayHandler = ({
 
   // `sink` present == the client asked for SSE and gets frames instead of a
   // payload; absent == the buffered path, unchanged since 0.1.0.
-  const completions = async (requestBody, clientAbort = null, sink = null) => {
+  const completions = async (requestBody, clientAbort = null, sink = null, api = CHAT) => {
     let lastError = null;
     const excluded = [];
     const streaming = Boolean(sink);
@@ -528,7 +557,7 @@ export const createGatewayHandler = ({
     const deadline = now() + waitFor(route);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       let leased;
-      try { leased = await leaseWithPrepare(sessionID, requestBody, excluded, route, clientAbort, deadline); }
+      try { leased = await leaseWithPrepare(sessionID, requestBody, excluded, route, clientAbort, deadline, api); }
       catch (error) { lastError = error; break; }
       const providerConfig = config.providers[leased.providerID];
       if (!providerConfig?.baseUrl) {
@@ -645,11 +674,12 @@ export const createGatewayHandler = ({
           // out; it then accounts by estimate, which is worse than measured and
           // enormously better than quarantined. A client's OWN stream_options
           // still rides through untouched -- that ask is not ours to strip.
-          if (providerConfig.streamUsage !== false) {
+          // Chat only: a responses stream always reports usage on response.completed.
+          if (api === CHAT && providerConfig.streamUsage !== false) {
             forwardBody.stream_options = { ...(forwardBody.stream_options ?? {}), include_usage: true };
           }
         }
-        if (providerConfig.jsonMode === "instruct" && forwardBody.response_format) {
+        if (api === CHAT && providerConfig.jsonMode === "instruct" && forwardBody.response_format) {
           const wantedJson = forwardBody.response_format?.type?.startsWith("json");
           delete forwardBody.response_format;
           if (wantedJson) {
@@ -663,7 +693,7 @@ export const createGatewayHandler = ({
             };
           }
         }
-        response = await fetchImpl(`${providerConfig.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        response = await fetchImpl(`${providerConfig.baseUrl.replace(/\/$/, "")}${api.path}`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -719,9 +749,15 @@ export const createGatewayHandler = ({
         const contentType = String(response.headers?.get?.("content-type") ?? "");
         let outcome;
         try {
+          // ☆ Dressing a buffered body as a stream is a chat-only courtesy: a
+          // responses stream is a sequence of typed events a client parses by
+          // type, and inventing them risks a shape the client rejects halfway.
           outcome = contentType.includes("application/json")
-            ? await relayBufferedAsStream({ response, sink, keepUsageFrames })
-            : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs) });
+            ? (api === CHAT
+              ? await relayBufferedAsStream({ response, sink, keepUsageFrames })
+              : { relayed: false, usage: null, outputChars: 0, sawDone: false,
+                error: new Error(`upstream ${leased.providerID} answered a streamed /responses request with one JSON body`) })
+            : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api });
         } finally {
           clearTimeout(stallTimer);
         }
@@ -759,8 +795,9 @@ export const createGatewayHandler = ({
             // parse; the broker gets the failure, because circuits only open on
             // reports and a lane that dies at token 200 is exactly the lane the
             // next request must route around.
-            sink.write(errorFrame(String(outcome.error?.message ?? outcome.error).slice(0, 200)));
-            sink.write(DONE_FRAME);
+            const why = String(outcome.error?.message ?? outcome.error).slice(0, 200);
+            if (api === RESPONSES) sink.write(responsesErrorFrame(why));
+            else { sink.write(errorFrame(why)); sink.write(DONE_FRAME); }
             await settle(leased.sessionID, "/failure", {
               error: { message: `stream failed after ${outcome.outputChars} chars: ${String(outcome.error?.message ?? outcome.error)}`.slice(0, 400) },
             });
@@ -769,7 +806,7 @@ export const createGatewayHandler = ({
           // ☆ A missing [DONE] does not indict -- it is a dialect gap, not a
           // fault -- but the client must never be left waiting for a terminator
           // that is not coming.
-          if (!outcome.sawDone) sink.write(DONE_FRAME);
+          if (api === CHAT && !outcome.sawDone) sink.write(DONE_FRAME);
           await settle(leased.sessionID, "/complete");
         }
         return { status: 200, streamed: true, providerID: leased.providerID, modelID: leased.modelID };
@@ -799,13 +836,7 @@ export const createGatewayHandler = ({
           }
         }
       }
-      const usage = payload?.usage;
-      if (usage) {
-        await reportUsage(leased, {
-          input: Number(usage.prompt_tokens) || 0,
-          output: Number(usage.completion_tokens) || 0,
-        });
-      }
+      if (payload?.usage) await reportUsage(leased, readUsage(payload.usage));
       await settle(leased.sessionID, "/complete");
       return { status: 200, payload, providerID: leased.providerID, modelID: leased.modelID };
     }
@@ -849,9 +880,10 @@ export const createGatewayHandler = ({
       }));
       return;
     }
-    if (request.method !== "POST" || url !== "/v1/chat/completions") {
+    const api = url === "/v1/chat/completions" ? CHAT : url === "/v1/responses" ? RESPONSES : null;
+    if (request.method !== "POST" || !api) {
       response.writeHead(404, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: { message: "only POST /v1/chat/completions and GET /v1/models" } }));
+      response.end(JSON.stringify({ error: { message: "only POST /v1/chat/completions, POST /v1/responses and GET /v1/models" } }));
       return;
     }
     let body = "";
@@ -896,7 +928,7 @@ export const createGatewayHandler = ({
         response.write(text);
       },
     } : null;
-    const result = await completions(parsed, clientAbortController.signal, sink);
+    const result = await completions(parsed, clientAbortController.signal, sink, api);
     // A streaming request that never got a frame out still owes the client an
     // ordinary JSON error, which is exactly what an OpenAI client expects when
     // a stream fails to start.
