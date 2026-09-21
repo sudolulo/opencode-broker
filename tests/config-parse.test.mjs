@@ -134,6 +134,37 @@ test("per-target modelCapacity is kept for local targets as a positive integer o
   assert.equal(CONFIG.targets.cloud.modelCapacity, undefined);
 });
 
+// An absent burnWatch block is the full watch with its documented defaults, and its
+// notifier falls back to the model watch's, so one notify script serves both.
+test("burnWatch defaults to on, takes its thresholds from config, and borrows watch.notifyCommand", async () => {
+  const { BURN_DEFAULTS } = await import("../lib/burn-watch.js");
+  const absent = (await loadConfig(`{ "watch": { "notifyCommand": ["/usr/local/bin/notify"] } }`)).CONFIG.burnWatch;
+  assert.equal(absent.enabled, true);
+  assert.deepEqual(absent.notifyCommand, ["/usr/local/bin/notify"]);
+  for (const [key, value] of Object.entries(BURN_DEFAULTS)) assert.equal(absent[key], value, key);
+
+  const tuned = (await loadConfig(`{
+    "watch": { "notifyCommand": ["/usr/local/bin/notify"] },
+    "burnWatch": {
+      "notifyCommand": ["/usr/local/bin/alert", "{title}", "{body}", "high"],
+      "sessionStopTokens": 8000000,
+      "planWindow": "wk",
+      "rewriteCount": "banana",
+      "providerSpendTokens": -1
+    }
+  }`)).CONFIG.burnWatch;
+  assert.deepEqual(tuned.notifyCommand, ["/usr/local/bin/alert", "{title}", "{body}", "high"]);
+  assert.equal(tuned.sessionStopTokens, 8000000);
+  assert.equal(tuned.planWindow, "wk");
+  assert.equal(tuned.rewriteCount, BURN_DEFAULTS.rewriteCount, "junk falls back to the default");
+  assert.equal(tuned.providerSpendTokens, BURN_DEFAULTS.providerSpendTokens);
+
+  const off = (await loadConfig(`{ "burnWatch": { "enabled": false, "notifyCommand": [] } }`)).CONFIG.burnWatch;
+  assert.equal(off.enabled, false);
+  assert.deepEqual(off.notifyCommand, []);
+  assert.deepEqual((await loadConfig(`{}`)).CONFIG.burnWatch.notifyCommand, [], "no notifier anywhere: log only");
+});
+
 // The shipped examples are documentation; a typo in one would teach every new install a
 // config that silently routes nothing.
 test("the shipped example configs parse and declare targets", async () => {

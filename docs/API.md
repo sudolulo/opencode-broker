@@ -16,7 +16,7 @@ tooling) is a supported client.
 | `/failure` | `{ sessionID, targetID?, error }` | Report a provider failure. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). |
 | `/complete` | `{ sessionID }` | Successful end: clears probation for the target's provider, drops the lease. |
 | `/forget` | `{ sessionID, completed? }` | Drop the lease at the end of a turn. The assignment (the session's pinned model) stays and ages out after 14 days; `completed: true` also clears probation. |
-| `/usage` | `{ providerID, modelID?, requests, tokens: { input, output, cacheRead, cacheWrite } }` | Feed the budget ledger (one report per provider request). Returns current `utilization`. |
+| `/usage` | `{ sessionID?, providerID, modelID?, requests, tokens: { input, output, cacheRead, cacheWrite } }` | Feed the budget ledger and the burn watch (one report per provider request). Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
 | `/inventory` | `{ targets, providers, modelContexts, modelVariants, authRevision, authOnly? }` | Publish discovered provider/model inventory. Refused unless `authRevision` matches the broker's own hash of opencode's `auth.json` — an OAuth-to-API-key change can never publish stale admission. |
 | `/status` | `{}` | Full public state: leases, circuits (with `renewsAt`), health, budget report, last decision, and `deprecations` when the broker is still reading a renamed setting. |
 | `/selection` | `{}` | Just `lastDecision` — why the last lease chose its target. |

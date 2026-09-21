@@ -113,7 +113,8 @@ so nothing is ever spent on a provider you did not list.
 | `localContextHeadroom` | Fraction of a local window the router will lease into (default 0.6) when a target declares no `outputReserve`. |
 | `workerLocalShareDenominator` | One in N `auto` worker assignments goes to a local target (default 4; 1 disables). |
 | `burstFence` | How full a short window must be before it counts as a balancing input (default 0.9). |
-| `watch.notifyCommand` | argv that `opencode-broker-watch` runs with a title and body when the catalog changes. |
+| `watch.notifyCommand` | argv that `opencode-broker-watch` runs when the catalog changes. `{title}`, `{body}` and `{kind}` in it are replaced; a command naming neither `{title}` nor `{body}` gets the title and body appended. No shell is involved. |
+| `burnWatch` | The [burn watch](#the-burn-watch): `enabled` (default `true`), `notifyCommand` (argv like `watch.notifyCommand`, which it defaults to; `[]` only logs) and the thresholds listed there. |
 | `hud` | The HUD's options; see [The HUD](#the-hud). |
 
 Environment:
@@ -129,6 +130,56 @@ Environment:
 
 The broker's socket protocol is documented in [docs/API.md](docs/API.md); the
 bundled plugins are clients like any other.
+
+## The burn watch
+
+A session caught in a loop (a compaction that repeats, a context-pruning plugin
+that keeps invalidating the prompt cache) can spend a large share of a
+subscription window in minutes. Every opencode process already reports each
+provider request's tokens to the broker, so the broker watches the rate across
+all sessions and acts on two kinds of signal:
+
+- **Stop.** A session that re-sends most of its prompt uncached again and again,
+  or spends far more than any working session does, has its turn aborted by the
+  router plugin, with a toast saying why. Nothing is deleted; sending another
+  message continues deliberately, and the counters start over.
+- **Notify.** Fast spend by one session, fast spend by one provider across all
+  sessions, or a plan window climbing fast (read from the provider's own usage
+  report, where `planUsage` is configured) runs `burnWatch.notifyCommand`, at
+  most once per subject per cooldown. Every stop is announced the same way and
+  logged to `decisions.jsonl` as `policy: "burn-stop"`.
+
+Local providers are never counted. Spend is weighted tokens: input + output +
+cache write + 0.1 x cache read. The defaults were chosen by replaying a week of
+real usage from frontier models with contexts up to ~450K: they would have
+stopped the four runaway bursts in that week and no other session. Tune them
+under `burnWatch`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rewriteTokens` | 100000 | A step is a *full re-send* when its uncached prompt (input + cache write) is at least this and at least half the prompt. |
+| `rewriteCount` | 4 | Stop after this many full re-sends inside `rewriteWindowMs` ... |
+| `rewriteVolumeTokens` | 1500000 | ... that carry at least this many tokens between them. |
+| `rewriteWindowMs` | 300000 | |
+| `sessionSpendTokens` | 3000000 | Notify when one session spends this much inside `sessionSpendWindowMs`. |
+| `sessionStopTokens` | 6000000 | Stop when one session spends this much inside `sessionSpendWindowMs`. |
+| `sessionSpendWindowMs` | 300000 | |
+| `providerSpendTokens` | 3000000 | Notify when one provider, across all sessions, spends this much inside `providerSpendWindowMs`. |
+| `providerSpendWindowMs` | 300000 | |
+| `planWindow` | `"5h"` | The plan-usage window id to watch for a fast climb. |
+| `planRisePoints` | 6 | Notify when that window rises this many percentage points inside `planRiseWindowMs`. |
+| `planRiseWindowMs` | 600000 | |
+| `notifyCooldownMs` | 900000 | At most one notification per session, provider or plan in this long. |
+
+The notify command gets a short title and body, and `{kind}` is one of `stop`,
+`session-spend`, `provider-spend` or `plan-rise`. For a notifier that takes a
+priority and a tag after the message:
+
+```jsonc
+"burnWatch": {
+  "notifyCommand": ["/usr/local/bin/notify", "{title}", "{body}", "high", "{kind}"]
+}
+```
 
 ## The gateway
 
@@ -261,7 +312,7 @@ share records.
 |---|---|
 | `bin/opencode-broker` | The daemon and its CLI: `serve`, `status`, `selection`, `decisions [n]`, `rearm [target or provider:<id>]`, `quarantine provider:<id>`. |
 | `bin/opencode-broker-watch` | Run daily: refreshes opencode's model catalog, republishes the broker's inventory, and reports new models and newer releases of the ones you pin through `watch.notifyCommand`. |
-| `plugin/router.js` | Leases a model at `chat.message`, tracks each session's context size, reports usage and failures, enforces profile tool rules, and waits out a busy or loading local model. |
+| `plugin/router.js` | Leases a model at `chat.message`, tracks each session's context size, reports usage and failures, enforces profile tool rules, waits out a busy or loading local model, and stops a turn the burn watch flags. |
 | `plugin/model-default.js`, `tui/` | Start new sessions on the model you last picked by hand. |
 | `plugin/compaction-guard.js` | Works around three compaction failures seen with opencode 1.18: a resumed summary parented to the wrong message (so the next turn resends the whole history), overflow and auto-compaction repeating without end, and a context-pruning plugin treating a cancelled compaction as a finished one. It uses only stock hooks and routes. |
 

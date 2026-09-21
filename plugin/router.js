@@ -1040,6 +1040,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
                 cacheRead: Number(part.tokens.cache?.read) || 0,
                 cacheWrite: Number(part.tokens.cache?.write) || 0,
               },
+            }).then((reply) => {
+              // The broker's burn watch (lib/burn-watch.js) judged this session a runaway.
+              // This process owns it, so this is the one place that can stop it: abort the
+              // turn and say why. Nothing is deleted, and continuing is the person's call.
+              if (!reply?.burn?.stop) return;
+              report("warn", `burn watch stopped session ${sessionID}: ${reply.burn.reason}`);
+              client.session.abort({ path: { id: sessionID }, query: { directory } }).catch(() => {});
+              client?.tui?.showToast?.({
+                body: {
+                  title: "Burn watch stopped this session",
+                  message: `${reply.burn.reason}. Nothing was lost; send a message to continue deliberately.`,
+                  variant: "error",
+                  duration: 30000,
+                },
+                query: { directory },
+              })?.catch?.(() => {});
             }).catch(() => {});
           }
         }

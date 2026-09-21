@@ -41,6 +41,8 @@ import {
   modelRefForTier,
 } from "../lib/routing.js";
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
+import { createBurnWatch } from "../lib/burn-watch.js";
+import { notifyArgv } from "../lib/notify.js";
 import { DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
   applyPlanUsageCircuit,
@@ -57,6 +59,26 @@ import {
   recordFailureEvidence,
   rearmQuarantinedProvider,
 } from "../lib/provider-health.js";
+
+// The burn watch (lib/burn-watch.js): fed by every /usage report and every plan
+// reading, so it sees all sessions on this host at once. In memory on purpose -- its
+// windows are minutes long, and a restart losing them only delays a trip.
+const burnWatch = CONFIG.burnWatch.enabled ? createBurnWatch({ config: CONFIG.burnWatch }) : null;
+const notifyBurn = (alert) => {
+  console.error(`[opencode-broker] ${alert.title}: ${alert.body}`);
+  const [command, ...args] = notifyArgv(CONFIG.burnWatch.notifyCommand, alert);
+  if (!command) return;
+  try {
+    // Detached and ignored: an alert must never hold up the /usage reply it rides on.
+    const child = spawn(command, args, { stdio: "ignore", detached: true });
+    child.on("error", (error) => console.error(`[opencode-broker] burn alert failed: ${error?.message ?? error}`));
+    child.unref();
+  } catch (error) {
+    console.error(`[opencode-broker] burn alert failed: ${error?.message ?? error}`);
+  }
+};
+const localProviderIDs = (targets) => new Set(Object.values(targets)
+  .filter((target) => target?.kind === "local").map((target) => target.providerID));
 
 const STATE_PATH = join(routingStateDir(), "broker.json");
 // Every routing decision -- grants, revalidations, stickiness, REFUSALS and
@@ -878,6 +900,14 @@ const serve = async () => {
       const body = await parseBody(request);
       sweep(state);
       const planRefresh = refreshPlanUsage(state);
+      // Plan velocity: every reading the refresh leaves behind, however it resolves.
+      if (burnWatch) {
+        planRefresh.then(() => {
+          for (const [providerID, plan] of Object.entries(planUsageSnapshot())) {
+            for (const alert of burnWatch.recordPlan({ providerID, windows: plan?.windows })) notifyBurn(alert);
+          }
+        }, () => {});
+      }
       if (request.url === "/lease") {
         // Admission must see the provider's latest plan window. A background refresh let
         // the first request after Anthropic reached 100% lease Opus before its circuit opened.
@@ -1111,6 +1141,25 @@ const serve = async () => {
         // budget reading remains useful. Keep the observation time so a delayed report
         // cannot clear newer probation.
         const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+        // Burn watch: after the ledger, before the reply, so a stop rides back to the
+        // client that reported the step -- the one process that can abort that session.
+        let burn = null;
+        if (burnWatch && !localProviderIDs(allTargets(state)).has(providerID)) {
+          const watched = burnWatch.recordUsage({
+            sessionID, providerID,
+            tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
+            at: Date.now(),
+          });
+          for (const alert of watched.alerts) notifyBurn(alert);
+          if (watched.stop) {
+            burn = { stop: true, reason: watched.stop.reason };
+            recordDecision(state, {
+              at: Date.now(), sessionID, providerID, policy: "burn-stop", code: "burn-stop",
+              targetID: null, reasons: [watched.stop.reason],
+              eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
+            });
+          }
+        }
         const assignment = sessionID ? (state.leases[sessionID] ?? state.assignments[sessionID]) : null;
         const target = targetForID(assignment?.targetID, allTargets(state));
         if (Number.isFinite(rawObservedAt) && rawObservedAt <= Date.now() &&
@@ -1118,7 +1167,7 @@ const serve = async () => {
           state.health = markProbationSuccessHealthy(state.health, providerID, { at: rawObservedAt });
         }
         writeState(state);
-        return reply(response, 200, { ok: true, utilization: effectiveUtilization(state.budgets, providerID) });
+        return reply(response, 200, { ok: true, utilization: effectiveUtilization(state.budgets, providerID), ...(burn ? { burn } : {}) });
       }
       if (request.url === "/status") {
         writeState(state);

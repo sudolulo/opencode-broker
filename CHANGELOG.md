@@ -19,6 +19,33 @@ All notable changes to this project are documented here. The format is based on
   caps the target's own share, and a target without `modelCapacity` behaves as
   before. Reclaiming idle leases now also frees a quiet lease on a sibling
   target that is holding a target full.
+- **Burn watch: a runaway session is stopped by its rate, whatever caused it**
+  (`lib/burn-watch.js`, config `burnWatch`). A loop of any shape (a compaction
+  that repeats, a context-pruning plugin that keeps invalidating the prompt
+  cache) could spend a large share of a plan window before anyone noticed. The
+  broker already receives every cloud request's tokens on `/usage`, so it now
+  watches the rate there:
+  - **Stop:** 4 or more steps in five minutes that each re-send most of the
+    prompt uncached (100K+ fresh tokens), 1.5M+ between them; or 6M weighted
+    tokens (input + output + cache write + 0.1 x cache read) from one session
+    in five minutes.
+  - **Notify only:** one session at 3M weighted tokens in five minutes, one
+    provider across all sessions at 3M, or the provider's own `5h` plan window
+    rising 6+ points in ten minutes.
+
+  The defaults come from replaying a week of real usage and are all config. A
+  stop rides back on the `/usage` reply as `burn: { stop: true, reason }`; the
+  router plugin that reported the step aborts that session's turn and shows a
+  toast with the reason. Nothing is deleted, and the counters restart so
+  continuing is deliberate. Alerts run `burnWatch.notifyCommand` (default:
+  `watch.notifyCommand`), at most once per subject per 15 minutes, and every
+  stop is logged to `decisions.jsonl` as `policy: "burn-stop"`. Local providers
+  are never counted. On by default; `burnWatch.enabled: false` turns it off.
+- **Placeholders in notify commands.** `watch.notifyCommand` and
+  `burnWatch.notifyCommand` replace `{title}`, `{body}` and `{kind}` wherever
+  they appear, so a notifier that wants a priority or a tag after the message
+  can be called directly. A command naming neither `{title}` nor `{body}` gets
+  both appended, as before.
 
 ### Changed
 

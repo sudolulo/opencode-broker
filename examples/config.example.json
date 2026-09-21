@@ -436,6 +436,20 @@
   "defaultAgentTier": "worker",
   // Lease another tier's lane for this one. Only upward: an alias never weakens a tier.
   "tierAliases": {},
+  // Where opencode-broker-watch reports catalog changes: argv, run without a shell.
+  // {title}, {body} and {kind} are filled in; a command naming neither {title} nor {body}
+  // gets the two appended.
+  "watch": {
+    "notifyCommand": ["/usr/local/bin/notify"]
+  },
+  // The burn watch: stops a session that is burning its plan in a loop, and notifies on
+  // fast spend. On by default with the thresholds in the README; list only what you change.
+  // notifyCommand defaults to watch.notifyCommand; [] only logs to the broker's stderr.
+  "burnWatch": {
+    "notifyCommand": ["/usr/local/bin/notify", "{title}", "{body}", "high", "{kind}"],
+    "sessionStopTokens": 6000000,
+    "planWindow": "5h"
+  },
   // The HUD (hud/tui.js). Every key is optional.
   "hud": {
     // opencode-guard's permission-mode controls: "auto" shows them when the guard is

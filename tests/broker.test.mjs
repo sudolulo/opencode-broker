@@ -313,6 +313,66 @@ test("modelCapacity counts every target on the same local model, and keeps a slo
   }
 }));
 
+// The burn watch end to end: /usage reports in, a stop back out on the reply that crossed
+// the line, a decision logged, and the notify command run with its placeholders filled.
+test("the broker stops a runaway session on the /usage reply and notifies, and never counts local usage", async () => withTempHome(async (home) => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  const sent = join(home, "notified.txt");
+  const notifier = join(home, "notify.sh");
+  writeFileSync(notifier, `#!/bin/sh\nprintf '%s|' "$@" >> "${sent}"\necho >> "${sent}"\n`);
+  chmodSync(notifier, 0o755);
+  fixture.burnWatch = { notifyCommand: [notifier, "{title}", "{body}", "urgent", "{kind}"] };
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const { child, socketPath } = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath });
+  try {
+    const step = (sessionID, providerID, cacheWrite, cacheRead = 17_000) => request(socketPath, "/usage", {
+      sessionID, providerID, modelID: "m", observedAt: Date.now(), requests: 1,
+      tokens: { input: 5, output: 400, cacheRead, cacheWrite },
+    });
+    // Local hardware costs no plan: four huge re-sends on a local provider are not a burn.
+    for (let i = 0; i < 4; i++) assert.equal((await step("ses_local", "llamacpp", 500_000)).burn, undefined);
+    const replies = [];
+    for (let i = 0; i < 4; i++) replies.push(await step("ses_runaway", "anthropic", 430_000));
+    assert.deepEqual(replies.map((r) => r.burn?.stop === true), [false, false, false, true]);
+    assert.match(replies[3].burn.reason, /re-sent its whole prompt uncached 4 times/);
+    const decisions = readFileSync(join(home, ".local/share/opencode/model-routing/decisions.jsonl"), "utf8");
+    assert.match(decisions, /"policy":"burn-stop".*"sessionID":"ses_runaway"|"sessionID":"ses_runaway".*"policy":"burn-stop"/);
+    // The alert is spawned detached; give it a moment to land.
+    let text = "";
+    for (let i = 0; i < 40 && !/stopped a session/.test(text); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      try { text = readFileSync(sent, "utf8"); } catch {}
+    }
+    assert.match(text, /Burn watch stopped a session \(anthropic\)\|Session ses_runaway was stopped because .*\|urgent\|stop\|/);
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+// `enabled: false` is the whole watch off: no stop rides back, whatever the rate.
+test("a disabled burn watch never stops a session", async () => withTempHome(async (home) => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  fixture.burnWatch = { enabled: false };
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const { child, socketPath } = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath });
+  try {
+    for (let i = 0; i < 6; i++) {
+      const reply = await request(socketPath, "/usage", {
+        sessionID: "ses_runaway", providerID: "anthropic", modelID: "m", observedAt: Date.now(), requests: 1,
+        tokens: { input: 5, output: 400, cacheRead: 17_000, cacheWrite: 430_000 },
+      });
+      assert.equal(reply.ok, true);
+      assert.equal(reply.burn, undefined);
+    }
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

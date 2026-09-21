@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { CONFIG } from "../lib/config.js";
+import { notifyArgv } from "../lib/notify.js";
 import { routingStateDir, publishCachedSubscriptionInventory } from "../lib/routing.js";
 import { watchReport, formatReport } from "../lib/watch.js";
 
@@ -63,10 +64,10 @@ const lines = formatReport(report);
 if (lines.length) {
   const body = lines.slice(0, 40).join("\n");
   console.log(body);
-  const argv = CONFIG.watch.notifyCommand;
-  if (argv.length) {
+  const [command, ...args] = notifyArgv(CONFIG.watch.notifyCommand, { title: "opencode model watch", body, kind: "model-watch" });
+  if (command) {
     try {
-      execFileSync(argv[0], [...argv.slice(1), "opencode model watch", body], { stdio: "ignore", timeout: 30_000 });
+      execFileSync(command, args, { stdio: "ignore", timeout: 30_000 });
     } catch (error) {
       console.error(`notify failed: ${error?.message ?? error}`);
     }
