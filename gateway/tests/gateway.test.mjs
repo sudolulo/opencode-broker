@@ -1582,3 +1582,70 @@ test("a streaming request never takes the hold path", async () => {
     assert.equal(response.status, 502, "no frame was produced, so the stream owes an ordinary error");
   });
 });
+
+// A lane's waiters are served in arrival order. Unfair admission -- every waiter retrying on its
+// own timer -- gave a memory service's 3-slot lane a 40-minute worst case against a 55 s median.
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const lineHandler = ({ modelProfiles, prepareRetryMs, onServe = () => {} }) => {
+  const state = { free: 0, served: [], refusals: [] };
+  const handler = createGatewayHandler({
+    config: namedConfig({ prepareRetryMs, modelProfiles }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => {
+      if (route !== "/lease") return { ok: true };
+      if (state.free > 0) { state.free -= 1; return { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } }; }
+      for (const notify of state.refusals.splice(0)) notify();
+      throw busyRefusal();
+    },
+    fetchImpl: async (url, init) => {
+      const who = JSON.parse(init.body).messages[0].content;
+      state.served.push(who);
+      onServe(who, state);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) };
+    },
+  });
+  const nextRefusal = () => new Promise((resolve) => state.refusals.push(resolve));
+  return { handler, state, nextRefusal };
+};
+
+test("waiters get freed slots in arrival order, and a newcomer does not jump the line", async () => {
+  const { handler, state, nextRefusal } = lineHandler({
+    prepareRetryMs: 1000,
+    modelProfiles: { memory: { profile: "memory", prepareWaitMs: 10000 } },
+    // Once the head is served, two more slots free up: they go to B, then C.
+    onServe: (who, s) => { if (who === "A") s.free += 2; },
+  });
+  await withServer(handler, async (base) => {
+    const ask = (who) => askModel(base, { model: "memory", messages: [{ role: "user", content: who }] });
+    const a = ask("A");
+    await nextRefusal();
+    const b = ask("B");
+    await delay(50);
+    // Right after the head's refused retry, a slot frees and C arrives: C must not take it.
+    await nextRefusal();
+    state.free = 1;
+    const c = ask("C");
+    const answers = await Promise.all([a, b, c]);
+    assert.deepEqual(answers.map((r) => r.status), [200, 200, 200]);
+  });
+  assert.deepEqual(state.served, ["A", "B", "C"]);
+});
+
+test("a waiter that gives up leaves the line, and the next one is still served", async () => {
+  const { handler, state, nextRefusal } = lineHandler({
+    prepareRetryMs: 20,
+    modelProfiles: {
+      impatient: { profile: "memory", prepareWaitMs: 150 },
+      memory: { profile: "memory", prepareWaitMs: 5000 },
+    },
+  });
+  await withServer(handler, async (base) => {
+    const first = askModel(base, { model: "impatient", messages: [{ role: "user", content: "A" }] });
+    await nextRefusal();
+    const second = askModel(base, { model: "memory", messages: [{ role: "user", content: "B" }] });
+    assert.equal((await first).status, 502, "A ran out of budget in line");
+    state.free = 1;
+    assert.equal((await second).status, 200, "B was not stranded behind A's stale place");
+  });
+  assert.deepEqual(state.served, ["B"]);
+});

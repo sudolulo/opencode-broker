@@ -509,27 +509,70 @@ export const createGatewayHandler = ({
     ? route.prepareWaitMs
     : prepareWaitMs);
 
+  // ☠️ WAITERS ARE SERVED IN ARRIVAL ORDER. Every waiting request used to retry on its own
+  // timer, so a freed slot went to whichever retry happened to land first -- often a request
+  // that had just arrived. Measured 2026-09-21 on a memory service's 3-slot lane: median wait
+  // 55 s, p99 27 minutes, max 40, against a 50-minute budget. The tail is the unfairness, not the
+  // load. Now the requests waiting on one profile form a queue: only its head retries, a newcomer
+  // does not try ahead of a non-empty queue, and a head that gets its lease wakes the next one at
+  // once, so several slots freeing together drain without a retry interval between them.
+  const waiting = new Map(); // profile -> entries in arrival order
+
   const leaseWithPrepare = async (sessionID, requestBody, excluded, route, clientAbort, deadline, api = CHAT) => {
-    for (;;) {
-      try { return await leaseOnce(sessionID, requestBody, excluded, route, api); } catch (refusal) {
-        // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
-        // out for everyone. The deadline is the request's own either way.
-        const absentLocal = route?.waitForLocal === true &&
-          (refusal?.code === ABSENT_LOCAL || brokerUnreachable(refusal));
-        if (!isBusy(refusal) && !(route && isPreparing(refusal)) && !absentLocal) throw refusal;
-        // ☠️ A ZERO BUDGET IS "TELL ME NOW", NOT "WAIT ZERO SECONDS". Rethrow the broker's own
-        // refusal untouched -- it carries the real reason and the machine-readable code, and
-        // rewriting it as "the gateway waited 0s" would be both noise and a lie.
-        const budget = waitFor(route);
-        if (budget === 0) throw refusal;
+    const line = route?.profile ?? config.profile;
+    const budget = waitFor(route);
+    let entry = null;
+    let lastRefusal = null;
+    const leave = () => {
+      if (!entry) return;
+      const queue = waiting.get(line) ?? [];
+      const at = queue.indexOf(entry);
+      if (at >= 0) queue.splice(at, 1);
+      if (!queue.length) waiting.delete(line);
+      else if (at === 0) queue[0].wake();
+      entry = null;
+    };
+    try {
+      for (;;) {
+        const queue = waiting.get(line);
+        // ☆ A zero budget never waits, so it never queues: it asks once and takes the answer.
+        const myTurn = budget === 0 || (entry ? queue?.[0] === entry : !queue?.length);
+        if (myTurn) {
+          try { return await leaseOnce(sessionID, requestBody, excluded, route, api); } catch (refusal) {
+            // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
+            // out for everyone. The deadline is the request's own either way.
+            const absentLocal = route?.waitForLocal === true &&
+              (refusal?.code === ABSENT_LOCAL || brokerUnreachable(refusal));
+            if (!isBusy(refusal) && !(route && isPreparing(refusal)) && !absentLocal) throw refusal;
+            // ☠️ A ZERO BUDGET IS "TELL ME NOW", NOT "WAIT ZERO SECONDS". Rethrow the broker's own
+            // refusal untouched -- it carries the real reason and the machine-readable code, and
+            // rewriting it as "the gateway waited 0s" would be both noise and a lie.
+            if (budget === 0) throw refusal;
+            lastRefusal = refusal;
+          }
+        }
         const left = deadline - now();
         // ☆ The swap outlives our patience often enough to say so plainly: the
         // message is what a human sees in the picker, and "try again shortly"
         // is actionable where a bare 502 is not.
-        if (left <= 0) throw new Error(`${refusal.message} -- the gateway waited ${Math.round(budget / 1000)}s and it is still ${isBusy(refusal) ? "busy" : "not resident"}; try again shortly`);
+        if (left <= 0) {
+          throw new Error(lastRefusal
+            ? `${lastRefusal.message} -- the gateway waited ${Math.round(budget / 1000)}s and it is still ${isBusy(lastRefusal) ? "busy" : "not resident"}; try again shortly`
+            : `every slot on this lane stayed busy -- the gateway waited ${Math.round(budget / 1000)}s in line behind earlier requests; try again shortly`);
+        }
         if (clientAbort?.aborted) throw new Error("client disconnected");
-        await sleep(Math.min(prepareRetryMs, left), clientAbort);
+        if (!entry) {
+          entry = { wake: () => {} };
+          if (!waiting.has(line)) waiting.set(line, []);
+          waiting.get(line).push(entry);
+        }
+        await new Promise((resolve) => {
+          entry.wake = resolve;
+          sleep(Math.min(prepareRetryMs, left), clientAbort).then(resolve);
+        });
       }
+    } finally {
+      leave();
     }
   };
 

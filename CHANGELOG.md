@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-09-21
+
+### Changed
+
+- **The gateway serves waiting requests in arrival order.** Every waiter used to
+  retry the broker on its own timer, so a freed slot went to whichever retry landed
+  first, often a request that had only just arrived. Measured on a memory service's
+  3-slot lane after 1.8.0: median wait 55 s, p99 27 minutes, worst 40 minutes,
+  against a 50-minute budget. A request that outwaits its budget is a lost call.
+  Waiters on one profile now form a queue. Only the head retries, a newcomer does not
+  try ahead of a non-empty queue, and a head that gets its lease wakes the next one
+  immediately, so several slots freeing together drain without a retry interval
+  between them. A name with `prepareWaitMs: 0` never waits, so it never queues.
+
 ## [1.8.0] — 2026-09-21
 
 ### Added

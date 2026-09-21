@@ -286,6 +286,11 @@ extras, failover and usage accounting.
   upstream for streamed usage and strips the extra frame for clients that did
   not ask. When an upstream sends none it estimates, and says so; it never
   reports zero, because a zero teaches the balancer that a paid lane is free.
+- **Waiters are served in arrival order.** Requests waiting on one profile form a
+  queue: only the oldest retries, a new request does not try ahead of a non-empty
+  queue, and a request that gets its lease wakes the next at once. Without it a
+  freed slot went to whichever retry landed first, and a busy lane's worst wait
+  was dozens of times its median.
 - **Waiting is for requests that asked for a specific model.** When the broker
   says a model is being loaded (`target-preparing`), a mapped request waits up
   to `prepareWaitMs` (default 3 minutes). An unmapped one fails at once rather
