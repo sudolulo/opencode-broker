@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] — 2026-09-21
+
+### Fixed
+
+- **A `waitForLocal` name kept waiting only while the broker stayed up.** The broker client
+  retries a refused socket once, 250 ms later, and a broker restart outlasts that, so every
+  request such a name had parked in the wait loop failed when the broker was bounced. Measured:
+  36 waiting ingestion requests stopped at one broker restart. An unreachable broker is now
+  waited out on the same budget as a busy or absent model, for `waitForLocal` names only; others
+  still fail at once.
+
 ## [1.5.1] — 2026-09-21
 
 ### Fixed

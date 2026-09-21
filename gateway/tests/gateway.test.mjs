@@ -1429,3 +1429,38 @@ test("an unknown path is a 404 that names both endpoints", async () => {
     assert.match((await response.json()).error.message, /POST \/v1\/chat\/completions, POST \/v1\/responses/);
   });
 });
+
+test("a waitForLocal name also waits out a broker that is restarting", async () => {
+  const down = () => new Error("connect ECONNREFUSED /run/user/1000/broker.sock");
+  const answers = [down(), down(), { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } }];
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { background: { profile: "background", waitForLocal: true } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => {
+      if (route !== "/lease") return { ok: true };
+      const next = answers.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "kept" } }], usage: {} }) }),
+  });
+  await withServer(handler, async (base) => {
+    const response = await askModel(base, { model: "background" });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).choices[0].message.content, "kept");
+  });
+});
+
+test("any other name still fails at once when the broker is unreachable", async () => {
+  let leases = 0;
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { quick: { profile: "quick" } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => { if (route === "/lease") { leases += 1; throw new Error("connect ECONNREFUSED broker.sock"); } return { ok: true }; },
+    fetchImpl: async () => { throw new Error("must not be called"); },
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "quick" })).status, 502);
+  });
+  assert.equal(leases, 1);
+});

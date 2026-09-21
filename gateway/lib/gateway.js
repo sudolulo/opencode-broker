@@ -64,6 +64,13 @@ const PREPARING = "target-preparing";
 const isPreparing = (refusal) => refusal?.code === PREPARING;
 // A local-only lane with no resident model; waited out only by a name with `waitForLocal`.
 const ABSENT_LOCAL = "no-eligible-local-target";
+// ☠️ AND A BROKER THAT IS RESTARTING. The broker client retries a refused socket once, 250 ms
+// later, which a restart (~1-2 s) outlasts, so every request a `waitForLocal` name had parked in
+// the wait loop failed the moment the broker was bounced -- measured: 36 waiting ingestion
+// requests stopped at one broker restart. For such a name an unreachable broker is one more
+// thing to wait out on the same budget. The same shapes the client itself treats as transient.
+const BROKER_UNREACHABLE = /broker timeout|ECONNREFUSED|ECONNRESET|EPIPE|ENOENT/;
+const brokerUnreachable = (error) => !error?.code && BROKER_UNREACHABLE.test(String(error?.message ?? ""));
 // A resident local model with every slot taken. Unlike a swap it
 // clears within one job, and it is the case where waiting is what gets unattended work done
 // on local hardware instead of dropped -- so EVERY request waits on it, mapped or not.
@@ -485,7 +492,8 @@ export const createGatewayHandler = ({
       try { return await leaseOnce(sessionID, requestBody, excluded, route, api); } catch (refusal) {
         // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
         // out for everyone. The deadline is the request's own either way.
-        const absentLocal = route?.waitForLocal === true && refusal?.code === ABSENT_LOCAL;
+        const absentLocal = route?.waitForLocal === true &&
+          (refusal?.code === ABSENT_LOCAL || brokerUnreachable(refusal));
         if (!isBusy(refusal) && !(route && isPreparing(refusal)) && !absentLocal) throw refusal;
         // ☠️ A ZERO BUDGET IS "TELL ME NOW", NOT "WAIT ZERO SECONDS". Rethrow the broker's own
         // refusal untouched -- it carries the real reason and the machine-readable code, and
