@@ -83,7 +83,8 @@ const sleep = (ms, signal) => new Promise((resolve) => {
 //
 //   "modelProfiles": {
 //     "<name a client may ask for>": "<broker profile>",
-//     "<name>": { "profile": "<broker profile>", "maxContextTokens": 39321 }
+//     "<name>": { "profile": "<broker profile>", "maxContextTokens": 39321 },
+//     "<name>": { "profile": "<broker profile>", "bodyExtras": { "chat_template_kwargs": null } }
 //   }
 //
 // ☆ The object form exists because `maxContextTokens` is per-PROVIDER
@@ -116,11 +117,19 @@ const modelRoute = (config, requested) => {
   // request instantly and is never what a deployment means, so falsy-means-default
   // is the right idiom here.
   const timeout = Number(typeof entry === "string" ? Number.NaN : entry?.timeoutMs);
+  // ☆ And the same again for the request body. A provider's `bodyExtras` is right for
+  // most of what that lane serves -- say, thinking off on every local model -- and wrong
+  // for the one model whose deployment wants that model's own default. A mapped name's
+  // `bodyExtras` is layered over the provider's, key by key; a key set to null injects
+  // nothing, so the client's own value (or the model's default) stands. It rides with
+  // the name to whichever lane serves it.
+  const extras = typeof entry === "string" ? null : entry?.bodyExtras;
   return {
     profile,
     maxContextTokens: Number.isFinite(cap) && cap > 0 ? cap : null,
     prepareWaitMs: Number.isFinite(wait) && wait >= 0 ? wait : null,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : null,
+    bodyExtras: extras && typeof extras === "object" && !Array.isArray(extras) ? extras : null,
   };
 };
 
@@ -587,8 +596,12 @@ export const createGatewayHandler = ({
         // instruction. Haiku-class models comply reliably; a rare miss is one
         // failed attempt, not a dead lane.
         let forwardBody = { ...requestBody, model: leased.modelID };
-        if (providerConfig.bodyExtras && typeof providerConfig.bodyExtras === "object") {
-          forwardBody = { ...forwardBody, ...providerConfig.bodyExtras };
+        const extras = {
+          ...(providerConfig.bodyExtras && typeof providerConfig.bodyExtras === "object" ? providerConfig.bodyExtras : {}),
+          ...(route?.bodyExtras ?? {}),
+        };
+        for (const [key, value] of Object.entries(extras)) {
+          if (value !== null) forwardBody[key] = value;
         }
         // ☠️ SOME LANES REJECT A COMBINATION THE CLIENT IS ENTITLED TO SEND. Anthropic's
         // OpenAI-compat endpoint 400s on `temperature` and `top_p` together ("Please use only

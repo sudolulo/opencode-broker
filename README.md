@@ -233,7 +233,12 @@ sends), `streamIdleMs`, `streamUsage: false` and `jsonMode: "instruct"`.
 
 - **A client's `model` is a routing request, not an order.** A name listed in
   `modelProfiles` leases that profile; anything else routes on the configured
-  tier. Profile names never leave the gateway.
+  tier. Profile names never leave the gateway. A name may override the
+  provider's `maxContextTokens`, `timeoutMs` and `prepareWaitMs`, and layer its
+  own `bodyExtras` over the provider's key by key. A key set to `null` injects
+  nothing, so the client's value, or the model's default, stands: a lane that
+  turns thinking off for every local model can still serve one name with
+  `"bodyExtras": { "chat_template_kwargs": null }` and its model's own default.
 - **Streaming is a real SSE passthrough, and failover ends at the first
   frame.** Up to the first byte relayed, a failing lane is retried on a fresh
   lease exactly like a buffered request. After it, the response is committed:

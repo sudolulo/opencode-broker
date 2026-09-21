@@ -51,13 +51,19 @@ test("config loader validates and applies defaults", () => {
       // A zero-length timeout is never a deployment's intent; it normalizes away
       // rather than aborting every request on that name instantly.
       zero: { profile: "private", timeoutMs: 0 },
+      thinking: { profile: "vision", bodyExtras: { chat_template_kwargs: null } },
+      // Only an object is a body; anything else is a typo, not an instruction.
+      garbled: { profile: "vision", bodyExtras: "enable_thinking" },
     },
   }));
+  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null };
   assert.deepEqual(loadGatewayConfig(path).modelProfiles, {
-    plain: { profile: "uncensored", maxContextTokens: null, prepareWaitMs: null, timeoutMs: null },
-    detailed: { profile: "private", maxContextTokens: 39321, prepareWaitMs: null, timeoutMs: null },
-    patient: { profile: "private", maxContextTokens: null, prepareWaitMs: null, timeoutMs: 60000 },
-    zero: { profile: "private", maxContextTokens: null, prepareWaitMs: null, timeoutMs: null },
+    plain: { ...none, profile: "uncensored" },
+    detailed: { ...none, profile: "private", maxContextTokens: 39321 },
+    patient: { ...none, profile: "private", timeoutMs: 60000 },
+    zero: { ...none, profile: "private" },
+    thinking: { ...none, profile: "vision", bodyExtras: { chat_template_kwargs: null } },
+    garbled: { ...none, profile: "vision" },
   }, "both shapes normalize to one");
   writeFileSync(path, JSON.stringify({ providers: { llamacpp: { baseUrl: "http://x/v1" } }, modelProfiles: { broken: { maxContextTokens: 10 } } }));
   // A mapping with no profile is a name the picker offers and the gateway then
@@ -940,6 +946,49 @@ test("a mapped model's timeoutMs replaces the provider timeout for that request"
   await withServer(impatient, async (base) => {
     assert.notEqual((await askModel(base, { model: NAMED })).status, 200, "without it, the lane's 30ms still applies");
   });
+});
+
+test("a mapped name's bodyExtras layer over the lane's, and null leaves the model its default", async () => {
+  // The lane turns thinking off for every local model it serves. One name wants the 27b's
+  // own default instead, another wants the lane's, and neither may move the other.
+  const upstream = [];
+  const handler = createGatewayHandler({
+    config: namedConfig({
+      providers: { llamacpp: { baseUrl: "http://local.example/v1",
+        bodyExtras: { chat_template_kwargs: { enable_thinking: false }, cache_prompt: true } } },
+      modelProfiles: {
+        "qwen3.8-27b": { profile: "vision", bodyExtras: { chat_template_kwargs: null } },
+        "qwen3.8-27b-nothink": { profile: "vision" },
+        "qwen3.8-27b-cool": { profile: "vision", bodyExtras: { temperature: 0.1 } },
+      },
+    }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => (route === "/lease"
+      ? { target: { model: { providerID: "llamacpp", id: "qwen3.8-27b" } } }
+      : { ok: true }),
+    fetchImpl: async (url, options) => {
+      upstream.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) };
+    },
+  });
+  await withServer(handler, async (base) => {
+    for (const body of [
+      { model: "qwen3.8-27b" },
+      { model: "qwen3.8-27b", chat_template_kwargs: { enable_thinking: true, custom: 1 } },
+      { model: "qwen3.8-27b-nothink" },
+      { model: "qwen3.8-27b-cool", temperature: 0.9 },
+      { model: "anything-unmapped" },
+    ]) assert.equal((await askModel(base, body)).status, 200);
+  });
+  const [thinking, clientsOwn, nothink, cool, unmapped] = upstream;
+  assert.equal("chat_template_kwargs" in thinking, false, "null injects nothing: the model's default stands");
+  assert.equal(thinking.cache_prompt, true, "every other lane extra still applies");
+  assert.deepEqual(clientsOwn.chat_template_kwargs, { enable_thinking: true, custom: 1 },
+    "with the lane's value lifted, the client's own survives untouched");
+  assert.deepEqual(nothink.chat_template_kwargs, { enable_thinking: false }, "a name without extras keeps the lane's");
+  assert.equal(cool.temperature, 0.1, "a name's value overrides the client's, as the lane's always has");
+  assert.deepEqual(cool.chat_template_kwargs, { enable_thinking: false }, "and only the keys it names");
+  assert.deepEqual(unmapped.chat_template_kwargs, { enable_thinking: false }, "an unmapped name is untouched");
 });
 
 test("routedModelId renames the routed entry in /v1/models", async () => {

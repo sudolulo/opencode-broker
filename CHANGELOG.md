@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A mapped model name can carry its own `bodyExtras`**, layered over the provider's key by
+  key. A key set to `null` injects nothing, so the client's own value, or the model's default,
+  stands. A lane whose `bodyExtras` turn thinking off for every local model can now serve one
+  name with that model's default (`"chat_template_kwargs": null`) without moving any other name.
+
 ## [1.2.0] — 2026-09-21
 
 ### Added
