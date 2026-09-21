@@ -62,6 +62,8 @@ const STREAM_IDLE_MS = 180_000;
 // waits only when it has been told in machine-readable terms that waiting helps.
 const PREPARING = "target-preparing";
 const isPreparing = (refusal) => refusal?.code === PREPARING;
+// A local-only lane with no resident model; waited out only by a name with `waitForLocal`.
+const ABSENT_LOCAL = "no-eligible-local-target";
 // A resident local model with every slot taken. Unlike a swap it
 // clears within one job, and it is the case where waiting is what gets unattended work done
 // on local hardware instead of dropped -- so EVERY request waits on it, mapped or not.
@@ -124,8 +126,16 @@ const modelRoute = (config, requested) => {
   // nothing, so the client's own value (or the model's default) stands. It rides with
   // the name to whichever lane serves it.
   const extras = typeof entry === "string" ? null : entry?.bodyExtras;
+  // ☠️ WORK THAT MUST NOT BE DROPPED WAITS FOR ITS MODEL TO COME BACK. A local-only lane
+  // refuses with `no-eligible-local-target` while its model is not resident (a server
+  // restart, a swap that displaced it), and that refusal is terminal for everyone else:
+  // an interactive caller would rather be told. For a background writer it is data loss --
+  // a memory service that treats a failed extraction as "no memories" never retries it.
+  // `waitForLocal: true` waits that refusal out on the same budget as a busy slot.
+  const waitForLocal = typeof entry === "string" ? false : entry?.waitForLocal === true;
   return {
     profile,
+    waitForLocal,
     maxContextTokens: Number.isFinite(cap) && cap > 0 ? cap : null,
     prepareWaitMs: Number.isFinite(wait) && wait >= 0 ? wait : null,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : null,
@@ -446,7 +456,8 @@ export const createGatewayHandler = ({
       try { return await leaseOnce(sessionID, requestBody, excluded, route); } catch (refusal) {
         // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
         // out for everyone. The deadline is the request's own either way.
-        if (!isBusy(refusal) && !(route && isPreparing(refusal))) throw refusal;
+        const absentLocal = route?.waitForLocal === true && refusal?.code === ABSENT_LOCAL;
+        if (!isBusy(refusal) && !(route && isPreparing(refusal)) && !absentLocal) throw refusal;
         // ☠️ A ZERO BUDGET IS "TELL ME NOW", NOT "WAIT ZERO SECONDS". Rethrow the broker's own
         // refusal untouched -- it carries the real reason and the machine-readable code, and
         // rewriting it as "the gateway waited 0s" would be both noise and a lie.

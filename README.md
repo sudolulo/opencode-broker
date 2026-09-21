@@ -251,6 +251,12 @@ sends), `streamIdleMs`, `streamUsage: false` and `jsonMode: "instruct"`.
   nothing, so the client's value, or the model's default, stands: a lane that
   turns thinking off for every local model can still serve one name with
   `"bodyExtras": { "chat_template_kwargs": null }` and its model's own default.
+- **A busy local slot is waited out for everyone; a missing local model only
+  for a name that asks.** With `"waitForLocal": true` a name also waits, on its
+  `prepareWaitMs` budget, while its local-only lane has no resident model (a
+  server restart, a swap that displaced it) instead of failing at once. Use it
+  for background writers that lose data on a failed call: a memory service that
+  records a failed extraction as "no memories" and never retries it.
 - **Streaming is a real SSE passthrough, and failover ends at the first
   frame.** Up to the first byte relayed, a failing lane is retried on a fresh
   lease exactly like a buffered request. After it, the response is committed:

@@ -56,7 +56,7 @@ test("config loader validates and applies defaults", () => {
       garbled: { profile: "vision", bodyExtras: "enable_thinking" },
     },
   }));
-  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null };
+  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null, waitForLocal: false };
   assert.deepEqual(loadGatewayConfig(path).modelProfiles, {
     plain: { ...none, profile: "uncensored" },
     detailed: { ...none, profile: "private", maxContextTokens: 39321 },
@@ -1223,4 +1223,48 @@ test("the busy wait is bounded and says it was busy", async () => {
     assert.match((await response.json()).error.message, /still busy; try again shortly/);
     assert.ok(Date.now() - started < 5000);
   });
+});
+
+const absentRefusal = () => Object.assign(
+  new Error("no eligible local model is currently deployed, free, or within its context window"),
+  { code: "no-eligible-local-target" },
+);
+
+test("a name with waitForLocal waits for its local model to come back instead of failing", async () => {
+  // A memory service's ingestion during a model-server restart: failing here is a lost memory.
+  const answers = [absentRefusal(), absentRefusal(), { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } }];
+  let leases = 0;
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { background: { profile: "background", waitForLocal: true } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => {
+      if (route !== "/lease") return { ok: true };
+      leases += 1;
+      const next = answers.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "remembered" } }], usage: {} }) }),
+  });
+  await withServer(handler, async (base) => {
+    const response = await askModel(base, { model: "background" });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).choices[0].message.content, "remembered");
+  });
+  assert.equal(leases, 3);
+});
+
+test("without waitForLocal, a missing local model is still reported at once", async () => {
+  let leases = 0;
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { quick: { profile: "quick" } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => { if (route === "/lease") { leases += 1; throw absentRefusal(); } return { ok: true }; },
+    fetchImpl: async () => { throw new Error("must not be called"); },
+  });
+  await withServer(handler, async (base) => {
+    const response = await askModel(base, { model: "quick" });
+    assert.equal(response.status, 502);
+  });
+  assert.equal(leases, 1, "no wait, no re-lease");
 });

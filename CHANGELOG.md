@@ -13,6 +13,18 @@ All notable changes to this project are documented here. The format is based on
   stands. A lane whose `bodyExtras` turn thinking off for every local model can now serve one
   name with that model's default (`"chat_template_kwargs": null`) without moving any other name.
 
+## [1.4.0] — 2026-09-21
+
+### Added
+
+- **`waitForLocal` on a gateway model name.** A busy local slot was already waited out for
+  every caller, but a local-only lane with no resident model answers `no-eligible-local-target`,
+  and the gateway failed that at once. That happens during a model-server restart (~70 s) or a
+  swap that displaced the model. A name with `"waitForLocal": true` now waits that refusal out on
+  its `prepareWaitMs` budget as well. It is for background writers where a failed call is lost
+  data. A self-hosted memory service, for example, records a failed extraction as "no memories"
+  and never tries the document again. Names without it still fail fast.
+
 ## [1.3.0] — 2026-09-21
 
 ### Added
