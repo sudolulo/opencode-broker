@@ -93,7 +93,8 @@ const sleep = (ms, signal) => new Promise((resolve) => {
 //   "modelProfiles": {
 //     "<name a client may ask for>": "<broker profile>",
 //     "<name>": { "profile": "<broker profile>", "maxContextTokens": 39321 },
-//     "<name>": { "profile": "<broker profile>", "bodyExtras": { "chat_template_kwargs": null } }
+//     "<name>": { "profile": "<broker profile>", "bodyExtras": { "chat_template_kwargs": null } },
+//     "<name>": { "profile": "<broker profile>", "waitForLocal": true, "holdOpenMs": 30000 }
 //   }
 //
 // ☆ The object form exists because `maxContextTokens` is per-PROVIDER
@@ -140,9 +141,23 @@ const modelRoute = (config, requested) => {
   // a memory service that treats a failed extraction as "no memories" never retries it.
   // `waitForLocal: true` waits that refusal out on the same budget as a busy slot.
   const waitForLocal = typeof entry === "string" ? false : entry?.waitForLocal === true;
+  // ☠️ A WAIT THE CLIENT CANNOT SEE IS A WAIT THE CLIENT WILL NOT SIT THROUGH. A buffered
+  // (non-streaming) request is silent until its whole answer is ready, and HTTP clients give up
+  // on silence long before a patient wait is over: Bun's fetch drops a connection after ~5 minutes
+  // with no bytes ("The operation timed out."), undici's headersTimeout is 5 minutes. Measured
+  // 2026-09-21: a memory service's cron retried 11 documents at once into a 3-slot lane, and
+  // every call the gateway parked past 5 minutes died client-side while its 50-minute budget
+  // still had 45 to run -- each one a document marked failed with its memories lost.
+  // `holdOpenMs` keeps such a request visibly alive: once it has waited that long with no answer,
+  // the 200 head is committed and a space follows every holdOpenMs until the JSON is written
+  // after them (leading whitespace is valid JSON). ☆ The price is the status line: a failure
+  // after that point can only arrive as the error object under a 200. A request that settles
+  // inside holdOpenMs never commits early and keeps its real status, so only the long waits pay.
+  const holdOpen = Number(typeof entry === "string" ? Number.NaN : entry?.holdOpenMs);
   return {
     profile,
     waitForLocal,
+    holdOpenMs: Number.isFinite(holdOpen) && holdOpen > 0 ? holdOpen : null,
     maxContextTokens: Number.isFinite(cap) && cap > 0 ? cap : null,
     prepareWaitMs: Number.isFinite(wait) && wait >= 0 ? wait : null,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : null,
@@ -974,11 +989,30 @@ export const createGatewayHandler = ({
       address,
       model: typeof parsed?.model === "string" ? parsed.model.slice(0, 100) : null,
     };
-    const result = await completions(parsed, clientAbortController.signal, sink, api, caller);
+    // A buffered request on a name with holdOpenMs: after that long without an answer, commit
+    // the 200 and send a space every holdOpenMs so the client's idle timeout never fires (see
+    // modelRoute). A streaming request has frames of its own and never takes this path.
+    const holdOpenMs = streaming ? null : modelRoute(config, parsed?.model)?.holdOpenMs ?? null;
+    let held = false;
+    const holdTimer = holdOpenMs ? setInterval(() => {
+      if (response.writableEnded || response.destroyed) return;
+      if (!held) {
+        held = true;
+        response.writeHead(200, { "Content-Type": "application/json" });
+      }
+      response.write(" ");
+    }, holdOpenMs) : null;
+    let result;
+    try {
+      result = await completions(parsed, clientAbortController.signal, sink, api, caller);
+    } finally {
+      if (holdTimer) clearInterval(holdTimer);
+    }
     // A streaming request that never got a frame out still owes the client an
     // ordinary JSON error, which is exactly what an OpenAI client expects when
     // a stream fails to start.
     if (sink?.started) { response.end(); return; }
+    if (held) { response.end(JSON.stringify(result.payload)); return; }
     response.writeHead(result.status, { "Content-Type": "application/json" });
     response.end(JSON.stringify(result.payload));
   };

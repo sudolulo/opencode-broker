@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] — 2026-09-21
+
+### Added
+
+- **`holdOpenMs` for a gateway name keeps a long buffered wait alive.** The gateway can
+  hold a request for many minutes waiting for a slot or a model (`waitForLocal`,
+  `prepareWaitMs`), but a non-streaming request is silent all that time, and clients
+  give up on silence. Bun's fetch drops the connection after about 5 minutes with no
+  bytes ("The operation timed out."). Measured live: a memory service's cron retried
+  11 documents at once into a 3-slot lane. Every call the gateway parked past 5 minutes
+  died client-side while its 50-minute budget still had 45 minutes to run, and each one
+  was a document marked failed with its memories lost.
+
+  With `holdOpenMs`, a buffered request still unanswered after that long gets its
+  `200` head and a space every `holdOpenMs` until the JSON follows. Leading whitespace
+  is valid JSON. A request that settles sooner is untouched and keeps its real status;
+  a failure after the commit arrives as the error object under the 200. Streaming
+  requests never take this path.
+
 ## [1.7.0] — 2026-09-21
 
 ### Fixed

@@ -56,7 +56,7 @@ test("config loader validates and applies defaults", () => {
       garbled: { profile: "vision", bodyExtras: "enable_thinking" },
     },
   }));
-  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null, waitForLocal: false };
+  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null, waitForLocal: false, holdOpenMs: null };
   assert.deepEqual(loadGatewayConfig(path).modelProfiles, {
     plain: { ...none, profile: "uncensored" },
     detailed: { ...none, profile: "private", maxContextTokens: 39321 },
@@ -1521,4 +1521,64 @@ test("the broker is told who asked: the client's address and the model name it s
   assert.deepEqual(lease.body.caller, { address: "127.0.0.1", model: "background" });
   assert.deepEqual(usage.body.caller, { address: "127.0.0.1", model: "background" });
   assert.equal(usage.body.sessionID, lease.body.sessionID);
+});
+
+// A client that hangs up on silence (Bun's fetch after ~5 minutes) must see bytes while the
+// gateway waits for a slot on its behalf, and still get one parseable JSON answer at the end.
+const heldHandler = ({ busyFor, extra = {}, entry = {} }) => {
+  let refusals = 0;
+  return createGatewayHandler({
+    config: namedConfig({ modelProfiles: { memory: { profile: "memory", waitForLocal: true, holdOpenMs: 10, ...entry } }, ...extra }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => {
+      if (route !== "/lease") return { ok: true };
+      if (refusals < busyFor) { refusals += 1; throw busyRefusal(); }
+      return { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "remembered" } }], usage: {} }) }),
+  });
+};
+
+test("holdOpenMs keeps a long buffered wait alive with whitespace, then sends the answer", async () => {
+  await withServer(heldHandler({ busyFor: 12 }), async (base) => {
+    const response = await askModel(base, { model: "memory" });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /application\/json/);
+    const text = await response.text();
+    assert.match(text, /^ +\{/, "spaces went out while it waited, before the JSON");
+    assert.equal(JSON.parse(text).choices[0].message.content, "remembered");
+  });
+});
+
+test("an answer inside holdOpenMs is sent as before, with no early commit", async () => {
+  await withServer(heldHandler({ busyFor: 0, entry: { holdOpenMs: 5000 } }), async (base) => {
+    const response = await askModel(base, { model: "memory" });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /^\{/);
+    assert.equal(JSON.parse(text).choices[0].message.content, "remembered");
+  });
+});
+
+test("a failure after the hold commits arrives as the error object under the 200", async () => {
+  await withServer(heldHandler({ busyFor: Infinity, entry: { prepareWaitMs: 120 } }), async (base) => {
+    const response = await askModel(base, { model: "memory" });
+    assert.equal(response.status, 200, "the head was already committed");
+    const body = JSON.parse(await response.text());
+    assert.match(body.error.message, /busy/);
+  });
+});
+
+test("a failure before holdOpenMs keeps its real status", async () => {
+  await withServer(heldHandler({ busyFor: Infinity, entry: { prepareWaitMs: 0, holdOpenMs: 5000 } }), async (base) => {
+    const response = await askModel(base, { model: "memory" });
+    assert.equal(response.status, 502);
+  });
+});
+
+test("a streaming request never takes the hold path", async () => {
+  await withServer(heldHandler({ busyFor: Infinity, entry: { prepareWaitMs: 120 } }), async (base) => {
+    const response = await askModel(base, { model: "memory", stream: true });
+    assert.equal(response.status, 502, "no frame was produced, so the stream owes an ordinary error");
+  });
 });

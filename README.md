@@ -267,6 +267,14 @@ extras, failover and usage accounting.
   server restart, a swap that displaced it) instead of failing at once. Use it
   for background writers that lose data on a failed call: a memory service that
   records a failed extraction as "no memories" and never retries it.
+- **A long wait stays visible to the client.** An HTTP client gives up on a silent
+  connection long before a patient wait is over: Bun's fetch after about 5 minutes
+  with no bytes, undici's `headersTimeout` at 5 minutes. With `"holdOpenMs": 30000` a
+  name's buffered (non-streaming) requests that are still unanswered after 30 s get
+  their `200` head, then a space every 30 s, then the JSON. Leading whitespace is
+  valid JSON, so the body still parses. A failure after that point arrives as the
+  error object under the 200; one inside the first `holdOpenMs` keeps its real
+  status. Pair it with `waitForLocal` for writers that must not lose a call.
 - **Streaming is a real SSE passthrough, and failover ends at the first
   frame.** Up to the first byte relayed, a failing lane is retried on a fresh
   lease exactly like a buffered request. After it, the response is committed:
