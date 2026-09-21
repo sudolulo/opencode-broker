@@ -391,6 +391,34 @@ test("every /usage report is logged with its prompt size, and the usage command 
   assert.match(report.stdout, /session peaks \(2 sessions\): p50 \d+K? {2}p90 40K/);
 }));
 
+// A caller waiting out a busy local slot re-leases every few seconds; each attempt must not
+// become a line in decisions.jsonl, or a burst of waiters truncates the whole trace.
+test("a session's repeated waits are logged once, not once per poll", async () => withTempHome(async (home) => {
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const modelsServer = await startModelsServer(["qwen3.5-9b-coder"]);
+  let child;
+  let socketPath;
+  try {
+    ({ child, socketPath } = await startBroker(home, { OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url }));
+    try {
+      const lease = (sessionID) => request(socketPath, "/lease", { sessionID, profile: "local", tier: "worker", contextTokens: 100, replace: true });
+      await lease("ses-holder");
+      for (let i = 0; i < 5; i++) await assert.rejects(lease("ses-waiter"), /busy/);
+      const lines = readFileSync(join(home, ".local/share/opencode/model-routing/decisions.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(lines.filter((line) => line.sessionID === "ses-waiter" && line.policy === "waiting").length, 1);
+      const selection = await request(socketPath, "/selection");
+      assert.equal(selection.lastDecision?.policy, "waiting", "the live state still shows the wait");
+    } finally {
+      await stopBroker(child);
+    }
+  } finally {
+    await modelsServer.stop();
+  }
+}));
+
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

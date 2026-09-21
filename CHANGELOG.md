@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-09-21
+
+### Fixed
+
+- **A caller waiting for a local slot no longer floods `decisions.jsonl`.** Every re-lease a
+  waiting caller made was logged as its own "waiting" decision. A burst of 36 background requests
+  waiting their turn wrote ~850 B/s, which would have truncated the 4 MiB decision trace, and
+  every routing decision in it, within half an hour. A session's wait is now logged once, and
+  then at most once a minute, until it is leased or refused. The live `/selection` state still
+  shows every wait.
+
 ## [1.5.0] — 2026-09-21
 
 ### Added

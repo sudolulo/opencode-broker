@@ -111,8 +111,25 @@ const logUsage = (record) => {
     appendFileSync(USAGE_LOG, JSON.stringify(record) + "\n");
   } catch {}
 };
+// ☠️ A WAIT IS LOGGED ONCE A MINUTE PER SESSION, NOT ONCE PER POLL. A caller that waits out a
+// busy or absent local model re-leases every few seconds, and each refusal was a decision line:
+// a 36-request background burst waiting its turn wrote ~850 B/s, which would have truncated this
+// 4 MiB trace -- and every routing decision in it -- within half an hour. The first wait, and one
+// a minute after it, say everything a reader needs; the eventual lease or refusal follows.
+const WAIT_LOG_INTERVAL_MS = 60_000;
+const waitLogged = new Map(); // `${sessionID}\0${code}` -> at
+const waitIsFresh = (decision) => {
+  if (decision?.policy !== "waiting" || !decision.sessionID) return false;
+  const key = `${decision.sessionID}\0${decision.code ?? ""}`;
+  const last = waitLogged.get(key);
+  if (last !== undefined && decision.at - last < WAIT_LOG_INTERVAL_MS) return true;
+  waitLogged.set(key, decision.at);
+  if (waitLogged.size > 2000) waitLogged.delete(waitLogged.keys().next().value);
+  return false;
+};
 const recordDecision = (state, decision) => {
   state.lastDecision = decision;
+  if (waitIsFresh(decision)) return;
   logDecision(decision);
 };
 const LEASE_TTL_MS = 2 * 60 * 60 * 1000;
