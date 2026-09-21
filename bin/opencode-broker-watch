@@ -1,0 +1,89 @@
+#!/usr/bin/env node
+// opencode-broker-watch: keep the model landscape from going stale.
+//
+// Run periodically (the fleet runs it from a daily systemd user timer). It:
+//   1. refreshes opencode's models.dev cache (`opencode models` rewrites it),
+//      so Anthropic family discovery and OAuth discovery keep auto-adopting
+//      the newest releases with no human in the loop;
+//   2. republishes the broker's subscription inventory from the fresh cache;
+//   3. diffs the catalog against the pinned targets and the reviewed-models
+//      ledger, and NOTIFIES (config watch.notifyCommand) about anything a human
+//      still has to judge: brand-new models (once each), newer releases in a
+//      pinned line, and unmapped Anthropic families.
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+import { CONFIG } from "../lib/config.js";
+import { routingStateDir, publishCachedSubscriptionInventory } from "../lib/routing.js";
+import { watchReport, formatReport } from "../lib/watch.js";
+
+const CACHE = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode/models.json");
+const LEDGER = join(routingStateDir(), "reviewed-models.json");
+
+// 1. Refresh the catalog cache. A failed refresh degrades to the stale cache
+// rather than aborting the watch -- stale findings beat no findings.
+try {
+  execFileSync("opencode", ["models"], { stdio: "ignore", timeout: 120_000 });
+} catch (error) {
+  console.error(`cache refresh failed (continuing on the stale cache): ${error?.message ?? error}`);
+}
+
+let catalog;
+try {
+  catalog = JSON.parse(readFileSync(CACHE, "utf8"));
+} catch (error) {
+  console.error(`no readable model cache at ${CACHE}: ${error?.message ?? error}`);
+  process.exit(1);
+}
+
+// 2. Keep the broker's discovered inventory current even when no session is
+// chatting. Best-effort: a stopped broker is not this job's problem.
+try {
+  await publishCachedSubscriptionInventory();
+  console.log("broker inventory republished from the fresh cache");
+} catch (error) {
+  console.error(`inventory republish skipped: ${error?.message ?? error}`);
+}
+
+// 3. Diff against pins + the reviewed ledger.
+let reviewed = {};
+try { reviewed = JSON.parse(readFileSync(LEDGER, "utf8")) || {}; } catch {}
+
+const watchProviders = [...new Set([
+  ...Object.values(CONFIG.targets).map((target) => target.providerID),
+  ...CONFIG.trustedSubscriptionProviders,
+  "anthropic",
+])].filter((providerID) => providerID !== "llamacpp");
+
+const report = watchReport({ catalog, reviewed, targets: CONFIG.targets, watchProviders });
+const lines = formatReport(report);
+
+if (lines.length) {
+  const body = lines.slice(0, 40).join("\n");
+  console.log(body);
+  const argv = CONFIG.watch.notifyCommand;
+  if (argv.length) {
+    try {
+      execFileSync(argv[0], [...argv.slice(1), "opencode model watch", body], { stdio: "ignore", timeout: 30_000 });
+    } catch (error) {
+      console.error(`notify failed: ${error?.message ?? error}`);
+    }
+  }
+} else {
+  console.log("no new models, no newer line-mates, no unmapped families");
+}
+
+// 4. Remember everything seen so each new model notifies exactly once.
+const now = new Date().toISOString().slice(0, 10);
+let changed = false;
+for (const key of report.seenKeys) {
+  if (!Object.prototype.hasOwnProperty.call(reviewed, key)) { reviewed[key] = now; changed = true; }
+}
+if (changed) {
+  mkdirSync(routingStateDir(), { recursive: true, mode: 0o700 });
+  const temporary = `${LEDGER}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(reviewed, null, 1) + "\n", { mode: 0o600 });
+  renameSync(temporary, LEDGER);
+}

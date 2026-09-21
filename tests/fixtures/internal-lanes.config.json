@@ -1,0 +1,85 @@
+{
+  // The fleet's shape where these lanes matter: every profile is LAN-only (no
+  // `profileCloudEgress` at all, which is the default), the classifier tier is
+  // local-first with a cloud rung under it, and the uncensored profile is a single
+  // local target at capacity 1 that has to be swapped onto its card.
+  "targets": {
+    "lan-classifier": {
+      "providerID": "llamacpp",
+      "modelID": "lan-small-4b",
+      "kind": "local",
+      "capacity": 2,
+      "context": 32768
+    },
+    "lan-coder": {
+      "providerID": "llamacpp",
+      "modelID": "lan-coder-9b",
+      "kind": "local",
+      "capacity": 6,
+      "context": 81920
+    },
+    "lan-uncensored": {
+      "providerID": "llamacpp",
+      "modelID": "lan-uncensored-27b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "lan-vision": {
+      "providerID": "llamacpp",
+      "modelID": "lan-vision-27b",
+      "kind": "local",
+      "capacity": 2,
+      "context": 131072
+    },
+    "lan-uncensored-big": {
+      "providerID": "llamacpp",
+      "modelID": "lan-uncensored-70b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 32768
+    },
+    "cloud-worker": {
+      "providerID": "openai",
+      "modelID": "cloud-worker-1",
+      "kind": "cloud"
+    }
+  },
+  "tiers": {
+    "worker": [
+      "cloud-worker"
+    ],
+    "classifier": [
+      "lan-classifier"
+    ]
+  },
+  "fallbacks": {
+    "classifier": [
+      [
+        "cloud-worker"
+      ]
+    ]
+  },
+  "profiles": {
+    "local": [
+      "lan-coder"
+    ],
+    "private": [
+      "lan-coder"
+    ],
+    "vision": [
+      "lan-vision"
+    ],
+    "uncensored": [
+      "lan-uncensored"
+    ],
+    "uncensored-70b": [
+      "lan-uncensored-big"
+    ],
+    "uncensored-offline": [
+      "lan-uncensored"
+    ]
+  },
+  "localModelsUrl": "http://127.0.0.1:1/v1/models",
+  "localContextHeadroom": 0.6
+}

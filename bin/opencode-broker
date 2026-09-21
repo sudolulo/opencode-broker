@@ -1,0 +1,1329 @@
+#!/usr/bin/env node
+// The broker coordinates independent OpenCode servers without handling prompts,
+// credentials, or provider traffic. It only assigns model leases and health state.
+import { spawn } from "node:child_process";
+import { appendFileSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer, request as httpRequest } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  CONFIG,
+  authSnapshot,
+  TARGETS,
+  brokerRequest,
+  brokerSocketPath,
+  budgetReport,
+  budgetUtilization,
+  effectiveUtilization,
+  cloudTargetAdmitted,
+  chooseTarget,
+  classifyRoutingFailure,
+  contextFits,
+  ensureRoutingStateDir,
+  localContextEligible,
+  recordBudgetUsage,
+  learnCapacityFromFailure,
+  isProfile,
+  normalizeDiscoveredInventory,
+  revalidateAdmission,
+  providerCircuitID,
+  quotaRenewalAt,
+  routingStateDir,
+  swapRequesterYields,
+  targetContext,
+  targetContextHeadroom,
+  targetOutputReserve,
+  targetForID,
+  targetAtCapacity,
+  targetEligibleIDsFor,
+  targetIDsFor,
+  modelRefForTier,
+} from "../lib/routing.js";
+import { PROVIDER_BUDGETS } from "../lib/budgets.js";
+import { DEPRECATIONS, envSetting } from "../lib/config.js";
+import {
+  applyPlanUsageCircuit,
+  cachedPlanUsage,
+  fetchPlanUsage,
+  planUsageConfigured,
+  planUsageResetAt, planUsageSnapshot, seedPlanUsageCache } from "../lib/plan-usage.js";
+import {
+  markProbationSuccessHealthy,
+  normalizeHealth,
+  normalizeProviderError,
+  operatorQuarantineProvider,
+  providerEligible,
+  recordFailureEvidence,
+  rearmQuarantinedProvider,
+} from "../lib/provider-health.js";
+
+const STATE_PATH = join(routingStateDir(), "broker.json");
+// Every routing decision -- grants, revalidations, stickiness, REFUSALS and
+// reported failures -- lands here as one JSON line, so "why did this session get
+// that model" is always answerable after the fact. Bounded by truncation: this
+// is a trace, not an audit ledger.
+const DECISION_LOG = join(routingStateDir(), "decisions.jsonl");
+const DECISION_LOG_MAX = 4 * 1024 * 1024;
+const logDecision = (record) => {
+  try {
+    ensureRoutingStateDir();
+    if (statSync(DECISION_LOG, { throwIfNoEntry: false })?.size > DECISION_LOG_MAX) {
+      writeFileSync(DECISION_LOG, JSON.stringify({ at: Date.now(), event: "truncated" }) + "\n");
+    }
+    appendFileSync(DECISION_LOG, JSON.stringify(record) + "\n");
+  } catch {}
+};
+const recordDecision = (state, decision) => {
+  state.lastDecision = decision;
+  logDecision(decision);
+};
+const LEASE_TTL_MS = 2 * 60 * 60 * 1000;
+const ASSIGNMENT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+// ☠️ A COUNT CAP, because the TTL alone is not a bound on anything that matters.
+// writeState() serialises the WHOLE state and rename-writes it on EVERY request --
+// /lease, /touch, /release, all of them -- so the size of this map is a per-request
+// cost paid by every session, on a single-threaded daemon they all share. With only a
+// 14-day TTL it grew with usage rather than with concurrency: measured 2026-09-08,
+// 2,958 assignments and a 405 KB state file, and /status p50 at 23.0 ms. Pruning to
+// the most recent 152 took the same call to 3.3 ms. The TTL says "old"; this says
+// "too many", and they are different questions.
+// ☆ 512 is generous on purpose. An assignment is ONLY a targetID fallback for
+// /failure, /complete and /forget when the lease has already gone, and all three
+// follow the session's own activity within minutes -- so what matters is how many
+// sessions could plausibly be mid-flight, not how many have ever run. 48 hours of
+// heavy use measured 152.
+const MAX_ASSIGNMENTS = 512;
+const RATE_LIMIT_MS = 5 * 60 * 1000;
+// A brief provider overload (529/503) is transient: fence the target for a few
+// seconds so a quick recovery returns to the SAME provider, record no health
+// evidence, and never quarantine. Kept under opencode's ~30s retry so its own
+// backoff rides it out without a switch.
+const OVERLOAD_MS = 15 * 1000;
+// An unreachable endpoint, provider-scoped. Long enough that a restarting container is not
+// hammered on every turn, short enough that a lane which comes back is used again promptly --
+// llama.cpp's own app restart took ~90 s door to door on 2026-09-14.
+const CONNECT_MS = 60 * 1000;
+// Quota with no known reset: re-probe at a bounded cadence (one failed request
+// per probe) instead of holding the provider out until state surgery.
+const QUOTA_REPROBE_MS = 15 * 60 * 1000;
+// Hosts auto-compact a session near (context - output reserve) -- about 60-70%
+// of the declared window. A model whose window the session has burned past
+// this share of is one the host will imminently compress on; selection should
+// move the session to a roomier window first.
+const CONTEXT_PRESSURE = 0.6;
+const LOCAL_MODELS_URL = envSetting("OPENCODE_BROKER_LOCAL_MODELS_URL", "OPENCODE_MODEL_ROUTER_LOCAL_MODELS_URL") ?? CONFIG.localModelsUrl;
+const PROVIDER_SCOPE = /^provider:([a-z0-9][a-z0-9._:-]{0,180})$/;
+const REASON_CODE = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
+
+const emptyInventory = () => ({ targets: {}, providers: {}, modelContexts: {}, modelOutputs: {}, modelVariants: {}, authRevision: null, updatedAt: 0 });
+// One derivation of auth revision/types for the whole product: routing.js
+// owns it (authSnapshot); duplicating the parse here desynchronized once.
+const authRevision = () => authSnapshot().revision;
+const authTypes = () => authSnapshot().types;
+const emptyHealth = () => normalizeHealth({});
+const emptyState = () => ({ version: 4, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {} });
+const readState = () => {
+  try {
+    const value = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+    const inventory = normalizeDiscoveredInventory(value?.inventory);
+    const health = normalizeHealth(value?.health);
+    // Restore the plan-usage readings the previous process had. Without this the
+    // cache is empty on boot, nothing counts as OBSERVED, and the unobserved
+    // balancing stands down until the first refresh lands -- a window in which
+    // an unreadable quota is once again the leanest-looking lane.
+    seedPlanUsageCache(value?.planUsage);
+    return {
+      version: 4,
+      leases: value?.leases && typeof value.leases === "object" ? value.leases : {},
+      assignments: value?.assignments && typeof value.assignments === "object" ? value.assignments : {},
+      circuits: value?.circuits && typeof value.circuits === "object" ? value.circuits : {},
+      cursors: value?.cursors && typeof value.cursors === "object" ? value.cursors : {},
+      inventory: {
+        ...inventory,
+        authRevision: typeof value?.inventory?.authRevision === "string" ? value.inventory.authRevision : null,
+        updatedAt: Number(value?.inventory?.updatedAt) || 0,
+      },
+      health,
+      budgets: value?.budgets && typeof value.budgets === "object" ? value.budgets : {},
+      planUsage: value?.planUsage && typeof value.planUsage === "object" ? value.planUsage : {},
+      // Per-session rebalance clock. This MUST survive a reload: readState is a
+      // whitelist, and a dropped map reads as "never rebalanced", which turns the
+      // cooldown off and lets every restart move a session to a new provider.
+      rebalances: value?.rebalances && typeof value.rebalances === "object" ? value.rebalances : {},
+      lastDecision: value?.lastDecision && typeof value.lastDecision === "object" ? value.lastDecision : null,
+    };
+  } catch { return emptyState(); }
+};
+
+const allTargets = (state) => ({ ...TARGETS, ...(state.inventory?.targets ?? {}) });
+
+const writeState = (state) => {
+  ensureRoutingStateDir();
+  state.version = 4;
+  state.health = normalizeHealth(state.health);
+  // Carry the plan readings across restarts; see seedPlanUsageCache. Written
+  // from the live cache rather than held on `state`, so it cannot go stale
+  // relative to what the process actually knows.
+  const planUsage = planUsageSnapshot();
+  if (Object.keys(planUsage).length) state.planUsage = planUsage;
+  const temporary = `${STATE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(state) + "\n", { mode: 0o600 });
+  renameSync(temporary, STATE_PATH);
+};
+
+const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(sessionID);
+const publicTarget = (target, tier, modelVariants) => target && {
+  id: target.id,
+  model: modelRefForTier(target, tier, modelVariants),
+  kind: target.kind,
+};
+
+const publicState = (state) => ({
+  ...state,
+  circuits: Object.fromEntries(Object.entries(state.circuits).map(([key, circuit]) => [key, {
+    ...circuit,
+    renewsAt: circuit?.until === null || !Number.isFinite(Number(circuit?.until))
+      ? null
+      : new Date(Number(circuit.until)).toISOString(),
+  }])),
+  health: normalizeHealth(state.health),
+  budgets: (() => {
+    const report = budgetReport(state.budgets);
+    for (const providerID of Object.keys(PROVIDER_BUDGETS)) {
+      const plan = cachedPlanUsage(providerID);
+      if (!plan) continue;
+      // The estimate fields (utilization, windows) keep their own source flag;
+      // the plan block is self-describing. Overwriting the top-level source
+      // made the object lie about the numbers next to it.
+      report[providerID] = {
+        ...(report[providerID] ?? { source: "provider-reported-only" }),
+        plan,
+      };
+    }
+    return report;
+  })(),
+  lastDecision: state.lastDecision,
+  // Renamed settings still in use (old config directory, old environment names).
+  // Empty on a clean install; see lib/config.js.
+  ...(DEPRECATIONS.length ? { deprecations: [...DEPRECATIONS] } : {}),
+});
+
+// Non-admission handlers start this without awaiting it. A due /lease awaits it so the
+// first request after a plan window closes cannot enter on stale usage; because every
+// handler shares the serial queue, later requests can still wait behind that /lease.
+// The module cache throttles the underlying provider request to once a minute.
+const refreshPlanUsage = (state) => Promise.all(Object.entries(PROVIDER_BUDGETS).map(async ([providerID, providerConfig]) => {
+  if (!planUsageConfigured(providerConfig)) return;
+  try {
+    const report = await fetchPlanUsage(providerID, providerConfig);
+    if (!report) return;
+    applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
+    writeState(state);
+  } catch {}
+}));
+
+const sweep = (state, now = Date.now()) => {
+  for (const [sessionID, lease] of Object.entries(state.leases)) {
+    if (!lease?.touchedAt || now - lease.touchedAt > LEASE_TTL_MS || !isProfile(lease?.profile) || !["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(lease?.tier)) {
+      delete state.leases[sessionID];
+    }
+  }
+  for (const [sessionID, assignment] of Object.entries(state.assignments)) {
+    if (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS) delete state.assignments[sessionID];
+  }
+  // Then the cap: keep the most recently touched, drop the rest. Recency is the right
+  // order because the only readers (/failure, /complete, /forget) ask about a session
+  // that was active moments ago -- so the entries this discards are exactly the ones
+  // nothing can still ask for.
+  const assignmentIDs = Object.keys(state.assignments);
+  if (assignmentIDs.length > MAX_ASSIGNMENTS) {
+    assignmentIDs
+      .sort((a, b) => (state.assignments[b]?.updatedAt ?? 0) - (state.assignments[a]?.updatedAt ?? 0))
+      .slice(MAX_ASSIGNMENTS)
+      .forEach((sessionID) => delete state.assignments[sessionID]);
+  }
+  // A rebalance stamp older than the cooldown already fails its own check, so
+  // dropping it changes no decision and keeps the map from growing per session.
+  if (state.rebalances && typeof state.rebalances === "object") {
+    const cooldownMs = Number(CONFIG.sessionRebalance?.cooldownMs ?? 1800000);
+    for (const [sessionID, at] of Object.entries(state.rebalances)) {
+      if (!Number.isFinite(Number(at)) || now - Number(at) >= cooldownMs) delete state.rebalances[sessionID];
+    }
+  }
+  for (const [targetID, circuit] of Object.entries(state.circuits)) {
+    if (circuit?.until !== null && Number(circuit?.until) <= now) delete state.circuits[targetID];
+  }
+  state.health = normalizeHealth(state.health, now);
+};
+
+const activeProviderCounts = (state, targets = allTargets(state), excludeSessionID = null) => {
+  const counts = {};
+  for (const [sessionID, lease] of Object.entries(state.leases)) {
+    if (sessionID === excludeSessionID) continue;
+    const target = targetForID(lease?.targetID, targets);
+    if (!target) continue;
+    counts[target.providerID] = (counts[target.providerID] ?? 0) + 1;
+  }
+  return counts;
+};
+
+const activeCounts = (state, targets = allTargets(state), excludeSessionID = null) => {
+  const counts = {};
+  for (const [sessionID, lease] of Object.entries(state.leases)) {
+    if (sessionID === excludeSessionID) continue;
+    if (targetForID(lease?.targetID, targets)) counts[lease.targetID] = (counts[lease.targetID] ?? 0) + 1;
+  }
+  return counts;
+};
+
+// ☠️ A SCARCE LOCAL TARGET MUST NOT BE SQUATTED BY A SESSION THAT WALKED AWAY. The plugin
+// releases on session.idle and heartbeats /touch every HEARTBEAT_MS while a turn is running, so
+// a lease is normally short-lived -- but neither happens if the session is abandoned without
+// going idle: `/new` navigates away mid-turn, or the opencode process holding the route is quit
+// or killed, and no session.idle is ever emitted. The lease then survives to LEASE_TTL_MS.
+// At capacity 1 that is not a degradation, it is a total outage of the profile for TWO HOURS:
+// uncensored-qwen has one slot, so the next session is refused every single attempt with
+// "...deployed, free, or within its context window" -- and it is the `free` clause that is true,
+// which is exactly the part nobody reads.
+// Reclaim is DEMAND-DRIVEN (only when someone is refused) and only touches leases that have gone
+// quiet. A live turn cannot be reclaimed by accident: the plugin touches on session.status=busy
+// and then every HEARTBEAT_MS, so the threshold below is more than two missed heartbeats.
+const RECLAIM_IDLE_MS = 12 * 60 * 1000;
+const reclaimIdleLeases = (state, targets, requestingSessionID, now = Date.now()) => {
+  const counts = activeCounts(state, targets);
+  const reclaimed = [];
+  for (const [targetID, count] of Object.entries(counts)) {
+    const target = targetForID(targetID, targets);
+    if (!target || target.kind !== "local") continue;
+    const capacity = Number(target.capacity);
+    if (!Number.isInteger(capacity) || capacity < 1 || count < capacity) continue;
+    for (const [sessionID, lease] of Object.entries(state.leases)) {
+      if (sessionID === requestingSessionID || lease?.targetID !== targetID) continue;
+      if (now - (lease.touchedAt ?? 0) <= RECLAIM_IDLE_MS) continue;
+      delete state.leases[sessionID];
+      reclaimed.push(`${sessionID} on ${targetID}`);
+    }
+  }
+  if (reclaimed.length) {
+    console.error(`[opencode-broker] reclaimed idle lease(s): ${reclaimed.join(", ")}`);
+  }
+  return reclaimed.length;
+};
+
+const localModels = async () => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(LOCAL_MODELS_URL, { signal: controller.signal });
+    if (!response.ok) throw new Error(`local model endpoint HTTP ${response.status}`);
+    const payload = await response.json();
+    const rows = Array.isArray(payload?.data) ? payload.data : [];
+    // ☠️ A row's PRESENCE means the id is CONFIGURED, not that the weights are on a GPU.
+    // llama.cpp router mode lists every models.ini preset whether or not it is resident, so
+    // mapping row.id here made a merely-declared model look routable. That is not academic:
+    // two 27b variants that share one 32 GiB GPU cannot both be resident (21,973 + 27,701 MiB
+    // of weights against 32,768), so exactly one of the pair is ever loaded. With
+    // presence as the test, the unloaded one stayed eligible and the broker leased it -- and
+    // with --no-models-autoload the request then fails outright, while WITHOUT that flag the
+    // router loads it on top of its cardmate and llama.cpp silently partial-offloads the
+    // remainder to a CPU with no AVX2 (measured 0.88 tok/s, HTTP 200 throughout).
+    // status.value is "loaded" | "loading" | "unloaded"; only the first can serve a request.
+    // "loading" is deliberately NOT eligible -- a swap takes ~20-40 s and a lease taken against
+    // a half-loaded instance blocks the session for the remainder of it.
+    // ☠️ A MISSING status field means "this server does not report load state", NOT "unloaded".
+    // Failing open there is the difference between one degraded target and every local target
+    // vanishing at once, which would silently move all local traffic to paid cloud.
+    const loaded = (row) => {
+      const status = row?.status;
+      if (status === undefined || status === null) return true;
+      const value = typeof status === "string" ? status : status?.value;
+      return typeof value === "string" ? value === "loaded" : true;
+    };
+    return new Set(rows.filter(loaded).map((row) => row?.id).filter((id) => typeof id === "string"));
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+// A local target can be non-resident for reasons routing cannot fix -- displaced by a cardmate,
+// reclaimed by an idle timer, lost to a restart. Before this, the lease was refused and every
+// session on a local-only profile stayed stuck until someone ran the swap by hand. `prepareCommand`
+// on the target says how to make it resident; this runs it.
+// ☠️ DETACHED AND NOT AWAITED, deliberately. A 27b swap measures 2m40s and /lease is called from
+// inside chat.params -- blocking it would hang the turn with no feedback for minutes. The lease is
+// still refused, but with a reason that says what is happening and to resend, which is the idiom
+// the router already uses for a mid-turn reroute ("route unavailable; resend the prompt").
+// ☠️ In-flight is tracked so a session retrying every few seconds spawns ONE swap, not a queue of
+// them. The TTL is the release valve: a prepare that dies, or one whose model never becomes
+// resident, must not wedge the target permanently -- after it, the next refusal tries again.
+const PREPARE_TTL_MS = 900_000;
+const preparing = new Map(); // targetID -> startedAt
+// ☠️ `yields` decides whether this swap may take the GPUs from a live conversation. A forward
+// swap used to evict unconditionally -- a swap-BACK should decline on an in-use model, but
+// coming the other way nothing asked -- so an opencode session pressing
+// F11 could yank the GPU out from under a gateway client's chat mid-sentence. See
+// swapRequesterYields: the gateway's consumers have someone waiting and never yield; an
+// opencode session can wait, and does. Passed to the command rather than decided inside it
+// because WHO is asking is a fact only the broker holds.
+const prepareTarget = (target, { sessionID } = {}) => {
+  const started = preparing.get(target.id);
+  if (started !== undefined && Date.now() - started < PREPARE_TTL_MS) return "in-flight";
+  try {
+    const [command, ...args] = target.prepareCommand;
+    // ☠️ AN ENVIRONMENT VARIABLE, NOT A FLAG, and the difference is a deploy hazard. This argv
+    // comes from the router's own config, so an unrecognised `--yield-to-active` reaching a
+    // swap script that predates the flag would exit 2 out of argparse -- and this spawn is
+    // detached with stdio ignored, so the swap would simply never happen and the session would
+    // sit on "preparing it now" until PREPARE_TTL_MS, with nothing logged anywhere. An unknown
+    // env var is ignored by an old build and read by a new one, so the two repos land in
+    // either order.
+    const env = swapRequesterYields({ sessionID })
+      ? { ...process.env, MODEL_SWAP_YIELD_TO_ACTIVE: "1" }
+      : process.env;
+    spawn(command, args, { detached: true, stdio: "ignore", env }).unref();
+    preparing.set(target.id, Date.now());
+    console.error(`[opencode-broker] ${target.id}: ${target.modelID} not resident -- running prepareCommand`);
+    return "started";
+  } catch (error) {
+    // Never let a bad prepareCommand take the refusal path down with it: the caller still
+    // needs the ordinary "no eligible target" answer, which is true either way.
+    console.error(`[opencode-broker] ${target.id}: prepareCommand failed to spawn -- ${error.message}`);
+    return null;
+  }
+};
+
+// The CLOSED set of machine-readable /lease refusal codes. A client has to tell "the
+// model is being swapped in, keep waiting" from "there is no target for you, give up",
+// and the only thing carrying that distinction was English prose -- so every consumer
+// was regexing the message, which makes the wording an unversioned API nobody may fix.
+// ☠️ The human `error` string is BYTE-IDENTICAL to what it has always been and must
+// stay that way: logs, the HUD's current match and lastDecision.reasons[0] all read it,
+// and this addition exists to let them migrate, not to break them first.
+// ☆ Closed and small on purpose. A refusal that fits none of these carries NO code
+// rather than a fourth one invented at the call site -- an unclassified refusal is
+// honest, an over-specific taxonomy is a contract nobody can rely on. The auth-store
+// refusal above is the one such path today.
+const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target"]);
+// ☠️ `refusalCode`, NOT `code`. This handler's catch sees EVERY error, and node puts
+// its own `code` on system errors (ENOENT from a state write, EPIPE from a socket) --
+// forwarding that field would publish "ENOENT" as a routing refusal code, outside the
+// closed set and meaningless to the client. A field only this file sets cannot collide.
+const refusal = (message, code, subject = null) => {
+  const error = new Error(message);
+  error.refusalCode = code;
+  // The target the code REFERS TO, when exactly one does: the model being prepared, or
+  // the single target the lane wanted. Omitted otherwise -- a client must not require
+  // it, and naming one of several would misattribute the reason.
+  if (subject) {
+    error.refusalTargetID = subject.id;
+    error.refusalModelID = subject.modelID;
+  }
+  return error;
+};
+
+const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null) => {
+  if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets).includes(target.id)) return false;
+  if (!cloudTargetAdmitted(target, state.inventory?.providers)) return false;
+  if (target.kind === "local") {
+    if (!localContextEligible(targetContext(target, state.inventory?.modelContexts), request.contextTokens,
+      targetContextHeadroom(target))) return false;
+  } else if (!contextFits(targetContext(target, state.inventory?.modelContexts), request.contextTokens,
+    targetOutputReserve(target, state.inventory?.modelOutputs))) {
+    return false;
+  }
+  const now = Date.now();
+  const circuit = state.circuits[target.id];
+  const providerCircuit = state.circuits[providerCircuitID(target)];
+  if ([circuit, providerCircuit].some((value) =>
+    value && (value.until === null || Number(value.until) > now))) return false;
+  const active = activeCounts(state, targets, excludeSessionID);
+  if (targetAtCapacity(target, active[target.id] ?? 0)) return false;
+  const providerActive = activeProviderCounts(state, targets, excludeSessionID);
+  if (!providerEligible(state.health, target.providerID, providerActive[target.providerID] ?? 0)) return false;
+  if (target.kind === "local") {
+    return availableModels instanceof Set && availableModels.has(target.modelID) &&
+      !targetAtCapacity(target, active[target.id] ?? 0);
+  }
+  return true;
+};
+
+const acquire = async (state, request) => {
+  const { sessionID, profile, tier = "worker", replace = false } = request;
+  if (!validSessionID(sessionID)) throw new Error("invalid session id");
+  if (!isProfile(profile)) throw new Error("invalid routing profile");
+  if (!["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(tier)) throw new Error("invalid routing tier");
+  const rawContext = Number(request.contextTokens);
+  const contextTokens = Number.isFinite(rawContext) && rawContext >= 0 &&
+    (typeof request.contextTokens === "number" || typeof request.contextTokens === "string")
+    ? Math.floor(rawContext)
+    : null;
+  const preferredModel = typeof request.preferredModel?.providerID === "string" && request.preferredModel.providerID &&
+    typeof request.preferredModel?.id === "string" && request.preferredModel.id
+    ? {
+      providerID: request.preferredModel.providerID,
+      id: request.preferredModel.id,
+      ...(typeof request.preferredModel.variant === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(request.preferredModel.variant)
+        ? { variant: request.preferredModel.variant }
+        : {}),
+    }
+    : null;
+  const fallbackTargetID = typeof request.fallbackTargetID === "string" && request.fallbackTargetID
+    ? request.fallbackTargetID
+    : null;
+  // A caller that deliberately wants the session re-decided (the plugin's restore-home after
+  // a provider displacement) says so; every other lease keeps the session's pinned model.
+  const releasePin = request.releasePin === true;
+  request = { ...request, contextTokens, preferredModel, fallbackTargetID, releasePin };
+  sweep(state);
+  let targets = allTargets(state);
+  const requestedCloud = targetIDsFor(profile, tier, targets)
+    .map((targetID) => targetForID(targetID, targets))
+    .some((target) => target?.kind === "cloud");
+  if (requestedCloud &&
+    (!state.inventory.authRevision || state.inventory.authRevision !== authRevision())) {
+    // Auth rotated (OAuth token refreshes rewrite auth.json routinely). Refusing
+    // here starved every caller that lacks the router plugin's republish-retry
+    // -- the classifier most painfully. Self-heal instead: recompute admission
+    // from the fresh auth types; a revoked provider's discovered targets drop,
+    // so a dead credential still cannot ride stale admission.
+    const revision = authRevision();
+    if (!revision) {
+      recordDecision(state, {
+        at: Date.now(), sessionID, profile, tier, targetID: null,
+        policy: "refused", reasons: ["no readable auth.json; cloud routing needs credentials"],
+        eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
+      });
+      throw new Error("no readable auth.json; cloud routing needs credentials");
+    }
+    state.inventory = { ...revalidateAdmission(state.inventory, authTypes()), authRevision: revision, updatedAt: Date.now() };
+    logDecision({ at: Date.now(), sessionID, policy: "auth-revalidated", reasons: ["auth revision rotated; admission recomputed from fresh auth types"] });
+    targets = allTargets(state);
+  }
+  // `chooseTarget` is a pure policy helper and cannot see broker inventory. Filter
+  // first so fresh leases cannot bypass the provider-auth admission gate.
+  // An optional providers allowlist NARROWS admission further (it can never
+  // widen it): callers that can only speak to certain providers -- the
+  // OpenAI-compatible gateway cannot forward to an OAuth-only provider --
+  // lease within their capability instead of receiving unusable targets.
+  const providerAllowlist = Array.isArray(request.providers) && request.providers.length
+    ? new Set(request.providers.filter((id) => typeof id === "string" && id))
+    : null;
+  // ☠️ LOCAL-ONLY: the caller states that this request's CONTENT may not leave the LAN,
+  // and asks for ordinary selection within that boundary. It narrows exactly like the
+  // providers allowlist and can never widen: `auto` still picks the tier normally, it
+  // simply cannot pick a target that is not on the LAN, and if nothing local can serve
+  // the request the lease is REFUSED. That is the point -- a failed compaction is
+  // recoverable, a transcript on a paid API is not.
+  // ☆ Kept as a request flag rather than a profile, because the profile is not what is
+  // asking. A caller that dispatches work on behalf of a session -- the guard classifying
+  // one of its shell commands, say -- routes that work on its own ordinary tier and
+  // inherits only this one property from the session it belongs to.
+  // ☠️ "keep only local", never "drop cloud" -- same reason as everywhere else.
+  const localOnlyRequest = request.localOnly === true;
+  const admittedTargets = Object.fromEntries(Object.entries(targets)
+    .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers))
+    .filter(([, target]) => !localOnlyRequest || target.kind === "local")
+    .filter(([, target]) => !providerAllowlist || providerAllowlist.has(target.providerID)));
+
+  const existing = state.leases[sessionID];
+  if (existing && !replace) {
+    const target = targetForID(existing.targetID, targets);
+    if (isProfile(existing.profile) && ["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(existing.tier) &&
+      existing.profile === profile && existing.tier === tier) {
+      let availableModels;
+      if (target?.kind === "local") {
+        try { availableModels = await localModels(); } catch { availableModels = null; }
+      }
+      // A held lease on an outgrown window falls through to fresh selection so
+      // context pressure can move the session up before the host compacts it.
+      const heldDeclared = Number(targetContext(target, state.inventory?.modelContexts ?? {}));
+      const heldOutgrown = target?.kind !== "local" && Number(contextTokens) > 0 &&
+        Number.isFinite(heldDeclared) && heldDeclared > 0 &&
+        Number(contextTokens) > heldDeclared * CONTEXT_PRESSURE;
+      if (target && !heldOutgrown && targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, targets, sessionID)) {
+        state.leases[sessionID].touchedAt = Date.now();
+        recordDecision(state, {
+          at: Date.now(),
+          sessionID,
+          targetID: target.id,
+          profile,
+          tier,
+          policy: "held-lease-revalidation",
+          reasons: ["revalidated-held-lease"],
+          eligibleTargetIDs: [target.id],
+          balancedTargetIDs: [target.id],
+          providerUtilization: { [target.providerID]: effectiveUtilization(state.budgets, target.providerID) },
+        });
+        return { target, existing: true };
+      }
+    }
+    delete state.leases[sessionID];
+  }
+  if (existing && replace) delete state.leases[sessionID];
+  const selection = {
+    profile,
+    tier,
+    circuits: state.circuits,
+    health: state.health,
+    cursors: state.cursors,
+    targets: admittedTargets,
+    contextTokens,
+    modelContexts: state.inventory?.modelContexts ?? {},
+    modelOutputs: state.inventory?.modelOutputs ?? {},
+    budgets: state.budgets ?? {},
+  };
+  // ☠️ A local-only request needs the resident-model set NO MATTER what the primary lane
+  // holds. Residency is only fetched when the lane itself names a local target, and an
+  // `auto` tier whose local target sits in a FALLBACK rung (build's last rung is exactly
+  // that) would otherwise be judged with localModels undefined -- where every local
+  // target is ineligible by definition, so a local-only lease could never succeed there.
+  const includesLocal = localOnlyRequest || targetIDsFor(profile, tier, targets)
+    .map((targetID) => targetForID(targetID, targets))
+    .some((target) => target?.kind === "local");
+  let availableModels;
+  if (includesLocal) {
+    try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+    // A prepare is finished the moment its model reports resident, and the in-flight mark has to
+    // go THEN, not when its TTL expires. Otherwise a model that lands and is evicted again inside
+    // the TTL -- a cardmate swapping back, another session leaving the profile -- reads as "still
+    // preparing" with nothing actually running, and stays stuck for the remainder of it.
+    for (const targetID of [...preparing.keys()]) {
+      const prepared = targetForID(targetID, targets);
+      if (prepared && availableModels.has(prepared.modelID)) preparing.delete(targetID);
+    }
+  }
+  // Free any slot whose holder has gone quiet BEFORE deciding, so a full scarce target is
+  // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
+  reclaimIdleLeases(state, admittedTargets, sessionID);
+  const ordinaryChoice = chooseTarget({
+    ...selection,
+    active: activeCounts(state, admittedTargets),
+    localModels: availableModels,
+  });
+  let choice = ordinaryChoice;
+  // Context pressure: the host compacts a session once it approaches the
+  // current model's usable window (context minus the output reserve, ~60-70%).
+  // A session that big belongs on a roomier model BEFORE compression eats its
+  // history -- a 133k session compacting on a 200k model while 1M models sit
+  // in the same tier is a routing failure, not a context problem. Try a
+  // selection restricted to models the host would not imminently compact on;
+  // if none exists (session bigger than everything), normal selection stands.
+  const modelContextsMap = state.inventory?.modelContexts ?? {};
+  const pressureFloor = Number(contextTokens) > 0 ? Number(contextTokens) / CONTEXT_PRESSURE : 0;
+  let pressureApplied = false;
+  if (pressureFloor > 0) {
+    const roomy = Object.fromEntries(Object.entries(admittedTargets).filter(([, target]) => {
+      if (target.kind === "local") return true;
+      const declared = Number(targetContext(target, modelContextsMap));
+      return !Number.isFinite(declared) || declared <= 0 || declared >= pressureFloor;
+    }));
+    if (Object.keys(roomy).length < Object.keys(admittedTargets).length && Object.keys(roomy).length > 0) {
+      const roomyChoice = chooseTarget({
+        ...selection,
+        targets: roomy,
+        active: activeCounts(state, roomy),
+        localModels: availableModels,
+      });
+      if (roomyChoice?.target) {
+        roomyChoice.decision.reasons = [...(roomyChoice.decision.reasons ?? []), "context-pressure-prefers-roomier-window"];
+        choice = roomyChoice;
+        pressureApplied = true;
+      }
+    }
+  }
+  // ☠️ A SESSION KEEPS ITS MODEL. The pin is the session's last assignment, which /forget
+  // no longer deletes, so it survives the lease being released at every idle. Without it,
+  // stickiness depended on the plugin naming a preferred model, which it never does for a
+  // subagent's turns. The local share was then re-rolled on EVERY lease, and a scout's
+  // session flipped between qwen-flash and the 9B turn by turn: 146 mid-session model
+  // changes in three days, each one a different model continuing a transcript it did not
+  // write, and re-reading all of it. A session moves only when its model cannot serve it:
+  // circuit open, quota, not resident, outgrown, or explicitly released (restore-home).
+  // A new TIER is a new decision (a bump or an escalation), so the pin only binds within
+  // the tier and profile it was made in.
+  const pin = !request.releasePin && state.assignments?.[sessionID]?.fallback !== true
+    ? state.assignments?.[sessionID]
+    : null;
+  const pinnedTarget = pin && pin.profile === profile && pin.tier === tier
+    ? admittedTargets[pin.targetID] ?? null
+    : null;
+  const preferredTarget = (preferredModel
+    ? Object.values(admittedTargets).find((target) =>
+      target.providerID === preferredModel.providerID && target.modelID === preferredModel.id)
+    : null) ?? pinnedTarget;
+  // Stickiness never holds a session on a model it has outgrown: when pressure
+  // moved the selection to a roomier window, the sticky model only wins if it
+  // is itself roomy enough.
+  // ...and only when the move actually buys a bigger window. Opus 5 and Opus 4.8 both have
+  // 1M, so a 600k+ session was being shuffled between two models with the SAME window: a
+  // model change and a full re-read, for nothing (35 such moves in three days).
+  const preferredOutgrown = pressureApplied && preferredTarget && (() => {
+    const declared = Number(targetContext(preferredTarget, modelContextsMap));
+    const offered = Number(targetContext(choice?.target, modelContextsMap));
+    return Number.isFinite(declared) && declared > 0 && declared < pressureFloor &&
+      (!Number.isFinite(offered) || offered <= 0 || offered > declared);
+  })();
+  // A transient circuit strands sessions on an older family member: opus-5
+  // down for five minutes -> the session leases opus-4.8 -> stickiness then
+  // holds 4.8 for days after opus-5 returns. Stickiness never outranks a
+  // NEWER sibling of the same family that is eligible again.
+  const newerFamilySibling = preferredTarget?.family && preferredTarget?.releaseDate &&
+    Object.values(admittedTargets).some((candidate) =>
+      candidate.id !== preferredTarget.id &&
+      candidate.providerID === preferredTarget.providerID &&
+      candidate.family === preferredTarget.family &&
+      (candidate.speed ?? "standard") === (preferredTarget.speed ?? "standard") &&
+      String(candidate.releaseDate ?? "") > String(preferredTarget.releaseDate) &&
+      targetEligibleFor(candidate, request, state, availableModels, admittedTargets, sessionID));
+  if (newerFamilySibling && choice?.decision) {
+    choice.decision.reasons = [...(choice.decision.reasons ?? []), "family-upgrade-releases-stickiness"];
+  }
+  // ☠️ NO LIVE REBALANCING. A cross-provider "correction" used to move a live session when
+  // one subscription ran 15% hotter than another. That hands a long session to a different
+  // model mid-task: a model that did not write the history and re-reads all of it at full
+  // price. Balancing happens where it costs nothing -- when a session gets its FIRST model.
+  if (preferredTarget && !preferredOutgrown && !newerFamilySibling && targetEligibleFor(
+    preferredTarget,
+    request,
+    state,
+    availableModels,
+    admittedTargets,
+    sessionID,
+  )) {
+    choice = {
+      target: preferredTarget,
+      cursorKey: null,
+      nextCursor: null,
+      decision: {
+        policy: "session-stickiness",
+        reasons: ["preferred-session-model-remains-eligible"],
+        eligibleTargetIDs: [preferredTarget.id],
+        balancedTargetIDs: [preferredTarget.id],
+        providerUtilization: {
+          [preferredTarget.providerID]: effectiveUtilization(state.budgets, preferredTarget.providerID),
+        },
+      },
+    };
+  }
+  const fallbackTarget = fallbackTargetID && ordinaryChoice?.decision?.policy === "strict-fallback" &&
+    ordinaryChoice.decision.eligibleTargetIDs?.includes(fallbackTargetID)
+    ? admittedTargets[fallbackTargetID]
+    : null;
+  const fallbackOutgrown = pressureApplied && fallbackTarget && (() => {
+    const declared = Number(targetContext(fallbackTarget, modelContextsMap));
+    return Number.isFinite(declared) && declared > 0 && declared < pressureFloor;
+  })();
+  if (fallbackTarget && !fallbackOutgrown) {
+    choice = {
+      target: fallbackTarget,
+      cursorKey: null,
+      nextCursor: null,
+      decision: {
+        ...ordinaryChoice.decision,
+        reasons: [...(ordinaryChoice.decision.reasons ?? []), "fallback-stickiness"],
+      },
+    };
+  }
+  if (!choice) {
+    const wanted = targetIDsFor(profile, tier, targets).map((id) => targetForID(id, targets)).filter(Boolean);
+    // A local-only REQUEST is refused for the local reason even when the lane it rode is
+    // mixed: "no eligible local model ..." is the true sentence there, and it is one of
+    // the two wordings that already exist rather than a third.
+    const localOnly = localOnlyRequest || (wanted.length && wanted.every((target) => target.kind === "local"));
+    // ☠️ Only a target that is genuinely NOT RESIDENT is preparable. A target that is loaded but
+    // busy, or that the request does not fit, is refused for a reason no swap can change -- and
+    // running one there would evict a working model to "fix" a capacity or context problem.
+    const absent = wanted.filter((target) =>
+      target.kind === "local" && target.prepareCommand && !availableModels.has(target.modelID));
+    const prepared = absent.length ? prepareTarget(absent[0], { sessionID }) : null;
+    // ☠️ FULL IS NOT GONE. A local model that is resident, fits the request and has no open
+    // circuit, and is refused ONLY because every slot is taken, frees a slot within one job.
+    // Refusing there dropped the work: 992 requests in three days, most of them background
+    // ingestion from a gateway client arriving while the cloud lane was rate-limited and the
+    // local model's slots were busy.
+    // So it WAITS -- the same transient answer as a model being swapped in, which every
+    // client already retries. Fallback rungs count (the lane's local step lives there). A
+    // local model that is not loaded at all is not a wait: that is the refusal below.
+    const nowMs = Date.now();
+    const activeNow = activeCounts(state, admittedTargets, sessionID);
+    const busy = prepared || !(availableModels instanceof Set) ? [] : targetEligibleIDsFor(profile, tier, targets)
+      .map((targetID) => admittedTargets[targetID])
+      .filter((target) => target?.kind === "local" && availableModels.has(target.modelID) &&
+        localContextEligible(targetContext(target, state.inventory?.modelContexts), contextTokens, targetContextHeadroom(target)) &&
+        ![state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((value) =>
+          value && (value.until === null || Number(value.until) > nowMs)) &&
+        targetAtCapacity(target, activeNow[target.id] ?? 0));
+    const reason = prepared
+      ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
+      : busy.length
+        ? `${busy.map((target) => target.modelID).join(" and ")} ${busy.length > 1 ? "are" : "is"} busy (every slot in use); waiting for a free slot -- resend the prompt in a moment`
+        : localOnly
+          ? "no eligible local model is currently deployed, free, or within its context window"
+          : "all lightweight routing targets are busy or unavailable";
+    // ☆ Both prepare wordings share ONE code. "preparing it now" and "still preparing
+    // it" differ only in what a human reading a log wants to know (did this call start
+    // the swap, or was it already running); to a client both mean the same thing --
+    // retry shortly, this WILL clear -- and splitting them would push the caller back
+    // into matching prose to recombine them.
+    const code = prepared
+      ? "target-preparing"
+      : busy.length ? "target-busy"
+        : localOnly ? "no-eligible-local-target" : "no-eligible-target";
+    const subject = prepared ? absent[0] : busy.length === 1 ? busy[0] : wanted.length === 1 ? wanted[0] : null;
+    // ☠️ A preparing target is NOT a refusal, and filing it as one makes the decision log
+    // lie about the router. A refusal is terminal -- nothing is eligible, and the caller
+    // must change something. `target-preparing` is transient and self-healing: a local
+    // model is loading and the same prompt will route on the retry. Sharing one policy
+    // meant `uncensored` read as a 43% failure rate (650 of 1500 decisions) when the
+    // router was doing its job and waiting out a GPU swap. The HTTP reply and the code
+    // are unchanged -- a client still has to resend -- only the classification differs.
+    const policy = prepared || busy.length ? "waiting" : "refused";
+    recordDecision(state, {
+      at: Date.now(), sessionID, profile, tier, targetID: null,
+      // ☆ The same code on the DECISION, so /selection and decisions.jsonl are
+      // machine-readable too -- that log is where refusals get read after the fact, and
+      // until now that reading was done by eye. `targetID` stays null: on a decision it
+      // means the target that was LEASED, and neither a refusal nor a wait leased anything.
+      policy, code, reasons: [reason],
+      contextTokens,
+      eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
+    });
+    throw refusal(reason, code, subject);
+  }
+
+  if (choice.cursorKey) state.cursors[choice.cursorKey] = choice.nextCursor;
+  state.leases[sessionID] = { targetID: choice.target.id, touchedAt: Date.now(), profile, tier };
+  state.assignments[sessionID] = {
+    targetID: choice.target.id,
+    profile,
+    tier,
+    updatedAt: Date.now(),
+    // A fallback rung is a degraded route, never a home: it must yield to the lane's
+    // primary the moment one is eligible (fallback-stickiness above owns that), so it
+    // is recorded but never pinned.
+    ...(choice.decision?.policy === "strict-fallback" ? { fallback: true } : {}),
+  };
+  recordDecision(state, {
+    at: Date.now(),
+    sessionID,
+    targetID: choice.target.id,
+    profile,
+    tier,
+    contextTokens,
+    ...choice.decision,
+  });
+  return { target: choice.target, existing: false };
+};
+
+const parseBody = (request) => new Promise((resolve, reject) => {
+  let text = "";
+  request.setEncoding("utf8");
+  request.on("data", (chunk) => {
+    text += chunk;
+    if (text.length > 64 * 1024) request.destroy(new Error("request too large"));
+  });
+  request.on("end", () => {
+    try { resolve(text ? JSON.parse(text) : {}); } catch { reject(new Error("invalid JSON")); }
+  });
+  request.on("error", reject);
+});
+
+const reply = (response, code, value) => {
+  response.writeHead(code, { "content-type": "application/json" });
+  response.end(JSON.stringify(value) + "\n");
+};
+
+const socketResponds = (socketPath) => new Promise((resolve) => {
+  const request = httpRequest({ socketPath, path: "/status", method: "POST", timeout: 300 }, (response) => {
+    response.resume();
+    response.once("end", () => resolve(true));
+  });
+  request.once("timeout", () => request.destroy());
+  request.once("error", () => resolve(false));
+  request.end("{}");
+});
+
+const serve = async () => {
+  ensureRoutingStateDir();
+  const socketPath = brokerSocketPath();
+  try {
+    const stat = lstatSync(socketPath);
+    if (!stat.isSocket()) throw new Error(`refusing to remove non-socket broker path: ${socketPath}`);
+    if (await socketResponds(socketPath)) throw new Error(`broker is already listening on ${socketPath}`);
+    unlinkSync(socketPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  let state = readState();
+  sweep(state);
+  writeState(state);
+  const handle = async (request, response) => {
+    if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+    try {
+      const body = await parseBody(request);
+      sweep(state);
+      const planRefresh = refreshPlanUsage(state);
+      if (request.url === "/lease") {
+        // Admission must see the provider's latest plan window. A background refresh let
+        // the first request after Anthropic reached 100% lease Opus before its circuit opened.
+        await planRefresh;
+        const lease = await acquire(state, body);
+        writeState(state);
+        // The decision rides along so clients can SURFACE a degraded route --
+        // policy "strict-fallback" means every primary was unavailable.
+        const { policy = null, reasons = [] } = state.lastDecision ?? {};
+        return reply(response, 200, {
+          target: publicTarget(lease.target, body.tier, state.inventory?.modelVariants),
+          existing: lease.existing,
+          decision: { policy, reasons },
+        });
+      }
+      if (request.url === "/release") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        delete state.leases[body.sessionID];
+        writeState(state);
+        return reply(response, 200, { ok: true });
+      }
+      if (request.url === "/touch") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const present = Boolean(state.leases[body.sessionID]);
+        if (present) state.leases[body.sessionID].touchedAt = Date.now();
+        writeState(state);
+        return reply(response, 200, { ok: true, present });
+      }
+      if (request.url === "/failure") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const lease = state.leases[body.sessionID];
+        const assignment = state.assignments[body.sessionID];
+        const targetID = body.targetID || lease?.targetID || assignment?.targetID;
+        const error = normalizeProviderError(body.error);
+        const kind = classifyRoutingFailure(error);
+        const target = targetForID(targetID, allTargets(state));
+        // A rate/quota complaint is the only capacity truth providers give us:
+        // calibrate the window ceiling to the spend that triggered it.
+        if (target && (kind === "quota" || kind === "rate")) {
+          state.budgets = learnCapacityFromFailure(state.budgets, target.providerID, kind);
+        }
+        let circuitUntil = null;
+        if (kind === "noop") {
+          // A caller-side non-fault (empty/unparsed classifier output, caller
+          // timeout). Release the lease, record NOTHING -- no circuit, no
+          // health evidence. This is the broker refusing to let a buggy or old
+          // client bench a healthy lane; it protects live sessions that cannot
+          // be patched in place.
+          logDecision({
+            at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+            policy: "failure-ignored", reasons: ["noop", error.message].filter(Boolean),
+          });
+          delete state.leases[body.sessionID];
+          writeState(state);
+          return reply(response, 200, { ok: true, kind: "noop" });
+        }
+        if (kind === "payload") {
+          // The REQUEST was malformed and the provider answered correctly by refusing
+          // it. Record no circuit and no health evidence: the fault belongs to this
+          // session's transcript, so every model on every provider rejects the same
+          // bytes, and the only thing fencing lanes for it achieves is emptying the
+          // pool one sibling at a time (anthropic, 2026-09-17). Release the lease so a
+          // resend is free to pick any target -- including the one that just refused.
+          logDecision({
+            at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+            policy: "failure-payload", reasons: ["payload", error.message].filter(Boolean),
+          });
+          delete state.leases[body.sessionID];
+          writeState(state);
+          return reply(response, 200, { ok: true, kind: "payload" });
+        }
+        if (kind === "context") {
+          // The request did not FIT the target's window. The provider is
+          // healthy and answered correctly, so record no circuit and no health
+          // evidence -- fencing llama.cpp here would take out every local
+          // target over one oversized session. Release the lease so the next
+          // one is chosen fresh: the session's context has grown, and
+          // localContextEligible will now steer it to a roomier window.
+          logDecision({
+            at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+            policy: "failure-context", reasons: ["context", error.message].filter(Boolean),
+          });
+          delete state.leases[body.sessionID];
+          writeState(state);
+          return reply(response, 200, { ok: true, kind: "context" });
+        }
+        if (target && kind === "quota") {
+          // Subscription quota is shared across a provider's models. Leaving this
+          // target-scoped would immediately route the next job to another capped SKU.
+          // Expiry prefers, in order: a reset named in the error, the provider's
+          // own usage report, then a bounded re-probe -- an unknown reset must
+          // cost one probing request per window, never a provider held out of
+          // the pool until state surgery.
+          circuitUntil = quotaRenewalAt(error);
+          if (!circuitUntil && planUsageConfigured(PROVIDER_BUDGETS[target.providerID])) {
+            const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
+            circuitUntil = planUsageResetAt(report);
+          }
+          if (!circuitUntil) circuitUntil = Date.now() + QUOTA_REPROBE_MS;
+          state.circuits[providerCircuitID(target)] = {
+            kind,
+            until: circuitUntil,
+            updatedAt: Date.now(),
+          };
+        } else if (target && kind === "auth") {
+          // Local credential staleness: fence the target for one minute so the
+          // retry lands elsewhere, record NOTHING against provider health --
+          // the token refresh fixes this, benching the provider does not.
+          state.circuits[targetID] = { kind, until: Date.now() + 60_000, updatedAt: Date.now() };
+        } else if (target && kind === "model") {
+          // A catalog can lead provider rollout. Reject only this immutable model
+          // version so the next lease can select the previous family member.
+          state.circuits[targetID] = { kind, until: null, updatedAt: Date.now() };
+        } else if (target && kind === "overload") {
+          // Transient provider capacity (529/overloaded): fence the target for a
+          // few seconds so a quick recovery returns to the SAME provider, and
+          // record NO health evidence -- a brief overload must not quarantine a
+          // provider or force a lasting switch. (opencode's own retry already
+          // rides out sub-30s backoffs without any switch at all.)
+          circuitUntil = Date.now() + OVERLOAD_MS;
+          state.circuits[targetID] = { kind, until: circuitUntil, updatedAt: Date.now() };
+        } else if (target && kind === "rate") {
+          // ☠️ A 429 IS THE PROVIDER ASKING FOR PATIENCE, NOT A COMPATIBILITY FAULT, and it was
+          // the only kind still falling through to the catch-all -- the one branch that records
+          // health evidence. `quota`, the harder version of the same signal, has never recorded
+          // any. So a provider that throttled two models inside the fifteen-minute window
+          // quarantined itself for being busy. alibaba-token-plan throttled `tester` and `scout`
+          // subagents every couple of minutes on 2026-09-17 and only escaped because every burst
+          // happened to land on the same model; a fan-out that spread over two would have taken
+          // the provider out. Fence the TARGET briefly so the retry moves, and record nothing.
+          circuitUntil = Date.now() + RATE_LIMIT_MS;
+          state.circuits[targetID] = { kind, until: circuitUntil, updatedAt: Date.now() };
+        } else if (target && kind === "connect") {
+          // ☠️ NOTHING ANSWERED, so this is not about the one target that was asked for --
+          // every target on that provider is behind the same dead socket. Fencing the target
+          // alone sends the next lease to its sibling on the SAME endpoint, which fails
+          // identically: on 2026-09-14 llama.cpp went down and local-coder, local-27b and
+          // local-classifier were all gone together. So the circuit is PROVIDER-scoped, which
+          // is what makes the next lease reach a different provider instead of a dead sibling.
+          // ☆ Short, and no health evidence: a container restart must not quarantine the lane
+          // for the rest of the day. Same reasoning as `overload` directly above -- the
+          // difference is only that nothing answered, so there is no status code to read.
+          circuitUntil = Date.now() + CONNECT_MS;
+          state.circuits[providerCircuitID(target)] = { kind, until: circuitUntil, updatedAt: Date.now() };
+        } else if (target) {
+          circuitUntil = Date.now() + RATE_LIMIT_MS;
+          state.circuits[targetID] = { kind, until: circuitUntil, updatedAt: Date.now() };
+          state.health = recordFailureEvidence(state.health, target.providerID, {
+            targetID: target.id,
+            modelID: target.modelID,
+            reasonCode: kind,
+            error,
+            at: Date.now(),
+          });
+        }
+        logDecision({
+          at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+          policy: "failure-reported", reasons: [kind, error.message].filter(Boolean),
+        });
+        delete state.leases[body.sessionID];
+        writeState(state);
+        return reply(response, 200, { ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
+      }
+      if (request.url === "/complete") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const lease = state.leases[body.sessionID];
+        const assignment = state.assignments[body.sessionID];
+        const targetID = lease?.targetID || assignment?.targetID;
+        const target = targetForID(targetID, allTargets(state));
+        if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
+        delete state.leases[body.sessionID];
+        writeState(state);
+        return reply(response, 200, { ok: true });
+      }
+      if (request.url === "/quarantine") {
+        const scope = body.scope;
+        const kind = body.kind;
+        const providerMatch = typeof body.providerID === "string" ? body.providerID : null;
+        const targetScope = typeof body.targetID === "string" ? body.targetID : null;
+        const scopeProvider = scope === "provider" ? providerMatch : null;
+        if (scope !== "provider" || kind !== "compatibility") throw new Error("invalid quarantine request");
+        if (!scopeProvider || !REASON_CODE.test(scopeProvider)) throw new Error("invalid provider id");
+        if (body.reasonCode !== undefined && body.reasonCode !== null && !REASON_CODE.test(body.reasonCode)) {
+          throw new Error("invalid reason code");
+        }
+        const providerID = scopeProvider || targetScope;
+        state.health = operatorQuarantineProvider(state.health, providerID, { reasonCode: body.reasonCode ?? "operator" });
+        writeState(state);
+        return reply(response, 200, { ok: true });
+      }
+      if (request.url === "/forget") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const completed = body.completed === true;
+        if (completed) {
+          const lease = state.leases[body.sessionID];
+          const assignment = state.assignments[body.sessionID];
+          const targetID = lease?.targetID || assignment?.targetID;
+          const target = targetForID(targetID, allTargets(state));
+          if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
+        }
+        // The lease goes (its slot is free again); the assignment stays. It is the session's
+        // pin, so the next turn after an idle returns to the same model instead of being
+        // re-rolled. It ages out on ASSIGNMENT_TTL_MS like any other.
+        delete state.leases[body.sessionID];
+        writeState(state);
+        return reply(response, 200, { ok: true });
+      }
+      if (request.url === "/usage") {
+        // Ledger for the depletion balancer: one report per provider request (a
+        // step-finish part in opencode), token counts included for token-metered plans.
+        // Manual/local-profile sessions report too — their spend burns the same windows.
+        const rawObservedAt = Number(body.observedAt);
+        const providerID = typeof body.providerID === "string" ? body.providerID : "";
+        if (!/^[a-z0-9][a-z0-9._:-]{0,180}$/.test(providerID)) throw new Error("invalid provider id");
+        const requests = Math.min(Math.max(0, Number(body.requests) || 0), 100);
+        const raw = body.tokens && typeof body.tokens === "object" ? body.tokens : {};
+        const clampTokens = (value) => Math.min(Math.max(0, Number(value) || 0), 50_000_000);
+        state.budgets = recordBudgetUsage(state.budgets, providerID, {
+          requests,
+          modelID: typeof body.modelID === "string" ? body.modelID : undefined,
+          tokens: {
+            input: clampTokens(raw.input),
+            output: clampTokens(raw.output),
+            cacheRead: clampTokens(raw.cacheRead),
+            cacheWrite: clampTokens(raw.cacheWrite),
+          },
+        });
+        // A step-finish usage report is stronger success evidence than waiting for
+        // session.idle, but only when it matches this session's current assignment.
+        // Missing, invalid, stale, and future observations retain probation while their
+        // budget reading remains useful. Keep the observation time so a delayed report
+        // cannot clear newer probation.
+        const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+        const assignment = sessionID ? (state.leases[sessionID] ?? state.assignments[sessionID]) : null;
+        const target = targetForID(assignment?.targetID, allTargets(state));
+        if (Number.isFinite(rawObservedAt) && rawObservedAt <= Date.now() &&
+          target && target.providerID === providerID && target.modelID === body.modelID) {
+          state.health = markProbationSuccessHealthy(state.health, providerID, { at: rawObservedAt });
+        }
+        writeState(state);
+        return reply(response, 200, { ok: true, utilization: effectiveUtilization(state.budgets, providerID) });
+      }
+      if (request.url === "/status") {
+        writeState(state);
+        return reply(response, 200, publicState(state));
+      }
+      if (request.url === "/preview") {
+        // Side-effect-free selection: what WOULD each tier get right now. No
+        // lease, no cursor advance, no assignment -- the UI shows this so a
+        // user tabbing agents on a new-session page can see the real routing
+        // destination instead of the agent's static pin.
+        const profile = isProfile(body.profile) ? body.profile : "auto";
+        const tiers = (Array.isArray(body.tiers) ? body.tiers : ["smart"])
+          .filter((tier) => ["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(tier));
+        // ☠️ Without a size the preview cannot answer for a LOCAL target at all:
+        // localContextEligible refuses a null estimate by design, so every local
+        // candidate drops out and the preview silently reports the cloud fallback
+        // instead of the real destination. That is wrong for any lane holding a
+        // local target and outright misleading for a local-FIRST one such as
+        // `classifier`. Normalized exactly as /lease does, so preview and lease
+        // answer the same question. Absent, it stays null and cloud-only lanes are
+        // unaffected.
+        const rawPreviewContext = Number(body.contextTokens);
+        const previewContextTokens = Number.isFinite(rawPreviewContext) && rawPreviewContext >= 0 &&
+          (typeof body.contextTokens === "number" || typeof body.contextTokens === "string")
+          ? Math.floor(rawPreviewContext)
+          : null;
+        const targets = allTargets(state);
+        const admitted = Object.fromEntries(Object.entries(targets)
+          .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers)));
+        let availableModels;
+        try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+        const preview = {};
+        for (const tier of tiers) {
+          const choice = chooseTarget({
+            profile,
+            tier,
+            circuits: state.circuits,
+            health: state.health,
+            cursors: { ...state.cursors },
+            targets: admitted,
+            active: activeCounts(state, admitted),
+            localModels: availableModels,
+            contextTokens: previewContextTokens,
+            modelContexts: state.inventory?.modelContexts ?? {},
+            modelOutputs: state.inventory?.modelOutputs ?? {},
+            budgets: state.budgets ?? {},
+          });
+          preview[tier] = choice
+            ? publicTarget(choice.target, tier, state.inventory?.modelVariants)
+            : null;
+        }
+        return reply(response, 200, { preview });
+      }
+      if (request.url === "/decisions") {
+        let lines = [];
+        try {
+          lines = readFileSync(DECISION_LOG, "utf8").trim().split("\n").slice(-Math.min(Math.max(1, Number(body.limit) || 50), 500));
+        } catch {}
+        const decisions = [];
+        for (const line of lines) { try { decisions.push(JSON.parse(line)); } catch {} }
+        return reply(response, 200, { decisions });
+      }
+      if (request.url === "/selection") {
+        writeState(state);
+        return reply(response, 200, { lastDecision: publicState(state).lastDecision });
+      }
+      if (request.url === "/inventory") {
+        // The router checked this before discovery; repeat it at the mutation boundary so
+        // an OAuth-to-API-key change cannot publish stale automatic admission.
+        if (typeof body.authRevision !== "string" || !body.authRevision || body.authRevision !== authRevision()) {
+          throw new Error("auth revision changed before inventory publication");
+        }
+        const inventory = normalizeDiscoveredInventory(body);
+        const previous = JSON.stringify(state.inventory?.targets ?? {}) + JSON.stringify(state.inventory?.providers ?? {}) +
+          JSON.stringify(state.inventory?.modelContexts ?? {}) + JSON.stringify(state.inventory?.modelOutputs ?? {}) +
+          JSON.stringify(state.inventory?.modelVariants ?? {});
+        const previousDynamicTargetIDs = new Set(Object.keys(state.inventory?.targets ?? {}));
+        state.inventory = body.authOnly === true
+          ? { ...state.inventory, providers: inventory.providers, authRevision: body.authRevision, updatedAt: Date.now() }
+          : { ...inventory, authRevision: body.authRevision, updatedAt: Date.now() };
+        if (body.authOnly !== true) {
+          for (const targetID of previousDynamicTargetIDs) {
+            if (!state.inventory.targets[targetID]) delete state.circuits[targetID];
+          }
+        }
+        const next = JSON.stringify(state.inventory.targets) + JSON.stringify(state.inventory.providers) +
+          JSON.stringify(state.inventory.modelContexts) + JSON.stringify(state.inventory.modelOutputs) +
+          JSON.stringify(state.inventory.modelVariants);
+        writeState(state);
+        return reply(response, 200, { ok: true, changed: previous !== next, inventory: state.inventory });
+      }
+      if (request.url === "/rearm") {
+        const targets = allTargets(state);
+        const target = targetForID(body.targetID, targets);
+        const providerMatch = typeof body.targetID === "string" ? body.targetID.match(PROVIDER_SCOPE) : null;
+        const providerID = providerMatch?.[1] ?? null;
+        const providerKey = providerID ? `provider:${providerID}` : (typeof body.targetID === "string" ? providerCircuitID(body.targetID) : null);
+        const knownProvider = providerKey && (Object.values(targets)
+          .some((candidate) => providerCircuitID(candidate) === providerKey) || state.health.providers?.[providerID] || state.circuits[providerKey]);
+        if (body.targetID && !target && !knownProvider) throw new Error("unknown target or provider");
+        if (body.reasonCode !== undefined && body.reasonCode !== null && !REASON_CODE.test(body.reasonCode)) {
+          throw new Error("invalid reason code");
+        }
+        if (providerID) {
+          state.health = rearmQuarantinedProvider(state.health, providerID, { reasonCode: body.reasonCode });
+          delete state.circuits[providerKey];
+        } else if (body.targetID) {
+          delete state.circuits[target ? target.id : providerKey];
+        } else {
+          state.circuits = {};
+        }
+        writeState(state);
+        return reply(response, 200, { ok: true });
+      }
+      return reply(response, 404, { error: "unknown broker endpoint" });
+    } catch (error) {
+      // Additive: `error` is unchanged, and a code is published only when it is one of
+      // the closed set this file assigned.
+      const code = REFUSAL_CODES.has(error?.refusalCode) ? error.refusalCode : null;
+      return reply(response, 400, {
+        error: String(error?.message ?? error),
+        ...(code ? { code } : {}),
+        ...(code && error.refusalTargetID ? { targetID: error.refusalTargetID } : {}),
+        ...(code && error.refusalModelID ? { modelID: error.refusalModelID } : {}),
+      });
+    }
+  };
+  // Local profile leases may await the model inventory. Serialize mutations so two
+  // simultaneous requests cannot both reserve the single local slot while awaiting it.
+  let serial = Promise.resolve();
+  // ☠️ THE SERIAL CHAIN IS A SINGLE POINT OF PERMANENT FAILURE. Every request is queued
+  // onto one promise, so a handler that never settles does not fail that ONE request --
+  // it stops the broker answering anything, for good, while the process stays perfectly
+  // healthy: alive in do_epoll_wait, accepting connections, replying to none. That is not
+  // a hypothetical. On 2026-09-17 a quota lookup whose child had died but whose stdio
+  // pipes stayed open left `handle` pending, and the broker sat mute for an hour and
+  // three quarters while every prompt in every session timed out. Reproduced in isolation
+  // by SIGSTOPping a broker and resuming it: five consecutive requests still timed out
+  // afterwards, because the chain never advanced past the one that died mid-flight.
+  // ☆ So the chain now advances no matter what a handler does. The deadline is longer
+  // than any legitimate handler (the slowest, a plan-usage refresh, is capped at 20s) and
+  // the caller gets an honest 503 rather than a socket that never answers. A wedged
+  // handler costs one slow request now, not the whole fleet's ability to route.
+  const HANDLER_DEADLINE_MS = 30_000;
+  const guarded = (request, response) => {
+    let timer = null;
+    const finished = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try {
+          if (!response.writableEnded) {
+            response.statusCode = 503;
+            response.setHeader("content-type", "application/json");
+            response.end(JSON.stringify({ error: "broker handler deadline exceeded" }));
+          }
+        } catch {}
+        resolve();
+      }, HANDLER_DEADLINE_MS);
+      if (typeof timer?.unref === "function") timer.unref();
+    });
+    let running;
+    try { running = Promise.resolve(handle(request, response)); }
+    catch (error) { running = Promise.reject(error); }
+    return Promise.race([running.catch(() => {}), finished]).finally(() => clearTimeout(timer));
+  };
+  const server = createServer((request, response) => {
+    serial = serial.then(() => guarded(request, response), () => guarded(request, response));
+  });
+  const removeSocket = () => { try { unlinkSync(socketPath); } catch {} };
+  server.on("close", removeSocket);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
+  for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      server.close(() => process.exit(0));
+    });
+  }
+};
+
+const main = async () => {
+  const [command = "status", targetID, reasonCode] = process.argv.slice(2);
+  if (command === "serve") return serve();
+  if (command === "status") {
+    process.stdout.write(JSON.stringify(await brokerRequest("/status"), null, 2) + "\n");
+    return;
+  }
+  if (command === "selection") {
+    process.stdout.write(JSON.stringify(await brokerRequest("/selection"), null, 2) + "\n");
+    return;
+  }
+  if (command === "decisions") {
+    process.stdout.write(JSON.stringify(await brokerRequest("/decisions", { limit: Number(targetID) || 50 }), null, 2) + "\n");
+    return;
+  }
+  if (command === "rearm") {
+    process.stdout.write(JSON.stringify(await brokerRequest("/rearm", { targetID }), null, 2) + "\n");
+    return;
+  }
+  if (command === "quarantine") {
+    const match = typeof targetID === "string" ? targetID.match(PROVIDER_SCOPE) : null;
+    if (!match) throw new Error("usage: opencode-broker quarantine provider:<id> [reason-code]");
+    if (reasonCode !== undefined && reasonCode !== null && !REASON_CODE.test(reasonCode)) {
+      throw new Error("invalid reason code");
+    }
+    process.stdout.write(JSON.stringify(await brokerRequest("/quarantine", {
+      scope: "provider",
+      kind: "compatibility",
+      providerID: match[1],
+      reasonCode: reasonCode ?? "operator",
+    }), null, 2) + "\n");
+    return;
+  }
+  throw new Error("usage: opencode-broker serve | status | selection | decisions [n] | rearm [target-or-provider] | quarantine provider:<id> [reason-code]");
+};
+
+main().catch((error) => {
+  process.stderr.write(`opencode-broker: ${error?.message ?? error}\n`);
+  process.exitCode = 1;
+});

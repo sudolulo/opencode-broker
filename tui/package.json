@@ -1,0 +1,11 @@
+{
+  "name": "opencode-broker-model-default-tui",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "description": "opencode TUI half of opencode-broker's model-default plugin: persists the user's last manually selected model",
+  "exports": {
+    "./tui": "./tui.js"
+  }
+}

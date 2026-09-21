@@ -1,0 +1,84 @@
+{
+  "name": "opencode-broker",
+  "version": "1.0.0",
+  "description": "A model broker for opencode: leases cost-tiered local and cloud models to every concurrent session, balances subscription windows, keeps private profiles on the LAN, and fails over on provider errors. Includes an OpenAI-compatible gateway, a TUI cockpit and a subagent-session janitor.",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "llm",
+    "model-routing",
+    "broker",
+    "load-balancing",
+    "failover",
+    "rate-limits",
+    "llama.cpp",
+    "local-llm",
+    "openai-compatible",
+    "gateway",
+    "tui"
+  ],
+  "homepage": "https://github.com/sudolulo/opencode-broker#readme",
+  "bugs": {
+    "url": "https://github.com/sudolulo/opencode-broker/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sudolulo/opencode-broker.git"
+  },
+  "license": "MIT",
+  "author": "Holden Salomon <holden@ssalomon.com>",
+  "type": "module",
+  "main": "lib/routing.js",
+  "bin": {
+    "opencode-broker": "bin/opencode-broker",
+    "opencode-broker-watch": "bin/opencode-broker-watch",
+    "opencode-broker-gateway": "gateway/bin/opencode-broker-gateway"
+  },
+  "exports": {
+    ".": "./lib/routing.js",
+    "./client": "./lib/client.js",
+    "./budgets": "./lib/budgets.js",
+    "./config": "./lib/config.js",
+    "./router-core": "./lib/router-core.js",
+    "./provider-health": "./lib/provider-health.js",
+    "./session-janitor": "./lib/session-janitor.js",
+    "./plugin/router": "./plugin/router.js",
+    "./plugin/model-default": "./plugin/model-default.js",
+    "./plugin/compaction-guard": "./plugin/compaction-guard.js",
+    "./plugin/session-janitor": "./plugin/session-janitor.js",
+    "./gateway": "./gateway/lib/gateway.js",
+    "./tui": "./hud/tui.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "plugin/",
+    "tui/",
+    "hud/tui.js",
+    "hud/guard.js",
+    "gateway/bin/",
+    "gateway/lib/",
+    "docs/",
+    "examples/",
+    "CHANGELOG.md",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --experimental-test-module-mocks --test tests/*.test.mjs gateway/tests/*.test.mjs hud/tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.18"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.22 <2"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "optionalDependencies": {
+    "@opentui/solid": "0.4.5"
+  }
+}

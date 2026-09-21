@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// opencode-broker-gateway: an OpenAI-compatible endpoint that leases every
+// request from the broker.
+//
+// Environment:
+//   PORT                               listen port (default 8790)
+//   HOST                               listen address (default 127.0.0.1; set 0.0.0.0 for LAN clients)
+//   OPENCODE_BROKER_GATEWAY_CONFIG     config file (default ~/.config/opencode-broker/gateway.json)
+//   OPENCODE_BROKER_GATEWAY_KEY_FILE   file holding the bearer key clients must present
+//                                      (default ~/.config/opencode-broker/gateway-key; required)
+import { createServer } from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
+import { DEFAULT_GATEWAY_CONFIG, createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
+import { brokerRequest } from "../../lib/client.js";
+
+const deprecations = [];
+const setting = (name, legacyName) => {
+  if (process.env[name]) return process.env[name];
+  if (process.env[legacyName]) {
+    deprecations.push(`${legacyName} is deprecated; set ${name} instead.`);
+    return process.env[legacyName];
+  }
+  return undefined;
+};
+// Pre-rename location of the gateway config, still read when the new one is absent.
+const LEGACY_CONFIG = join(homedir(), ".config/opencode-fleet-gateway/config.json");
+const configPath = (() => {
+  const explicit = process.env.OPENCODE_BROKER_GATEWAY_CONFIG;
+  if (explicit) return explicit;
+  if (!existsSync(DEFAULT_GATEWAY_CONFIG) && existsSync(LEGACY_CONFIG)) {
+    deprecations.push(`${LEGACY_CONFIG} is a deprecated location; move it to ${DEFAULT_GATEWAY_CONFIG}.`);
+    return LEGACY_CONFIG;
+  }
+  return DEFAULT_GATEWAY_CONFIG;
+})();
+const keyPath = setting("OPENCODE_BROKER_GATEWAY_KEY_FILE", "OPENCODE_FLEET_GATEWAY_KEY_FILE")
+  ?? join(dirname(DEFAULT_GATEWAY_CONFIG), "gateway-key");
+
+// This endpoint fronts paid quota: no key, no server.
+const gatewayKey = readFileSync(keyPath, "utf8").trim();
+if (!gatewayKey) throw new Error(`${keyPath} is empty: the gateway refuses to run without a key`);
+const config = loadGatewayConfig(configPath);
+for (const note of deprecations) console.error(`opencode-broker-gateway: deprecated: ${note}`);
+// A crash strands one-shot gw- leases for the broker's full 2h TTL, and ONE
+// stale lease pins a probation provider (probation admits one probe at a
+// time -- measured live). Startup sweeps our own debris.
+try {
+  const status = await brokerRequest("/status", {});
+  for (const sessionID of Object.keys(status?.leases ?? {})) {
+    if (sessionID.startsWith("gw-")) {
+      try { await brokerRequest("/release", { sessionID }); } catch {}
+    }
+  }
+} catch { /* broker down: nothing to sweep */ }
+const handler = createGatewayHandler({ config, brokerRequest, gatewayKey });
+const port = Number(process.env.PORT) || 8790;
+const host = process.env.HOST || "127.0.0.1";
+createServer((request, response) => { void handler(request, response); }).listen(port, host, () => {
+  console.log(`opencode-broker-gateway: routing tier "${config.tier}" across [${Object.keys(config.providers).join(", ")}] on ${host}:${port}`);
+});

@@ -1,0 +1,103 @@
+{
+  // A deployment shaped like the fleet's restrictive profiles: every profile lane is a
+  // LOCAL target, and every profile declares fallback rungs -- including rungs that
+  // name a cloud target, which is the mistake this fixture exists to pin down.
+  // `uncensored` and `uncensored-offline` BOTH ask for cloud egress; only the first may
+  // have it, because the second is an offline profile.
+  "targets": {
+    "lan-coder": {
+      "providerID": "llamacpp",
+      "modelID": "lan-coder-9b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 81920
+    },
+    "lan-small": {
+      "providerID": "llamacpp",
+      "modelID": "lan-small-4b",
+      "kind": "local",
+      "capacity": 2,
+      "context": 32768
+    },
+    "lan-uncensored": {
+      "providerID": "llamacpp",
+      "modelID": "lan-uncensored-27b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "cloud-worker": {
+      "providerID": "openai",
+      "modelID": "cloud-worker-1",
+      "kind": "cloud"
+    }
+  },
+  "tiers": {
+    "worker": [
+      "cloud-worker"
+    ]
+  },
+  "fallbacks": {
+    "worker": [
+      [
+        "lan-small"
+      ]
+    ]
+  },
+  "profiles": {
+    "local": [
+      "lan-coder"
+    ],
+    "private": [
+      "lan-coder"
+    ],
+    "uncensored": [
+      "lan-uncensored"
+    ],
+    "uncensored-offline": [
+      "lan-uncensored"
+    ]
+  },
+  "profileFallbacks": {
+    // A whole rung of cloud: must vanish, leaving the LAN rung behind it.
+    "local": [
+      [
+        "lan-small"
+      ],
+      [
+        "cloud-worker"
+      ]
+    ],
+    // A MIXED rung: the cloud member goes, the rung itself survives.
+    "private": [
+      [
+        "lan-small",
+        "cloud-worker"
+      ]
+    ],
+    // Granted egress below, so this cloud rung is kept.
+    "uncensored": [
+      [
+        "lan-coder"
+      ],
+      [
+        "cloud-worker"
+      ]
+    ],
+    // Identical text, offline profile: the cloud rung must go anyway.
+    "uncensored-offline": [
+      [
+        "lan-coder"
+      ],
+      [
+        "cloud-worker"
+      ]
+    ]
+  },
+  "profileCloudEgress": [
+    "uncensored",
+    "uncensored-offline"
+  ],
+  "localModelsUrl": "http://127.0.0.1:1/v1/models",
+  "localContextHeadroom": 0.6
+}

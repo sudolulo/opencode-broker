@@ -1,0 +1,342 @@
+{
+  "targets": {
+    "qwen-max": {
+      "providerID": "alibaba-token-plan",
+      "modelID": "qwen3.8-max",
+      "kind": "cloud",
+      "fit": {
+        "smart": 1.1
+      }
+    },
+    "qwen-flash": {
+      "providerID": "alibaba-token-plan",
+      "modelID": "qwen3.8-flash",
+      "kind": "cloud"
+    },
+    "deepseek-pro": {
+      "providerID": "alibaba-token-plan",
+      "modelID": "deepseek-v4-pro-0813",
+      "kind": "cloud",
+      "fit": {
+        "build": 1.15
+      }
+    },
+    "gpt-flagship": {
+      "providerID": "openai",
+      "modelID": "gpt-5.6-sol",
+      "kind": "cloud",
+      "fit": {
+        "smart": 1.4
+      },
+      "effort": {
+        "smart": "high"
+      }
+    },
+    "gpt-terra": {
+      "providerID": "openai",
+      "modelID": "gpt-5.6-terra",
+      "kind": "cloud",
+      "fit": {
+        "build": 1.2
+      },
+      "effort": {
+        "build": "medium",
+        "review": "medium",
+        "fast-build": "low"
+      }
+    },
+    "claude-opus-4-8-fast": {
+      "providerID": "anthropic",
+      "modelID": "claude-opus-4-8-fast",
+      "kind": "cloud",
+      "fit": {
+        "fast-build": 1.3
+      }
+    },
+    "claude-opus-5-fast": {
+      "providerID": "anthropic",
+      "modelID": "claude-opus-5-fast",
+      "kind": "cloud",
+      "fit": {
+        "fast-build": 1.3
+      }
+    },
+    "local-coder": {
+      "providerID": "llamacpp",
+      "modelID": "qwen3.5-9b-coder",
+      "kind": "local",
+      "capacity": 1,
+      "context": 32768
+    },
+    "uncensored-qwen": {
+      "providerID": "llamacpp",
+      "modelID": "qwen3.8-27b-uncensored",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "uncensored-hermes": {
+      "providerID": "llamacpp",
+      "modelID": "hermes-4.3-36b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "gpt-luna": {
+      "providerID": "openai",
+      "modelID": "gpt-5.6-luna",
+      "kind": "cloud",
+      "effort": {
+        "worker": "low",
+        "classifier": "low"
+      }
+    },
+    "glm": {
+      "providerID": "alibaba-token-plan",
+      "modelID": "glm-5.2",
+      "kind": "cloud",
+      "fit": {
+        "build": 1.1,
+        "review": 1.1
+      }
+    },
+    "deepseek-flash": {
+      "providerID": "alibaba-token-plan",
+      "modelID": "deepseek-v4-flash-0731",
+      "kind": "cloud"
+    },
+    "gpt-pro": {
+      "providerID": "openai",
+      "modelID": "gpt-5.5-pro",
+      "kind": "cloud",
+      "effort": {
+        "deep": "high"
+      }
+    },
+    "haiku": {
+      "providerID": "anthropic",
+      "modelID": "claude-haiku-4-5",
+      "kind": "cloud",
+      "fit": {
+        "classifier": 1.3
+      }
+    }
+  },
+  "tiers": {
+    "smart": [
+      "gpt-flagship",
+      "qwen-max"
+    ],
+    "build": [
+      "gpt-terra",
+      "deepseek-pro",
+      "glm"
+    ],
+    "fast-build": [
+      "claude-opus-5-fast",
+      "claude-opus-4-8-fast",
+      "gpt-terra",
+      "deepseek-flash"
+    ],
+    "worker": [
+      "qwen-flash",
+      "gpt-luna",
+      "deepseek-flash",
+      "local-coder"
+    ],
+    "classifier": [
+      "haiku",
+      "qwen-flash",
+      "gpt-luna"
+    ],
+    "deep": [
+      "gpt-pro",
+      "qwen-max"
+    ],
+    "review": [
+      "glm",
+      "deepseek-pro",
+      "gpt-terra"
+    ]
+  },
+  "fallbacks": {
+    "smart": [
+      [
+        "gpt-terra"
+      ]
+    ],
+    "build": [
+      [
+        "claude-opus-5-fast",
+        "claude-opus-4-8-fast"
+      ],
+      [
+        "gpt-flagship"
+      ]
+    ],
+    "fast-build": [
+      [
+        "gpt-terra"
+      ]
+    ],
+    "deep": [
+      [
+        "gpt-flagship",
+        "qwen-max"
+      ],
+      [
+        "gpt-terra"
+      ]
+    ],
+    "review": [
+      [
+        "gpt-terra"
+      ],
+      [
+        "gpt-luna"
+      ]
+    ]
+  },
+  "profiles": {
+    "local": [
+      "local-coder"
+    ],
+    "private": [
+      "local-coder"
+    ],
+    "uncensored": [
+      "uncensored-qwen",
+      "uncensored-hermes"
+    ],
+    "uncensored-offline": [
+      "uncensored-qwen",
+      "uncensored-hermes"
+    ],
+    "uncensored-70b": [
+      "uncensored-hermes"
+    ],
+    "vision": [
+      "local-coder"
+    ]
+  },
+  "budgets": {
+    "anthropic": {
+      "windows": [
+        {
+          "id": "5h",
+          "periodMs": 18000000,
+          "meter": "requests",
+          "capacity": 600
+        },
+        {
+          "id": "week",
+          "periodMs": 604800000,
+          "meter": "requests",
+          "capacity": 12000
+        }
+      ]
+    },
+    "openai": {
+      "windows": [
+        {
+          "id": "5h",
+          "periodMs": 18000000,
+          "meter": "requests",
+          "capacity": 300
+        },
+        {
+          "id": "week",
+          "periodMs": 604800000,
+          "meter": "requests",
+          "capacity": 6000
+        }
+      ]
+    },
+    "alibaba-token-plan": {
+      "windows": [
+        {
+          "id": "week",
+          "periodMs": 604800000,
+          "meter": "tokens",
+          "capacity": 25000000
+        }
+      ]
+    }
+  },
+  "localModelsUrl": "http://gpu-box:8080/v1/models",
+  "trustedSubscriptionProviders": [
+    "alibaba-token-plan"
+  ],
+  "workerLocalShareDenominator": 4,
+  "profileTools": {
+    "localOnlineExtra": [
+      "searxng_search",
+      "searxng_web_search",
+      "searxng_web_url_read"
+    ],
+    "localOnlinePrefixes": [
+      "gitea_"
+    ]
+  },
+  "localContextHeadroom": 0.6,
+  "modelVariants": {
+    "openai/gpt-5.6-sol": [
+      "high",
+      "low",
+      "medium"
+    ],
+    "openai/gpt-5.6-terra": [
+      "high",
+      "low",
+      "medium"
+    ],
+    "openai/gpt-5.6-luna": [
+      "high",
+      "low",
+      "medium"
+    ],
+    "openai/gpt-5.5-pro": [
+      "high",
+      "low",
+      "medium"
+    ]
+  },
+  // The agent names this deployment uses beyond opencode's built-ins; see
+  // lib/config.js DEFAULT_AGENT_TIERS for what is already mapped.
+  "agentTiers": {
+    "sp-implementer": "build",
+    "review-verifier": "smart",
+    "verifier": "smart",
+    "tester": "worker",
+    "reviewer": "review",
+    "review-*": "review",
+    "researcher": "smart"
+  },
+  // The HUD's deployment copy: what each swap costs the rest of the machine, said where the
+  // choice is made (the F11 picker) and while the user waits (the prepare notice).
+  "hud": {
+    "profiles": {
+      "uncensored": {
+        "badge": "R:unc",
+        "prepareNotice": "Swapping GPU 1 to the uncensored 27b -- 1-3 minutes."
+      },
+      "uncensored-offline": {
+        "badge": "R:unc-off",
+        "prepareNotice": "Swapping GPU 1 to the uncensored 27b -- 1-3 minutes."
+      },
+      "uncensored-70b": {
+        "badge": "R:unc-70b",
+        "description": "Takes BOTH GPUs for several minutes and evicts every other resident model until you leave this profile",
+        "prepareNotice": "Loading the 70B across BOTH GPUs -- several minutes. Every other local model is down until you leave this profile."
+      },
+      "vision": {
+        "description": "Pins the local vision model instead of letting the broker pick the coder",
+        "prepareNotice": "Bringing the vision model back. If another session is mid-conversation on the model that displaced it, this waits for them rather than taking it -- retry once they are done."
+      }
+    },
+    "swapBack": {
+      "profiles": ["uncensored*"],
+      "command": ["true", "default"]
+    }
+  }
+}
