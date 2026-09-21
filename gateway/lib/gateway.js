@@ -406,6 +406,12 @@ export const createGatewayHandler = ({
 }) => {
   const allowedProviders = Object.keys(config.providers);
 
+  // WHO ASKED, per gateway session: the client's address and the model name it sent. Every
+  // gateway request is a fresh `gw-...` session, so without this the broker's decision and
+  // usage logs cannot tell one consumer from another -- a memory service's ingestion, a
+  // document extractor and a chat UI all read as anonymous gateway traffic.
+  const callers = new Map();
+  const callerOf = (sessionID) => callers.get(sessionID);
   const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null, api = CHAT) => {
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. chars/4 is the usual
@@ -446,6 +452,7 @@ export const createGatewayHandler = ({
       replace: true,
       contextTokens,
       providers,
+      ...(callerOf(sessionID) ? { caller: callerOf(sessionID) } : {}),
     });
     const model = lease?.target?.model;
     if (!model?.providerID || !model?.id) {
@@ -516,6 +523,7 @@ export const createGatewayHandler = ({
   };
 
   const reportUsage = async (leased, tokens) => settle(leased.sessionID, "/usage", {
+    ...(callerOf(leased.sessionID) ? { caller: callerOf(leased.sessionID) } : {}),
     providerID: leased.providerID,
     modelID: leased.modelID,
     requests: 1,
@@ -525,9 +533,7 @@ export const createGatewayHandler = ({
 
   // `sink` present == the client asked for SSE and gets frames instead of a
   // payload; absent == the buffered path, unchanged since 0.1.0.
-  const completions = async (requestBody, clientAbort = null, sink = null, api = CHAT) => {
-    let lastError = null;
-    const excluded = [];
+  const completions = async (requestBody, clientAbort = null, sink = null, api = CHAT, caller = null) => {
     const streaming = Boolean(sink);
     const wantedJson = Boolean(requestBody?.response_format?.type?.startsWith?.("json"));
     // Did the CLIENT ask for the usage tail, or only we? (See the strip in
@@ -547,6 +553,16 @@ export const createGatewayHandler = ({
     // deletes the held lease before selecting. ☆ It also collapses the
     // decisions.jsonl trail for one curl from 19 unrelated ids down to one.
     const sessionID = `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    if (caller) callers.set(sessionID, caller);
+    try {
+      return await completionsFor(sessionID, requestBody, clientAbort, sink, api, route, streaming, wantedJson, keepUsageFrames);
+    } finally {
+      callers.delete(sessionID);
+    }
+  };
+  const completionsFor = async (sessionID, requestBody, clientAbort, sink, api, route, streaming, wantedJson, keepUsageFrames) => {
+    let lastError = null;
+    const excluded = [];
     // ☠️ A PROFILE-MAPPED REQUEST MUST NOT EXCLUDE ITS OWN LANE. The exclusion
     // (0.2.2) exists because the gateway picks among the providers IT can
     // forward to for a TIER: dropping the one that just failed sends the retry
@@ -953,7 +969,12 @@ export const createGatewayHandler = ({
         response.write(text);
       },
     } : null;
-    const result = await completions(parsed, clientAbortController.signal, sink, api);
+    const address = String(request.socket?.remoteAddress ?? "").replace(/^::ffff:/, "") || null;
+    const caller = {
+      address,
+      model: typeof parsed?.model === "string" ? parsed.model.slice(0, 100) : null,
+    };
+    const result = await completions(parsed, clientAbortController.signal, sink, api, caller);
     // A streaming request that never got a frame out still owes the client an
     // ordinary JSON error, which is exactly what an OpenAI client expects when
     // a stream fails to start.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { summarizeUsage, usageRecord } from "../lib/usage-log.js";
+import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js";
 
 test("a record's prompt is everything the model read: input, cache reads and cache writes", () => {
   const record = usageRecord({
@@ -35,4 +35,26 @@ test("local models sort first, then by request count", () => {
     { at: 1, sessionID: "b", providerID: "llamacpp", modelID: "small", prompt: 1, output: 1, local: true },
   ]);
   assert.deepEqual(rows.map((row) => row.model), ["llamacpp/small", "cloud/big"]);
+});
+
+test("a caller is an address and a short model name, and anything else is dropped", () => {
+  assert.deepEqual(sanitizeCaller({ address: "192.168.50.1", model: "background" }), { address: "192.168.50.1", model: "background" });
+  assert.deepEqual(sanitizeCaller({ address: "::1" }), { address: "::1", model: null });
+  assert.equal(sanitizeCaller({ address: "evil; rm -rf /", model: "x\n" }), null);
+  assert.equal(sanitizeCaller("192.168.50.1"), null);
+});
+
+test("the summary names who used each model", () => {
+  const rec = (sessionID, caller) => ({ at: 10, sessionID, providerID: "llamacpp", modelID: "small", prompt: 1, output: 1, local: true, ...(caller ? { caller } : {}) });
+  const [row] = summarizeUsage([
+    rec("gw-1", { address: "10.0.0.5", model: "background" }),
+    rec("gw-2", { address: "10.0.0.5", model: "background" }),
+    rec("ses_abc"),
+    rec("gw-3", { address: "10.0.0.9", model: "quick" }),
+  ]);
+  assert.deepEqual(row.callers, [
+    { caller: "10.0.0.5 background", requests: 2 },
+    { caller: "opencode", requests: 1 },
+    { caller: "10.0.0.9 quick", requests: 1 },
+  ]);
 });

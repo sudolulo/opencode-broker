@@ -16,7 +16,7 @@ tooling) is a supported client.
 | `/failure` | `{ sessionID, targetID?, error }` | Report a provider failure. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). |
 | `/complete` | `{ sessionID }` | Successful end: clears probation for the target's provider, drops the lease. |
 | `/forget` | `{ sessionID, completed? }` | Drop the lease at the end of a turn. The assignment (the session's pinned model) stays and ages out after 14 days; `completed: true` also clears probation. |
-| `/usage` | `{ sessionID?, providerID, modelID?, requests, tokens: { input, output, cacheRead, cacheWrite } }` | Feed the budget ledger and the burn watch (one report per provider request). Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
+| `/usage` | `{ sessionID?, providerID, modelID?, requests, tokens: { input, output, cacheRead, cacheWrite }, caller? }` | Feed the budget ledger and the burn watch (one report per provider request). Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
 | `/inventory` | `{ targets, providers, modelContexts, modelVariants, authRevision, authOnly? }` | Publish discovered provider/model inventory. Refused unless `authRevision` matches the broker's own hash of opencode's `auth.json` — an OAuth-to-API-key change can never publish stale admission. |
 | `/status` | `{}` | Full public state: leases, circuits (with `renewsAt`), health, budget report, last decision, and `deprecations` when the broker is still reading a renamed setting. |
 | `/selection` | `{}` | Just `lastDecision` — why the last lease chose its target. |
@@ -135,3 +135,12 @@ Concurrency: the broker serializes request handling, so two simultaneous
   carry `circuitUntil` so callers can schedule a restore; a displaced session's
   fallback marker records it as `restoreAt` and stickiness is released once it
   passes.
+
+### `caller`
+
+`/lease` and `/usage` accept an optional `caller: { address?, model? }`: the client address and the
+model name a proxy's own client asked for. The gateway sends it for every request, so its
+anonymous `gw-...` sessions can be told apart. The broker records it on that session's lines in
+`decisions.jsonl` and `usage.jsonl`, and `opencode-broker usage` reports the top callers per
+model. An address must look like an IP and a model name must be 1-100 printable characters;
+anything else is dropped, never logged raw.

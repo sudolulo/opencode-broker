@@ -43,7 +43,7 @@ import {
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
-import { summarizeUsage, usageRecord } from "../lib/usage-log.js";
+import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js";
 import { notifyArgv } from "../lib/notify.js";
 import { DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
@@ -127,7 +127,13 @@ const waitIsFresh = (decision) => {
   if (waitLogged.size > 2000) waitLogged.delete(waitLogged.keys().next().value);
   return false;
 };
+// The caller of the /lease being handled (handlers run one at a time), so every decision
+// made for that session records who asked for it. Set and cleared around acquire().
+let leaseCaller = null; // { sessionID, caller }
 const recordDecision = (state, decision) => {
+  if (leaseCaller && decision?.sessionID === leaseCaller.sessionID && !decision.caller) {
+    decision = { ...decision, caller: leaseCaller.caller };
+  }
   state.lastDecision = decision;
   if (waitIsFresh(decision)) return;
   logDecision(decision);
@@ -967,7 +973,10 @@ const serve = async () => {
         // Admission must see the provider's latest plan window. A background refresh let
         // the first request after Anthropic reached 100% lease Opus before its circuit opened.
         await planRefresh;
-        const lease = await acquire(state, body);
+        const caller = sanitizeCaller(body.caller);
+        leaseCaller = caller && typeof body.sessionID === "string" ? { sessionID: body.sessionID, caller } : null;
+        let lease;
+        try { lease = await acquire(state, body); } finally { leaseCaller = null; }
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
@@ -1222,6 +1231,7 @@ const serve = async () => {
           lease: assignment,
           tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
           local: localProviderIDs(allTargets(state)).has(providerID),
+          caller: sanitizeCaller(body.caller),
         }));
         const target = targetForID(assignment?.targetID, allTargets(state));
         if (Number.isFinite(rawObservedAt) && rawObservedAt <= Date.now() &&
@@ -1460,6 +1470,9 @@ const main = async () => {
       process.stdout.write(`${row.local ? "local" : "cloud"}  ${row.model}\n`);
       process.stdout.write(`  requests ${r.count}: p50 ${k(r.p50)}  p90 ${k(r.p90)}  p99 ${k(r.p99)}  max ${k(r.max)}\n`);
       process.stdout.write(`  session peaks (${p.count} sessions): p50 ${k(p.p50)}  p90 ${k(p.p90)}  p99 ${k(p.p99)}  max ${k(p.max)}\n`);
+      if (row.callers.length) {
+        process.stdout.write(`  callers: ${row.callers.map((c) => `${c.caller} x${c.requests}`).join(", ")}\n`);
+      }
       for (const window of row.windows) {
         const share = p.count ? ((window.sessionsFit / p.count) * 100).toFixed(1) : "0.0";
         process.stdout.write(`  ${window.targetID} routes up to ${k(window.ceiling)}: ${share}% of session peaks fit\n`);

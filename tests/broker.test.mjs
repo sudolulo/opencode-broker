@@ -419,6 +419,22 @@ test("a session's repeated waits are logged once, not once per poll", async () =
   }
 }));
 
+test("a gateway caller is recorded on the session's decisions and usage lines", async () => withBroker(async ({ home, socketPath }) => {
+  const caller = { address: "192.168.50.1", model: "background" };
+  await request(socketPath, "/inventory", inventory({ openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 } }));
+  await request(socketPath, "/lease", { sessionID: "gw-caller", profile: "auto", tier: "worker", preferredModel: { providerID: "openai", id: "gpt-5.6-luna" }, replace: true, caller });
+  await request(socketPath, "/usage", { sessionID: "gw-caller", providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1, tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 }, caller });
+  await request(socketPath, "/lease", { sessionID: "gw-junk", profile: "auto", tier: "worker", replace: true, caller: { address: "not an ip!", model: "x".repeat(500) } });
+  const dir = join(home, ".local/share/opencode/model-routing");
+  const decisions = readFileSync(join(dir, "decisions.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const mine = decisions.filter((line) => line.sessionID === "gw-caller");
+  assert.ok(mine.length >= 1);
+  for (const line of mine) assert.deepEqual(line.caller, caller);
+  assert.ok(decisions.filter((line) => line.sessionID === "gw-junk").every((line) => line.caller === undefined), "junk is dropped, never logged raw");
+  const usage = readFileSync(join(dir, "usage.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(usage.find((line) => line.sessionID === "gw-caller").caller, caller);
+}));
+
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

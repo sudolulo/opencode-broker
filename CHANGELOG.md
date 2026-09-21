@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — 2026-09-21
+
+### Added
+
+- **The broker's logs say who asked.** Every gateway request is its own anonymous `gw-...`
+  session, so `decisions.jsonl` and `usage.jsonl` could not tell a memory service's ingestion
+  from a document extractor or a chat UI. The gateway now sends `caller: { address, model }` on
+  `/lease` and `/usage`: the client's address (IPv4-mapped form normalized) and the model name
+  it sent. The broker records it on that session's decision lines and on its usage lines, and
+  `opencode-broker usage` lists each model's top callers (`opencode` for routed sessions). A
+  caller that does not look like an address or a short printable name is dropped, never logged
+  raw.
+
 ## [1.5.3] — 2026-09-21
 
 ### Added

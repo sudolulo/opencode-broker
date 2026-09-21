@@ -1500,3 +1500,25 @@ test("mirrorTextFormat copies a /responses text.format into response_format, and
   assert.deepEqual(chatReq.response_format, { type: "json_object" }, "chat requests are untouched");
   assert.equal(unmarked.response_format, undefined, "a lane without the flag gets exactly what the client sent");
 });
+
+test("the broker is told who asked: the client's address and the model name it sent", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { background: { profile: "background" } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/lease") return { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } };
+      return { ok: true };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: { prompt_tokens: 10, completion_tokens: 2 } }) }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "background" })).status, 200);
+  });
+  const lease = brokerCalls.find((call) => call.route === "/lease");
+  const usage = brokerCalls.find((call) => call.route === "/usage");
+  assert.deepEqual(lease.body.caller, { address: "127.0.0.1", model: "background" });
+  assert.deepEqual(usage.body.caller, { address: "127.0.0.1", model: "background" });
+  assert.equal(usage.body.sessionID, lease.body.sessionID);
+});

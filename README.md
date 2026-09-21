@@ -203,7 +203,9 @@ also the only one with each session's real PEAK: a lease records a session's siz
 turn starts, and a subagent's long turn grows well past that. `opencode-broker usage [days]`
 (default 7) prints, per model, request and session-peak percentiles, and for each local target
 how many session peaks fit what it routes (`context` minus `outputReserve`, else the headroom
-fraction). That is the number to size a slot's context and a server's slot count by.
+fraction). That is the number to size a slot's context and a server's slot count by. It also
+names each model's top callers: `opencode` for routed sessions, and for the gateway the client
+address and the model name it asked for.
 
 ## The gateway
 
