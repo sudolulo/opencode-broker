@@ -265,6 +265,54 @@ test("cloud leases share unlimited capacity while local leases stay capped and J
   }
 }));
 
+// ☠️ Slots belong to the model: two targets naming one llama.cpp model share its slots, and
+// modelCapacity is how full the MODEL may be (summed across both) for a target to take another.
+// Built on a temp copy of the fixture where local-classifier runs on local-coder's model, the
+// shape a deployment has when its coder and classifier lanes share one small model. The
+// fixture's comments are stripped the same way the config-parse tests read it.
+test("modelCapacity counts every target on the same local model, and keeps a slot in reserve", async () => withTempHome(async (home) => {
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  fixture.targets["local-coder"] = { ...fixture.targets["local-coder"], capacity: 4, modelCapacity: 2 };
+  fixture.targets["local-classifier"] = {
+    ...fixture.targets["local-classifier"], modelID: "qwen3.5-9b-coder", capacity: 2, modelCapacity: 3,
+  };
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const modelsServer = await startModelsServer(["qwen3.5-9b-coder"]);
+  let child;
+  let socketPath;
+  try {
+    ({ child, socketPath } = await startBroker(home, {
+      OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url,
+      OPENCODE_BROKER_CONFIG: configPath,
+    }));
+    try {
+      const lease = (sessionID, profile, tier) =>
+        request(socketPath, "/lease", { sessionID, profile, tier, contextTokens: 100, replace: true });
+      assert.equal((await lease("ses-coder-1", "local", "worker")).target.id, "local-coder");
+      assert.equal((await lease("ses-classify-1", "auto", "classifier")).target.id, "local-classifier");
+      // local-coder holds ONE of its own four, but the model carries two leases -- its
+      // modelCapacity -- so the classifier's lease counts against it and the coder waits.
+      await assert.rejects(lease("ses-coder-2", "local", "worker"),
+        /is busy \(every slot in use\); waiting for a free slot/);
+      // The classifier lane may fill the model further: the reserved slot is its to take.
+      assert.equal((await lease("ses-classify-2", "auto", "classifier")).target.id, "local-classifier");
+      // Releasing the classifier's leases frees the model-wide count, not just its own.
+      await request(socketPath, "/forget", { sessionID: "ses-classify-1" });
+      await request(socketPath, "/forget", { sessionID: "ses-classify-2" });
+      assert.equal((await lease("ses-coder-2", "local", "worker")).target.id, "local-coder");
+    } finally {
+      await stopBroker(child);
+    }
+  } finally {
+    await modelsServer.stop();
+  }
+}));
+
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

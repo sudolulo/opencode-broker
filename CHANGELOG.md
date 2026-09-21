@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`modelCapacity`: a model-wide slot limit for local targets that share one
+  model.** Two targets can name the same local model (a coder lane and a
+  classifier lane on one small model, say), and per-target `capacity` let them
+  claim more slots between them than the server has; it also left nothing for a
+  caller that reaches the model server without a lease, such as a command
+  classifier that calls it directly and fails closed when it times out.
+  `modelCapacity` is how many leases the model may already carry, summed over
+  every target that names it, for this target to take another. `capacity` still
+  caps the target's own share, and a target without `modelCapacity` behaves as
+  before. Reclaiming idle leases now also frees a quiet lease on a sibling
+  target that is holding a target full.
+
+### Changed
+
+- **The broker sizes a local window the same way everywhere.** Selection
+  admitted a target that declares `outputReserve` up to `context -
+  outputReserve`, but the broker's eligibility re-check and its busy test used
+  the headroom fraction instead (147,456 against 117,964 tokens on a 196,608
+  window). A session between the two was leased the model, judged ineligible
+  for it on the next turn, and moved off it mid-task. Both checks now apply the
+  reserve.
+
 ## [1.0.0] — 2026-09-21
 
 The first public release. The project was developed privately as

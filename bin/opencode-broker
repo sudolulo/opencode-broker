@@ -34,7 +34,8 @@ import {
   targetContextHeadroom,
   targetOutputReserve,
   targetForID,
-  targetAtCapacity,
+  targetFull,
+  modelSlotKey,
   targetEligibleIDsFor,
   targetIDsFor,
   modelRefForTier,
@@ -267,11 +268,17 @@ const activeProviderCounts = (state, targets = allTargets(state), excludeSession
   return counts;
 };
 
+// Per target, plus one model-wide count per local model under modelSlotKey (see targetFull).
+// The model-wide count is taken over EVERY target, not just `targets`: a sibling target left
+// out of this subset still holds its slot on the same model server.
 const activeCounts = (state, targets = allTargets(state), excludeSessionID = null) => {
   const counts = {};
+  const every = allTargets(state);
   for (const [sessionID, lease] of Object.entries(state.leases)) {
     if (sessionID === excludeSessionID) continue;
     if (targetForID(lease?.targetID, targets)) counts[lease.targetID] = (counts[lease.targetID] ?? 0) + 1;
+    const key = modelSlotKey(targetForID(lease?.targetID, every));
+    if (key) counts[key] = (counts[key] ?? 0) + 1;
   }
   return counts;
 };
@@ -291,17 +298,19 @@ const activeCounts = (state, targets = allTargets(state), excludeSessionID = nul
 const RECLAIM_IDLE_MS = 12 * 60 * 1000;
 const reclaimIdleLeases = (state, targets, requestingSessionID, now = Date.now()) => {
   const counts = activeCounts(state, targets);
+  const every = allTargets(state);
   const reclaimed = [];
-  for (const [targetID, count] of Object.entries(counts)) {
-    const target = targetForID(targetID, targets);
-    if (!target || target.kind !== "local") continue;
-    const capacity = Number(target.capacity);
-    if (!Number.isInteger(capacity) || capacity < 1 || count < capacity) continue;
+  for (const [targetID, target] of Object.entries(targets)) {
+    if (!target || target.kind !== "local" || !targetFull(target, counts)) continue;
+    // A target full only MODEL-wide is held up by its siblings' leases, so a quiet
+    // sibling lease is squatting this target's slot just as much as its own would be.
+    const key = modelSlotKey(target);
     for (const [sessionID, lease] of Object.entries(state.leases)) {
-      if (sessionID === requestingSessionID || lease?.targetID !== targetID) continue;
+      if (sessionID === requestingSessionID) continue;
+      if (lease?.targetID !== targetID && modelSlotKey(targetForID(lease?.targetID, every)) !== key) continue;
       if (now - (lease.touchedAt ?? 0) <= RECLAIM_IDLE_MS) continue;
       delete state.leases[sessionID];
-      reclaimed.push(`${sessionID} on ${targetID}`);
+      reclaimed.push(`${sessionID} on ${lease.targetID}`);
     }
   }
   if (reclaimed.length) {
@@ -425,8 +434,12 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets).includes(target.id)) return false;
   if (!cloudTargetAdmitted(target, state.inventory?.providers)) return false;
   if (target.kind === "local") {
+    // The output reserve too, exactly as chooseTarget applies it. Without it this check sized
+    // a reserve-declaring target by the headroom FRACTION instead -- 117,964 of a 196,608
+    // window where selection admits 147,456 -- so a session between the two was leased the
+    // model, then judged ineligible for it on the next turn and moved off it mid-task.
     if (!localContextEligible(targetContext(target, state.inventory?.modelContexts), request.contextTokens,
-      targetContextHeadroom(target))) return false;
+      targetContextHeadroom(target), targetOutputReserve(target, state.inventory?.modelOutputs))) return false;
   } else if (!contextFits(targetContext(target, state.inventory?.modelContexts), request.contextTokens,
     targetOutputReserve(target, state.inventory?.modelOutputs))) {
     return false;
@@ -437,12 +450,12 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   if ([circuit, providerCircuit].some((value) =>
     value && (value.until === null || Number(value.until) > now))) return false;
   const active = activeCounts(state, targets, excludeSessionID);
-  if (targetAtCapacity(target, active[target.id] ?? 0)) return false;
+  if (targetFull(target, active)) return false;
   const providerActive = activeProviderCounts(state, targets, excludeSessionID);
   if (!providerEligible(state.health, target.providerID, providerActive[target.providerID] ?? 0)) return false;
   if (target.kind === "local") {
     return availableModels instanceof Set && availableModels.has(target.modelID) &&
-      !targetAtCapacity(target, active[target.id] ?? 0);
+      !targetFull(target, active);
   }
   return true;
 };
@@ -749,10 +762,11 @@ const acquire = async (state, request) => {
     const busy = prepared || !(availableModels instanceof Set) ? [] : targetEligibleIDsFor(profile, tier, targets)
       .map((targetID) => admittedTargets[targetID])
       .filter((target) => target?.kind === "local" && availableModels.has(target.modelID) &&
-        localContextEligible(targetContext(target, state.inventory?.modelContexts), contextTokens, targetContextHeadroom(target)) &&
+        localContextEligible(targetContext(target, state.inventory?.modelContexts), contextTokens,
+          targetContextHeadroom(target), targetOutputReserve(target, state.inventory?.modelOutputs)) &&
         ![state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((value) =>
           value && (value.until === null || Number(value.until) > nowMs)) &&
-        targetAtCapacity(target, activeNow[target.id] ?? 0));
+        targetFull(target, activeNow));
     const reason = prepared
       ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
       : busy.length

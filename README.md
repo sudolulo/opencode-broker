@@ -91,7 +91,8 @@ so nothing is ever spent on a provider you did not list.
 
 | Key | Meaning |
 |---|---|
-| `targets` | The models. Each has `providerID`, `modelID` and `kind` (`cloud` or `local`). Local targets add `capacity` (the server's `--parallel`), `context` (tokens per slot) and optionally `prepareCommand` (argv, run when the model is not loaded), `minContextTokens`, `outputReserve` and `contextHeadroom`. Any target may add `fit` (per-tier preference weight) and `effort` (per-tier reasoning variant). |
+| `targets` | The models. Each has `providerID`, `modelID` and `kind` (`cloud` or `local`). Local targets add `capacity` (the server's `--parallel`), `context` (tokens per slot) and optionally `prepareCommand` (argv, run when the model is not loaded), `minContextTokens`, `outputReserve`, `contextHeadroom` and `modelCapacity`. Any target may add `fit` (per-tier preference weight) and `effort` (per-tier reasoning variant). |
+| `targets.*.modelCapacity` | For local targets that share one model (say a coder lane and a classifier lane on the same server model): how many leases the *model* may already carry, summed over every target that names it, for this target to take another. A second limit next to `capacity`, which still caps the target's own share. Set it below `--parallel` on one target to keep slots free for the others, or for callers that reach the model server without a lease. Unset: only `capacity` applies. |
 | `tiers` | Ordered target lists for `deep`, `smart`, `build`, `fast-build`, `review`, `worker` and `classifier`. |
 | `fallbacks` | Per tier, ordered groups consulted only when the tier's own list has nothing eligible. |
 | `agentTiers` | Which tier each opencode agent rides. Exact names, or a trailing `*` for a prefix; values are a tier, `inherit` (ride the parent session's tier) or `classifier`. Merged over the defaults: `build`→build, `plan`→smart, `general`→inherit, `explore`→worker, tier-named agents to their tier, and opencode-guard's `fleet-classifier*` agents to classifier. |
@@ -312,20 +313,21 @@ full of words like "circuit breaker" and "stroke".
 
 **Local and cloud are mixed on purpose.** A local target is eligible only when
 the model server reports it *loaded* (a configured-but-unloaded model would
-either fail or load on top of its GPU-mate and crawl), when it has a free
-slot, and when the session's context fits the slot with room to grow. Room is
-an absolute `outputReserve` where declared, because reasoning budget and answer
-size do not scale with window size, and a fraction (`localContextHeadroom`)
-otherwise. One in four `auto` worker assignments goes local by default, so the
-local GPU does useful work without becoming a bottleneck. A model that is not
-loaded but has a `prepareCommand` is swapped in by the broker, and the lease
-answers `target-preparing` so the client waits instead of failing; a model
-whose slots are all busy answers `target-busy` and is waited out the same way.
-When a swap would evict a model someone is using, who asks matters: the broker
-runs `prepareCommand` with `MODEL_SWAP_YIELD_TO_ACTIVE=1` for an opencode
-session, which can wait, and without it for a gateway client, which has a
-person or a device on the other end. Honouring the flag is the swap script's
-job.
+either fail or load on top of its GPU-mate and crawl), when it has a free slot
+(per target, and per model when several targets share one and declare
+`modelCapacity`), and when the session's context fits the slot with room to
+grow. Room is an absolute `outputReserve` where declared, because reasoning
+budget and answer size do not scale with window size, and a fraction
+(`localContextHeadroom`) otherwise. One in four `auto` worker assignments goes
+local by default, so the local GPU does useful work without becoming a
+bottleneck. A model that is not loaded but has a `prepareCommand` is swapped in
+by the broker, and the lease answers `target-preparing` so the client waits
+instead of failing; a model whose slots are all busy answers `target-busy` and
+is waited out the same way. When a swap would evict a model someone is using,
+who asks matters: the broker runs `prepareCommand` with
+`MODEL_SWAP_YIELD_TO_ACTIVE=1` for an opencode session, which can wait, and
+without it for a gateway client, which has a person or a device on the other
+end. Honouring the flag is the swap script's job.
 
 **Profiles are egress boundaries.** `auto` routes on the tiers, `manual` never
 leases, and every declared profile is its own lane. A profile made of local

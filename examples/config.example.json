@@ -101,8 +101,11 @@
     //     so asking for the vision model would yank a model out from under whoever displaced it,
     //     mid-request.
     // ☠️ Two targets on ONE model means two capacity budgets against one server's `--parallel`.
-    // Size them so the SUM does not exceed it, or the broker hands out more concurrent leases
-    // than the model has slots and the extras queue at the server.
+    // Give each a `modelCapacity` no higher than `--parallel` -- the broker then counts every
+    // target's leases on the model against it -- or size the capacities so their SUM does not
+    // exceed it. Otherwise the broker hands out more concurrent leases than the model has
+    // slots and the extras queue at the server. A `modelCapacity` below `--parallel` keeps
+    // the rest of the slots for callers that reach the server without a lease.
     "vision-27b": {
       "providerID": "llamacpp",
       "modelID": "qwen3.8-27b",

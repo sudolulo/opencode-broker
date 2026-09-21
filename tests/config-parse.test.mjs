@@ -117,6 +117,23 @@ test("per-target outputReserve is parsed for both kinds, floored, and junk is dr
   assert.equal(CONFIG.targets.cloud.outputReserve, 32000);
 });
 
+// modelCapacity counts a local model server's slots across every target naming the model;
+// a cloud target has no slots to share, and a non-integer limit is not a limit.
+test("per-target modelCapacity is kept for local targets as a positive integer only", async () => {
+  const { CONFIG } = await loadConfig(`{
+    "targets": {
+      "local-valid": { "providerID": "llamacpp", "modelID": "m", "kind": "local", "capacity": 4, "modelCapacity": 3 },
+      "local-zero": { "providerID": "llamacpp", "modelID": "m", "kind": "local", "modelCapacity": 0 },
+      "local-fraction": { "providerID": "llamacpp", "modelID": "m", "kind": "local", "modelCapacity": 2.5 },
+      "cloud": { "providerID": "openai", "modelID": "c", "kind": "cloud", "modelCapacity": 3 }
+    }
+  }`);
+  assert.equal(CONFIG.targets["local-valid"].modelCapacity, 3);
+  assert.equal(CONFIG.targets["local-zero"].modelCapacity, undefined);
+  assert.equal(CONFIG.targets["local-fraction"].modelCapacity, undefined);
+  assert.equal(CONFIG.targets.cloud.modelCapacity, undefined);
+});
+
 // The shipped examples are documentation; a typo in one would teach every new install a
 // config that silently routes nothing.
 test("the shipped example configs parse and declare targets", async () => {
