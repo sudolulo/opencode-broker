@@ -48,6 +48,7 @@ test("config loader validates and applies defaults", () => {
       plain: "uncensored",
       smart: { profile: "auto", tier: "smart" },
       blankTier: { profile: "auto", tier: "" },
+      malformedTier: { profile: "auto", tier: 42 },
       detailed: { profile: "private", maxContextTokens: 39321 },
       patient: { profile: "private", timeoutMs: 60000 },
       // A zero-length timeout is never a deployment's intent; it normalizes away
@@ -71,6 +72,7 @@ test("config loader validates and applies defaults", () => {
     plain: { ...none, profile: "uncensored" },
     smart: { ...none, profile: "auto", tier: "smart" },
     blankTier: { ...none, profile: "auto" },
+    malformedTier: { ...none, profile: "auto" },
     detailed: { ...none, profile: "private", maxContextTokens: 39321 },
     patient: { ...none, profile: "private", timeoutMs: 60000 },
     zero: { ...none, profile: "private" },
