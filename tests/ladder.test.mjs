@@ -50,23 +50,43 @@ test("fable discovery lands in deep only; sonnet serves build and review", () =>
   assert.deepEqual(fable.tiers, ["deep"]);
   assert.deepEqual(sonnet.tiers, ["build", "review"]);
   const targets = { ...R.TARGETS, ...discovered };
-  assert.deepEqual(R.targetIDsFor("auto", "deep", targets), ["gpt-pro", "qwen-max", fable.id], "deep is a POOL, not a single model");
-  assert.equal(R.targetIDsFor("auto", "smart", targets).includes(fable.id), false, "smart no longer pays 2x credits");
+  assert.deepEqual(R.targetIDsFor("auto", "deep", targets),
+    ["gpt-flagship", "qwen-max", "claude-fable-5-1", fable.id],
+    "deep contains the approved static pool plus the discovered newest family candidate");
+  assert.equal(R.targetIDsFor("auto", "smart", targets).includes(fable.id), false,
+    "smart no longer pays 2x credits");
   assert.equal(R.targetIDsFor("auto", "review", targets).includes(sonnet.id), true);
 });
 
-test("deep falls back to the smart lane, review to terra then luna", () => {
+test("deep and review fall back to Terra", () => {
   const discovered = R.discoverSubscriptionTargets({ connected: ["anthropic"], all: [{
     id: "anthropic",
     models: { "claude-fable-5": { id: "claude-fable-5", family: "claude-fable", release_date: "2026-06-07", tool_call: true } },
   }] }, { anthropic: "oauth" }).targets;
   const targets = { ...R.TARGETS, ...discovered };
   const fableID = Object.keys(discovered)[0];
-  const emergency = R.chooseTarget({ profile: "auto", tier: "deep", targets,
-    circuits: { [fableID]: { until: null }, "gpt-pro": { until: null }, "qwen-max": { until: null } } });
-  assert.equal(emergency.target.id, "gpt-flagship");
+  const emergency = R.chooseTarget({
+    profile: "auto",
+    tier: "deep",
+    targets,
+    circuits: {
+      [fableID]: { until: null },
+      "claude-fable-5-1": { until: null },
+      "gpt-flagship": { until: null },
+      "qwen-max": { until: null },
+    },
+  });
+  assert.equal(emergency.target.id, "gpt-terra");
   assert.equal(emergency.decision.policy, "strict-fallback");
-  const review = R.chooseTarget({ profile: "auto", tier: "review", circuits: { "glm": { until: null }, "deepseek-pro": { until: null } } });
+  const review = R.chooseTarget({
+    profile: "auto",
+    tier: "review",
+    circuits: {
+      glm: { until: null },
+      "deepseek-pro": { until: null },
+      "claude-sonnet-4-6": { until: null },
+    },
+  });
   assert.equal(review.target.id, "gpt-terra");
 });
 

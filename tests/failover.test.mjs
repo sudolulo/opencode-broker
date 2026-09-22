@@ -982,6 +982,13 @@ test("tierAliases build->smart: build and sp-implementer lease the smart lane; f
   }
   assert.deepEqual(runLeaseWait([{ ok: true }], "fast-build").tiers, ["fast-build"]);
 });
+test("researcher verifier and sp-implementer lease the effective Smart tier", () => {
+  for (const agent of ["researcher", "verifier", "sp-implementer"]) {
+    const result = runLeaseWait([{ ok: true }], agent);
+    assert.equal(result.outcome, "routed", agent);
+    assert.deepEqual(result.tiers, ["smart"], `${agent} must lease exactly the Smart lane`);
+  }
+});
 test("without a tierAliases entry the build agent keeps its own lane", () => {
   const dir = mkdtempSync(join(tmpdir(), "broker-no-alias-"));
   try {

@@ -45,12 +45,37 @@
         "fast-build": "low"
       }
     },
+    "claude-opus-5": {
+      "providerID": "anthropic",
+      "modelID": "claude-opus-5",
+      "kind": "cloud",
+      "fit": {
+        "smart": 1.4
+      },
+      "effort": {
+        "smart": "high"
+      }
+    },
+    "claude-opus-4-8": {
+      "providerID": "anthropic",
+      "modelID": "claude-opus-4-8",
+      "kind": "cloud",
+      "fit": {
+        "smart": 1.1
+      },
+      "effort": {
+        "smart": "high"
+      }
+    },
     "claude-opus-4-8-fast": {
       "providerID": "anthropic",
       "modelID": "claude-opus-4-8-fast",
       "kind": "cloud",
       "fit": {
         "fast-build": 1.3
+      },
+      "effort": {
+        "fast-build": "medium"
       }
     },
     "claude-opus-5-fast": {
@@ -59,6 +84,20 @@
       "kind": "cloud",
       "fit": {
         "fast-build": 1.3
+      },
+      "effort": {
+        "fast-build": "medium"
+      }
+    },
+    "claude-sonnet-4-6": {
+      "providerID": "anthropic",
+      "modelID": "claude-sonnet-4-6",
+      "kind": "cloud",
+      "fit": {
+        "review": 1.4
+      },
+      "effort": {
+        "review": "medium"
       }
     },
     "local-classifier": {
@@ -151,14 +190,30 @@
       "modelID": "claude-haiku-4-5",
       "kind": "cloud",
       "fit": {
+        "worker": 1.0,
         "classifier": 1.3
+      },
+      "effort": {
+        "worker": "medium",
+        "classifier": "none"
+      }
+    },
+    "claude-fable-5-1": {
+      "providerID": "anthropic",
+      "modelID": "claude-fable-5-1",
+      "kind": "cloud",
+      "fit": {
+        "deep": 1.5
+      },
+      "effort": {
+        "deep": "xhigh"
       }
     }
   },
   "tiers": {
     "smart": [
       "gpt-flagship",
-      "qwen-max"
+      "claude-opus-5"
     ],
     "build": [
       "gpt-terra",
@@ -168,37 +223,41 @@
     "fast-build": [
       "claude-opus-5-fast",
       "claude-opus-4-8-fast",
-      "gpt-terra",
-      "deepseek-flash"
+      "gpt-terra"
     ],
     "worker": [
-      "qwen-flash",
       "gpt-luna",
-      "deepseek-flash",
+      "qwen-flash",
+      "haiku",
       "local-coder"
     ],
     "classifier": [
       "local-classifier"
     ],
     "deep": [
-      "gpt-pro",
-      "qwen-max"
+      "gpt-flagship",
+      "qwen-max",
+      "claude-fable-5-1"
     ],
     "review": [
       "glm",
       "deepseek-pro",
-      "gpt-terra"
+      "gpt-terra",
+      "claude-sonnet-4-6"
     ]
   },
   "fallbacks": {
     "classifier": [
       [
         "haiku",
-        "qwen-flash",
         "gpt-luna"
       ]
     ],
     "smart": [
+      [
+        "claude-opus-4-8",
+        "qwen-max"
+      ],
       [
         "gpt-terra"
       ]
@@ -219,19 +278,12 @@
     ],
     "deep": [
       [
-        "gpt-flagship",
-        "qwen-max"
-      ],
-      [
         "gpt-terra"
       ]
     ],
     "review": [
       [
         "gpt-terra"
-      ],
-      [
-        "gpt-luna"
       ]
     ]
   },
@@ -342,6 +394,46 @@
       "high",
       "low",
       "medium"
+    ],
+    "anthropic/claude-opus-5": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "anthropic/claude-opus-4-8": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "anthropic/claude-opus-5-fast": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "anthropic/claude-opus-4-8-fast": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "anthropic/claude-sonnet-4-6": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "anthropic/claude-haiku-4-5": [
+      "none",
+      "low",
+      "medium"
+    ],
+    "anthropic/claude-fable-5-1": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
     ]
   },
   // The agent names this deployment uses beyond opencode's built-ins; see

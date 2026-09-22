@@ -110,10 +110,48 @@ test("reviewer is always Review while general inherits every route tier", async 
   }
 });
 
+test("explicit static Anthropic targets cover every routing role", () => {
+  assert.deepEqual(R.targetIDsFor("auto", "smart"), ["gpt-flagship", "claude-opus-5"]);
+  assert.deepEqual(R.targetEligibleIDsFor("auto", "smart"),
+    ["gpt-flagship", "claude-opus-5", "claude-opus-4-8", "qwen-max", "gpt-terra"]);
+  assert.deepEqual(R.targetIDsFor("auto", "build"), ["gpt-terra", "deepseek-pro", "glm"]);
+  assert.deepEqual(R.targetIDsFor("auto", "fast-build"),
+    ["claude-opus-5-fast", "claude-opus-4-8-fast", "gpt-terra"]);
+  assert.deepEqual(R.targetIDsFor("auto", "review"),
+    ["glm", "deepseek-pro", "gpt-terra", "claude-sonnet-4-6"]);
+  assert.deepEqual(R.targetIDsFor("auto", "worker"),
+    ["gpt-luna", "qwen-flash", "haiku", "local-coder"]);
+  assert.deepEqual(R.targetEligibleIDsFor("auto", "classifier"),
+    ["local-classifier", "haiku", "gpt-luna"]);
+  assert.deepEqual(R.targetIDsFor("auto", "deep"), ["gpt-flagship", "qwen-max", "claude-fable-5-1"]);
+  assert.equal(R.TARGETS.haiku.modelID, "claude-haiku-4-5");
+  assert.equal(R.TARGETS["claude-opus-5"].fit.smart, 1.4);
+  assert.equal(R.TARGETS["claude-opus-4-8"].fit.smart, 1.1);
+  assert.equal(R.TARGETS["claude-opus-5-fast"].fit["fast-build"], 1.3);
+  assert.equal(R.TARGETS["claude-opus-4-8-fast"].fit["fast-build"], 1.3);
+  const rawConfig = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  assert.deepEqual(rawConfig.targets["claude-sonnet-4-6"], {
+    providerID: "anthropic",
+    modelID: "claude-sonnet-4-6",
+    kind: "cloud",
+    fit: { review: 1.4 },
+    effort: { review: "medium" },
+  });
+  assert.deepEqual(R.modelRefForTier(R.TARGETS["claude-sonnet-4-6"], "review"), {
+    providerID: "anthropic",
+    id: "claude-sonnet-4-6",
+    variant: "medium",
+  });
+  assert.deepEqual(R.TARGETS.haiku.fit, { worker: 1.0, classifier: 1.3 });
+  assert.equal(R.TARGETS["claude-fable-5-1"].fit.deep, 1.5);
+  assert.equal(R.desiredVariantForTier("review"), null);
+});
+
 test("Auto worker routing balances healthy cloud providers", () => {
   // Deterministic rotation may select gpt-luna after qwen-flash even when qwen has active work
   const first = R.chooseTarget({ profile: "auto", tier: "worker" });
-  assert.equal(first.target.id, "qwen-flash");
+  assert.equal(first.target.id, "gpt-luna");
 
   const second = R.chooseTarget({
     profile: "auto",
@@ -121,7 +159,7 @@ test("Auto worker routing balances healthy cloud providers", () => {
     active: { "qwen-flash": 1 },
     cursors: { [first.cursorKey]: first.nextCursor },
   });
-  assert.equal(second.target.id, "gpt-luna");
+  assert.equal(second.target.id, "qwen-flash");
 
   const third = R.chooseTarget({
     profile: "auto",
@@ -129,7 +167,7 @@ test("Auto worker routing balances healthy cloud providers", () => {
     active: { "qwen-flash": 1, "gpt-luna": 1 },
     cursors: { [second.cursorKey]: second.nextCursor },
   });
-  assert.equal(third.target.id, "deepseek-flash");
+  assert.equal(third.target.id, "haiku");
 
   // High active counts on all cloud targets must NOT force local fallback while eligible cloud exists
   const highActive = R.chooseTarget({
@@ -138,7 +176,7 @@ test("Auto worker routing balances healthy cloud providers", () => {
     active: { "qwen-flash": 2, "gpt-luna": 2 },
     cursors: { [third.cursorKey]: third.nextCursor },
   });
-  assert.equal(["qwen-flash", "gpt-luna", "deepseek-flash"].includes(highActive.target.id), true,
+  assert.equal(["gpt-luna", "qwen-flash", "haiku"].includes(highActive.target.id), true,
     "high active counts on cloud never force local fallback");
 });
 
@@ -149,6 +187,7 @@ test("cloud targets remain eligible under high active counts", () => {
     profile: "auto",
     tier: "worker",
     active: { "qwen-flash": 999 },
+    circuits: { "gpt-luna": { until: null }, haiku: { until: null } },
     cursors: { "auto:worker:cloud": 0 },
   });
 
@@ -183,7 +222,7 @@ test("cloud selection stays deterministic and JSON-safe", () => {
   const first = R.chooseTarget(input);
   const second = R.chooseTarget(input);
 
-  assert.equal(first.target.id, "deepseek-flash");
+  assert.equal(first.target.id, "haiku");
   assert.equal(second.target.id, first.target.id);
   assert.doesNotMatch(JSON.stringify(first), /Infinity|NaN/);
 });
@@ -208,8 +247,125 @@ test("a provider quota circuit excludes every capped Alibaba target", () => {
   const worker = R.chooseTarget({ profile: "auto", tier: "worker", circuits });
   assert.equal(worker.target.id, "gpt-luna");
   assert.deepEqual(R.targetIDsFor("auto", "build"), ["gpt-terra", "deepseek-pro", "glm"]);
-  assert.deepEqual(R.targetIDsFor("auto", "smart"), ["gpt-flagship", "qwen-max"]);
+  assert.deepEqual(R.targetIDsFor("auto", "smart"), ["gpt-flagship", "claude-opus-5"]);
   assert.equal(R.providerCircuitID("alibaba-token-plan"), "provider:alibaba-token-plan");
+});
+
+test("Anthropic role targets obey target and provider circuits", () => {
+  const open = { until: null };
+  const cases = [
+    { tier: "smart", anthropic: "claude-opus-5", competitors: ["gpt-flagship"], nonAnthropic: "gpt-flagship" },
+    { tier: "fast-build", anthropic: "claude-opus-5-fast", competitors: ["claude-opus-4-8-fast", "gpt-terra"], nonAnthropic: "gpt-terra" },
+    { tier: "fast-build", anthropic: "claude-opus-4-8-fast", competitors: ["claude-opus-5-fast", "gpt-terra"], nonAnthropic: "gpt-terra" },
+    { tier: "review", anthropic: "claude-sonnet-4-6", competitors: ["glm", "deepseek-pro", "gpt-terra"], nonAnthropic: "glm" },
+    { tier: "worker", anthropic: "haiku", competitors: ["gpt-luna", "qwen-flash", "local-coder"], nonAnthropic: "gpt-luna" },
+    { tier: "deep", anthropic: "claude-fable-5-1", competitors: ["gpt-flagship", "qwen-max"], nonAnthropic: "gpt-flagship" },
+  ];
+  for (const { tier, anthropic, competitors, nonAnthropic } of cases) {
+    const forced = R.chooseTarget({
+      profile: "auto", tier, localModels: new Set(), contextTokens: 1000,
+      circuits: Object.fromEntries(competitors.map((id) => [id, open])),
+    });
+    assert.equal(forced.target.id, anthropic, `${tier}: explicit Anthropic target is eligible`);
+    const unavailable = R.chooseTarget({
+      profile: "auto", tier, localModels: new Set(), contextTokens: 1000,
+      circuits: { [anthropic]: open },
+    });
+    assert.notEqual(unavailable.target.id, anthropic, `${tier}: target circuit excludes it`);
+    assert.equal(unavailable.decision.eligibleTargetIDs.includes(anthropic), false,
+      `${tier}: target circuit removes it from the eligible set`);
+    const exhausted = R.chooseTarget({
+      profile: "auto", tier, localModels: new Set(), contextTokens: 1000,
+      circuits: { "provider:anthropic": open },
+    });
+    assert.ok(exhausted.decision.eligibleTargetIDs.includes(nonAnthropic), `${tier}: non-Anthropic candidate remains`);
+    assert.equal(exhausted.decision.eligibleTargetIDs.some((id) => R.TARGETS[id]?.providerID === "anthropic"), false);
+  }
+});
+
+test("classifier Haiku fallback yields to non-Anthropic fallback when quota is exhausted", () => {
+  const haiku = R.chooseTarget({ profile: "auto", tier: "classifier", localModels: new Set(), contextTokens: 1100 });
+  assert.equal(haiku.target.id, "haiku");
+  const exhausted = R.chooseTarget({
+    profile: "auto",
+    tier: "classifier",
+    localModels: new Set(),
+    contextTokens: 1100,
+    circuits: { "provider:anthropic": { until: null } },
+  });
+  assert.notEqual(exhausted.target.providerID, "anthropic");
+  assert.ok(exhausted.decision.eligibleTargetIDs.includes("gpt-luna"));
+});
+
+test("Smart uses Opus 4.8 in the first fallback rung", () => {
+  const choice = R.chooseTarget({
+    profile: "auto",
+    tier: "smart",
+    circuits: {
+      "gpt-flagship": { until: null },
+      "claude-opus-5": { until: null },
+      "qwen-max": { until: null },
+    },
+  });
+  assert.equal(choice.target.id, "claude-opus-4-8");
+  assert.equal(choice.decision.policy, "strict-fallback");
+});
+
+test("researcher verifier and sp-implementer retain declared tiers and resolve to Smart", () => {
+  const open = { until: null };
+  const declaredByAgent = {
+    researcher: "smart",
+    verifier: "smart",
+    "sp-implementer": "build",
+  };
+  for (const [agent, declared] of Object.entries(declaredByAgent)) {
+    assert.equal(R.tierForAgent(agent), declared, `${agent}: declared tier`);
+    const effective = R.CONFIG.tierAliases[declared] ?? declared;
+    assert.equal(effective, "smart", `${agent}: effective tier`);
+    assert.ok(R.targetEligibleIDsFor("auto", effective).includes("claude-opus-5"),
+      `${agent}: explicit Opus is eligible`);
+
+    const opus = R.chooseTarget({
+      profile: "auto", tier: effective, localModels: new Set(), contextTokens: 1000,
+      circuits: { "gpt-flagship": open },
+    });
+    assert.equal(opus.target.id, "claude-opus-5", `${agent}: GPT circuit leaves Opus eligible`);
+
+    const targetExcluded = R.chooseTarget({
+      profile: "auto", tier: effective, localModels: new Set(), contextTokens: 1000,
+      circuits: { "claude-opus-5": open },
+    });
+    assert.equal(targetExcluded.target.id, "gpt-flagship", `${agent}: Opus target circuit falls back to GPT`);
+    assert.equal(targetExcluded.decision.eligibleTargetIDs.includes("claude-opus-5"), false,
+      `${agent}: Opus target circuit removes it from the eligible set`);
+
+    const quotaExcluded = R.chooseTarget({
+      profile: "auto", tier: effective, localModels: new Set(), contextTokens: 1000,
+      circuits: { "provider:anthropic": open },
+    });
+    assert.equal(quotaExcluded.target.id, "gpt-flagship", `${agent}: Anthropic quota falls back to GPT`);
+    assert.ok(quotaExcluded.decision.eligibleTargetIDs.includes("gpt-flagship"),
+      `${agent}: non-Anthropic candidate remains`);
+    assert.equal(quotaExcluded.decision.eligibleTargetIDs
+      .some((id) => R.TARGETS[id]?.providerID === "anthropic"), false,
+    `${agent}: Anthropic candidates are excluded`);
+  }
+});
+
+test("equal-utilization Smart tie break follows configured order then cursor", () => {
+  const first = R.chooseTarget({
+    profile: "auto", tier: "smart", localModels: new Set(), contextTokens: 1000,
+  });
+  assert.equal(first.target.id, "gpt-flagship");
+  assert.deepEqual(first.decision.balancedTargetIDs, ["gpt-flagship", "claude-opus-5"]);
+  assert.ok(first.decision.reasons.includes("round-robin-tiebreak"));
+
+  const second = R.chooseTarget({
+    profile: "auto", tier: "smart", localModels: new Set(), contextTokens: 1000,
+    cursors: { [first.cursorKey]: first.nextCursor },
+  });
+  assert.equal(second.target.id, "claude-opus-5");
+  assert.equal(second.decision.policy, "weighted-depletion");
 });
 
 test("Smart falls back to Terra and Build to the flagship only as a strict emergency", () => {
@@ -249,13 +405,14 @@ test("Smart falls back to Terra and Build to the flagship only as a strict emerg
 });
 
 test("Fast Build is explicit while regular Build uses Fast models only as emergency fallbacks", () => {
-  assert.deepEqual(R.targetIDsFor("auto", "fast-build"), ["claude-opus-5-fast", "claude-opus-4-8-fast", "gpt-terra", "deepseek-flash"]);
+  assert.deepEqual(R.targetIDsFor("auto", "fast-build"), ["claude-opus-5-fast", "claude-opus-4-8-fast", "gpt-terra"]);
   assert.equal(R.targetIDsFor("auto", "build").includes("claude-opus-5-fast"), false);
 
   const dynamic = R.discoverSubscriptionTargets({ connected: ["anthropic"], all: [{
     id: "anthropic",
-    models: { "claude-opus-5": { id: "claude-opus-5", family: "claude-opus", release_date: "2026-08-01", tool_call: true } },
+    models: { "claude-opus-5-20260820": { id: "claude-opus-5-20260820", family: "claude-opus", release_date: "2026-08-20", tool_call: true } },
   }] }, { anthropic: "oauth" }).targets;
+  const standardOpusID = Object.keys(dynamic)[0];
   const targets = { ...R.TARGETS, ...dynamic };
 
   const interactive = R.chooseTarget({ profile: "auto", tier: "fast-build" });
@@ -270,7 +427,7 @@ test("Fast Build is explicit while regular Build uses Fast models only as emerge
       "gpt-terra": { until: null },
       "deepseek-pro": { until: null },
       "glm": { until: null },
-      "subscription-anthropic-claude-opus-5-standard": { until: null },
+      [standardOpusID]: { until: null },
     },
   });
   assert.equal(["claude-opus-5-fast", "claude-opus-4-8-fast"].includes(regularEmergency.target.id), true);
@@ -287,7 +444,7 @@ test("Fast Build is explicit while regular Build uses Fast models only as emerge
       "claude-opus-4-8-fast": { until: null },
     },
   });
-  assert.equal(["gpt-terra", "deepseek-flash"].includes(anthropicDown.target.id), true);
+  assert.equal(anthropicDown.target.id, "gpt-terra");
   assert.equal(anthropicDown.decision.policy, "weighted-depletion");
 
   // Only when the WHOLE lane is out does the newest standard opus take over.
@@ -299,27 +456,29 @@ test("Fast Build is explicit while regular Build uses Fast models only as emerge
       "claude-opus-5-fast": { until: null },
       "claude-opus-4-8-fast": { until: null },
       "gpt-terra": { until: null },
-      "deepseek-flash": { until: null },
     },
   });
-  assert.equal(interactiveFallback.target.id, "subscription-anthropic-claude-opus-5-standard");
+  assert.equal(interactiveFallback.target.id, standardOpusID);
   assert.equal(interactiveFallback.decision.policy, "strict-fallback");
 });
 
-test("only explicit Anthropic Fast targets remain static", () => {
+test("approved static Anthropic targets coexist with discovered families", () => {
   const providers = { anthropic: { connected: true, authType: "oauth" } };
   assert.equal(R.TARGETS["claude-haiku"], undefined);
   assert.equal(R.TARGETS["claude-fable"], undefined);
-  assert.equal(R.TARGETS["claude-opus-5"], undefined);
+  assert.equal(R.TARGETS["claude-opus-5"].modelID, "claude-opus-5");
   assert.equal(R.cloudTargetAdmitted(R.TARGETS["claude-opus-5-fast"], providers), true);
   assert.equal(R.cloudTargetAdmitted(R.TARGETS["claude-opus-5-fast"], { anthropic: { connected: true, authType: "api-key" } }), false);
 });
 
-test("Smart routing uses admitted Qwen Max when its OpenAI flagship is unavailable", () => {
+test("Smart routing uses admitted Qwen Max when both primaries are unavailable", () => {
   const choice = R.chooseTarget({
     profile: "auto",
     tier: "smart",
-    circuits: { "gpt-flagship": { until: null } },
+    circuits: {
+      "gpt-flagship": { until: null },
+      "provider:anthropic": { until: null },
+    },
   });
   assert.equal(choice.target.id, "qwen-max");
 });
@@ -390,7 +549,12 @@ test("Anthropic families choose the newest rolling alias and fall back after a t
   const sonnet = Object.values(discovered.targets).find((target) => target.modelID === "claude-sonnet-5");
   assert.deepEqual(sonnet?.tiers, ["build", "review"]);
   assert.equal(Object.values(discovered.targets).some((target) => target.modelID === "claude-opus-5-fast"), false);
-  const circuits = { "gpt-flagship": { until: null }, "gpt-pro": { until: null }, "provider:alibaba-token-plan": { until: null } };
+  const circuits = {
+    "gpt-flagship": { until: null },
+    "gpt-pro": { until: null },
+    "claude-fable-5-1": { until: null },
+    "provider:alibaba-token-plan": { until: null },
+  };
   const newest = R.chooseTarget({ profile: "auto", tier: "deep", targets, circuits });
   assert.equal(newest.target.modelID, "claude-fable-5");
   const fallback = R.chooseTarget({
@@ -916,7 +1080,7 @@ test("quota circuits use the provider renewal time and otherwise remain blocked"
     circuits: { "provider:alibaba-token-plan": { until: now + 1 } },
     now: now + 2,
   });
-  assert.equal(renewed.target.id, "qwen-flash");
+  assert.equal(renewed.target.id, "gpt-luna");
 });
 
 test("Auto worker routing reserves one quarter of healthy assignments for local", () => {

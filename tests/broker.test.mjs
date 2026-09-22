@@ -634,6 +634,7 @@ test("estimated budget exhaustion remains advisory until the provider reports qu
     profile: "auto",
     tier: "worker",
     replace: true,
+    preferredModel: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" },
   });
   assert.equal(lease.target.model.id, "qwen3.8-flash");
   await request(socketPath, "/usage", {
@@ -657,6 +658,7 @@ test("a confirmed Alibaba allocation quota blocks every Alibaba model until its 
   }));
   const lease = await request(socketPath, "/lease", {
     sessionID: "ses-quota-reset", profile: "auto", tier: "worker", replace: true,
+    preferredModel: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" },
   });
   assert.equal(lease.target.model.id, "qwen3.8-flash");
   // Relative to now: quotaRenewalAt deliberately REFUSES a reset already in the past,
@@ -851,7 +853,7 @@ test("model-not-found circuits only that version, falls back, and is pruned with
     kind: "cloud",
     capacity: null,
     source: "subscription-oauth",
-    tiers: ["smart"],
+    tiers: ["deep"],
     family: "claude-fable",
     releaseDate,
     speed: "standard",
@@ -865,8 +867,13 @@ test("model-not-found circuits only that version, falls back, and is pruned with
     targetID: "qwen-max",
     error: { code: "insufficient_quota", message: "subscription quota exhausted" },
   });
+  await request(socketPath, "/failure", {
+    sessionID: "ses-block-static-fable",
+    targetID: "claude-fable-5-1",
+    error: { statusCode: 404, code: "model_not_found", message: "model: claude-fable-5-1 not found" },
+  });
   const lease = await request(socketPath, "/lease", {
-    sessionID: "ses-model-newest", profile: "auto", tier: "smart", replace: true,
+    sessionID: "ses-model-newest", profile: "auto", tier: "deep", replace: true,
   });
   assert.equal(lease.target.model.id, "claude-fable-5");
   const failure = await request(socketPath, "/failure", {
@@ -881,7 +888,7 @@ test("model-not-found circuits only that version, falls back, and is pruned with
   assert.equal(status.circuits["provider:anthropic"], undefined);
   assert.equal(status.health.providers.anthropic, undefined);
   const fallback = await request(socketPath, "/lease", {
-    sessionID: "ses-model-fallback", profile: "auto", tier: "smart", replace: true,
+    sessionID: "ses-model-fallback", profile: "auto", tier: "deep", replace: true,
   });
   assert.equal(fallback.target.model.id, "claude-fable-4-8");
   await request(socketPath, "/inventory", { ...base, targets: { [older.id]: older } });
@@ -901,13 +908,13 @@ test("a session keeps its pinned model across releases; only a NEW session is ba
     tier: "worker",
     replace: true,
   });
-  assert.equal(first.target.model.id, "qwen3.8-flash");
+  assert.equal(first.target.model.id, "gpt-5.6-luna");
 
   // Spend the session's provider hard, then release the lease the way the plugin does at idle.
   await request(socketPath, "/usage", {
-    providerID: "alibaba-token-plan",
-    requests: 0,
-    tokens: { input: 10_000_000, output: 0, cacheRead: 0, cacheWrite: 0 },
+    providerID: "openai",
+    requests: 100,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   });
   await request(socketPath, "/forget", { sessionID: "ses-replace" });
 
@@ -919,7 +926,7 @@ test("a session keeps its pinned model across releases; only a NEW session is ba
     tier: "worker",
     replace: true,
   });
-  assert.equal(again.target.model.id, "qwen3.8-flash");
+  assert.equal(again.target.model.id, "gpt-5.6-luna");
   assert.equal((await request(socketPath, "/selection")).lastDecision.policy, "session-stickiness");
 
   // Balancing still happens -- when a session gets its FIRST model.
@@ -929,7 +936,7 @@ test("a session keeps its pinned model across releases; only a NEW session is ba
     tier: "worker",
     replace: true,
   });
-  assert.equal(fresh.target.model.id, "gpt-5.6-luna");
+  assert.equal(fresh.target.model.id, "qwen3.8-flash");
   const selection = await request(socketPath, "/selection");
   assert.deepEqual(selection.lastDecision.reasons, ["lowest-normalized-provider-utilization"]);
 }));
@@ -965,6 +972,31 @@ test("a preferred session model stays sticky until it becomes ineligible", async
   assert.equal(rerouted.target.model.id, "qwen3.8-flash");
   selection = await request(socketPath, "/selection");
   assert.notEqual(selection.lastDecision.policy, "session-stickiness");
+}));
+
+test("a preferred Smart Opus session reroutes to GPT when Opus becomes ineligible", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  }));
+  const body = {
+    sessionID: "ses-smart-opus",
+    profile: "auto",
+    tier: "smart",
+    replace: true,
+    preferredModel: { providerID: "anthropic", id: "claude-opus-5" },
+  };
+  assert.equal((await request(socketPath, "/lease", body)).target.id, "claude-opus-5");
+  assert.equal((await request(socketPath, "/lease", body)).decision.policy, "session-stickiness");
+  await request(socketPath, "/failure", {
+    sessionID: "ses-smart-opus",
+    targetID: "claude-opus-5",
+    error: "rate limit",
+  });
+  const rerouted = await request(socketPath, "/lease", body);
+  assert.equal(rerouted.target.id, "gpt-flagship");
+  assert.notEqual(rerouted.decision.policy, "session-stickiness");
 }));
 
 test("strict fallback target stickiness yields to an eligible primary", async () => withBroker(async ({ socketPath }) => {
@@ -1071,18 +1103,14 @@ test("budget, auth, and circuit gates reject fresh leasing", async () => withBro
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
     "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
   }));
-  const qwenLease = await request(socketPath, "/lease", {
-    sessionID: "ses-circuit-qwen",
-    profile: "auto",
-    tier: "worker",
-    replace: true,
+  const gptLease = await request(socketPath, "/lease", {
+    sessionID: "ses-circuit-gpt", profile: "auto", tier: "worker", replace: true,
   });
-  assert.equal(qwenLease.target.model.id, "qwen3.8-flash");
+  assert.equal(gptLease.target.model.id, "gpt-5.6-luna");
   await request(socketPath, "/failure", {
-    sessionID: "ses-circuit-qwen",
-    targetID: "qwen-flash",
-    error: "rate limit",
+    sessionID: "ses-circuit-gpt", targetID: "gpt-luna", error: "rate limit",
   });
+
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "api-key", connected: true, classification: "subscription", models: 1 },
     "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
@@ -1092,54 +1120,30 @@ test("budget, auth, and circuit gates reject fresh leasing", async () => withBro
     requests: 0,
     tokens: { input: 50_000_000, output: 50_000_000, cacheRead: 0, cacheWrite: 0 },
   });
-  // openai is now an api-key (quarantined, not a subscription) and qwen-flash is
-  // circuited, so neither may serve. The request is also far larger than any declared
-  // window, which used to make this reject outright; it now falls to the roomiest
-  // remaining CLOUD window. The gates under test still hold -- the circuited and
-  // unadmitted targets are excluded from the last-resort pass too, which is the point.
   const gated = await request(socketPath, "/lease", {
-    sessionID: "ses-auth-budget",
-    profile: "auto",
-    tier: "worker",
-    contextTokens: 100_000,
-    replace: true,
+    sessionID: "ses-auth-budget", profile: "auto", tier: "worker",
+    contextTokens: 100_000, replace: true,
   });
   assert.equal(gated.decision.policy, "context-overflow-last-resort");
-  assert.notEqual(gated.target.id, "qwen-flash", "a circuited target must not be revived by the last resort");
-  assert.notEqual(gated.target.model.providerID, "openai", "an unadmitted provider must not be revived by the last resort");
+  assert.equal(gated.target.id, "qwen-flash");
+  assert.notEqual(gated.target.model.providerID, "openai");
 
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
     "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
   }));
-  const gptLease = await request(socketPath, "/lease", {
-    sessionID: "ses-circuit-gpt",
-    profile: "auto",
-    tier: "worker",
-    replace: true,
+  const qwenLease = await request(socketPath, "/lease", {
+    sessionID: "ses-circuit-qwen", profile: "auto", tier: "worker", replace: true,
   });
-  assert.equal(gptLease.target.model.id, "gpt-5.6-luna");
+  assert.equal(qwenLease.target.model.id, "qwen3.8-flash");
   await request(socketPath, "/failure", {
-    sessionID: "ses-circuit-gpt",
-    targetID: "gpt-luna",
-    error: "rate limit",
+    sessionID: "ses-circuit-qwen", targetID: "qwen-flash", error: "rate limit",
   });
 
-  // qwen-flash and gpt-luna are both circuited now. deepseek-flash is not, so an
-  // oversized request lands there under the last resort rather than refusing -- and
-  // that is the assertion worth making: the circuited lanes stay excluded from the
-  // last-resort pass, which only ever skips the SIZE check.
-  const blocked = await request(socketPath, "/lease", {
-    sessionID: "ses-circuit-blocked",
-    profile: "auto",
-    tier: "worker",
-    contextTokens: 100_000,
-    replace: true,
-  });
-  assert.equal(blocked.decision.policy, "context-overflow-last-resort");
-  assert.equal(blocked.target.id, "deepseek-flash");
-  assert.notEqual(blocked.target.id, "qwen-flash");
-  assert.notEqual(blocked.target.id, "gpt-luna");
+  await assert.rejects(request(socketPath, "/lease", {
+    sessionID: "ses-circuit-blocked", profile: "auto", tier: "worker",
+    contextTokens: 100_000, replace: true,
+  }), /all lightweight routing targets are busy or unavailable/);
 }));
 
 // The boundary the last resort must NOT cross: local targets. A llama.cpp slot's window

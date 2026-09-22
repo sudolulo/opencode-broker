@@ -1359,7 +1359,7 @@ test("every fleet-classifier lane agent keeps its own pin instead of the manual 
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout);
   for (const agent of ["fleet-classifier", "fleet-classifier-qwen", "fleet-classifier-haiku", "fleet-classifier-future"]) {
-    assert.deepEqual(result[agent], { providerID: "anthropic", modelID: "claude-haiku-4-5" },
+    assert.deepEqual(result[agent], { providerID: "anthropic", modelID: "claude-haiku-4-5", variant: "none" },
       `${agent} must keep its frontmatter pin, not the manual parent's llamacpp model`);
   }
 }));

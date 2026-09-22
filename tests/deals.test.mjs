@@ -47,19 +47,21 @@ test("deal scoping: provider, model prefix, absolute window", () => {
 });
 
 test("selection prefers discounted targets within the balanced set, never across tiers", () => {
-  const localModels = new Set(["qwen3.5-9b-coder"]);
-  const base = { profile: "auto", tier: "worker", localModels, contextTokens: 1000, cursors: { "auto:worker:mixed": 1 } };
-  // Night: deepseek-flash absorbs the cloud pick.
+  const targets = {
+    ...R.TARGETS,
+    "gpt-terra": { ...R.TARGETS["gpt-terra"], fit: { build: 1 } },
+    "deepseek-pro": { ...R.TARGETS["deepseek-pro"], fit: { build: 1 } },
+    glm: { ...R.TARGETS.glm, fit: { build: 1 } },
+  };
+  const base = { profile: "auto", tier: "build", targets };
   const night = R.chooseTarget({ ...base, now: NIGHT, deals: [NIGHT_DEAL] });
-  assert.equal(night.target.id, "deepseek-flash");
+  assert.equal(night.target.id, "deepseek-pro");
   assert.ok(night.decision.reasons.includes("active-usage-deal-x0.5"), String(night.decision.reasons));
-  // Day: no deal reason, normal balancing.
   const day = R.chooseTarget({ ...base, now: DAY, deals: [NIGHT_DEAL] });
+  assert.equal(day.target.id, "gpt-terra");
   assert.equal(day.decision.reasons.includes("active-usage-deal-x0.5"), false);
-  // A deal never promotes a worker target into smart.
   const smart = R.chooseTarget({ profile: "auto", tier: "smart", now: NIGHT, deals: [NIGHT_DEAL] });
-  assert.notEqual(smart.target.providerID, "llamacpp");
-  assert.equal(["gpt-flagship", "qwen-max"].includes(smart.target.id), true);
+  assert.equal(["gpt-flagship", "claude-opus-5"].includes(smart.target.id), true);
 });
 
 test("the ledger records discounted spend at the multiplier", () => {
