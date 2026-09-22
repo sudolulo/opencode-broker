@@ -46,6 +46,8 @@ test("config loader validates and applies defaults", () => {
     providers: { llamacpp: { baseUrl: "http://x/v1" } },
     modelProfiles: {
       plain: "uncensored",
+      smart: { profile: "auto", tier: "smart" },
+      blankTier: { profile: "auto", tier: "" },
       detailed: { profile: "private", maxContextTokens: 39321 },
       patient: { profile: "private", timeoutMs: 60000 },
       // A zero-length timeout is never a deployment's intent; it normalizes away
@@ -56,9 +58,19 @@ test("config loader validates and applies defaults", () => {
       garbled: { profile: "vision", bodyExtras: "enable_thinking" },
     },
   }));
-  const none = { maxContextTokens: null, prepareWaitMs: null, timeoutMs: null, bodyExtras: null, waitForLocal: false, holdOpenMs: null };
+  const none = {
+    tier: null,
+    maxContextTokens: null,
+    prepareWaitMs: null,
+    timeoutMs: null,
+    bodyExtras: null,
+    waitForLocal: false,
+    holdOpenMs: null,
+  };
   assert.deepEqual(loadGatewayConfig(path).modelProfiles, {
     plain: { ...none, profile: "uncensored" },
+    smart: { ...none, profile: "auto", tier: "smart" },
+    blankTier: { ...none, profile: "auto" },
     detailed: { ...none, profile: "private", maxContextTokens: 39321 },
     patient: { ...none, profile: "private", timeoutMs: 60000 },
     zero: { ...none, profile: "private" },
@@ -715,6 +727,29 @@ test("a mapped model name leases its profile; every other name leases the tier's
   assert.equal(named.body.profile, "uncensored", "the name the human picked selects its profile");
   assert.equal(named.body.tier, "worker", "the configured tier still rides along");
   assert.equal(unmapped.body.profile, "auto", "an unmapped name is 0.3.1 exactly: the configured profile");
+});
+
+test("a per-model tier overrides the global tier and unmapped names preserve it", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: namedConfig({ modelProfiles: { smart: { profile: "auto", tier: "smart" } } }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/lease") return { target: { model: { providerID: "llamacpp", id: NAMED } } };
+      return { ok: true };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "smart" })).status, 200);
+    assert.equal((await askModel(base, { model: "unknown-compatible-name" })).status, 200);
+  });
+  const [mapped, unmapped] = brokerCalls.filter((call) => call.route === "/lease");
+  assert.equal(mapped.body.profile, "auto");
+  assert.equal(mapped.body.tier, "smart");
+  assert.equal(unmapped.body.profile, "auto");
+  assert.equal(unmapped.body.tier, "worker");
 });
 
 test("a mapped name with no budget of its own still waits", async () => {

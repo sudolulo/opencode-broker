@@ -154,8 +154,11 @@ const modelRoute = (config, requested) => {
   // after that point can only arrive as the error object under a 200. A request that settles
   // inside holdOpenMs never commits early and keeps its real status, so only the long waits pay.
   const holdOpen = Number(typeof entry === "string" ? Number.NaN : entry?.holdOpenMs);
+  const tier = typeof entry === "string" ? null
+    : typeof entry?.tier === "string" && entry.tier ? entry.tier : null;
   return {
     profile,
+    tier,
     waitForLocal,
     holdOpenMs: Number.isFinite(holdOpen) && holdOpen > 0 ? holdOpen : null,
     maxContextTokens: Number.isFinite(cap) && cap > 0 ? cap : null,
@@ -463,7 +466,7 @@ export const createGatewayHandler = ({
       // routes a profile within its own lane and ignores the tier there, and
       // sending the real one keeps /selection and decisions.jsonl honest about
       // which consumer asked.
-      tier: config.tier,
+      tier: route?.tier ?? config.tier,
       replace: true,
       contextTokens,
       providers,
