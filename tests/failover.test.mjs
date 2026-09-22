@@ -391,6 +391,242 @@ test("bailian token-plan usage normalizes CLI fractions and epoch resets", async
   assert.equal(errored, null);
 });
 
+const canonicalUsage = () => ({
+  windows: [
+    { id: "5h", percent: 42, resetsAt: "2026-09-22T12:00:00Z", active: true, severity: "warning" },
+    { id: "wk", percent: 7, resetsAt: null, active: false, severity: null },
+  ],
+  lockedUntil: null,
+});
+
+const httpAuthFixture = (t, auth) => {
+  const dir = mkdtempSync(join(tmpdir(), "plan-usage-http-"));
+  const path = join(dir, "auth.json");
+  writeFileSync(path, JSON.stringify(auth));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return path;
+};
+
+const httpPlanConfig = (authPath, overrides = {}) => ({
+  windows: [],
+  planUsage: {
+    type: "http",
+    url: "https://usage.example.invalid/v1/plan-usage",
+    authRef: "provider-credential",
+    authPath,
+    ...overrides,
+  },
+});
+
+test("HTTP plan usage resolves an exact authRef and sends only x-api-key", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, {
+    "provider-credential-extra": { key: "wrong-secret" },
+    "provider-credential": { key: "expected-secret" },
+  });
+  let request;
+  const report = await fetchPlanUsage("example-provider", httpPlanConfig(authPath), {
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return { ok: true, json: async () => canonicalUsage() };
+    },
+  });
+  assert.deepEqual(report, canonicalUsage());
+  assert.equal(request.url, "https://usage.example.invalid/v1/plan-usage");
+  assert.equal(request.options.headers["x-api-key"], "expected-secret");
+  assert.equal(Object.hasOwn(request.options.headers, "authorization"), false);
+  assert.equal(Object.hasOwn(request.options.headers, "Authorization"), false);
+});
+
+test("HTTP plan usage supports key, apiKey, and access in precedence order", async (t) => {
+  const cases = [
+    {
+      name: "key wins",
+      credential: { key: "key-secret", apiKey: "api-secret", access: "access-secret" },
+      expected: "key-secret",
+    },
+    {
+      name: "apiKey is compatible",
+      credential: { key: "", apiKey: "api-secret", access: "access-secret" },
+      expected: "api-secret",
+    },
+    {
+      name: "access is compatible",
+      credential: { apiKey: "", access: "access-secret" },
+      expected: "access-secret",
+    },
+  ];
+  for (const { name, credential, expected } of cases) {
+    await t.test(name, async (st) => {
+      __resetPlanUsageCacheForTests();
+      const authPath = httpAuthFixture(st, { "provider-credential": credential });
+      let sent;
+      await fetchPlanUsage(`example-provider-${name}`, httpPlanConfig(authPath), {
+        fetchImpl: async (_url, options) => {
+          sent = options.headers["x-api-key"];
+          return { ok: true, json: async () => canonicalUsage() };
+        },
+      });
+      assert.equal(sent, expected);
+    });
+  }
+});
+
+test("HTTP plan usage rereads credentials after the success TTL", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "first-secret" } });
+  const sent = [];
+  const fetchImpl = async (_url, options) => {
+    sent.push(options.headers["x-api-key"]);
+    return { ok: true, json: async () => canonicalUsage() };
+  };
+  const config = httpPlanConfig(authPath);
+  await fetchPlanUsage("example-provider", config, { fetchImpl, now: 1_000 });
+  writeFileSync(authPath, JSON.stringify({ "provider-credential": { key: "rotated-secret" } }));
+  await fetchPlanUsage("example-provider", config, { fetchImpl, now: 61_000 });
+  assert.deepEqual(sent, ["first-secret", "rotated-secret"]);
+});
+
+test("HTTP plan usage accepts canonical multi-window JSON and returns a normalized copy", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  const payload = canonicalUsage();
+  const report = await fetchPlanUsage("example-provider", httpPlanConfig(authPath), {
+    fetchImpl: async () => ({ ok: true, json: async () => payload }),
+  });
+  assert.deepEqual(report, canonicalUsage());
+  assert.notStrictEqual(report, payload);
+  assert.notStrictEqual(report.windows, payload.windows);
+  assert.notStrictEqual(report.windows[0], payload.windows[0]);
+  assert.equal(report.windows.length, 2);
+});
+
+test("HTTP plan usage rejects invalid schemes and URL credentials before fetch", async (t) => {
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  for (const url of [
+    "ftp://usage.example.invalid/v1/plan-usage",
+    "file:///tmp/plan-usage.json",
+    "/v1/plan-usage",
+    "not a URL",
+    "https://user:pass@usage.example.invalid/v1/plan-usage",
+  ]) {
+    __resetPlanUsageCacheForTests();
+    let calls = 0;
+    const report = await fetchPlanUsage(`invalid-url-${url}`, httpPlanConfig(authPath, { url }), {
+      fetchImpl: async () => { calls += 1; throw new Error("must not fetch"); },
+    });
+    assert.equal(report, null, url);
+    assert.equal(calls, 0, url);
+  }
+});
+
+test("HTTP plan usage requires authRef and a matching non-empty credential before fetch", async (t) => {
+  const authPath = httpAuthFixture(t, {
+    "provider-credential-extra": { key: "wrong-secret" },
+    "empty-credential": { key: "", apiKey: "", access: "" },
+  });
+  const cases = [
+    { name: "missing authRef", overrides: { authRef: undefined } },
+    { name: "missing exact key", overrides: { authRef: "provider-credential" } },
+    { name: "empty credential", overrides: { authRef: "empty-credential" } },
+  ];
+  for (const { name, overrides } of cases) {
+    __resetPlanUsageCacheForTests();
+    let calls = 0;
+    const report = await fetchPlanUsage(`missing-auth-${name}`, httpPlanConfig(authPath, overrides), {
+      fetchImpl: async () => { calls += 1; throw new Error("must not fetch"); },
+    });
+    assert.equal(report, null, name);
+    assert.equal(calls, 0, name);
+  }
+});
+
+test("HTTP plan usage rejects non-2xx, malformed JSON, and invalid canonical reports", async (t) => {
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  const invalidReports = [
+    null,
+    {},
+    { windows: [], lockedUntil: null },
+    { windows: [{ id: "", percent: 1, resetsAt: null, active: false, severity: null }], lockedUntil: null },
+    { windows: [{ id: "5h", percent: Infinity, resetsAt: null, active: false, severity: null }], lockedUntil: null },
+    { windows: [{ id: "5h", percent: 1, resetsAt: "", active: false, severity: null }], lockedUntil: null },
+    { windows: [{ id: "5h", percent: 1, resetsAt: null, active: "false", severity: null }], lockedUntil: null },
+    { windows: [{ id: "5h", percent: 1, resetsAt: null, active: false, severity: 1 }], lockedUntil: null },
+    { windows: [{ id: "5h", percent: 1, resetsAt: null, active: false, severity: null }], lockedUntil: "123" },
+  ];
+  const cases = [
+    { name: "non-2xx", response: { ok: false, status: 503, json: async () => canonicalUsage() } },
+    { name: "malformed JSON", response: { ok: true, json: async () => { throw new SyntaxError("malformed JSON"); } } },
+    ...invalidReports.map((payload, index) => ({
+      name: `invalid canonical report ${index + 1}`,
+      response: { ok: true, json: async () => payload },
+    })),
+  ];
+  for (const { name, response } of cases) {
+    __resetPlanUsageCacheForTests();
+    const report = await fetchPlanUsage(`bad-response-${name}`, httpPlanConfig(authPath), {
+      fetchImpl: async () => response,
+    });
+    assert.equal(report, null, name);
+  }
+});
+
+test("HTTP plan usage degrades timeout and network rejection to null", async (t) => {
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  for (const [name, error] of [
+    ["timeout", new DOMException("timed out", "TimeoutError")],
+    ["network", new TypeError("network failed")],
+  ]) {
+    __resetPlanUsageCacheForTests();
+    const report = await fetchPlanUsage(`rejected-${name}`, httpPlanConfig(authPath), {
+      fetchImpl: async (_url, options) => {
+        assert.ok(options.signal instanceof AbortSignal);
+        throw error;
+      },
+    });
+    assert.equal(report, null, name);
+  }
+});
+
+test("HTTP plan usage caches a successful fetch for its 60-second TTL", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: true, json: async () => canonicalUsage() };
+  };
+  const config = httpPlanConfig(authPath);
+  const first = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 1_000 });
+  const second = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 60_999 });
+  assert.deepEqual(first, canonicalUsage());
+  assert.deepEqual(second, canonicalUsage());
+  assert.equal(calls, 1);
+});
+
+test("HTTP plan usage serves the last good report and backs off failed refreshes", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  const good = canonicalUsage();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) return { ok: true, json: async () => good };
+    throw new TypeError("network failed");
+  };
+  const config = httpPlanConfig(authPath);
+  const first = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 1_000 });
+  const stale = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 61_000 });
+  const backedOff = await fetchPlanUsage("example-provider", config, {
+    fetchImpl: async () => { throw new Error("backoff must suppress refresh"); },
+    now: 660_999,
+  });
+  assert.deepEqual(first, good);
+  assert.deepEqual(stale, good);
+  assert.deepEqual(backedOff, good);
+  assert.equal(calls, 2, "one success, one failed refresh, then no call during failure backoff");
+});
+
 test("fallback markers release stickiness for a primary rebalance", async () => {
   const home = mkdtempSync(join(tmpdir(), "fleet-restore-home-"));
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
@@ -730,4 +966,3 @@ test("without a tierAliases entry the build agent keeps its own lane", () => {
     assert.deepEqual(runLeaseWait([{ ok: true }], "build", configPath).tiers, ["build"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-

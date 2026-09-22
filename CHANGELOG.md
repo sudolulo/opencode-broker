@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] — 2026-09-22
+
+### Added
+
+- **Generic authenticated HTTP plan-usage sources.** A provider budget can set
+  `planUsage.type` to `http`, name an absolute HTTP or HTTPS URL, and select an
+  exact auth-file entry with `authRef`. The broker sends the resolved credential
+  only as `x-api-key`, accepts only canonical multi-window reports, refreshes
+  credentials after the cache TTL, and degrades endpoint failures to the last
+  good report or local estimates.
+
 ## [1.9.0] — 2026-09-21
 
 ### Changed

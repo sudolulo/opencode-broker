@@ -104,7 +104,7 @@ so nothing is ever spent on a provider you did not list.
 | `profileFallbacks` | Per profile, fallback groups like `fallbacks`. Cloud targets are dropped unless the profile is in `profileCloudEgress`. |
 | `profileCloudEgress` | Profiles that may fall back to cloud targets. Offline profiles are refused here. |
 | `profileTools` | Extra tools (`localOnlineExtra`) and tool-name prefixes (`localOnlinePrefixes`) that LAN-only profiles may use. |
-| `budgets` | Per provider, the subscription's `windows` (`id`, `periodMs`, `meter`: `requests` or `tokens`, `capacity`, optional `anchor`) and optionally `planUsage.type` (`anthropic-oauth`, `openai-oauth`, `bailian-cli`) to read exact usage from the provider. |
+| `budgets` | Per provider, the subscription's `windows` (`id`, `periodMs`, `meter`: `requests` or `tokens`, `capacity`, optional `anchor`) and optionally `planUsage.type` (`anthropic-oauth`, `openai-oauth`, `bailian-cli`, or the generic `http`) to read exact usage from the provider. |
 | `deals` | Time-limited discounts (`providerID`, `multiplier`, optional `modelPrefix`, `daily`, `window`) the balancer leans into. |
 | `tierProviderWeights` | Per tier, a provider preference weight (>1 leans toward, <1 saves for other tiers). |
 | `trustedSubscriptionProviders` | Providers admitted without proving OAuth (flat-rate plans that use API keys). |
@@ -131,6 +131,64 @@ Environment:
 
 The broker's socket protocol is documented in [docs/API.md](docs/API.md); the
 bundled plugins are clients like any other.
+
+### Generic HTTP plan usage
+
+An administrator-controlled HTTP endpoint can supply the same canonical plan
+report as the built-in sources:
+
+```jsonc
+"budgets": {
+  "example-provider": {
+    "windows": [
+      { "id": "wk", "periodMs": 604800000, "meter": "tokens", "capacity": 1000000 }
+    ],
+    "planUsage": {
+      "type": "http",
+      "url": "https://usage.example.invalid/v1/plan-usage",
+      "authRef": "provider-credential"
+    }
+  }
+}
+```
+
+`authRef` is an exact top-level key in opencode's auth JSON
+(`~/.local/share/opencode/auth.json` by default). The broker reads that file
+fresh for each uncached request, takes the first non-empty credential from
+`key`, `apiKey`, then `access`, and sends it only as the `x-api-key` header.
+The URL must be absolute HTTP or HTTPS and must not contain a username or
+password.
+
+The endpoint must return this canonical JSON shape; every field shown is
+required, and `windows` may contain more than one window:
+
+```json
+{
+  "windows": [
+    {
+      "id": "5h",
+      "percent": 42,
+      "resetsAt": "2026-09-22T12:00:00Z",
+      "active": true,
+      "severity": "warning"
+    },
+    {
+      "id": "wk",
+      "percent": 7,
+      "resetsAt": null,
+      "active": false,
+      "severity": null
+    }
+  ],
+  "lockedUntil": null
+}
+```
+
+`lockedUntil` is either `null` or epoch milliseconds. A missing credential,
+invalid URL or report, non-2xx response, timeout, or network failure produces
+no new exact reading: the broker serves its last good report when one exists,
+backs the failed source off for ten minutes, and otherwise continues using its
+local estimates.
 
 ## The burn watch
 

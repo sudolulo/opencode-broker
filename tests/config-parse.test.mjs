@@ -134,6 +134,44 @@ test("per-target modelCapacity is kept for local targets as a positive integer o
   assert.equal(CONFIG.targets.cloud.modelCapacity, undefined);
 });
 
+test("HTTP plan usage keeps its type, URL, and exact auth reference", async () => {
+  const { CONFIG } = await loadConfig(`{
+    "budgets": {
+      "example-provider": {
+        "windows": [{ "id": "wk", "periodMs": 604800000, "meter": "tokens", "capacity": 1000000 }],
+        "planUsage": {
+          "type": "http",
+          "url": "https://usage.example.invalid/v1/plan-usage",
+          "authRef": "provider-credential"
+        }
+      }
+    }
+  }`);
+  assert.deepEqual(CONFIG.budgets["example-provider"].planUsage, {
+    type: "http",
+    url: "https://usage.example.invalid/v1/plan-usage",
+    authRef: "provider-credential",
+  });
+});
+
+test("HTTP plan usage drops empty and non-string URL and auth reference fields", async () => {
+  const window = `"windows": [{ "id": "wk", "periodMs": 604800000, "meter": "tokens", "capacity": 1000000 }]`;
+  const { CONFIG } = await loadConfig(`{
+    "budgets": {
+      "empty-fields": {
+        ${window},
+        "planUsage": { "type": "http", "url": "", "authRef": "" }
+      },
+      "invalid-fields": {
+        ${window},
+        "planUsage": { "type": "http", "url": 42, "authRef": false }
+      }
+    }
+  }`);
+  assert.deepEqual(CONFIG.budgets["empty-fields"].planUsage, { type: "http" });
+  assert.deepEqual(CONFIG.budgets["invalid-fields"].planUsage, { type: "http" });
+});
+
 // An absent burnWatch block is the full watch with its documented defaults, and its
 // notifier falls back to the model watch's, so one notify script serves both.
 test("burnWatch defaults to on, takes its thresholds from config, and borrows watch.notifyCommand", async () => {
