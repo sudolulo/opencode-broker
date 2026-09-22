@@ -393,7 +393,7 @@ test("bailian token-plan usage normalizes CLI fractions and epoch resets", async
 
 const canonicalUsage = () => ({
   windows: [
-    { id: "5h", percent: 42, resetsAt: "2026-09-22T12:00:00Z", active: true, severity: "warning" },
+    { id: "5h", percent: 42, resetsAt: "2026-09-22T08:00:00-04:00", active: true, severity: "warning" },
     { id: "wk", percent: 7, resetsAt: null, active: false, severity: null },
   ],
   lockedUntil: null,
@@ -436,6 +436,19 @@ test("HTTP plan usage resolves an exact authRef and sends only x-api-key", async
   assert.equal(request.options.headers["x-api-key"], "expected-secret");
   assert.equal(Object.hasOwn(request.options.headers, "authorization"), false);
   assert.equal(Object.hasOwn(request.options.headers, "Authorization"), false);
+});
+
+test("HTTP plan usage rejects redirects instead of following them", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  let requestOptions;
+  await fetchPlanUsage("redirect-policy", httpPlanConfig(authPath), {
+    fetchImpl: async (_url, options) => {
+      requestOptions = options;
+      return { ok: true, json: async () => canonicalUsage() };
+    },
+  });
+  assert.equal(requestOptions.redirect, "error");
 });
 
 test("HTTP plan usage supports key, apiKey, and access in precedence order", async (t) => {
@@ -569,6 +582,17 @@ test("HTTP plan usage rejects non-2xx, malformed JSON, and invalid canonical rep
     });
     assert.equal(report, null, name);
   }
+});
+
+test("HTTP plan usage rejects a canonical report with an invalid resetsAt date", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  const payload = canonicalUsage();
+  payload.windows[0].resetsAt = "not-a-date";
+  const report = await fetchPlanUsage("invalid-reset-date", httpPlanConfig(authPath), {
+    fetchImpl: async () => ({ ok: true, json: async () => payload }),
+  });
+  assert.equal(report, null);
 });
 
 test("HTTP plan usage degrades timeout and network rejection to null", async (t) => {
