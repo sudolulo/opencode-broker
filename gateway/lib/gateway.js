@@ -176,6 +176,12 @@ export const DEFAULT_GATEWAY_CONFIG = join(process.env.XDG_CONFIG_HOME || join(h
 // client's model picker shows.
 const DEFAULT_ROUTED_MODEL_ID = "routed";
 
+const advertisedModelIDs = (config) => {
+  const routedID = config.routedModelId ?? DEFAULT_ROUTED_MODEL_ID;
+  return [routedID, ...Object.keys(config.modelProfiles ?? {})]
+    .filter((id, index, ids) => ids.indexOf(id) === index);
+};
+
 export const loadGatewayConfig = (path = DEFAULT_GATEWAY_CONFIG) => {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   const providers = raw.providers && typeof raw.providers === "object" ? raw.providers : {};
@@ -199,6 +205,7 @@ export const loadGatewayConfig = (path = DEFAULT_GATEWAY_CONFIG) => {
     providers,
     modelProfiles,
     routedModelId: typeof raw.routedModelId === "string" && raw.routedModelId ? raw.routedModelId : DEFAULT_ROUTED_MODEL_ID,
+    strictModelNames: raw.strictModelNames === true,
     ...(Number.isFinite(Number(raw.prepareWaitMs)) ? { prepareWaitMs: Number(raw.prepareWaitMs) } : {}),
     ...(Number.isFinite(Number(raw.prepareRetryMs)) ? { prepareRetryMs: Number(raw.prepareRetryMs) } : {}),
   };
@@ -970,15 +977,10 @@ export const createGatewayHandler = ({
       // does not care which model answers should send -- and every mapped name
       // joins it, because a name the gateway will honour is exactly a name a
       // human may select.
-      const routedID = config.routedModelId ?? DEFAULT_ROUTED_MODEL_ID;
-      const named = Object.keys(config.modelProfiles ?? {}).filter((id) => id !== routedID);
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         object: "list",
-        data: [
-          { id: routedID, object: "model", owned_by: "opencode-broker" },
-          ...named.map((id) => ({ id, object: "model", owned_by: "opencode-broker" })),
-        ],
+        data: advertisedModelIDs(config).map((id) => ({ id, object: "model", owned_by: "opencode-broker" })),
       }));
       return;
     }
@@ -994,6 +996,19 @@ export const createGatewayHandler = ({
     try { parsed = JSON.parse(body); } catch {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: "invalid JSON body" } }));
+      return;
+    }
+    const requestedModel = String(parsed?.model ?? "");
+    if (config.strictModelNames && !advertisedModelIDs(config).includes(requestedModel)) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        error: {
+          message: `unknown model "${requestedModel}"; use "auto" or a model listed by GET /v1/models`,
+          type: "invalid_request_error",
+          param: "model",
+          code: "unknown_model",
+        },
+      }));
       return;
     }
     const streaming = parsed.stream === true;

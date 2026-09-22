@@ -40,6 +40,12 @@ test("config loader validates and applies defaults", () => {
   assert.deepEqual(Object.keys(config.providers), ["llamacpp"]);
   assert.deepEqual(config.modelProfiles, {}, "no mapping is the default");
   assert.equal(config.routedModelId, "routed", "the id /v1/models lists for broker-picked routing");
+  writeFileSync(path, JSON.stringify({ providers: { llamacpp: { baseUrl: "http://x/v1" } } }));
+  assert.equal(loadGatewayConfig(path).strictModelNames, false);
+  writeFileSync(path, JSON.stringify({ providers: { llamacpp: { baseUrl: "http://x/v1" } }, strictModelNames: true }));
+  assert.equal(loadGatewayConfig(path).strictModelNames, true);
+  writeFileSync(path, JSON.stringify({ providers: { llamacpp: { baseUrl: "http://x/v1" } }, strictModelNames: "true" }));
+  assert.equal(loadGatewayConfig(path).strictModelNames, false);
   writeFileSync(path, JSON.stringify({ providers: { llamacpp: { baseUrl: "http://x/v1" } }, routedModelId: "auto-pick" }));
   assert.equal(loadGatewayConfig(path).routedModelId, "auto-pick");
   writeFileSync(path, JSON.stringify({
@@ -709,6 +715,67 @@ const askModel = (base, body) => fetch(`${base}/v1/chat/completions`, {
   body: JSON.stringify({ messages: [{ role: "user", content: "x" }], ...body }),
 });
 
+test("strict model names reject missing blank and unknown labels before leasing", async () => {
+  const brokerCalls = [];
+  let upstreamCalls = 0;
+  const handler = createGatewayHandler({
+    config: namedConfig({
+      strictModelNames: true,
+      routedModelId: "fleet-routed",
+      modelProfiles: {
+        auto: { profile: "auto", tier: "worker" },
+        smart: { profile: "auto", tier: "smart" },
+      },
+    }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/lease") return { target: { model: { providerID: "llamacpp", id: NAMED } } };
+      return { ok: true };
+    },
+    fetchImpl: async () => {
+      upstreamCalls += 1;
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) };
+    },
+  });
+  await withServer(handler, async (base) => {
+    for (const body of [{}, { model: "" }, { model: "not-listed" }]) {
+      const response = await askModel(base, body);
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), {
+        error: {
+          message: `unknown model "${String(body.model ?? "")}"; use "auto" or a model listed by GET /v1/models`,
+          type: "invalid_request_error",
+          param: "model",
+          code: "unknown_model",
+        },
+      });
+    }
+  });
+  assert.equal(brokerCalls.some((call) => call.route === "/lease"), false);
+  assert.equal(upstreamCalls, 0);
+});
+
+test("strict mode false preserves unmapped compatibility", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: namedConfig({ strictModelNames: false }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/lease") return { target: { model: { providerID: "llamacpp", id: NAMED } } };
+      return { ok: true };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "legacy-client-label" })).status, 200);
+  });
+  const lease = brokerCalls.find((call) => call.route === "/lease");
+  assert.equal(lease.body.profile, "auto");
+  assert.equal(lease.body.tier, "worker");
+});
+
 test("a mapped model name leases its profile; every other name leases the tier's", async () => {
   const brokerCalls = [];
   const handler = createGatewayHandler({
@@ -1043,7 +1110,14 @@ test("routedModelId renames the routed entry in /v1/models", async () => {
 
 test("GET /v1/models lists the routed id plus every mapped name", async () => {
   const handler = createGatewayHandler({
-    config: namedConfig({ modelProfiles: { [NAMED]: "uncensored", "some-other-name": { profile: "private" } } }),
+    config: namedConfig({
+      routedModelId: "fleet-routed",
+      modelProfiles: {
+        "fleet-routed": { profile: "auto" },
+        auto: { profile: "auto", tier: "worker" },
+        smart: { profile: "auto", tier: "smart" },
+      },
+    }),
     gatewayKey: "gw-secret",
     brokerRequest: async () => ({ ok: true }),
     fetchImpl: async () => { throw new Error("must not be called"); },
@@ -1053,12 +1127,12 @@ test("GET /v1/models lists the routed id plus every mapped name", async () => {
     assert.equal(response.status, 200);
     const payload = await response.json();
     assert.equal(payload.object, "list");
-    assert.deepEqual(payload.data.map((entry) => entry.id), ["routed", NAMED, "some-other-name"]);
-    assert.ok(payload.data.every((entry) => entry.object === "model" && entry.owned_by === "opencode-broker"));
-    // ☠️ No profile name may leak to a client: it is deployment topology. (The
-    // "uncensored" in the model id is the NAME the human picked, not the
-    // profile behind it -- "private" is the one that would prove a leak.)
-    assert.doesNotMatch(JSON.stringify(payload), /profile|"private"/);
+    assert.deepEqual(payload.data, [
+      { id: "fleet-routed", object: "model", owned_by: "opencode-broker" },
+      { id: "auto", object: "model", owned_by: "opencode-broker" },
+      { id: "smart", object: "model", owned_by: "opencode-broker" },
+    ]);
+    assert.doesNotMatch(JSON.stringify(payload), /profile/);
   });
 });
 
