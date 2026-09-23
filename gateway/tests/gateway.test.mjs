@@ -1336,6 +1336,100 @@ test("the busy wait is bounded and says it was busy", async () => {
   });
 });
 
+// The broker can only hold a delayed rung shut if it knows how long this caller has waited,
+// and the gateway is the only party that knows. These pin the clock it reports.
+// Time is injected on both sides -- `now` and `sleepImpl` move the same counter -- so the
+// assertions are exact integers rather than wall-clock approximations.
+const leaseOk = () => ({ target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } });
+const okUpstream = async () => ({
+  ok: true, status: 200,
+  json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }),
+});
+
+test("the gateway tells the broker how long it has already waited", async () => {
+  let clock = 1_000_000;
+  const leaseBodies = [];
+  const answers = [busyRefusal(), busyRefusal(), leaseOk()];
+  const handler = createGatewayHandler({
+    config: namedConfig({ prepareWaitMs: 60_000, prepareRetryMs: 5 }),
+    gatewayKey: "gw-secret",
+    now: () => clock,
+    sleepImpl: async (ms) => { clock += ms; },
+    brokerRequest: async (route, body) => {
+      if (route !== "/lease") return { ok: true };
+      leaseBodies.push(body);
+      const next = answers.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    fetchImpl: okUpstream,
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "something-unmapped" })).status, 200);
+  });
+  assert.deepEqual(leaseBodies.map((body) => body.waitedMs), [0, 5, 10]);
+});
+
+test("the wait clock starts at the first refusal, not at request arrival", async () => {
+  // A slow FIRST answer is not time this caller spent queuing for a slot. Counting it would
+  // let a request that never actually waited walk straight onto a delayed rung.
+  let clock = 5_000_000;
+  const leaseBodies = [];
+  let calls = 0;
+  const handler = createGatewayHandler({
+    config: namedConfig({ prepareWaitMs: 60_000, prepareRetryMs: 5 }),
+    gatewayKey: "gw-secret",
+    now: () => clock,
+    sleepImpl: async (ms) => { clock += ms; },
+    brokerRequest: async (route, body) => {
+      if (route !== "/lease") return { ok: true };
+      leaseBodies.push(body);
+      calls += 1;
+      if (calls === 1) { clock += 1_234; throw busyRefusal(); }
+      return leaseOk();
+    },
+    fetchImpl: okUpstream,
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "something-unmapped" })).status, 200);
+  });
+  assert.deepEqual(leaseBodies.map((body) => body.waitedMs), [0, 5]);
+});
+
+test("a new forward attempt resets the elapsed wait", async () => {
+  // The request-level deadline is deliberately shared across attempts, but the WAIT is not:
+  // attempt 2 has not queued for anything yet, and inheriting attempt 1's elapsed time would
+  // hand it a delayed rung on its very first ask.
+  let clock = 9_000_000;
+  const leaseBodies = [];
+  const answers = [busyRefusal(), leaseOk(), leaseOk()];
+  let forwards = 0;
+  const handler = createGatewayHandler({
+    // A MAPPED name: an unmapped one would exclude its only provider after the failed
+    // forward and never reach a second lease.
+    config: namedConfig({ prepareWaitMs: 60_000, prepareRetryMs: 5, modelProfiles: { retryable: { profile: "retryable" } } }),
+    gatewayKey: "gw-secret",
+    now: () => clock,
+    sleepImpl: async (ms) => { clock += ms; },
+    brokerRequest: async (route, body) => {
+      if (route !== "/lease") return { ok: true };
+      leaseBodies.push(body);
+      const next = answers.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    fetchImpl: async () => {
+      forwards += 1;
+      if (forwards === 1) throw new Error("upstream exploded");
+      return okUpstream();
+    },
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askModel(base, { model: "retryable" })).status, 200);
+  });
+  assert.deepEqual(leaseBodies.map((body) => body.waitedMs), [0, 5, 0]);
+});
+
 const absentRefusal = () => Object.assign(
   new Error("no eligible local model is currently deployed, free, or within its context window"),
   { code: "no-eligible-local-target" },

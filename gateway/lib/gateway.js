@@ -428,6 +428,9 @@ export const createGatewayHandler = ({
   gatewayKey,
   authPath,
   now = Date.now,
+  // Injected beside `now` so a test can advance the SAME clock the wait arithmetic reads.
+  // Production passes neither and behaves exactly as before.
+  sleepImpl = sleep,
 }) => {
   const allowedProviders = Object.keys(config.providers);
 
@@ -437,7 +440,7 @@ export const createGatewayHandler = ({
   // document extractor and a chat UI all read as anonymous gateway traffic.
   const callers = new Map();
   const callerOf = (sessionID) => callers.get(sessionID);
-  const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null, api = CHAT) => {
+  const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null, api = CHAT, waitedMs = 0) => {
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. chars/4 is the usual
     // serviceable estimate for OpenAI-shaped payloads.
@@ -481,6 +484,10 @@ export const createGatewayHandler = ({
       // without it, gateway traffic evicted live sessions' models purely by being newer.
       oneShot: true,
       contextTokens,
+      // How long THIS caller has already queued for a slot on this lane. The broker holds a
+      // delayed fallback rung shut until this reaches the rung's threshold, so a lane that is
+      // merely bursty cannot seize a scarce shared target the moment its own lane is busy.
+      waitedMs,
       providers,
       ...(callerOf(sessionID) ? { caller: callerOf(sessionID) } : {}),
     });
@@ -538,6 +545,12 @@ export const createGatewayHandler = ({
     const budget = waitFor(route);
     let entry = null;
     let lastRefusal = null;
+    // ☠️ Set at the first WAITABLE refusal, not at entry. This is per INVOCATION, and
+    // completionsFor calls this once per forward attempt, so attempt 2 starts from zero -- it
+    // has not queued for anything yet, and inheriting attempt 1's elapsed time would hand it a
+    // delayed rung on its very first ask. Deliberately not derived from the request deadline,
+    // which is shared across attempts precisely so a retry cannot buy a second full window.
+    let waitStarted = null;
     const leave = () => {
       if (!entry) return;
       const queue = waiting.get(line) ?? [];
@@ -553,7 +566,10 @@ export const createGatewayHandler = ({
         // ☆ A zero budget never waits, so it never queues: it asks once and takes the answer.
         const myTurn = budget === 0 || (entry ? queue?.[0] === entry : !queue?.length);
         if (myTurn) {
-          try { return await leaseOnce(sessionID, requestBody, excluded, route, api); } catch (refusal) {
+          // Time spent waiting, not time spent being answered: a slow first refusal is latency,
+          // and counting it would let a request that never queued walk onto a delayed rung.
+          const waitedMs = waitStarted === null ? 0 : Math.max(0, now() - waitStarted);
+          try { return await leaseOnce(sessionID, requestBody, excluded, route, api, waitedMs); } catch (refusal) {
             // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
             // out for everyone. The deadline is the request's own either way.
             const absentLocal = route?.waitForLocal === true &&
@@ -563,6 +579,9 @@ export const createGatewayHandler = ({
             // refusal untouched -- it carries the real reason and the machine-readable code, and
             // rewriting it as "the gateway waited 0s" would be both noise and a lie.
             if (budget === 0) throw refusal;
+            // After the waitability gate and after the zero-budget throw, so a caller that is
+            // never going to wait never accrues a wait.
+            if (waitStarted === null) waitStarted = now();
             lastRefusal = refusal;
           }
         }
@@ -583,7 +602,7 @@ export const createGatewayHandler = ({
         }
         await new Promise((resolve) => {
           entry.wake = resolve;
-          sleep(Math.min(prepareRetryMs, left), clientAbort).then(resolve);
+          sleepImpl(Math.min(prepareRetryMs, left), clientAbort).then(resolve);
         });
       }
     } finally {
