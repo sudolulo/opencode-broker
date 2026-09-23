@@ -1,0 +1,138 @@
+{
+  // A deployment shaped like the fleet's `memory` lane: a local primary with a local rung
+  // behind it, and a declared wait before that rung becomes eligible. The rung is overflow
+  // after waiting, not an alternative to waiting.
+  //
+  // ☠️ `shifted` is the alignment trap in fixture form: its FIRST authored rung is cloud on
+  // a LAN profile, so config load deletes it and every later index moves. Its surviving rung
+  // must keep the 300000 that was authored against index 1, not the 0 authored against the
+  // rung that no longer exists.
+  "targets": {
+    "lan-primary": {
+      "providerID": "llamacpp",
+      "modelID": "lan-primary-9b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "lan-rung-a": {
+      "providerID": "llamacpp",
+      "modelID": "lan-rung-a-27b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "lan-rung-b": {
+      "providerID": "llamacpp",
+      "modelID": "lan-rung-b-4b",
+      "kind": "local",
+      "capacity": 1,
+      "context": 65536
+    },
+    "cloud-small": {
+      "providerID": "openai",
+      "modelID": "cloud-small-1",
+      "kind": "cloud",
+      "context": 8000
+    },
+    "cloud-big": {
+      "providerID": "openai",
+      "modelID": "cloud-big-1",
+      "kind": "cloud",
+      "context": 200000
+    }
+  },
+  "tiers": {
+    "worker": [
+      "cloud-small"
+    ]
+  },
+  "profiles": {
+    "memory": [
+      "lan-primary"
+    ],
+    "assist": [
+      "lan-primary"
+    ],
+    "staged": [
+      "lan-primary"
+    ],
+    "wobbly": [
+      "lan-primary"
+    ],
+    "shifted": [
+      "lan-primary"
+    ],
+    "overflow": [
+      "cloud-small"
+    ]
+  },
+  "profileFallbacks": {
+    "memory": [
+      [
+        "lan-rung-a"
+      ]
+    ],
+    // No delay entry at all: the pre-existing behaviour, which voice control relies on.
+    "assist": [
+      [
+        "lan-rung-a"
+      ]
+    ],
+    "staged": [
+      [
+        "lan-rung-a"
+      ],
+      [
+        "lan-rung-b"
+      ]
+    ],
+    "wobbly": [
+      [
+        "lan-rung-a"
+      ],
+      [
+        "lan-rung-b"
+      ]
+    ],
+    "shifted": [
+      [
+        "cloud-small"
+      ],
+      [
+        "lan-rung-a"
+      ]
+    ],
+    "overflow": [
+      [
+        "cloud-big"
+      ]
+    ]
+  },
+  "profileFallbackAfterMs": {
+    "memory": [
+      300000
+    ],
+    "staged": [
+      60000,
+      300000
+    ],
+    // Delays need not increase: the earlier rung still wins once both are eligible.
+    "wobbly": [
+      900000,
+      0
+    ],
+    "shifted": [
+      0,
+      300000
+    ],
+    "overflow": [
+      300000
+    ]
+  },
+  "profileCloudEgress": [
+    "overflow"
+  ],
+  "localModelsUrl": "http://127.0.0.1:1/v1/models",
+  "localContextHeadroom": 0.6
+}
