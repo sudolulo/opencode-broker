@@ -1,6 +1,6 @@
 {
   "name": "opencode-broker",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "A model broker for opencode: leases cost-tiered local and cloud models to every concurrent session, balances subscription windows, keeps private profiles on the LAN, and fails over on provider errors. Includes an OpenAI-compatible gateway, a TUI cockpit and a subagent-session janitor.",
   "keywords": [
     "opencode",

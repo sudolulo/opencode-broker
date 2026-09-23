@@ -627,10 +627,15 @@ test("cached inventory publishes only authenticated catalog providers", async ()
     metered: { id: "metered", models: { expensive: { id: "expensive", tool_call: true } } },
   }));
   const calls = [];
-  await routing.publishCachedSubscriptionInventory({ cachePath, request: async (path, body) => {
-    calls.push({ path, body });
-    return { changed: true };
-  } });
+  await routing.publishCachedSubscriptionInventory({
+    cachePath,
+    // The host's resolver view, stubbed: the real one shells out to `opencode models --pure`.
+    listResolvableModels: () => new Set(["anthropic/claude-fable-5", "metered/expensive"]),
+    request: async (path, body) => {
+      calls.push({ path, body });
+      return { changed: true };
+    },
+  });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, "/inventory");
   assert.deepEqual(Object.keys(calls[0].body.providers), ["anthropic"]);
@@ -646,6 +651,165 @@ test("cached inventory errors are actionable", async () => withTempHome(async (h
   const invalid = join(home, "invalid.json");
   writeFileSync(invalid, "[]\n");
   await assert.rejects(routing.publishCachedSubscriptionInventory({ cachePath: invalid }), /opencode models --refresh/);
+}));
+
+// CRITICAL: models.dev is a CATALOG, not a resolver. On 2026-09-22 it published gpt-6-luna,
+// gpt-6-sol and gpt-6-astra; this deployment's OpenCode provider config admits none of
+// them, so discovery minted three targets the host could not resolve, they outranked the
+// static pins on release date, and every lease on them died with
+// `ProviderModelNotFoundError: Model not found: openai/gpt-6-luna` -- 11 worker-tier and
+// 8 deep-tier failures before anyone noticed. A model the host cannot resolve must never
+// become a candidate.
+test("discovery drops a catalog model the host cannot resolve", () => {
+  const catalog = {
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      models: {
+        "gpt-5.6-luna": { id: "gpt-5.6-luna", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-07-09" },
+        // Newer, and therefore the winner on every ranking the router applies -- which is
+        // exactly why an unresolvable model is worse than no model at all.
+        "gpt-6-luna": { id: "gpt-6-luna", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-09-22" },
+      },
+    }],
+  };
+  const discovery = R.discoverSubscriptionTargets(catalog, { openai: "oauth" }, {}, {
+    resolvableModels: ["openai/gpt-5.6-luna"],
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID), ["gpt-5.6-luna"]);
+  assert.deepEqual(discovery.skipped, [
+    { providerID: "openai", modelID: "gpt-6-luna", tiers: ["worker"], reason: "unresolvable" },
+  ]);
+});
+
+test("catalog metadata for an unresolvable model stays out of the inventory", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      models: {
+        "gpt-5.6-luna": { id: "gpt-5.6-luna", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-07-09",
+          limit: { context: 1050000, output: 128000 }, variants: { fast: {} } },
+        "gpt-6-luna": { id: "gpt-6-luna", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-09-22",
+          limit: { context: 1050000, output: 128000 }, variants: { fast: {} } },
+      },
+    }],
+  }, { openai: "oauth" }, {}, { resolvableModels: ["openai/gpt-5.6-luna"] });
+  assert.deepEqual(Object.keys(discovery.modelContexts), ["openai/gpt-5.6-luna"]);
+  assert.deepEqual(Object.keys(discovery.modelOutputs), ["openai/gpt-5.6-luna"]);
+  assert.deepEqual(Object.keys(discovery.modelVariants), ["openai/gpt-5.6-luna"]);
+});
+
+// The guard that needs no resolver view: a catalog id that is not a usable model
+// reference at all can never resolve, so it is dropped even when the caller handed us no
+// resolvable set -- and the tier keeps routing on its next candidate instead of going down.
+test("a malformed catalog model id is skipped and the worker tier keeps its next candidate", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      models: {
+        "gpt luna/6": { id: "gpt luna/6", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-09-22" },
+      },
+    }],
+  }, { openai: "oauth" }, {});
+  assert.deepEqual(Object.keys(discovery.targets), []);
+  assert.deepEqual(discovery.skipped, [
+    { providerID: "openai", modelID: "gpt luna/6", tiers: ["worker"], reason: "invalid-model-id" },
+  ]);
+  const choice = R.chooseTarget({
+    profile: "auto",
+    tier: "worker",
+    targets: { ...R.TARGETS, ...discovery.targets },
+  });
+  assert.equal(choice.target.id, "gpt-luna");
+  assert.equal(choice.target.modelID, "gpt-5.6-luna");
+});
+
+test("cached inventory publishes only models OpenCode can resolve", async () => withTempHome(async (home) => {
+  const routing = await freshRouting();
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
+  const cachePath = join(home, "models.json");
+  writeFileSync(cachePath, JSON.stringify({
+    openai: { id: "openai", models: {
+      // Neither model is a config pin, so both reach discovery on their own merits; only
+      // one of them is something this host's OpenCode can actually address.
+      "gpt-5.7-sol": { id: "gpt-5.7-sol", family: "gpt-sol", release_date: "2026-08-01", tool_call: true },
+      "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true },
+    } },
+  }));
+  const calls = [];
+  const published = await routing.publishCachedSubscriptionInventory({
+    cachePath,
+    listResolvableModels: () => new Set(["openai/gpt-5.7-sol"]),
+    request: async (path, body) => {
+      calls.push({ path, body });
+      return { changed: true };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.values(calls[0].body.targets).map((target) => target.modelID), ["gpt-5.7-sol"]);
+  // The skip is reported to the caller (the watch job logs it), never silently dropped.
+  assert.deepEqual(published.skipped, [
+    { providerID: "openai", modelID: "gpt-6-sol", tiers: ["smart"], reason: "unresolvable" },
+  ]);
+}));
+
+// CRITICAL: FAIL CLOSED. With no resolver view on disk the broker knows nothing about what this
+// host can address, so it admits nothing from the catalog and every tier stays on its
+// hand-pinned config targets. The opposite default -- no view, admit the whole catalog --
+// is precisely the failure being fixed.
+test("a missing resolver view fences catalog discovery off instead of admitting it", async () => withTempHome(async (home) => {
+  const routing = await freshRouting();
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
+  const cachePath = join(home, "models.json");
+  writeFileSync(cachePath, JSON.stringify({
+    openai: { id: "openai", models: {
+      "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true },
+    } },
+  }));
+  assert.equal(existsSync(routing.resolvableModelsPath()), false, "no snapshot has been written");
+  const calls = [];
+  const published = await routing.publishCachedSubscriptionInventory({ cachePath, request: async (path, body) => {
+    calls.push({ path, body });
+    return { ok: true, changed: true };
+  } });
+  assert.deepEqual(Object.keys(calls[0].body.targets), []);
+  assert.deepEqual(published.skipped.map((skip) => `${skip.providerID}/${skip.modelID}:${skip.reason}`),
+    ["openai/gpt-6-sol:unresolvable"]);
+  // The broker's own response still reaches the caller: plugin/router.js routes on `changed`.
+  assert.equal(published.changed, true);
+}));
+
+test("the resolver view snapshot is written from OpenCode's own model listing", async () => withTempHome(async () => {
+  const routing = await freshRouting();
+  const calls = [];
+  const view = routing.refreshResolvableModels({ exec: (command, args) => {
+    calls.push([command, ...args]);
+    return "openai/gpt-5.6-luna\nanthropic/claude-opus-5\n\nnot a model key\n";
+  } });
+  assert.deepEqual(calls, [["opencode", "models", "--pure"]]);
+  assert.deepEqual([...view].sort(), ["anthropic/claude-opus-5", "openai/gpt-5.6-luna"]);
+  // Written where the prompt path reads it, so no chat.message ever shells out.
+  assert.deepEqual([...routing.readResolvableModels()].sort(),
+    ["anthropic/claude-opus-5", "openai/gpt-5.6-luna"]);
+}));
+
+test("an unusable resolver listing fails loudly instead of writing an empty view", async () => withTempHome(async () => {
+  const routing = await freshRouting();
+  assert.throws(() => routing.refreshResolvableModels({ exec: () => { throw new Error("opencode: not found"); } }),
+    /opencode models --pure.*not found/);
+  assert.throws(() => routing.refreshResolvableModels({ exec: () => "\n" }), /empty resolver view/);
+  assert.equal(existsSync(routing.resolvableModelsPath()), false);
 }));
 
 // ☠️ An OAuth provider nobody has MAPPED gets no lane. Tier roles are a deployment

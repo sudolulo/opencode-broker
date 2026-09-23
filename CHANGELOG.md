@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] — 2026-09-23
+
+### Fixed
+
+- **Catalog discovery no longer admits models this host cannot resolve.** models.dev
+  is a catalog, not a resolver: it lists every model a vendor ships, while opencode
+  resolves only what the deployment's provider configuration admits. When the catalog
+  published `gpt-6-astra`, `gpt-6-luna` and `gpt-6-sol`, discovery minted targets for
+  all three, they outranked the configured pins on release date, and every lease on
+  them died client-side with `ProviderModelNotFoundError: Model not found:
+  openai/gpt-6-luna` — 11 worker-tier and 8 deep-tier failures, with no provider error
+  to trip a circuit, so the tiers stayed down. Discovery now intersects the catalog
+  with the host's own resolver view and drops what is not in it.
+
+### Added
+
+- **Resolver-view snapshot.** `opencode-broker-watch` now records what this host can
+  actually address (`opencode models --pure`) as `resolvable-models.json` in the
+  routing state directory, next to the model catalog it already refreshes. The
+  publication path inside `chat.message` reads that snapshot rather than running the
+  subprocess, so no prompt pays for it. A missing or unusable snapshot fails closed:
+  discovery admits nothing and every tier stays on its configured targets, rather than
+  admitting a catalog the host may not resolve. A failed or empty listing throws
+  instead of writing an empty view.
+- **Discovery admission is reported, never silent.** Every model dropped at admission
+  is returned to the caller with its provider, model id, would-be tiers and reason
+  (`unresolvable` or `invalid-model-id`); `opencode-broker-watch` logs one line each.
+  A model id that is not a usable model reference at all is dropped on shape alone,
+  with or without a resolver view.
+
 ## [1.11.0] — 2026-09-22
 
 ### Added

@@ -17,7 +17,7 @@ import { join } from "node:path";
 
 import { CONFIG } from "../lib/config.js";
 import { notifyArgv } from "../lib/notify.js";
-import { routingStateDir, publishCachedSubscriptionInventory } from "../lib/routing.js";
+import { routingStateDir, publishCachedSubscriptionInventory, refreshResolvableModels } from "../lib/routing.js";
 import { watchReport, formatReport } from "../lib/watch.js";
 
 const CACHE = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode/models.json");
@@ -42,8 +42,19 @@ try {
 // 2. Keep the broker's discovered inventory current even when no session is
 // chatting. Best-effort: a stopped broker is not this job's problem.
 try {
-  await publishCachedSubscriptionInventory();
+  // The resolver view rides with the catalog refresh above: models.dev says what OpenAI
+  // ships, `opencode models --pure` says what THIS host can address, and discovery admits
+  // only the intersection. Refreshed here because it costs a ~3s subprocess -- the
+  // chat.message publication path reads the snapshot instead.
+  const resolvable = refreshResolvableModels();
+  console.log(`resolver view refreshed: ${resolvable.size} models this host can address`);
+  const { skipped } = await publishCachedSubscriptionInventory();
   console.log("broker inventory republished from the fresh cache");
+  // A catalog model that would have taken a lane but which OpenCode cannot resolve is a
+  // real finding, not noise: it is why a tier went down on 2026-09-22. Name every one.
+  for (const skip of skipped) {
+    console.error(`discovery skipped ${skip.providerID}/${skip.modelID} (${skip.reason}) for ${skip.tiers.join(", ")}`);
+  }
 } catch (error) {
   console.error(`inventory republish skipped: ${error?.message ?? error}`);
 }
