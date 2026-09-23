@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] — 2026-09-23
+
+### Changed
+
+- **The usage log now keeps the prompt's cache split, so a burn-watch stop can be audited
+  after the fact.** Each `usage.jsonl` line recorded only `prompt` — the total of fresh
+  input, cache reads and cache writes — which is the size that has to fit the window but
+  cannot say how much of it was actually uncached. The burn watch stops a session on
+  exactly that distinction (`lib/burn-watch.js` counts a step as a full rewrite when fresh
+  input is at least half the prompt), yet the ledger it rode on threw the split away, and
+  opencode deletes a stopped session's own token history. So when a session was stopped for
+  "re-sending its whole prompt uncached", nothing on disk could confirm or refute it. The
+  record now also carries `input`, `cacheRead` and `cacheWrite`, always present including
+  zero — a `cacheRead: 0` beside a large `prompt` is the uncached-resend signal. `prompt`
+  keeps its exact meaning, and `opencode-broker usage` is unchanged.
+
 ## [1.13.0] — 2026-09-23
 
 ### Fixed
