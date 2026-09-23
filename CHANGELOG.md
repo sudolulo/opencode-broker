@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] — 2026-09-23
+
+### Fixed
+
+- **The daemon no longer trusts a publisher's inventory.** Model admission shipped in
+  1.12.0 lives in `plugin/router.js`, which every opencode process loads at spawn, so a
+  pane started before the fix keeps publishing the old unfiltered inventory on every
+  `chat.message`. Seconds after a clean `systemctl --user restart
+  opencode-model-broker.service` reported `discovered: []`, one such pane republished
+  `gpt-6-astra`, `gpt-6-luna` and `gpt-6-sol`, and `/preview` again routed the worker
+  tier at `openai/gpt-6-luna` — a model this host cannot resolve, so every worker-tier
+  session died with `ProviderModelNotFoundError`. `/inventory` ingest now applies the
+  same admission filter server-side: it intersects published targets with the host's
+  resolver-view snapshot, drops anything unresolvable or with a malformed model id, and
+  drops that model's `modelContexts`, `modelOutputs` and `modelVariants` entries with
+  it. The snapshot is read from disk per ingest, never by running `opencode models`.
+  Fail-closed matches the publisher: a missing or unusable snapshot admits nothing and
+  leaves every tier on its configured static pins. Every drop is logged with its
+  provider, model id and reason; the `/inventory` response contract is unchanged.
+
 ## [1.12.0] — 2026-09-23
 
 ### Fixed

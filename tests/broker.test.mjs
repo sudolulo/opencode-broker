@@ -56,8 +56,40 @@ const request = (socketPath, path, body = {}) => new Promise((resolve, reject) =
   req.end(payload);
 });
 
-const startBroker = async (home, extraEnv = {}) => {
+// The daemon's own resolver view (lib/routing.js `resolvableModelsPath`), i.e. what
+// `opencode models --pure` reports on this host. The /inventory ingest filter is
+// FAIL-CLOSED, so a daemon test without this file admits no discovered inventory at
+// all -- these are the model references the existing tests publish and expect to keep.
+const DEFAULT_RESOLVABLE_MODELS = [
+  "openai/gpt-5.6-luna",
+  "openai/gpt-test",
+  "alibaba-token-plan/qwen3.8-flash",
+  "alibaba-token-plan/deepseek-v4-flash-0731",
+  "anthropic/claude-fable-4-8",
+  "anthropic/claude-fable-5",
+];
+
+const writeResolvableModels = (home, models) => {
+  const routing = join(home, ".local/share/opencode/model-routing");
+  mkdirSync(routing, { recursive: true });
+  writeFileSync(join(routing, "resolvable-models.json"),
+    JSON.stringify({ updatedAt: Date.now(), models }));
+};
+
+const waitFor = async (predicate, description, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+// `resolvableModels: null` starts a daemon with NO resolver view on disk, which is the
+// fail-closed case; anything else is written before the daemon starts.
+const startBroker = async (home, extraEnv = {}, resolvableModels = DEFAULT_RESOLVABLE_MODELS) => {
   const socketPath = join(home, ".local/share/opencode/model-routing/broker.sock");
+  if (resolvableModels !== null) writeResolvableModels(home, resolvableModels);
   const child = spawn(process.execPath, [brokerScript, "serve"], {
     cwd: repoRoot,
     // Most broker tests isolate cloud selection. The local-share policy has dedicated
@@ -80,7 +112,8 @@ const startBroker = async (home, extraEnv = {}) => {
     child.once("error", reject);
     child.once("exit", (code, signal) => reject(new Error(`broker exited before listen (${code ?? signal}): ${stderr}`)));
   });
-  return { child, socketPath };
+  // The daemon reports what it drops on stderr; tests that assert on that read it here.
+  return { child, socketPath, stderr: () => stderr };
 };
 
 const stopBroker = async (child) => {
@@ -113,13 +146,13 @@ const startModelsServer = async (models) => {
   };
 };
 
-const withBroker = async (fn) => withTempHome(async (home) => {
+const withBroker = async (fn, { resolvableModels = DEFAULT_RESOLVABLE_MODELS } = {}) => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });
   writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
-  const { child, socketPath } = await startBroker(home);
+  const { child, socketPath, stderr } = await startBroker(home, {}, resolvableModels);
   try {
-    return await fn({ home, socketPath });
+    return await fn({ home, socketPath, stderr });
   } finally {
     await stopBroker(child);
   }
@@ -1272,4 +1305,119 @@ test("the first lease waits for a due plan refresh before admitting an exhausted
   } finally {
     await stopBroker(child);
   }
+}));
+
+// CRITICAL: THE DAEMON DOES NOT TRUST A PUBLISHER. Model admission (drop anything this host
+// cannot resolve) was first implemented in the PUBLISHER -- plugin/router.js, which every
+// opencode process loads at spawn and which re-publishes on every chat.message. A pane
+// started before an admission fix therefore keeps publishing the OLD unfiltered inventory
+// for its whole life, and re-poisons the broker within seconds of a restart. Measured
+// 2026-09-23: a clean `discovered: []` became `["gpt-6-astra","gpt-6-luna","gpt-6-sol"]`
+// again from a pre-existing pane, and every worker-tier lease died with
+// ProviderModelNotFoundError. The same filter therefore runs again at the ingest boundary,
+// where no client can be ahead of or behind the daemon.
+const discoveredFable = (modelID, releaseDate) => ({
+  id: `subscription-anthropic-${modelID}-standard`,
+  providerID: "anthropic",
+  modelID,
+  kind: "cloud",
+  capacity: null,
+  source: "subscription-oauth",
+  tiers: ["deep"],
+  family: "claude-fable",
+  releaseDate,
+  speed: "standard",
+});
+
+// The deep tier's two static pins, cleared so the DISCOVERED claude-fable family is what
+// the tier actually selects -- the same setup the model-not-found test above uses.
+const clearStaticDeepPins = async (socketPath) => {
+  await request(socketPath, "/failure", {
+    sessionID: "ses-ingest-quota",
+    targetID: "qwen-max",
+    error: { code: "insufficient_quota", message: "subscription quota exhausted" },
+  });
+  await request(socketPath, "/failure", {
+    sessionID: "ses-ingest-not-found",
+    targetID: "claude-fable-5-1",
+    error: { statusCode: 404, code: "model_not_found", message: "model: claude-fable-5-1 not found" },
+  });
+};
+
+const fableInventory = () => {
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  const unresolvable = discoveredFable("claude-fable-6", "2026-08-20");
+  const base = inventory({
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  });
+  return { older, unresolvable, body: { ...base, targets: { [older.id]: older, [unresolvable.id]: unresolvable } } };
+};
+
+test("/inventory refuses a published target this host cannot resolve and the tier falls back", async () => withBroker(async ({ socketPath }) => {
+  const { older, unresolvable, body } = fableInventory();
+  await request(socketPath, "/inventory", body);
+  await clearStaticDeepPins(socketPath);
+  // The point of the drop, asserted first: the tier must land on its next eligible
+  // candidate. Without the filter claude-fable-6 wins the family outright (newest
+  // release) and every lease on it dies at the provider.
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-ingest-fallback", profile: "auto", tier: "deep", replace: true,
+  });
+  assert.equal(lease.target.model.id, "claude-fable-5");
+  const status = await request(socketPath, "/status");
+  assert.equal(status.inventory.targets[unresolvable.id], undefined,
+    "a target for a model outside the resolver view is never stored");
+  assert.ok(status.inventory.targets[older.id], "the resolvable sibling is still stored");
+}));
+
+test("/inventory still stores a published target this host can resolve", async () => withBroker(async ({ socketPath }) => {
+  const { older, unresolvable, body } = fableInventory();
+  await request(socketPath, "/inventory", body);
+  await clearStaticDeepPins(socketPath);
+  const status = await request(socketPath, "/status");
+  assert.ok(status.inventory.targets[unresolvable.id], "a resolvable target is admitted, not suppressed");
+  assert.ok(status.inventory.targets[older.id]);
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-ingest-admitted", profile: "auto", tier: "deep", replace: true,
+  });
+  assert.equal(lease.target.model.id, "claude-fable-6");
+}, { resolvableModels: [...DEFAULT_RESOLVABLE_MODELS, "anthropic/claude-fable-6"] }));
+
+test("/inventory drops the catalog data of an unresolvable model with the model", async () => withBroker(async ({ socketPath }) => {
+  const { body } = fableInventory();
+  await request(socketPath, "/inventory", {
+    ...body,
+    modelContexts: { ...body.modelContexts, "anthropic/claude-fable-5": 200_000, "anthropic/claude-fable-6": 400_000 },
+    modelOutputs: { "anthropic/claude-fable-5": 32_000, "anthropic/claude-fable-6": 64_000 },
+    modelVariants: { "anthropic/claude-fable-5": ["high"], "anthropic/claude-fable-6": ["xhigh"] },
+  });
+  const status = await request(socketPath, "/status");
+  assert.equal(status.inventory.modelContexts["anthropic/claude-fable-6"], undefined,
+    "a window for a model that can never be leased would outlive the target that justified it");
+  assert.equal(status.inventory.modelOutputs["anthropic/claude-fable-6"], undefined);
+  assert.equal(status.inventory.modelVariants["anthropic/claude-fable-6"], undefined);
+  assert.equal(status.inventory.modelContexts["anthropic/claude-fable-5"], 200_000);
+  assert.equal(status.inventory.modelOutputs["anthropic/claude-fable-5"], 32_000);
+  assert.deepEqual(status.inventory.modelVariants["anthropic/claude-fable-5"], ["high"]);
+}));
+
+test("with no resolver view on disk /inventory admits nothing and the static pins still route", async () => withBroker(async ({ socketPath }) => {
+  const { body } = fableInventory();
+  await request(socketPath, "/inventory", body);
+  const status = await request(socketPath, "/status");
+  assert.deepEqual(status.inventory.targets, {},
+    "a missing snapshot means nothing is known to resolve, so nothing is admitted");
+  // Fail-closed must never strand a tier: every tier keeps its configured static pins,
+  // which this filter does not touch.
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-ingest-no-snapshot", profile: "auto", tier: "deep", replace: true,
+  });
+  assert.equal(lease.target.model.id, "claude-fable-5-1");
+}, { resolvableModels: null }));
+
+test("an ingest drop is reported, never swallowed", async () => withBroker(async ({ socketPath, stderr }) => {
+  const { body } = fableInventory();
+  await request(socketPath, "/inventory", body);
+  await waitFor(() => /anthropic\/claude-fable-6/.test(stderr()), "the daemon to report the dropped target");
+  assert.match(stderr(), /\[opencode-broker\].*inventory.*anthropic\/claude-fable-6/);
 }));
