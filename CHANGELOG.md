@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] — 2026-09-23
+
+### Added
+
+- **A profile's fallback rung can now be made to wait before it opens, with
+  `profileFallbackAfterMs`.** A rung has always opened the instant the profile's own lane had
+  nothing eligible, which is right for an interactive lane and wrong for a bursty background one
+  sharing a scarce target: "my lane is busy" arrives constantly, so the rung stops being overflow
+  and quietly becomes a second primary. The new setting takes one non-negative delay per rung,
+  positionally, and holds that rung shut until the caller has actually waited that long. A rung
+  with no entry opens immediately, so every rung that existed before this release behaves exactly
+  as it did — the setting can only ever delay a rung, never introduce one. Delays are attached to
+  their rung before the cloud-target drop that `profileCloudEgress` governs, so a rung deleted for
+  naming a cloud target on a LAN profile takes its delay with it instead of shifting another
+  rung's delay onto a neighbour. Once two rungs are both open the earlier authored one wins, so
+  delays need not increase.
+- **`/lease` accepts `waitedMs`,** the milliseconds a caller has already spent waiting for its
+  primary, and the gateway now reports it. The clock starts at the first *waitable* refusal rather
+  than at request arrival — a slow answer is latency, not time spent queuing — and resets for each
+  upstream forward attempt, because attempt two has not waited for anything yet. The request
+  deadline stays shared across attempts, so a retry still cannot buy itself a second full wait
+  window. A zero-budget caller never accrues a wait, preserving tell-me-now behaviour. An invalid
+  value is refused rather than coerced: read as 0 it would hold a delayed rung shut forever, and
+  read as huge it would surrender a scarce slot immediately.
+- **`/preview` reports `delayedProfileFallbacks`.** A preview answers for the present moment, so a
+  rung that is merely *not yet* open reads as `null` — indistinguishable from a profile that has no
+  fallback at all. The new field names each delayed rung and its threshold so a reader can tell
+  "nothing behind this" from "not yet". The existing `preview` object is unchanged.
+
+Two paths deliberately ignore the delay. Refusal classification keeps seeing every rung, so a
+full-but-delayed rung still reads as `target-busy` — "keep waiting" — rather than "no target
+exists"; on a lane where a refusal is a permanently lost record, that distinction is the whole
+difference. The context-overflow last resort also keeps seeing every rung, so a session too big
+for every window is never denied the roomiest one merely because its clock has not run out.
+
+### Fixed
+
+- **A profile whose only local target sat in a fallback rung could never reach it.** The
+  resident-model set was fetched only when the profile's *primary* lane named a local target, and
+  a local target judged without that set is ineligible by definition — so a profile with a cloud
+  primary and a local rung behind it refused forever, reporting "no eligible target" rather than
+  naming the rung. Residency is now fetched whenever a local target appears anywhere in the
+  profile's eligible set. This shape was previously unused, and a per-rung delay invites it.
+
 ## [1.14.0] — 2026-09-23
 
 ### Changed
