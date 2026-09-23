@@ -254,10 +254,13 @@ move off a saturated model is a routing decision.
 ## Tuning local windows: the usage log
 
 Every provider request's size lands in `usage.jsonl` in the routing state directory:
-session, model, the lease's target and lane, and `prompt` (everything the model read) and
-`output` tokens. opencode deletes subagent and workflow child sessions when their work is
-done, and their token history goes with them, so this is the record that survives. It is
-also the only one with each session's real PEAK: a lease records a session's size when its
+session, model, the lease's target and lane, `prompt` (everything the model read) and
+`output` tokens, and that prompt split into `input`, `cacheRead` and `cacheWrite`. The split
+is always written, zeroes included: after a burn-watch stop the question is whether the
+session was re-sending an uncached prompt, and `cacheRead: 0` is exactly that signal, so the
+total alone cannot answer it. opencode deletes subagent and workflow child sessions when their
+work is done, and their token history goes with them, so this is the record that survives. It
+is also the only one with each session's real PEAK: a lease records a session's size when its
 turn starts, and a subagent's long turn grows well past that. `opencode-broker usage [days]`
 (default 7) prints, per model, request and session-peak percentiles, and for each local target
 how many session peaks fit what it routes (`context` minus `outputReserve`, else the headroom

@@ -417,6 +417,8 @@ test("every /usage report is logged with its prompt size, and the usage command 
   }
   const lines = readFileSync(join(home, ".local/share/opencode/model-routing/usage.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(lines.map((line) => [line.sessionID, line.prompt, line.local]), [["ses-a", 1_000, false], ["ses-a", 40_000, false], ["ses-b", 5_000, false]]);
+  // The cache split survives to disk, zeroes included: without it a burn-watch stop cannot be audited.
+  assert.deepEqual(lines.map((line) => [line.input, line.cacheRead, line.cacheWrite]), [[1_000, 0, 0], [40_000, 0, 0], [5_000, 0, 0]]);
   const { spawnSync } = await import("node:child_process");
   const report = spawnSync(process.execPath, [brokerScript, "usage", "1"], { env: { ...process.env, HOME: home }, encoding: "utf8" });
   assert.equal(report.status, 0, report.stderr);
@@ -465,7 +467,9 @@ test("a gateway caller is recorded on the session's decisions and usage lines", 
   for (const line of mine) assert.deepEqual(line.caller, caller);
   assert.ok(decisions.filter((line) => line.sessionID === "gw-junk").every((line) => line.caller === undefined), "junk is dropped, never logged raw");
   const usage = readFileSync(join(dir, "usage.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  assert.deepEqual(usage.find((line) => line.sessionID === "gw-caller").caller, caller);
+  const gatewayUsage = usage.find((line) => line.sessionID === "gw-caller");
+  assert.deepEqual(gatewayUsage.caller, caller);
+  assert.deepEqual([gatewayUsage.input, gatewayUsage.cacheRead, gatewayUsage.cacheWrite], [10, 0, 0]);
 }));
 
 test("a configured-but-unloaded local model is not routable", async () => withTempHome(async (home) => {

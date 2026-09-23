@@ -104,7 +104,7 @@ const logDecision = (record) => {
 // The usage log (lib/usage-log.js): one line per provider request with the prompt size it
 // actually carried, for tuning local windows. ROTATED rather than truncated, unlike the
 // decision trace: a size distribution is only worth anything with history behind it, so the
-// previous generation is kept as usage.jsonl.1 (~2 x 8 MB, several weeks of a busy host).
+// previous generation is kept as usage.jsonl.1 (~2 x 8 MB, ~2-3 weeks of a busy host).
 const USAGE_LOG = join(routingStateDir(), "usage.jsonl");
 const USAGE_LOG_MAX = 8 * 1024 * 1024;
 const logUsage = (record) => {

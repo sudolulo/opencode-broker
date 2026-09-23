@@ -10,9 +10,27 @@ test("a record's prompt is everything the model read: input, cache reads and cac
   });
   assert.deepEqual(record, {
     at: 1, sessionID: "ses_a", providerID: "llamacpp", modelID: "small", targetID: "local-coder",
-    profile: "auto", tier: "worker", prompt: 21_500, output: 300, local: true,
+    profile: "auto", tier: "worker", prompt: 21_500, input: 1_000, cacheRead: 20_000, cacheWrite: 500,
+    output: 300, local: true,
   });
+  assert.equal(record.prompt, record.input + record.cacheRead + record.cacheWrite, "the total is the split added back up");
   assert.equal(usageRecord({ at: 1, providerID: "x", tokens: {} }).targetID, null, "no lease is recorded as null, not guessed");
+});
+
+// Why the split is kept and not just the total: after a burn-watch stop, the only question that
+// matters is whether the session was re-sending an uncached prompt. `prompt` alone cannot answer it.
+test("a fully uncached prompt and a fully cached one of the same size are distinguishable", () => {
+  const rec = (tokens) => usageRecord({ at: 1, sessionID: "ses_a", providerID: "anthropic", modelID: "m", tokens, local: false });
+  const uncached = rec({ input: 270_000, output: 500, cacheRead: 0, cacheWrite: 0 });
+  const cached = rec({ input: 1_000, output: 500, cacheRead: 269_000, cacheWrite: 0 });
+  assert.equal(uncached.prompt, cached.prompt, "the same size prompt, so the same `prompt`");
+  assert.equal(uncached.input, 270_000);
+  assert.equal(uncached.cacheRead, 0, "a zero cache read is the signal, so it is recorded, not omitted");
+  assert.ok("cacheRead" in uncached, "the field is always present");
+  assert.equal(cached.input, 1_000);
+  assert.equal(cached.cacheRead, 269_000);
+  assert.equal(uncached.cacheWrite, 0);
+  assert.equal(cached.cacheWrite, 0);
 });
 
 test("the summary reports each session's PEAK, not its lease-time size, and what fits each local window", () => {
