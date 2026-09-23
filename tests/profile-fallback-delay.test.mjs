@@ -144,3 +144,64 @@ test("a non-object profileFallbackAfterMs map is ignored safely", () => {
     assert.equal(errorLines(stderr, "profileFallbackAfterMs must be an object").length, 1);
   }
 });
+
+// Ordinary selection: a rung is only a candidate once the caller has waited out its delay.
+// The primary is held full so that every one of these turns on the rung alone.
+const fullPrimary = { "lan-primary": 1 };
+const lanResident = resident("lan-primary-9b", "lan-rung-a-27b", "lan-rung-b-4b");
+
+const choose = (profile, waitedMs) =>
+  R.chooseTarget({
+    profile,
+    tier: "worker",
+    active: fullPrimary,
+    localModels: lanResident,
+    contextTokens: CONTEXT,
+    ...(waitedMs === undefined ? {} : { waitedMs }),
+  });
+
+test("a delayed rung is not selected before its threshold", () => {
+  assert.equal(choose("memory", 299_999), null);
+});
+
+test("a delayed rung is selected at its threshold", () => {
+  assert.equal(choose("memory", 300_000).target.id, "lan-rung-a");
+});
+
+test("a rung with no delay entry is selected immediately", () => {
+  assert.equal(choose("assist", 0).target.id, "lan-rung-a");
+});
+
+test("staged rungs open in order and the earliest eligible group keeps winning", () => {
+  assert.equal(choose("staged", 59_999), null);
+  assert.equal(choose("staged", 60_000).target.id, "lan-rung-a");
+  assert.equal(choose("staged", 299_999).target.id, "lan-rung-a");
+  // Both groups are open here; filtering preserves group order, so the earliest still wins.
+  assert.equal(choose("staged", 300_000).target.id, "lan-rung-a");
+});
+
+test("a non-monotonic delay list serves whichever rung is open", () => {
+  assert.equal(choose("wobbly", 0).target.id, "lan-rung-b");
+  assert.equal(choose("wobbly", 900_000).target.id, "lan-rung-a");
+});
+
+test("an omitted waitedMs behaves as zero elapsed", () => {
+  assert.equal(choose("memory", undefined), null);
+});
+
+// The last-resort rescue for an oversized session must keep seeing EVERY rung, delayed or not.
+// It is the one path whose refusal is unrecoverable: the session cannot run and cannot compact.
+test("context-overflow rescue keeps seeing unfiltered delayed rungs", () => {
+  const choice = R.chooseTarget({
+    profile: "overflow",
+    tier: "worker",
+    active: {},
+    contextTokens: 100_000,
+    waitedMs: 0,
+  });
+  assert.equal(choice.target.id, "cloud-big");
+  // Pin the path as well as the target: cloud-big is only reachable here THROUGH the rescue,
+  // because its 300000ms delay excludes it from ordinary selection at waitedMs 0. Without this
+  // the test would still pass if the delay filter were removed altogether.
+  assert.equal(choice.decision.policy, "context-overflow-last-resort");
+});
