@@ -1421,3 +1421,144 @@ test("an ingest drop is reported, never swallowed", async () => withBroker(async
   await waitFor(() => /anthropic\/claude-fable-6/.test(stderr()), "the daemon to report the dropped target");
   assert.match(stderr(), /\[opencode-broker\].*inventory.*anthropic\/claude-fable-6/);
 }));
+
+// CRITICAL: THE DAEMON MUST NOT TRUST ITS OWN STATE FILE EITHER. Filtering at /inventory
+// only covers what a live client publishes; broker.json is the OTHER way discovered
+// inventory enters the process. A daemon poisoned before the ingest filter existed --
+// or by any pane still running pre-fix plugin code -- persists those targets to disk, and
+// the next restart loads them straight back into routing WITHOUT any client publishing
+// anything. Measured on this host 2026-09-23: broker.json held gpt-6-astra/-luna/-sol, so
+// a restart would have routed worker and deep to unresolvable models until the first
+// ingest happened to land. The admission filter therefore runs at load as well.
+//
+// A daemon started against a broker.json that ALREADY holds discovered inventory -- i.e.
+// every real restart. State is written BEFORE the process starts, so whatever the daemon
+// comes up with is exactly what readState admitted, with no /inventory call involved.
+const withStateFile = async (stateInventory, fn, { resolvableModels = DEFAULT_RESOLVABLE_MODELS } = {}) =>
+  withTempHome(async (home) => {
+    const shared = join(home, ".local/share/opencode");
+    mkdirSync(shared, { recursive: true });
+    const authPath = join(shared, "auth.json");
+    // anthropic proves OAuth so that a reloaded claude-fable target can only be dropped by
+    // the resolver view, never by admission revalidation.
+    writeFileSync(authPath, JSON.stringify({ test: { type: "oauth" }, anthropic: { type: "oauth" } }));
+    const contents = readFileSync(authPath);
+    const stat = statSync(authPath);
+    mkdirSync(join(shared, "model-routing"), { recursive: true });
+    writeFileSync(join(shared, "model-routing/broker.json"), JSON.stringify({
+      version: 4,
+      leases: {},
+      assignments: {},
+      circuits: {},
+      cursors: {},
+      inventory: {
+        providers: { anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 } },
+        modelContexts: {},
+        modelOutputs: {},
+        modelVariants: {},
+        ...stateInventory,
+        // Matches the live auth.json, so the stored inventory is reloaded as-is rather
+        // than being rebuilt by the auth-rotation path.
+        authRevision: `${Math.trunc(stat.mtimeMs)}:${stat.size}:${createHash("sha256").update(contents).digest("hex")}`,
+        updatedAt: Date.now(),
+      },
+      health: {},
+      budgets: {},
+      lastDecision: null,
+      planUsage: {},
+      rebalances: {},
+    }));
+    const { child, socketPath, stderr } = await startBroker(home, {}, resolvableModels);
+    try {
+      return await fn({ home, socketPath, stderr });
+    } finally {
+      await stopBroker(child);
+    }
+  });
+
+test("a stored target this host cannot resolve is never routable after load", async () => {
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  const unresolvable = discoveredFable("claude-fable-6", "2026-08-20");
+  return withStateFile({ targets: { [older.id]: older, [unresolvable.id]: unresolvable } }, async ({ socketPath }) => {
+    await clearStaticDeepPins(socketPath);
+    // The point of the drop, asserted first: the tier must land on its next eligible
+    // candidate. Reloaded unfiltered, claude-fable-6 wins the family outright (newest
+    // release) and every deep lease dies at the provider -- with no client involved.
+    const lease = await request(socketPath, "/lease", {
+      sessionID: "ses-load-fallback", profile: "auto", tier: "deep", replace: true,
+    });
+    assert.equal(lease.target.model.id, "claude-fable-5");
+    const status = await request(socketPath, "/status");
+    assert.equal(status.inventory.targets[unresolvable.id], undefined,
+      "a stored target outside the resolver view is dropped at load, not resurrected");
+    assert.ok(status.inventory.targets[older.id], "the resolvable sibling is still reloaded");
+  });
+});
+
+test("a stored target this host can resolve survives load", async () => {
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  return withStateFile({ targets: { [older.id]: older } }, async ({ socketPath }) => {
+    const status = await request(socketPath, "/status");
+    assert.ok(status.inventory.targets[older.id], "a resolvable stored target is reloaded, not suppressed");
+    await clearStaticDeepPins(socketPath);
+    const lease = await request(socketPath, "/lease", {
+      sessionID: "ses-load-admitted", profile: "auto", tier: "deep", replace: true,
+    });
+    assert.equal(lease.target.model.id, "claude-fable-5");
+  });
+});
+
+test("stored catalog data for an unresolvable model is dropped at load with the model", async () => {
+  const unresolvable = discoveredFable("claude-fable-6", "2026-08-20");
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  return withStateFile({
+    targets: { [older.id]: older, [unresolvable.id]: unresolvable },
+    modelContexts: { "anthropic/claude-fable-5": 200_000, "anthropic/claude-fable-6": 400_000 },
+    modelOutputs: { "anthropic/claude-fable-5": 32_000, "anthropic/claude-fable-6": 64_000 },
+    modelVariants: { "anthropic/claude-fable-5": ["high"], "anthropic/claude-fable-6": ["xhigh"] },
+  }, async ({ socketPath }) => {
+    const status = await request(socketPath, "/status");
+    assert.equal(status.inventory.modelContexts["anthropic/claude-fable-6"], undefined,
+      "a reloaded window for a model that can never be leased would outlive its target");
+    assert.equal(status.inventory.modelOutputs["anthropic/claude-fable-6"], undefined);
+    assert.equal(status.inventory.modelVariants["anthropic/claude-fable-6"], undefined);
+    assert.equal(status.inventory.modelContexts["anthropic/claude-fable-5"], 200_000);
+    assert.equal(status.inventory.modelOutputs["anthropic/claude-fable-5"], 32_000);
+    assert.deepEqual(status.inventory.modelVariants["anthropic/claude-fable-5"], ["high"]);
+  });
+});
+
+test("with no resolver view on disk a stored inventory is not reloaded and the static pins still route", async () => {
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  const unresolvable = discoveredFable("claude-fable-6", "2026-08-20");
+  return withStateFile({ targets: { [older.id]: older, [unresolvable.id]: unresolvable } }, async ({ socketPath }) => {
+    const status = await request(socketPath, "/status");
+    // claude-fable-5 is resolvable on a normal host, so its loss here proves the MISSING
+    // snapshot did it: load is fail-closed exactly like ingest.
+    assert.deepEqual(status.inventory.targets, {},
+      "a missing snapshot means nothing is known to resolve, so nothing is reloaded");
+    const lease = await request(socketPath, "/lease", {
+      sessionID: "ses-load-no-snapshot", profile: "auto", tier: "deep", replace: true,
+    });
+    assert.equal(lease.target.model.id, "claude-fable-5-1");
+  }, { resolvableModels: null });
+});
+
+test("a load-time drop is reported, never swallowed", async () => {
+  const unresolvable = discoveredFable("claude-fable-6", "2026-08-20");
+  return withStateFile({ targets: { [unresolvable.id]: unresolvable } }, async ({ stderr }) => {
+    await waitFor(() => /anthropic\/claude-fable-6/.test(stderr()), "the daemon to report the dropped stored target");
+    assert.match(stderr(), /\[opencode-broker\].*broker\.json.*anthropic\/claude-fable-6/);
+  });
+});
+
+test("a clean restart reports no load-time drops", async () => {
+  const older = discoveredFable("claude-fable-5", "2026-05-01");
+  return withStateFile({ targets: { [older.id]: older } }, async ({ socketPath, stderr }) => {
+    // Reaching /status proves the daemon finished loading, so silence here is a real
+    // absence rather than a race.
+    await request(socketPath, "/status");
+    assert.doesNotMatch(stderr(), /dropped/,
+      "a normal start has nothing to report and must stay quiet");
+  });
+});

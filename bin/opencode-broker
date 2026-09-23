@@ -185,27 +185,45 @@ const emptyInventory = () => ({ targets: {}, providers: {}, modelContexts: {}, m
 const authRevision = () => authSnapshot().revision;
 const authTypes = () => authSnapshot().types;
 const emptyHealth = () => normalizeHealth({});
-// What the ingest filter refused, on stderr. A poisoned publication is the operator's
+// What an admission filter refused, on stderr. A poisoned publication is the operator's
 // only signal that some pane is still running pre-fix plugin code, so it is reported on
 // every ingest rather than once: it stops when the offending publisher does. The name
 // list is bounded because a missing resolver view drops the whole catalog at once.
-const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }) => {
+// `source` names the boundary that refused it -- `/inventory` for a client publication,
+// `broker.json` for the stored inventory reloaded at startup -- because the two call for
+// different operator action: a live publisher to find versus a state file already written.
+// Nothing is logged when nothing was dropped, so a clean start stays silent.
+const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }, source = "/inventory") => {
   const overflow = (list, shown) => (list.length > shown ? `, and ${list.length - shown} more` : "");
   if (droppedTargets.length) {
     const named = droppedTargets.slice(0, 10)
       .map((drop) => `${drop.providerID}/${drop.modelID} (${drop.reason})`).join(", ");
-    console.error(`[opencode-broker] /inventory dropped ${droppedTargets.length} target(s) this host cannot resolve: ${named}${overflow(droppedTargets, 10)}`);
+    console.error(`[opencode-broker] ${source} dropped ${droppedTargets.length} target(s) this host cannot resolve: ${named}${overflow(droppedTargets, 10)}`);
   }
   if (droppedModelKeys.length) {
     const named = droppedModelKeys.slice(0, 10).join(", ");
-    console.error(`[opencode-broker] /inventory dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
+    console.error(`[opencode-broker] ${source} dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
   }
 };
 const emptyState = () => ({ version: 4, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {} });
 const readState = () => {
   try {
     const value = JSON.parse(readFileSync(STATE_PATH, "utf8"));
-    const inventory = normalizeDiscoveredInventory(value?.inventory);
+    // CRITICAL: THE DAEMON DOES NOT TRUST ITS OWN STATE FILE. /inventory is only one of the
+    // two ways discovered inventory enters this process; the other is this reload. A daemon
+    // poisoned before the ingest filter existed -- or by any pane still publishing pre-fix --
+    // has already written those targets to broker.json, and without this they come straight
+    // back at the next restart with no client involved (measured on this host 2026-09-23:
+    // broker.json held gpt-6-astra/-luna/-sol, so a restart routed worker and deep to
+    // unresolvable models until some later ingest happened to clean them out).
+    //
+    // Same filter, same fail-closed semantics as ingest: a missing or unusable resolver view
+    // admits NOTHING, which leaves every tier on its configured static pins -- the known-good
+    // ones, which this filter never touches. Scope is the DISCOVERED inventory only; every
+    // other field below keeps its existing shape-normalization behavior untouched.
+    const admitted = admitResolvableInventory(normalizeDiscoveredInventory(value?.inventory), readResolvableModels());
+    reportInventoryDrops(admitted, "broker.json");
+    const inventory = admitted.inventory;
     const health = normalizeHealth(value?.health);
     // Restore the plan-usage readings the previous process had. Without this the
     // cache is empty on boot, nothing counts as OBSERVED, and the unobserved

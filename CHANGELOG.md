@@ -23,6 +23,19 @@ All notable changes to this project are documented here. The format is based on
   Fail-closed matches the publisher: a missing or unusable snapshot admits nothing and
   leaves every tier on its configured static pins. Every drop is logged with its
   provider, model id and reason; the `/inventory` response contract is unchanged.
+- **A restart no longer resurrects unresolvable targets from `broker.json`.** Ingest is
+  only one of the two ways discovered inventory enters the daemon; the other is the
+  state file it reloads at startup. A daemon poisoned before the filter existed has
+  already persisted those targets, so `gpt-6-astra`, `gpt-6-luna` and `gpt-6-sol` came
+  back on the next restart with no client publishing anything, routing the deep, worker
+  and smart tiers at models this host cannot resolve until some later ingest happened to
+  clean them out. `readState` now applies the same admission filter to the stored
+  inventory, with the same fail-closed semantics: a missing or unusable resolver-view
+  snapshot admits nothing and every tier keeps its configured static pins. Scope is the
+  discovered inventory alone — leases, circuits, health, budgets and plan usage keep
+  their existing shape-normalization. A load-time drop is reported on stderr as
+  `broker.json` rather than `/inventory`, so the operator can tell a state file already
+  on disk from a publisher still running; a clean start logs nothing.
 
 ## [1.12.0] — 2026-09-23
 
