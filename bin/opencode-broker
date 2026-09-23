@@ -651,6 +651,16 @@ const acquire = async (state, request) => {
     (typeof request.contextTokens === "number" || typeof request.contextTokens === "string")
     ? Math.floor(rawContext)
     : null;
+  // How long this caller has ALREADY waited for its primary in the current lease loop. A rung
+  // carrying a configured delay only becomes selectable once this reaches it.
+  // ☠️ Refused, not coerced. A bad value silently read as 0 would hold a delayed rung shut
+  // forever, and one silently read as huge would hand over a scarce shared slot immediately --
+  // the two failures this whole mechanism exists to prevent, both of them invisible in a log.
+  const hasWaitedMs = request.waitedMs !== undefined;
+  const waitedMs = hasWaitedMs ? request.waitedMs : 0;
+  if (hasWaitedMs && (typeof waitedMs !== "number" || !Number.isFinite(waitedMs) || waitedMs < 0)) {
+    throw new Error("waitedMs must be a non-negative finite number");
+  }
   const preferredModel = typeof request.preferredModel?.providerID === "string" && request.preferredModel.providerID &&
     typeof request.preferredModel?.id === "string" && request.preferredModel.id
     ? {
@@ -780,13 +790,23 @@ const acquire = async (state, request) => {
     modelContexts: state.inventory?.modelContexts ?? {},
     modelOutputs: state.inventory?.modelOutputs ?? {},
     budgets: state.budgets ?? {},
+    // Carried on `selection` so the context-pressure retry below inherits it through `...selection`.
+    // Passing it only to the ordinary call would make a delayed rung unreachable for exactly the
+    // oversized sessions that most need the roomier target.
+    waitedMs,
   };
   // ☠️ A local-only request needs the resident-model set NO MATTER what the primary lane
   // holds. Residency is only fetched when the lane itself names a local target, and an
   // `auto` tier whose local target sits in a FALLBACK rung (build's last rung is exactly
   // that) would otherwise be judged with localModels undefined -- where every local
   // target is ineligible by definition, so a local-only lease could never succeed there.
-  const includesLocal = localOnlyRequest || targetIDsFor(profile, tier, targets)
+  // ☠️ Rungs count, which is why this reads targetEligibleIDsFor and not targetIDsFor. A profile
+  // whose only local target sits in a FALLBACK rung -- a cloud primary with a local rung behind
+  // it, the shape a per-rung delay invites -- would otherwise be judged with localModels
+  // undefined, where every local target is ineligible by definition. The rung would then be
+  // unreachable no matter how long the caller waited, and the refusal would read as
+  // "no eligible target" rather than naming the rung.
+  const includesLocal = localOnlyRequest || targetEligibleIDsFor(profile, tier, targets)
     .map((targetID) => targetForID(targetID, targets))
     .some((target) => target?.kind === "local");
   let availableModels;
@@ -1411,12 +1431,21 @@ const serve = async () => {
             modelContexts: state.inventory?.modelContexts ?? {},
             modelOutputs: state.inventory?.modelOutputs ?? {},
             budgets: state.budgets ?? {},
+            // A preview is a snapshot of NOW, and nobody has waited yet.
+            waitedMs: 0,
           });
           preview[tier] = choice
             ? publicTarget(choice.target, tier, state.inventory?.modelVariants)
             : null;
         }
-        return reply(response, 200, { preview });
+        // ☆ Additive, and load-bearing for honesty: at waitedMs 0 a delayed rung is invisible to
+        // the selection above, so a lane whose only fallback is delayed previews as a bare null --
+        // indistinguishable from "this profile has no fallback at all". Publishing the rungs and
+        // their thresholds lets a reader tell "nothing behind this" from "not yet".
+        const delayedProfileFallbacks = (CONFIG.profileFallbacks?.[profile] ?? [])
+          .map((targetIDs, index) => ({ targetIDs: [...targetIDs], afterMs: CONFIG.profileFallbackAfterMs?.[profile]?.[index] ?? 0 }))
+          .filter((rung) => rung.afterMs > 0);
+        return reply(response, 200, { preview, delayedProfileFallbacks });
       }
       if (request.url === "/decisions") {
         let lines = [];

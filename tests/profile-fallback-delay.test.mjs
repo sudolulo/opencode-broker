@@ -205,3 +205,144 @@ test("context-overflow rescue keeps seeing unfiltered delayed rungs", () => {
   // the test would still pass if the delay filter were removed altogether.
   assert.equal(choice.decision.policy, "context-overflow-last-resort");
 });
+
+// --- The value has to survive the trip from the gateway, not just work inside chooseTarget. ---
+// These run a REAL broker: an implementation that adds waitedMs to chooseTarget but drops it in
+// the lease handler passes every unit test above and is completely inert in production.
+const brokerScript = fileURLToPath(new URL("../bin/opencode-broker", import.meta.url));
+
+const postRaw = (socketPath, path, payload) => new Promise((resolve, reject) => {
+  const req = http.request({
+    socketPath, path, method: "POST",
+    headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+  }, (res) => {
+    let text = "";
+    res.setEncoding("utf8");
+    res.on("data", (c) => { text += c; });
+    res.on("end", () => { try { resolve({ statusCode: res.statusCode, body: JSON.parse(text) }); } catch (error) { reject(error); } });
+  });
+  req.on("error", reject);
+  req.end(payload);
+});
+
+const post = (socketPath, path, body = {}) => postRaw(socketPath, path, JSON.stringify(body));
+
+const withBroker = async ({ resident = () => [] } = {}, run) => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-delay-broker-"));
+  const models = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: resident().map((id) => ({ id, status: { value: "loaded" } })) }));
+  });
+  await new Promise((resolve) => models.listen(0, "127.0.0.1", resolve));
+  mkdirSync(join(home, ".local/share/opencode"), { recursive: true });
+  writeFileSync(join(home, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }));
+  const env = {
+    ...process.env, HOME: home,
+    OPENCODE_BROKER_CONFIG: fixturePath,
+    OPENCODE_BROKER_LOCAL_MODELS_URL: `http://127.0.0.1:${models.address().port}/v1/models`,
+  };
+  let stderr = "";
+  const child = spawn(process.execPath, [brokerScript, "serve"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => {
+    child.stdout.on("data", (c) => { if (String(c).includes("listening on ")) resolve(); });
+    child.stderr.on("data", (c) => { stderr += String(c); });
+    child.once("error", reject);
+    child.once("exit", (code) => reject(new Error(`broker exited before listen (${code}): ${stderr}`)));
+  });
+  try {
+    return await run({ socketPath: join(home, ".local/share/opencode/model-routing/broker.sock"), home, env });
+  } finally {
+    child.kill("SIGKILL");
+    models.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+};
+
+test("a delayed rung is a wait before its threshold and a lease after it", async () => {
+  await withBroker({ resident: () => ["lan-primary-9b", "lan-rung-a-27b"] }, async ({ socketPath }) => {
+    const holder = await post(socketPath, "/lease", {
+      sessionID: "ses-holder", profile: "memory", tier: "worker", contextTokens: CONTEXT,
+    });
+    assert.equal(holder.statusCode, 200);
+    assert.equal(holder.body.target.id, "lan-primary");
+
+    const early = await post(socketPath, "/lease", {
+      sessionID: "ses-memory-early", profile: "memory", tier: "worker", contextTokens: CONTEXT, waitedMs: 299_999,
+    });
+    assert.equal(early.statusCode, 400);
+    // ☆ A wait, NOT a refusal: the delayed rung must stay visible to the busy computation,
+    // or a caller that should keep waiting is told to give up instead.
+    assert.equal(early.body.code, "target-busy");
+
+    const elapsed = await post(socketPath, "/lease", {
+      sessionID: "ses-memory-elapsed", profile: "memory", tier: "worker", contextTokens: CONTEXT, waitedMs: 300_000,
+    });
+    assert.equal(elapsed.statusCode, 200);
+    assert.equal(elapsed.body.target.id, "lan-rung-a");
+  });
+});
+
+// The busy computation reads targetEligibleIDsFor(), which is deliberately NOT delay-filtered.
+// If a future change moved the delay filter down into fallbackTargetGroupsFor(), the rung would
+// vanish from busy and a caller that should keep waiting would be told no target exists at all.
+// Naming both models in the refusal is the direct evidence that the delayed rung is still counted.
+test("a delayed rung that is full still counts as busy, not as a missing target", async () => {
+  await withBroker({ resident: () => ["lan-primary-9b", "lan-rung-a-27b"] }, async ({ socketPath }) => {
+    const primary = await post(socketPath, "/lease", {
+      sessionID: "ses-fill-primary", profile: "memory", tier: "worker", contextTokens: CONTEXT,
+    });
+    assert.equal(primary.body.target.id, "lan-primary");
+    const rung = await post(socketPath, "/lease", {
+      sessionID: "ses-fill-rung", profile: "memory", tier: "worker", contextTokens: CONTEXT, waitedMs: 300_000,
+    });
+    assert.equal(rung.body.target.id, "lan-rung-a");
+
+    const refused = await post(socketPath, "/lease", {
+      sessionID: "ses-both-full", profile: "memory", tier: "worker", contextTokens: CONTEXT, waitedMs: 0,
+    });
+    assert.equal(refused.statusCode, 400);
+    assert.equal(refused.body.code, "target-busy");
+    assert.match(refused.body.error, /lan-primary-9b and lan-rung-a-27b are busy/);
+  });
+});
+
+test("an invalid waitedMs is refused rather than silently read as elapsed", async () => {
+  await withBroker({ resident: () => ["lan-primary-9b", "lan-rung-a-27b"] }, async ({ socketPath }) => {
+    for (const waitedMs of [-1, "300000", null]) {
+      const res = await post(socketPath, "/lease", {
+        sessionID: "ses-bad", profile: "memory", tier: "worker", contextTokens: CONTEXT, waitedMs,
+      });
+      assert.equal(res.statusCode, 400, `waitedMs=${JSON.stringify(waitedMs)}`);
+      assert.match(res.body.error, /waitedMs must be a non-negative finite number/);
+    }
+    // JSON.stringify(Infinity) emits `null`, so the only way to exercise the non-finite branch
+    // is a raw body: JSON.parse turns 1e309 into Infinity.
+    const infinite = await postRaw(socketPath, "/lease",
+      '{"sessionID":"ses-inf","profile":"memory","tier":"worker","contextTokens":100,"waitedMs":1e309}');
+    assert.equal(infinite.statusCode, 400);
+    assert.match(infinite.body.error, /waitedMs must be a non-negative finite number/);
+  });
+});
+
+test("context pressure keeps the elapsed wait when it re-selects on a roomier set", async () => {
+  await withBroker({ resident: () => ["lan-rung-a-27b"] }, async ({ socketPath }) => {
+    const res = await post(socketPath, "/lease", {
+      sessionID: "ses-pressured", profile: "pressured", tier: "worker", contextTokens: 6000, waitedMs: 300_000,
+    });
+    assert.equal(res.statusCode, 200);
+    // Only reachable if waitedMs rode `...selection` into the SECOND chooseTarget call.
+    assert.equal(res.body.target.id, "lan-rung-a");
+  });
+});
+
+test("preview names a delayed rung instead of implying no fallback exists", async () => {
+  await withBroker({ resident: () => ["lan-primary-9b", "lan-rung-a-27b"] }, async ({ socketPath }) => {
+    await post(socketPath, "/lease", {
+      sessionID: "ses-preview-holder", profile: "memory", tier: "worker", contextTokens: CONTEXT,
+    });
+    const res = await post(socketPath, "/preview", { profile: "memory", tiers: ["worker"], contextTokens: CONTEXT });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.preview.worker, null);
+    assert.deepEqual(res.body.delayedProfileFallbacks, [{ targetIDs: ["lan-rung-a"], afterMs: 300_000 }]);
+  });
+});

@@ -10,7 +10,7 @@ tooling) is a supported client.
 
 | Endpoint | Body | Purpose |
 |---|---|---|
-| `/lease` | `{ sessionID, profile, tier, replace?, preferredModel?, contextTokens?, providers?, localOnly?, releasePin?, oneShot? }` | Acquire (or revalidate) a model lease. Returns `{ target: { id, model: { providerID, id, variant? }, kind }, existing }`. Fails with a clear error when no eligible target fits (context, circuits, health, admission) — see **Refusals** below. `providers` and `localOnly` NARROW admission and can never widen it: `providers` to callers a client can actually speak to, `localOnly: true` to targets on the LAN, for content that may not leave it. A session keeps the model it was last assigned while that model can serve it; `releasePin: true` asks for a fresh decision. `oneShot: true` declares that this `sessionID` is minted per request and will never be reused (the gateway does this): it does not affect selection, it only marks the assignment as safe to discard ahead of real sessions' pins. It is **refused** unless the `sessionID` starts with `gw-`, the per-request naming contract — a real session must not be able to ask for its own pin to be spent first. |
+| `/lease` | `{ sessionID, profile, tier, replace?, preferredModel?, contextTokens?, providers?, localOnly?, releasePin?, oneShot?, waitedMs? }` | Acquire (or revalidate) a model lease. Returns `{ target: { id, model: { providerID, id, variant? }, kind }, existing }`. Fails with a clear error when no eligible target fits (context, circuits, health, admission) — see **Refusals** below. `providers` and `localOnly` NARROW admission and can never widen it: `providers` to callers a client can actually speak to, `localOnly: true` to targets on the LAN, for content that may not leave it. A session keeps the model it was last assigned while that model can serve it; `releasePin: true` asks for a fresh decision. `oneShot: true` declares that this `sessionID` is minted per request and will never be reused (the gateway does this): it does not affect selection, it only marks the assignment as safe to discard ahead of real sessions' pins. It is **refused** unless the `sessionID` starts with `gw-`, the per-request naming contract — a real session must not be able to ask for its own pin to be spent first. `waitedMs` is the optional non-negative finite count of milliseconds this caller has **already** spent waiting for its primary in the current lease loop; it defaults to 0 and gates rungs carrying `profileFallbackAfterMs` (see **Selection semantics**). Callers reset it for a new upstream-forward attempt, so a retry after a failed forward does not inherit the first attempt's elapsed time. An invalid value is refused rather than coerced: read as 0 it would hold a delayed rung shut forever, and read as huge it would surrender a scarce shared slot immediately. |
 | `/release` | `{ sessionID }` | Drop the session's lease. A one-shot session's assignment is dropped with it (nothing can read it back); an ordinary session's pin stays. |
 | `/touch` | `{ sessionID }` | Heartbeat; leases expire after 2h untouched. |
 | `/failure` | `{ sessionID, targetID?, error }` | Report a provider failure. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). |
@@ -20,6 +20,7 @@ tooling) is a supported client.
 | `/inventory` | `{ targets, providers, modelContexts, modelVariants, authRevision, authOnly? }` | Publish discovered provider/model inventory. Refused unless `authRevision` matches the broker's own hash of opencode's `auth.json` — an OAuth-to-API-key change can never publish stale admission. |
 | `/status` | `{}` | Full public state: leases, circuits (with `renewsAt`), health, budget report, last decision, and `deprecations` when the broker is still reading a renamed setting. |
 | `/selection` | `{}` | Just `lastDecision` — why the last lease chose its target. |
+| `/preview` | `{ profile?, tiers?, contextTokens? }` | Side-effect-free selection: what each tier WOULD get right now. No lease, no cursor advance. Returns `{ preview: { <tier>: target \| null }, delayedProfileFallbacks: [{ targetIDs, afterMs }] }`. Preview answers for the present moment, so it selects as `waitedMs: 0` and a rung that is merely *not yet* open reads as `null`. `delayedProfileFallbacks` is what keeps that honest: it names the profile's delayed rungs and their thresholds, so a reader can tell "this profile has no fallback" from "its fallback has not opened yet". |
 | `/rearm` | `{ targetID? , reasonCode? }` | Clear a circuit. `provider:<id>` rearms a quarantined provider into probation; a target id clears that target; empty clears all circuits. |
 | `/quarantine` | `{ scope: "provider", kind: "compatibility", providerID, reasonCode? }` | Operator quarantine of a provider. |
 
@@ -84,6 +85,15 @@ Concurrency: the broker serializes request handling, so two simultaneous
   load unless the deployment names the profile in `profileCloudEgress` — which an offline
   profile (`offlineProfiles`; by default `private` and `*-offline`) may never be. A lease
   taken from a rung carries `profile-fallback-rung` in its reasons.
+  A rung may also declare a WAIT before it opens, via `profileFallbackAfterMs` (per profile, one
+  entry per rung, positionally): the rung is only considered for ordinary selection once the
+  caller's `waitedMs` reaches its threshold. A rung with no entry opens immediately, which is
+  every rung that existed before the setting. This exists so a bursty background lane cannot
+  seize a scarce shared target the instant its own lane is busy, while an interactive lane keeps
+  its immediate rung. Two things deliberately ignore the delay: the refusal classifier, so a
+  full-but-delayed rung still reads as `target-busy` (keep waiting) rather than "no target
+  exists"; and the context-overflow last resort, so a session too big for every window is never
+  denied the roomiest one just because its clock has not run out.
   A profile whose single target is made resident by a `prepareCommand` should be given **no**
   rungs at all: an eligible rung means the lease succeeds, so the refusal that runs the
   prepare never happens and the target is never swapped back in.

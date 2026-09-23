@@ -65,6 +65,12 @@
     ],
     "overflow": [
       "cloud-small"
+    ],
+    // Context pressure in fixture form: an 8k cloud primary that a 6000-token request pushes
+    // past its own floor (6000/0.6 = 10000), leaving only the local rung in the roomier set.
+    // Reaching that rung requires the elapsed wait to survive the SECOND chooseTarget call.
+    "pressured": [
+      "cloud-small"
     ]
   },
   "profileFallbacks": {
@@ -107,6 +113,11 @@
       [
         "cloud-big"
       ]
+    ],
+    "pressured": [
+      [
+        "lan-rung-a"
+      ]
     ]
   },
   "profileFallbackAfterMs": {
@@ -127,6 +138,9 @@
       300000
     ],
     "overflow": [
+      300000
+    ],
+    "pressured": [
       300000
     ]
   },

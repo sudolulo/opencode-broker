@@ -102,6 +102,7 @@ so nothing is ever spent on a provider you did not list.
 | `offlineProfiles` | Profiles with no network at all. Default: any profile named `private` or ending in `-offline`. |
 | `profileTitles` | Display names. Default: the name, title-cased. |
 | `profileFallbacks` | Per profile, fallback groups like `fallbacks`. Cloud targets are dropped unless the profile is in `profileCloudEgress`. |
+| `profileFallbackAfterMs` | Per profile, one non-negative delay per `profileFallbacks` rung, positionally. A rung opens for ordinary selection only once the caller has waited that long; a rung with no entry opens immediately, as every rung did before this setting. Delays travel with their rung through the cloud-target drop above, so a deleted group never shifts another group's delay onto it. |
 | `profileCloudEgress` | Profiles that may fall back to cloud targets. Offline profiles are refused here. |
 | `profileTools` | Extra tools (`localOnlineExtra`) and tool-name prefixes (`localOnlinePrefixes`) that LAN-only profiles may use. |
 | `budgets` | Per provider, the subscription's `windows` (`id`, `periodMs`, `meter`: `requests` or `tokens`, `capacity`, optional `anchor`) and optionally `planUsage.type` (`anthropic-oauth`, `openai-oauth`, `bailian-cli`, or the generic `http`) to read exact usage from the provider. |
