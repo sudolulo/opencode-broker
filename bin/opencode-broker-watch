@@ -48,7 +48,7 @@ try {
   // chat.message publication path reads the snapshot instead.
   const resolvable = refreshResolvableModels();
   console.log(`resolver view refreshed: ${resolvable.size} models this host can address`);
-  const { skipped } = await publishCachedSubscriptionInventory();
+  const { skipped } = await publishCachedSubscriptionInventory({ listResolvableModels: () => resolvable });
   console.log("broker inventory republished from the fresh cache");
   // A catalog model that would have taken a lane but which OpenCode cannot resolve is a
   // real finding, not noise: it is why a tier went down on 2026-09-22. Name every one.

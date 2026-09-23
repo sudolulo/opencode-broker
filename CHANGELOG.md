@@ -18,6 +18,12 @@ All notable changes to this project are documented here. The format is based on
   to trip a circuit, so the tiers stayed down. Discovery now intersects the catalog
   with the host's own resolver view and drops what is not in it.
 
+### Changed
+
+- Resolvable-models snapshot now emits a staleness warning when older than 72 hours,
+  and the watch job reuses the in-memory model set instead of re-reading the snapshot
+  file.
+
 ### Added
 
 - **Resolver-view snapshot.** `opencode-broker-watch` now records what this host can
@@ -28,6 +34,7 @@ All notable changes to this project are documented here. The format is based on
   discovery admits nothing and every tier stays on its configured targets, rather than
   admitting a catalog the host may not resolve. A failed or empty listing throws
   instead of writing an empty view.
+
 - **Discovery admission is reported, never silent.** Every model dropped at admission
   is returned to the caller with its provider, model id, would-be tiers and reason
   (`unresolvable` or `invalid-model-id`); `opencode-broker-watch` logs one line each.
