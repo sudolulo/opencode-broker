@@ -270,6 +270,9 @@ const writeState = (state) => {
 };
 
 const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(sessionID);
+// The prefix a per-request session id must carry. The gateway builds `gw-<time36>-<rand>`
+// for every client call; nothing else may claim oneShot (acquire() refuses it).
+const ONE_SHOT_SESSION_PREFIX = /^gw-/;
 const publicTarget = (target, tier, modelVariants) => target && {
   id: target.id,
   model: modelRefForTier(target, tier, modelVariants),
@@ -320,14 +323,42 @@ const refreshPlanUsage = (state) => Promise.all(Object.entries(PROVIDER_BUDGETS)
   } catch {}
 }));
 
+// A one-shot assignment belongs to a session id that is minted per REQUEST and never reused,
+// so once its lease is gone nothing can read it back. Callers declare it on /lease, but the
+// flag only exists on assignments written since that option shipped: a broker upgraded in
+// place carries hundreds of flagless gateway entries (455 measured on this host 2026-09-23).
+// Treating those as session pins makes the tiered eviction below a no-op on exactly the
+// traffic it was written for -- they would sit PROTECTED ahead of real pins for the full
+// 14-day TTL. So the prefix is read when the flag is absent: `gw-` is the gateway's own naming
+// contract (`gw-<time36>-<rand>`, gateway/lib/gateway.js), and acquire() refuses a oneShot
+// declaration from any other prefix, which is what keeps the two sides of this agreeing.
+const isOneShotAssignment = (assignment, sessionID) => assignment?.oneShot === true ||
+  (assignment?.oneShot === undefined && ONE_SHOT_SESSION_PREFIX.test(sessionID));
+
+// Called wherever a lease ENDS. An ordinary assignment stays -- it is the session's pin, and
+// the next turn reads it back, which is what stickiness is. A one-shot's has no next turn and
+// no reader, so keeping it only spends cap space and file size until the cap overflows onto
+// real pins. Dropping it here is what keeps the tiered eviction a rarely-used backstop.
+const dropOneShotAssignment = (state, sessionID) => {
+  if (isOneShotAssignment(state.assignments[sessionID], sessionID)) delete state.assignments[sessionID];
+};
+
 const sweep = (state, now = Date.now()) => {
   for (const [sessionID, lease] of Object.entries(state.leases)) {
     if (!lease?.touchedAt || now - lease.touchedAt > LEASE_TTL_MS || !isProfile(lease?.profile) || !["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(lease?.tier)) {
       delete state.leases[sessionID];
     }
   }
+  // A LIVE LEASE IS NEVER EVICTED -- by age here, or by the cap below. `updatedAt` moves only
+  // on a fresh SELECTION: held-lease revalidation (`replace: false`) refreshes the LEASE and
+  // leaves the assignment's timestamp alone, so a session that revalidates for longer than the
+  // TTL is mid-flight with an assignment this loop would otherwise delete out from under it,
+  // costing it its pinned model on its next selection. The lease loop above has already dropped
+  // the expired leases, so what remains in state.leases is alive right now.
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
-    if (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS) delete state.assignments[sessionID];
+    if (!state.leases[sessionID] && (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS)) {
+      delete state.assignments[sessionID];
+    }
   }
   // Then the cap. Eviction is TIERED, because "oldest" and "safe to lose" are different
   // questions and ordering by age alone answered the wrong one.
@@ -351,8 +382,8 @@ const sweep = (state, now = Date.now()) => {
     // alone, hundreds of dead gateway ids outranked live pins (450 of 512 on this host), so
     // the cap re-rolled sessions mid-task: the exact failure the stickiness comment in
     // acquire() describes, arriving through the sweep instead of through selection.
-    const spent = evictable.filter((sessionID) => state.assignments[sessionID]?.oneShot === true);
-    const pins = evictable.filter((sessionID) => state.assignments[sessionID]?.oneShot !== true);
+    const spent = evictable.filter((sessionID) => isOneShotAssignment(state.assignments[sessionID], sessionID));
+    const pins = evictable.filter((sessionID) => !isOneShotAssignment(state.assignments[sessionID], sessionID));
     // Oldest-first inside each tier: spend every settled one-shot before the first pin.
     const order = [...spent.sort(oldestFirst), ...pins.sort(oldestFirst)];
     // slice() clamps on its own: when live leases alone exceed the cap, every evictable
@@ -641,6 +672,16 @@ const acquire = async (state, request) => {
   // about selection or stickiness; it only tells the cap that this assignment is safe to
   // evict first, because after the request settles no one can ever read it back.
   const oneShot = request.oneShot === true;
+  // REFUSED, not ignored, when the id does not carry the prefix. Declaring oneShot is asking
+  // the cap to spend this entry first, so a caller that sets it on a REAL session id hands the
+  // cap a live pin to discard ahead of dead gateway traffic -- the failure the tier order
+  // exists to stop. The prefix is also what the sweep reads when the flag is absent (see
+  // isOneShotAssignment), so the declaration and the id have to agree or the same entry reads
+  // two ways. Failing loudly here puts the error on the buggy caller instead of on whichever
+  // session's pin it would have cost.
+  if (oneShot && !ONE_SHOT_SESSION_PREFIX.test(sessionID)) {
+    throw new Error("oneShot requires a per-request session id (gw- prefix)");
+  }
   request = { ...request, contextTokens, preferredModel, fallbackTargetID, releasePin, oneShot };
   sweep(state);
   let targets = allTargets(state);
@@ -1068,6 +1109,7 @@ const serve = async () => {
       if (request.url === "/release") {
         if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
         delete state.leases[body.sessionID];
+        dropOneShotAssignment(state, body.sessionID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }
@@ -1221,6 +1263,7 @@ const serve = async () => {
         const target = targetForID(targetID, allTargets(state));
         if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
         delete state.leases[body.sessionID];
+        dropOneShotAssignment(state, body.sessionID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }
@@ -1253,7 +1296,11 @@ const serve = async () => {
         // The lease goes (its slot is free again); the assignment stays. It is the session's
         // pin, so the next turn after an idle returns to the same model instead of being
         // re-rolled. It ages out on ASSIGNMENT_TTL_MS like any other.
+        // ONE-SHOT SESSIONS ARE THE EXCEPTION: their id is minted per request and never
+        // recurs, so there is no next turn to return and nothing that can read the pin back.
+        // The assignment goes with the lease rather than waiting out the TTL in the cap.
         delete state.leases[body.sessionID];
+        dropOneShotAssignment(state, body.sessionID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }

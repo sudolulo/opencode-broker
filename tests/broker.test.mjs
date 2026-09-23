@@ -1350,6 +1350,52 @@ test("the assignment cap evicts settled one-shot gateway entries before session 
   }
 }));
 
+// THE FLAG IS ABSENT ON EVERY ENTRY THIS HOST ALREADY HAS. `oneShot` is only written by
+// leases taken since it existed, so a broker upgraded in place carries hundreds of gateway
+// assignments with no such field (455 measured here 2026-09-23). Read as session pins they are
+// PROTECTED by the tier order for the full 14-day TTL, and the tiered eviction then applies to
+// new traffic only -- live pins keep losing to dead gateway ids, which is the failure the tier
+// order was written to stop. The `gw-` prefix is the gateway's own naming contract
+// (`gw-<time36>-<rand>`, gateway.js) and acquire() refuses a oneShot declaration from any other
+// prefix, so inferring one-shot from the prefix when the flag is absent is reading that
+// contract, not guessing.
+test("the assignment cap evicts a gw- entry that predates the oneShot flag ahead of a session pin", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const assignments = {};
+  // Session pins, older than every gateway entry -- the real shape, since a pin's timestamp
+  // stops moving as soon as the session stops being re-selected.
+  for (let i = 0; i < 20; i++) {
+    assignments[`ses_legacy_pin${String(i).padStart(2, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker",
+      updatedAt: now - 3_600_000 - (20 - i) * 1000,
+    };
+  }
+  // No `oneShot` field anywhere in this group: these are the entries already on disk.
+  for (let i = 0; i < 600; i++) {
+    assignments[`gw-legacy-${String(i).padStart(4, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker",
+      updatedAt: now - 60_000 - (600 - i) * 1000,
+    };
+  }
+  const statePath = seedState(home, { assignments });
+
+  const { child } = await startBroker(home);
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    const ids = Object.keys(after.assignments);
+    assert.equal(ids.length, 512, `capped to MAX_ASSIGNMENTS, got ${ids.length}`);
+    for (let i = 0; i < 20; i++) {
+      const pin = `ses_legacy_pin${String(i).padStart(2, "0")}`;
+      assert.ok(after.assignments[pin], `${pin} must outlive flagless gateway traffic`);
+    }
+    // 620 seeded, 512 kept: the 108 evicted are the oldest gw- entries and nothing else.
+    assert.ok(!after.assignments["gw-legacy-0107"], "the 108th-oldest flagless gw- entry is evicted");
+    assert.ok(after.assignments["gw-legacy-0108"], "the 109th-oldest flagless gw- entry survives");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 test("the assignment cap never evicts a session that still holds a live lease", async () => withTempHome(async (home) => {
   const now = Date.now();
   // The competitors here are ORDINARY assignments, not one-shots, so tier ordering cannot
@@ -1384,6 +1430,37 @@ test("the assignment cap never evicts a session that still holds a live lease", 
   }
 }));
 
+// The 14-day TTL is an AGE rule, and age alone is the wrong question for a session that is
+// still running. Held-lease revalidation (`/lease` with `replace: false`) refreshes
+// `lease.touchedAt` and never `assignment.updatedAt` -- only a FRESH selection moves that --
+// so a session that revalidates for longer than the TTL has a live lease and an assignment the
+// age sweep deletes out from under it. That contradicts the rule the cap below obeys, and it
+// costs the session its pinned model on its next selection.
+test("the assignment TTL evicts by age only when no live lease holds the session", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const aged = now - 15 * 24 * 3_600_000; // past ASSIGNMENT_TTL_MS (14 days) either way
+  const statePath = seedState(home, {
+    assignments: {
+      ses_ttl_live: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: aged },
+      ses_ttl_idle: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: aged },
+    },
+    // Touched a moment ago, so it survives the lease sweep in this same pass.
+    leases: { ses_ttl_live: { targetID: "gpt-luna", touchedAt: now, profile: "auto", tier: "worker" } },
+  });
+
+  const { child } = await startBroker(home);
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.ok(after.leases["ses_ttl_live"], "the lease itself survived the lease sweep");
+    assert.ok(after.assignments["ses_ttl_live"],
+      "an assignment whose session still holds a live lease is never evicted, by age or by cap");
+    assert.ok(!after.assignments["ses_ttl_idle"],
+      "and the TTL still removes an aged assignment that no lease holds");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 test("a session keeps its pinned model across the rebalance cooldown while one-shot traffic floods the cap", async () => withTempHome(async (home) => {
   const now = Date.now();
   writeAuth(home);
@@ -1411,7 +1488,10 @@ test("a session keeps its pinned model across the rebalance cooldown while one-s
     });
     assert.equal(lease.decision.policy, "session-stickiness",
       "the pin must still decide the lease after a cap flood of dead one-shot entries");
-    assert.equal(lease.target.model.id, "gpt-5.6-luna", "and it returns to the pinned model");
+    // The pinned TARGET this test seeded, not a model id out of the inventory fixture: a
+    // renamed fixture model would otherwise fail this as "wrong model" when the property
+    // under test -- that the pin survived and decided the lease -- is fine.
+    assert.equal(lease.target.id, "gpt-luna", "and it returns to the target the pin names");
   } finally {
     await stopBroker(child);
   }
@@ -1420,7 +1500,10 @@ test("a session keeps its pinned model across the rebalance cooldown while one-s
 test("assignment eviction is deterministic under injected timestamps and idempotent on a second sweep", async () => withTempHome(async (home) => {
   // Pins and one-shots INTERLEAVED in time, so neither group is uniformly older and the
   // survivor set is a fact about the policy rather than about the seeding order. Every
-  // timestamp is injected and distinct, so there is no wall clock and no tie to break.
+  // timestamp is injected, distinct, and offset from one fixed base, so the survivor set is
+  // decided by the relative order alone and there is no tie to break. The base is 15 minutes
+  // back -- far inside ASSIGNMENT_TTL_MS at both ends, so the age sweep removes nothing here
+  // however long the run takes, and only the cap is under test.
   const base = Date.now() - 900_000;
   const assignments = {};
   for (let i = 0; i < 300; i++) {
@@ -1483,6 +1566,64 @@ test("a one-shot lease marks its assignment so the cap can evict it ahead of ses
     "a caller that declares its session id is per-request gets a one-shot assignment");
   assert.equal(status.assignments["ses_marker_test"].oneShot, undefined,
     "an ordinary session assignment carries no such marker");
+}));
+
+// A ONE-SHOT ASSIGNMENT IS DEAD THE MOMENT ITS LEASE ENDS. The reason an ordinary assignment
+// outlives its lease is that the session's NEXT turn reads it back -- that is what stickiness
+// is. A one-shot session id is minted per client request and never recurs, so there is no next
+// turn and no reader: keeping the entry only spends cap space and file size on something
+// nothing can ever ask for. Dropping it at the end of the lease means the cap rarely has to
+// evict at all, instead of carrying hundreds of settled gateway ids until it overflows.
+const oneShotEndOfLease = (endpoint) =>
+  test(`${endpoint} drops a one-shot session's assignment and keeps an ordinary session's pin`, async () => withBroker(async ({ socketPath }) => {
+    await request(socketPath, "/inventory", inventory({
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+      "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const oneShotID = `gw-end-${endpoint.slice(1)}`;
+    const sessionPinID = `ses_end_${endpoint.slice(1)}`;
+    for (const [sessionID, oneShot] of [[oneShotID, true], [sessionPinID, false]]) {
+      await request(socketPath, "/lease", {
+        sessionID, profile: "auto", tier: "worker", contextTokens: 100, replace: true,
+        ...(oneShot ? { oneShot: true } : {}),
+      });
+      await request(socketPath, endpoint, { sessionID });
+    }
+    const status = await request(socketPath, "/status");
+    assert.equal(status.assignments[oneShotID], undefined,
+      `${endpoint} must drop a one-shot assignment -- nothing can ever read it back`);
+    assert.ok(status.assignments[sessionPinID],
+      `${endpoint} must keep an ordinary session's pin for its next turn`);
+  }));
+
+oneShotEndOfLease("/release");
+oneShotEndOfLease("/complete");
+oneShotEndOfLease("/forget");
+
+// `oneShot` is CLIENT-DECLARED, and declaring it is asking to be evicted first. A caller that
+// sets it on a real session id -- a copied request body, a wrapper that sets it for every
+// lease it proxies -- would hand the cap a genuine session's pin to spend ahead of dead
+// gateway traffic, which is the original failure wearing the fix's clothes. The prefix is the
+// contract on both sides: the sweep infers one-shot from `gw-` when the flag is absent, so the
+// declaration has to agree with the prefix or the two readings of the same entry diverge.
+test("/lease refuses a oneShot declaration from a session id that is not per-request", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  await assert.rejects(request(socketPath, "/lease", {
+    sessionID: "ses_bogus_one_shot", profile: "auto", tier: "worker", contextTokens: 100,
+    replace: true, oneShot: true,
+  }), /per-request session id/);
+  const status = await request(socketPath, "/status");
+  assert.equal(status.assignments["ses_bogus_one_shot"], undefined,
+    "a refused lease leaves no assignment behind");
+  // The gateway's own ids keep working, so the contract refuses only the mismatch.
+  await request(socketPath, "/lease", {
+    sessionID: "gw-contract-ok", profile: "auto", tier: "worker", contextTokens: 100,
+    replace: true, oneShot: true,
+  });
+  assert.equal((await request(socketPath, "/status")).assignments["gw-contract-ok"].oneShot, true);
 }));
 
 test("the first lease waits for a due plan refresh before admitting an exhausted provider", async () => withTempHome(async (home) => {

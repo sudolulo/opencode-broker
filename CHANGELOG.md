@@ -26,13 +26,37 @@ All notable changes to this project are documented here. The format is based on
   oldest-first. When pins are evicted anyway the daemon says so on stderr with the counts,
   since reaching that point means the cap is below the host's real session concurrency.
   The cap, the TTL, selection, and the `sessionRebalance` cooldown are all unchanged.
+  The tier applies to the entries a host **already has**, not only to new traffic: the
+  455 gateway assignments already on disk here predate the `oneShot` flag and carry no
+  such field, so read literally they would have counted as session pins and sat protected
+  ahead of real pins for the full 14-day TTL — leaving this fix inert on exactly the
+  traffic it was written for. An entry with no flag whose id starts with `gw-` is read as
+  one-shot, which is the gateway's own naming contract (`gw-<time36>-<rand>`) and is
+  enforced on the other side by the refusal below. No manual state surgery is needed on
+  an existing `broker.json`.
+- **A live lease's assignment now survives the 14-day age rule too, not just the cap.**
+  The TTL evicted on `updatedAt` alone, which the same paragraph above explains is not
+  evidence of idleness: a session that only ever revalidates a held lease (`replace:
+  false`) refreshes `lease.touchedAt` and never the assignment, so after 14 days of that
+  pattern the lease was alive and its pin was deleted underneath it. The age rule now
+  skips any session that still holds a live lease, which is what the tiered cap already
+  promised.
+- **One-shot assignments are dropped when their lease ends,** at `/release`, `/complete`
+  and `/forget`, instead of waiting for the cap to reclaim them. An ordinary assignment
+  outlives its lease because the session's next turn reads it back; a one-shot id never
+  recurs, so there is no next turn and no reader. This keeps settled gateway traffic out
+  of the assignment map entirely rather than parked in it until the cap overflows.
 
 ### Added
 
 - **`oneShot` on `/lease`.** A caller whose `sessionID` is minted per request and never
-  reused declares it with `oneShot: true`; the broker records it on the assignment and
-  the cap discards those entries first. It has no effect on selection or stickiness. The
-  bundled gateway now sets it on every lease it takes.
+  reused declares it with `oneShot: true`; the broker records it on the assignment, the
+  cap discards those entries first, and the end-of-lease endpoints drop them outright. It
+  has no effect on selection or stickiness. The bundled gateway now sets it on every lease
+  it takes. The declaration is **refused** for a `sessionID` that does not start with
+  `gw-`: `oneShot` asks for preferential eviction, so a caller that set it on a real
+  session id — a copied request body, a proxy that sets it for everything — would hand the
+  cap a live pin to spend first, and that is the original bug in new clothes.
 
 ## [1.12.1] — 2026-09-23
 
