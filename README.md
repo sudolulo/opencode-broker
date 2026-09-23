@@ -133,6 +133,41 @@ Environment:
 The broker's socket protocol is documented in [docs/API.md](docs/API.md); the
 bundled plugins are clients like any other.
 
+### Delayed fallback rungs
+
+A fallback rung normally opens the instant the profile's own lane has nothing eligible. That is
+the right answer for an interactive lane, and the wrong one for a bursty background lane sharing
+a scarce target: "my lane is busy" arrives constantly, so the rung stops being overflow and
+becomes a second primary. `profileFallbackAfterMs` makes a rung wait first.
+
+```jsonc
+"profileFallbacks":       { "memory": [["local-27b"], ["haiku"]] },
+"profileFallbackAfterMs": { "memory": [300000, 900000] }
+```
+
+Read that as: `memory` serves from its own lane; after five minutes of waiting it may also use
+`local-27b`; after fifteen it may also go to `haiku`.
+
+- **Positional, and aligned after normalization.** Each delay belongs to the rung at the same
+  index. Delays are attached before the cloud-target drop that `profileCloudEgress` governs, so
+  a rung deleted for naming a cloud target on a LAN profile takes its delay with it and never
+  shifts another rung's delay onto a neighbour.
+- **A missing entry means 0**, and a profile with no entry at all keeps the immediate fallback
+  it has always had. This setting can only ever delay a rung, never introduce one.
+- **The first eligible group in authored order wins.** Delays need not increase; once two rungs
+  are both open, the earlier one is chosen, so a later rung with a shorter delay serves only
+  until the earlier one opens.
+- **The clock is the caller's own wait, not the target's.** A gateway caller accumulates it only
+  after its first *waitable* refusal, and starts from zero again on a new forward attempt. Time
+  spent waiting for an answer is not time spent waiting for a slot.
+- **Only callers that report a wait are delayed.** The gateway does; the router plugin does not,
+  so plugin-driven profiles such as `local` and `private` keep immediate fallback regardless of
+  what is configured here. Configure delays for lanes the gateway serves.
+- Two things deliberately ignore the delay: refusal classification, so a full-but-delayed rung
+  still reads as `target-busy` (keep waiting) rather than "no target exists"; and the
+  context-overflow last resort, so an oversized session is never denied the roomiest window
+  just because its clock has not run out.
+
 ### Generic HTTP plan usage
 
 An administrator-controlled HTTP endpoint can supply the same canonical plan
