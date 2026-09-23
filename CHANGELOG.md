@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] — 2026-09-23
+
+### Fixed
+
+- **The assignment cap no longer spends live sessions' sticky pins on dead gateway
+  traffic.** The 512-entry cap and the 14-day TTL both worked — measured on this host,
+  `broker.json` sat at exactly 512 assignments and 65 KB, not growing — but the cap
+  ranked entries purely by `updatedAt`, and that is the wrong order. `updatedAt` moves
+  only on a fresh *selection*: `/touch` and held-lease revalidation refresh the lease and
+  leave the assignment's timestamp untouched, so an active session's pin ages as though
+  it were idle. Meanwhile the gateway mints a new `sessionID` per client request and
+  never reuses it, so each one-shot completion leaves an assignment that nothing can ever
+  read again. Those dead entries were *newer*, so they outranked real pins: 450 of the
+  512 were settled gateway one-shots, and one of ten live leases already had no
+  assignment left at all. A session that lost its pin gets re-rolled onto a different
+  model mid-task and re-reads its whole transcript — the exact failure session stickiness
+  exists to prevent, arriving through the sweep instead of through selection. Eviction is
+  now tiered: an assignment whose session still holds a live lease is never evicted, and
+  settled `oneShot` entries are all spent before the first session pin, each tier
+  oldest-first. When pins are evicted anyway the daemon says so on stderr with the counts,
+  since reaching that point means the cap is below the host's real session concurrency.
+  The cap, the TTL, selection, and the `sessionRebalance` cooldown are all unchanged.
+
+### Added
+
+- **`oneShot` on `/lease`.** A caller whose `sessionID` is minted per request and never
+  reused declares it with `oneShot: true`; the broker records it on the assignment and
+  the cap discards those entries first. It has no effect on selection or stickiness. The
+  bundled gateway now sets it on every lease it takes.
+
 ## [1.12.1] — 2026-09-23
 
 ### Fixed

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import http from "node:http";
@@ -1264,6 +1264,225 @@ test("assignments are capped by count, not just age, and the cap keeps the newes
   } finally {
     await stopBroker(child);
   }
+}));
+
+// THE CAP MUST NOT SPEND A LIVE SESSION'S PIN ON DEAD ONE-SHOT TRAFFIC. The gateway mints
+// a NEW broker session id per CLIENT REQUEST (`gw-<time36>-<rand>`, gateway.js), so a gateway
+// assignment becomes unreadable the moment that request settles -- the id never recurs, and
+// nothing can ever ask about it again. A session pin is the exact opposite: it is read on that
+// session's NEXT lease, which is what stickiness IS. Ordering the cap purely by recency ranked
+// hundreds of dead gateway entries ABOVE live pins, because `updatedAt` is only rewritten by a
+// FRESH selection -- /touch and held-lease revalidation refresh the LEASE and never the
+// assignment, so an active session's pin ages as if it were idle. Measured on this host
+// 2026-09-23: 512 assignments (the cap, holding), 450 of them settled gateway one-shots, and
+// one of ten LIVE leases already had no assignment left at all.
+const oneShotFlood = (count, newestAt, prefix = "gw-flood") => {
+  const entries = {};
+  for (let i = 0; i < count; i++) {
+    entries[`${prefix}-${String(i).padStart(4, "0")}`] = {
+      targetID: "gpt-luna",
+      profile: "auto",
+      tier: "worker",
+      oneShot: true,
+      updatedAt: newestAt - (count - i) * 1000,
+    };
+  }
+  return entries;
+};
+
+// Every assignment test seeds BEFORE the daemon starts: the broker holds state in memory and
+// never re-reads the file, so writing behind a running broker exercises none of the sweep.
+// WRITE auth.json ONCE. authRevision is (mtime, size, hash), so REWRITING the same bytes
+// still moves the revision, and a test that captures it via inventory() and then rewrites the
+// file hands the daemon what looks like an auth rotation: admission is revalidated against
+// the fixture's `test` provider, every cloud target drops, and the lease is refused with
+// "all lightweight routing targets are busy or unavailable". It reproduces only when the two
+// writes straddle a millisecond boundary -- 12 runs in 500 standalone, far more often under
+// the parallel full-suite run -- so leaving it in buys an intermittent failure, not a test.
+const writeAuth = (home) => {
+  const share = join(home, ".local/share/opencode");
+  mkdirSync(join(share, "model-routing"), { recursive: true });
+  const authPath = join(share, "auth.json");
+  if (!existsSync(authPath)) writeFileSync(authPath, JSON.stringify({ test: { type: "oauth" } }));
+  return share;
+};
+
+const seedState = (home, state) => {
+  const share = writeAuth(home);
+  const statePath = join(share, "model-routing/broker.json");
+  writeFileSync(statePath, JSON.stringify({
+    version: 4, leases: {}, assignments: {}, circuits: {}, cursors: {},
+    inventory: {}, health: {}, budgets: {}, lastDecision: null, planUsage: {}, rebalances: {},
+    ...state,
+  }));
+  return statePath;
+};
+
+test("the assignment cap evicts settled one-shot gateway entries before session pins", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const assignments = {};
+  // Session pins, deliberately OLDER than every one-shot entry -- which is the real shape,
+  // since a pin's timestamp stops moving the moment the session stops being re-selected.
+  // Under a flat recency order these are precisely the entries the cap discards first.
+  for (let i = 0; i < 20; i++) {
+    assignments[`ses_pin${String(i).padStart(2, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker",
+      updatedAt: now - 3_600_000 - (20 - i) * 1000,
+    };
+  }
+  Object.assign(assignments, oneShotFlood(600, now - 60_000));
+  const statePath = seedState(home, { assignments });
+
+  const { child } = await startBroker(home);
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    const ids = Object.keys(after.assignments);
+    assert.equal(ids.length, 512, `capped to MAX_ASSIGNMENTS, got ${ids.length}`);
+    for (let i = 0; i < 20; i++) {
+      const pin = `ses_pin${String(i).padStart(2, "0")}`;
+      assert.ok(after.assignments[pin], `${pin} must outlive dead one-shot gateway traffic`);
+    }
+    // 620 seeded, 512 kept: the 108 evicted are the OLDEST one-shots and nothing else.
+    assert.ok(!after.assignments["gw-flood-0107"], "the 108th-oldest one-shot is evicted");
+    assert.ok(after.assignments["gw-flood-0108"], "the 109th-oldest one-shot survives");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+test("the assignment cap never evicts a session that still holds a live lease", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  // The competitors here are ORDINARY assignments, not one-shots, so tier ordering cannot
+  // rescue the pin: only the live-lease rule can. That keeps this test about one property.
+  const assignments = {};
+  for (let i = 0; i < 600; i++) {
+    assignments[`ses_busy${String(i).padStart(4, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker",
+      updatedAt: now - 60_000 - (600 - i) * 1000,
+    };
+  }
+  // The oldest assignment in the file by ten hours, and the one session demonstrably alive:
+  // its lease was touched a moment ago, so it survives the lease sweep in this same pass.
+  assignments["ses_live"] = {
+    targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now - 10 * 3_600_000,
+  };
+  const statePath = seedState(home, {
+    assignments,
+    leases: { ses_live: { targetID: "gpt-luna", touchedAt: now, profile: "auto", tier: "worker" } },
+  });
+
+  const { child } = await startBroker(home);
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(Object.keys(after.assignments).length, 512,
+      "the cap still bounds the map");
+    assert.ok(after.leases["ses_live"], "the lease itself is still live");
+    assert.ok(after.assignments["ses_live"],
+      "an assignment whose session still holds a live lease is never evicted by the cap");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+test("a session keeps its pinned model across the rebalance cooldown while one-shot traffic floods the cap", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  writeAuth(home);
+  const inv = inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  });
+  const statePath = seedState(home, {
+    assignments: {
+      ses_sticky: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now - 3_600_000 },
+      ...oneShotFlood(600, now - 60_000),
+    },
+    // Well inside sessionRebalance's cooldown, so the stamp is not what decides this lease:
+    // the pin is. A fix that preserved the pin by disturbing the rebalance clock fails here.
+    rebalances: { ses_sticky: now - 60_000 },
+    inventory: inv,
+  });
+
+  const { child, socketPath } = await startBroker(home);
+  try {
+    const seeded = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.ok(seeded.assignments["ses_sticky"], "the pin survives the startup sweep");
+    const lease = await request(socketPath, "/lease", {
+      sessionID: "ses_sticky", profile: "auto", tier: "worker", contextTokens: 100,
+    });
+    assert.equal(lease.decision.policy, "session-stickiness",
+      "the pin must still decide the lease after a cap flood of dead one-shot entries");
+    assert.equal(lease.target.model.id, "gpt-5.6-luna", "and it returns to the pinned model");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+test("assignment eviction is deterministic under injected timestamps and idempotent on a second sweep", async () => withTempHome(async (home) => {
+  // Pins and one-shots INTERLEAVED in time, so neither group is uniformly older and the
+  // survivor set is a fact about the policy rather than about the seeding order. Every
+  // timestamp is injected and distinct, so there is no wall clock and no tie to break.
+  const base = Date.now() - 900_000;
+  const assignments = {};
+  for (let i = 0; i < 300; i++) {
+    assignments[`ses_mix${String(i).padStart(4, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: base + i * 2000,
+    };
+  }
+  for (let i = 0; i < 400; i++) {
+    assignments[`gw-one-${String(i).padStart(4, "0")}`] = {
+      targetID: "gpt-luna", profile: "auto", tier: "worker", oneShot: true,
+      updatedAt: base + i * 2000 + 1000,
+    };
+  }
+  const statePath = seedState(home, { assignments });
+
+  // 700 seeded, cap 512, so 188 go -- and they are the 188 OLDEST ONE-SHOTS exactly:
+  // 300 pins + 212 surviving one-shots = 512.
+  const first = await startBroker(home);
+  let surviving;
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    surviving = Object.keys(after.assignments).sort();
+    assert.equal(surviving.length, 512, `capped to MAX_ASSIGNMENTS, got ${surviving.length}`);
+    for (let i = 0; i < 300; i++) {
+      const pin = `ses_mix${String(i).padStart(4, "0")}`;
+      assert.ok(after.assignments[pin], `${pin} outranks every settled one-shot`);
+    }
+    assert.ok(!after.assignments["gw-one-0187"], "the 188th-oldest one-shot is evicted");
+    assert.ok(after.assignments["gw-one-0188"], "the 189th-oldest one-shot survives");
+  } finally {
+    await stopBroker(first.child);
+  }
+
+  // Same injected timestamps, same file: a second sweep must neither drop nor revive one.
+  const second = await startBroker(home);
+  try {
+    const again = Object.keys(JSON.parse(readFileSync(statePath, "utf8")).assignments).sort();
+    assert.deepEqual(again, surviving,
+      "eviction is a function of the injected updatedAt, not of when the sweep happened");
+  } finally {
+    await stopBroker(second.child);
+  }
+}));
+
+test("a one-shot lease marks its assignment so the cap can evict it ahead of session pins", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  await request(socketPath, "/lease", {
+    sessionID: "gw-marker-test", profile: "auto", tier: "worker", contextTokens: 100,
+    replace: true, oneShot: true,
+  });
+  await request(socketPath, "/lease", {
+    sessionID: "ses_marker_test", profile: "auto", tier: "worker", contextTokens: 100,
+    replace: true,
+  });
+  const status = await request(socketPath, "/status");
+  assert.equal(status.assignments["gw-marker-test"].oneShot, true,
+    "a caller that declares its session id is per-request gets a one-shot assignment");
+  assert.equal(status.assignments["ses_marker_test"].oneShot, undefined,
+    "an ordinary session assignment carries no such marker");
 }));
 
 test("the first lease waits for a due plan refresh before admitting an exhausted provider", async () => withTempHome(async (home) => {

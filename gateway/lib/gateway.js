@@ -475,6 +475,11 @@ export const createGatewayHandler = ({
       // which consumer asked.
       tier: route?.tier ?? config.tier,
       replace: true,
+      // This session id is minted per CLIENT REQUEST above and never reused, so the
+      // assignment it leaves behind is unreadable the moment the request settles. Saying so
+      // lets the broker's assignment cap spend these before any real session's sticky pin;
+      // without it, gateway traffic evicted live sessions' models purely by being newer.
+      oneShot: true,
       contextTokens,
       providers,
       ...(callerOf(sessionID) ? { caller: callerOf(sessionID) } : {}),

@@ -329,16 +329,46 @@ const sweep = (state, now = Date.now()) => {
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
     if (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS) delete state.assignments[sessionID];
   }
-  // Then the cap: keep the most recently touched, drop the rest. Recency is the right
-  // order because the only readers (/failure, /complete, /forget) ask about a session
-  // that was active moments ago -- so the entries this discards are exactly the ones
-  // nothing can still ask for.
+  // Then the cap. Eviction is TIERED, because "oldest" and "safe to lose" are different
+  // questions and ordering by age alone answered the wrong one.
   const assignmentIDs = Object.keys(state.assignments);
   if (assignmentIDs.length > MAX_ASSIGNMENTS) {
-    assignmentIDs
-      .sort((a, b) => (state.assignments[b]?.updatedAt ?? 0) - (state.assignments[a]?.updatedAt ?? 0))
-      .slice(MAX_ASSIGNMENTS)
-      .forEach((sessionID) => delete state.assignments[sessionID]);
+    const oldestFirst = (a, b) => (state.assignments[a]?.updatedAt ?? 0) - (state.assignments[b]?.updatedAt ?? 0);
+    // A LIVE LEASE IS NEVER EVICTED. The lease loop above has already dropped the expired
+    // ones, so anything still in state.leases is a session that is mid-flight right now, and
+    // its assignment is the pin its NEXT lease reads. `updatedAt` moves only on a fresh
+    // SELECTION -- /touch and held-lease revalidation refresh the LEASE and leave the
+    // assignment's timestamp untouched -- so a busy session's pin looks arbitrarily old, and
+    // a pure recency order evicted it while the session was still running. Measured on this
+    // host 2026-09-23: one of ten live leases already had no assignment left.
+    const retained = assignmentIDs.filter((sessionID) => state.leases[sessionID]);
+    const evictable = assignmentIDs.filter((sessionID) => !state.leases[sessionID]);
+    // SETTLED ONE-SHOTS GO FIRST, because they are the only entries that are provably
+    // unreadable. A one-shot caller (the gateway) mints a new session id per CLIENT REQUEST
+    // and never reuses it, so once its lease is gone nothing can ever ask about that id
+    // again. A session pin is the opposite: it exists precisely to be read AFTER the lease
+    // is released, on the session's next turn -- that is what stickiness is. Ranked by age
+    // alone, hundreds of dead gateway ids outranked live pins (450 of 512 on this host), so
+    // the cap re-rolled sessions mid-task: the exact failure the stickiness comment in
+    // acquire() describes, arriving through the sweep instead of through selection.
+    const spent = evictable.filter((sessionID) => state.assignments[sessionID]?.oneShot === true);
+    const pins = evictable.filter((sessionID) => state.assignments[sessionID]?.oneShot !== true);
+    // Oldest-first inside each tier: spend every settled one-shot before the first pin.
+    const order = [...spent.sort(oldestFirst), ...pins.sort(oldestFirst)];
+    // slice() clamps on its own: when live leases alone exceed the cap, every evictable
+    // entry goes and the map settles at the live-lease count. That is still a bound -- it
+    // tracks concurrency, which the 2h lease TTL bounds, rather than total traffic.
+    const evicted = order.slice(0, assignmentIDs.length - MAX_ASSIGNMENTS);
+    // Counted before the deletes, while the entries are still readable.
+    const evictedPins = Math.max(0, evicted.length - spent.length);
+    for (const sessionID of evicted) delete state.assignments[sessionID];
+    if (evictedPins > 0) {
+      // Never silent: losing a pin costs a live session its model mid-task. Reaching here
+      // means every settled one-shot was already spent and MAX_ASSIGNMENTS is still below
+      // this host's real session concurrency -- an operator decision, not something to
+      // absorb quietly. Stays quiet in normal operation, where one-shots absorb the overflow.
+      console.error(`[opencode-broker] assignment cap evicted ${evictedPins} session pin(s) after spending all ${spent.length} settled one-shot entr${spent.length === 1 ? "y" : "ies"}; ${retained.length} live lease(s) retained, cap ${MAX_ASSIGNMENTS}`);
+    }
   }
   // A rebalance stamp older than the cooldown already fails its own check, so
   // dropping it changes no decision and keeps the map from growing per session.
@@ -606,7 +636,12 @@ const acquire = async (state, request) => {
   // A caller that deliberately wants the session re-decided (the plugin's restore-home after
   // a provider displacement) says so; every other lease keeps the session's pinned model.
   const releasePin = request.releasePin === true;
-  request = { ...request, contextTokens, preferredModel, fallbackTargetID, releasePin };
+  // A caller whose session id is minted per REQUEST and never reused -- the gateway, which
+  // builds `gw-<time36>-<rand>` for each client call -- declares it here. It changes nothing
+  // about selection or stickiness; it only tells the cap that this assignment is safe to
+  // evict first, because after the request settles no one can ever read it back.
+  const oneShot = request.oneShot === true;
+  request = { ...request, contextTokens, preferredModel, fallbackTargetID, releasePin, oneShot };
   sweep(state);
   let targets = allTargets(state);
   const requestedCloud = targetIDsFor(profile, tier, targets)
@@ -936,6 +971,8 @@ const acquire = async (state, request) => {
     // primary the moment one is eligible (fallback-stickiness above owns that), so it
     // is recorded but never pinned.
     ...(choice.decision?.policy === "strict-fallback" ? { fallback: true } : {}),
+    // Recorded, never acted on during selection -- see the sweep's tiered eviction.
+    ...(oneShot ? { oneShot: true } : {}),
   };
   recordDecision(state, {
     at: Date.now(),
