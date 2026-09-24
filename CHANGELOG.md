@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] — 2026-09-24
+
+### Fixed
+
+- **A full primary no longer pre-empts a delayed fallback rung.** The context-overflow last
+  resort fires whenever nothing is available and a context size was supplied, and it reads the
+  rung list unfiltered by design — so a lane whose primary was merely *busy* fell straight
+  through to the roomiest cloud window, and any delay configured on the rung it reached became
+  decorative. Measured on a live lane configured to wait 60 s: 183 cloud leases in eight minutes.
+  The rescue now runs only when context is genuinely what disqualified everything. A target that
+  fits the request but is full is a wait — the broker returns `target-busy`, the caller retries,
+  and the rung still opens once its delay elapses — while a request nothing can hold even with
+  every slot free still gets the roomiest window, because a refusal there is unrecoverable.
+- **The gateway now names a lane whose credential fails to resolve.** An expired OAuth token
+  makes `providerKey` throw; the gateway releases the lease and skips the lane, and deliberately
+  files no `/failure` because a stale *local* credential must not indict a healthy provider. With
+  no log line that was completely invisible: the only trace was cloud leases in the decision log
+  with no matching usage, which reads like a routing bug rather than an expired token. The lane
+  and the reason now reach both stderr and the client-visible error.
+
 ## [1.15.0] — 2026-09-23
 
 ### Added

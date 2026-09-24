@@ -189,6 +189,38 @@ test("an omitted waitedMs behaves as zero elapsed", () => {
   assert.equal(choose("memory", undefined), null);
 });
 
+// ☠️ A FULL primary is a WAIT, not grounds to pre-empt a rung's delay. The last-resort rescue
+// fires whenever nothing is available and a context size was supplied, and it reads the rung list
+// UNFILTERED -- so without a guard it hands out the delayed cloud rung the instant the local
+// primary fills, and the configured delay becomes decorative. Observed in production: 183 cloud
+// leases in eight minutes on a lane configured to wait 60s first.
+test("a full primary waits rather than pre-empting a delayed cloud rung", () => {
+  const choice = R.chooseTarget({
+    profile: "spill",
+    tier: "worker",
+    active: { "lan-primary": 1 },
+    localModels: resident("lan-primary-9b"),
+    contextTokens: CONTEXT,
+    waitedMs: 0,
+  });
+  // null here becomes target-busy at the broker: the caller waits and retries, which is exactly
+  // what the delay is for. The rung is still reachable once the wait elapses.
+  assert.equal(choice, null);
+});
+
+test("a full primary still yields to the cloud rung once the delay elapses", () => {
+  const choice = R.chooseTarget({
+    profile: "spill",
+    tier: "worker",
+    active: { "lan-primary": 1 },
+    localModels: resident("lan-primary-9b"),
+    contextTokens: CONTEXT,
+    waitedMs: 300_000,
+  });
+  assert.equal(choice.target.id, "cloud-big");
+  assert.ok(choice.decision.reasons.includes("profile-fallback-rung"));
+});
+
 // The last-resort rescue for an oversized session must keep seeing EVERY rung, delayed or not.
 // It is the one path whose refusal is unrecoverable: the session cannot run and cannot compact.
 test("context-overflow rescue keeps seeing unfiltered delayed rungs", () => {

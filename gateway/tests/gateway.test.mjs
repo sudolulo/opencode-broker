@@ -1430,6 +1430,44 @@ test("a new forward attempt resets the elapsed wait", async () => {
   assert.deepEqual(leaseBodies.map((body) => body.waitedMs), [0, 5, 0]);
 });
 
+// ☠️ This path spends a real lease and yields nothing: no usage is reported and no /failure is
+// filed, so before it named the lane it was invisible. An expired OAuth token made a whole lane
+// fail this way in production -- 183 cloud leases in eight minutes with zero matching usage,
+// which reads like a routing bug rather than a stale credential.
+test("an expired provider credential is named, not swallowed", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-gw-cred-"));
+  const authFile = join(home, "auth.json");
+  writeFileSync(authFile, JSON.stringify({ someprovider: { key: "stale", expires: 1 } }));
+  let forwarded = 0;
+  const handler = createGatewayHandler({
+    // A MAPPED name, as the real lanes are: an unmapped one excludes its only provider after the
+    // first failure, and attempt 2 then reports "every forwardable provider was excluded",
+    // burying the actual reason.
+    config: namedConfig({
+      providers: { llamacpp: { baseUrl: "http://local.example/v1", authRef: "someprovider" } },
+      modelProfiles: { credtest: { profile: "credtest" } },
+    }),
+    gatewayKey: "gw-secret",
+    authPath: authFile,
+    brokerRequest: async (route) => (route === "/lease"
+      ? { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b" } } }
+      : { ok: true }),
+    fetchImpl: async () => { forwarded += 1; throw new Error("must not be reached"); },
+  });
+  try {
+    await withServer(handler, async (base) => {
+      const response = await askModel(base, { model: "credtest" });
+      assert.equal(response.status, 502);
+      const message = (await response.json()).error.message;
+      assert.match(message, /llamacpp credential did not resolve/);
+      assert.match(message, /expired/);
+    });
+    assert.equal(forwarded, 0, "the lane must be skipped before any upstream call");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 const absentRefusal = () => Object.assign(
   new Error("no eligible local model is currently deployed, free, or within its context window"),
   { code: "no-eligible-local-target" },

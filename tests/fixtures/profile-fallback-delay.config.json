@@ -71,6 +71,12 @@
     // Reaching that rung requires the elapsed wait to survive the SECOND chooseTarget call.
     "pressured": [
       "cloud-small"
+    ],
+    // A LOCAL primary with a delayed CLOUD rung: the shape the fleet's memory lane actually
+    // runs. Its primary fits the request and is merely FULL, which must read as a wait rather
+    // than as grounds to hand the request straight to the cloud rung before its delay elapses.
+    "spill": [
+      "lan-primary"
     ]
   },
   "profileFallbacks": {
@@ -118,6 +124,11 @@
       [
         "lan-rung-a"
       ]
+    ],
+    "spill": [
+      [
+        "cloud-big"
+      ]
     ]
   },
   "profileFallbackAfterMs": {
@@ -142,10 +153,14 @@
     ],
     "pressured": [
       300000
+    ],
+    "spill": [
+      300000
     ]
   },
   "profileCloudEgress": [
-    "overflow"
+    "overflow",
+    "spill"
   ],
   "localModelsUrl": "http://127.0.0.1:1/v1/models",
   "localContextHeadroom": 0.6

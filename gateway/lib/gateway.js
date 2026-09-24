@@ -688,7 +688,14 @@ export const createGatewayHandler = ({
       try { key = providerKey(providerConfig, authPath); } catch (error) {
         await settle(leased.sessionID, "/release");
         excludeLane(leased.providerID);
-        lastError = error;
+        // ☠️ SAY SO. This path spends a real lease and produces nothing: no usage is reported and
+        // no `/failure` is filed (deliberately -- a stale LOCAL credential must not indict a
+        // healthy provider), so before this line it was completely invisible. A lane whose
+        // credential stopped resolving burned two leases per request in total silence; the only
+        // trace was cloud leases in the decision log with no matching usage, which reads like a
+        // routing bug rather than an expired token. Name the lane and the reason.
+        console.error(`opencode-gateway: ${leased.providerID} credential did not resolve -- released the lease and skipped the lane for this request: ${String(error?.message ?? error)}`);
+        lastError = new Error(`${leased.providerID} credential did not resolve: ${String(error?.message ?? error)}`);
         continue;
       }
       // A provider slower than the CLIENT's own patience helps nobody: time
