@@ -60,7 +60,23 @@ mock.module(routerUrl, nodeMajor >= 24 ? { exports: mockedRouter } : { namedExpo
 // with one that returns a plain object carrying the SAME property descriptors, so
 // `element.content` still re-reads the closure on every access. Nothing in tui.js is restructured
 // for testability: a test drives the exact factory opencode drives, with the exact getters.
-const jsxUrl = import.meta.resolve("@opentui/solid/jsx-runtime");
+//
+// @opentui/solid is an optionalDependency, and tui.js treats it as one: its import at
+// tui.js:345 is dynamic and falls back to null. Resolving it at module scope therefore turned
+// its absence into 30 unrelated HUD failures. Only the three sidebar tests need the runtime, so
+// only they fail for it, and by name. Nothing is skipped: no test passes without what it needs.
+let jsxUrl = null;
+let jsxRuntimeMissing = null;
+try {
+  jsxUrl = import.meta.resolve("@opentui/solid/jsx-runtime");
+} catch (error) {
+  jsxRuntimeMissing = error?.message ?? String(error);
+}
+const requireJsxRuntime = () => {
+  if (jsxRuntimeMissing) {
+    throw new Error(`the usage-sidebar tests need the @opentui/solid jsx runtime: ${jsxRuntimeMissing}`);
+  }
+};
 const recordingJsx = (type, props = {}) => {
   const element = { type };
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(props ?? {}))) {
@@ -69,7 +85,7 @@ const recordingJsx = (type, props = {}) => {
   return element;
 };
 const recordingRuntime = { jsx: recordingJsx, jsxs: recordingJsx, Fragment: "fragment" };
-mock.module(jsxUrl, nodeMajor >= 24 ? { exports: recordingRuntime } : { namedExports: recordingRuntime });
+if (jsxUrl) mock.module(jsxUrl, nodeMajor >= 24 ? { exports: recordingRuntime } : { namedExports: recordingRuntime });
 
 const tuiUrl = new URL("../tui.js", import.meta.url).href;
 const plugin = await import(tuiUrl);
@@ -821,6 +837,7 @@ const withStatus = (status) => {
 };
 
 test("a plan-lapsed provider leaves the usage sidebar entirely while every other note stays", async () => {
+  requireJsxRuntime();
   withStatus({
     budgets: {
       "alibaba-token-plan": learnedWindow(50),
@@ -860,6 +877,7 @@ test("a plan-lapsed provider leaves the usage sidebar entirely while every other
 });
 
 test("the sidebar says so when every budgeted provider is lapsed, instead of rendering an empty block", async () => {
+  requireJsxRuntime();
   withStatus({
     budgets: { "alibaba-token-plan": learnedWindow(50) },
     health: { providers: {} },
@@ -880,6 +898,7 @@ test("the sidebar says so when every budgeted provider is lapsed, instead of ren
 
 test("a failed poll marks an all-lapsed sidebar stale without hiding its empty state", async () => {
   const originalNow = Date.now;
+  requireJsxRuntime();
   withStatus({
     budgets: { "alibaba-token-plan": learnedWindow(50) },
     health: { providers: {} },
