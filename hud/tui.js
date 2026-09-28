@@ -44,6 +44,7 @@ import {
   writePendingForgetRecord,
   writeSessionProfile,
 } from "../lib/routing.js";
+import { PLAN_LAPSED_REASON } from "../lib/provider-check.js";
 import { detectGuard } from "./guard.js";
 
 // ---- swap-back: put the resting models back when the last session leaves -----------------
@@ -869,8 +870,18 @@ export default {
       try {
         const status = await brokerRequest("/status", {}, { timeout: 1500 });
         brokerFailingSince = null;
+        // A provider whose SUBSCRIPTION has lapsed is not a provider in use: /status keeps
+        // reporting its budget for diagnostics, so without this the sidebar showed a
+        // percentage and a circuit note for a plan nobody holds. Computed before anything is
+        // filled in, because the budgets, health and circuit loops below all consult it.
+        // Only `plan-lapsed` counts -- a quota stop or a bench is a lane still in use, and
+        // its note is the only warning that routing is avoiding it.
+        const lapsedProviders = new Set(Object.entries(status?.circuits ?? {})
+          .filter(([key, circuit]) => key.startsWith("provider:") && circuit?.reason === PLAN_LAPSED_REASON)
+          .map(([key]) => key.slice("provider:".length)));
         budgetUtil.clear();
         for (const [providerID, report] of Object.entries(status?.budgets ?? {})) {
+          if (lapsedProviders.has(providerID)) continue;
           // A provider that reports its own plan usage is EXACT: those numbers
           // replace the local spend estimate entirely (no tilde). Everything
           // else keeps the estimate, "~" marking a guessed capacity until a
@@ -896,6 +907,7 @@ export default {
         // from routing (openai sat quarantined for a day before anyone knew).
         laneNotes.clear();
         for (const [providerID, record] of Object.entries(status?.health?.providers ?? {})) {
+          if (lapsedProviders.has(providerID)) continue;
           // Only surface states that actually affect routing: quarantined and
           // probation exclude or restrict the lane. "observing" is a passive
           // pre-quarantine watch -- the lane is fully usable and it self-clears
@@ -910,6 +922,7 @@ export default {
             ? new Date(until).toTimeString().slice(0, 5) : null;
           if (key.startsWith("provider:")) {
             const providerID = key.slice("provider:".length);
+            if (lapsedProviders.has(providerID)) continue;
             if (!laneNotes.has(providerID)) laneNotes.set(providerID, when ? `circuit til ${when}` : "circuit");
           } else if (!laneNotes.has(key)) {
             laneNotes.set(key, when ? `benched til ${when}` : "benched");
@@ -1030,6 +1043,10 @@ export default {
           const cells = windows.map((w) => `${windowLabel(w.id)} ${w.estimate ? "~" : ""}${w.pct}%${w.pct >= 85 ? "!" : ""}`).join(" \u00b7 ");
           return ` ${name} ${cells}`;
         });
+      // The broker answered and every provider it budgets is filtered out (all plans lapsed).
+      // Saying nothing would leave the "Usage" heading standing over an empty block, which
+      // reads as a broken HUD rather than as the true answer.
+      if (!rows.length && !laneNotes.size) rows.push(" (no active providers)");
       const age = Date.now() - budgetAt;
       if (age > 120_000) rows.unshift(` (stale ${Math.round(age / 60_000)}m)`);
       if ([...budgetUtil.values()].some((windows) => windows.some((w) => w.pct > 100))) {

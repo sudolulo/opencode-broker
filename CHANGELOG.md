@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.1] — 2026-09-28
+
+### Fixed
+
+- **A lapsed subscription no longer occupies the usage sidebar.** `/status` keeps reporting a
+  provider's budget after its plan lapses, because that spend history is diagnostic, so the HUD
+  went on drawing a stale percentage row for it plus a `circuit til HH:MM` note that the
+  background check renewed every six hours -- two permanent lines for a plan nobody holds. The
+  sidebar now drops a provider whose `provider:` circuit reads `plan-lapsed`, along with its
+  health note and its session usage badge. Only that reason hides a lane: a quota stop, a bench,
+  a quarantine or a probation is a provider still in use, and its note is the only warning anyone
+  gets that routing is avoiding it. Nothing is muted -- the lapse and the recovery each push a
+  notification as they happen, and the row returns on its own once the plan is renewed. With every
+  budgeted provider lapsed the block reads `(no active providers)` instead of standing empty
+  under its heading, and still carries the stale marker when the broker has stopped answering.
+
 ## [1.19.0] — 2026-09-28
 
 ### Added

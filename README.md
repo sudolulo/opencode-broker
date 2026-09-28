@@ -403,7 +403,7 @@ extras, failover and usage accounting.
 |---|---|
 | Prompt badge | The session's routing profile (`R:local`), `FALLBACK:<target>` when the broker degraded it, and the burn of the current provider's tightest window (`ant 42% 5h`, `!` from 85%). |
 | Bottom panel | Subagents and background shells with status, elapsed time and tokens; recently finished jobs and workflow runs. Arrow keys move into it, Enter opens a subagent. |
-| Sidebar | Every budgeted provider's windows, any provider that is quarantined, on probation or behind an open circuit, and the model each tier would get right now (shown under the prompt on the home screen too). |
+| Sidebar | Every budgeted provider still in use, with its windows, plus any of them quarantined, on probation or behind an open circuit, and the model each tier would get right now (shown under the prompt on the home screen too). A provider whose plan has lapsed is dropped until it is renewed. |
 | F11 | One menu for the profile picker, usage block, subagent list and MCP servers. Choosing a profile for a running session offers "switch next reply" or "new clean session"; on the home screen it arms the next session. |
 
 With [opencode-guard](https://github.com/sudolulo/opencode-guard) installed, the

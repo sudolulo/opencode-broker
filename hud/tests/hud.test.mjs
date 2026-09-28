@@ -53,6 +53,24 @@ const mockedRouter = {
 const nodeMajor = Number(process.versions.node.split(".")[0]);
 mock.module(routerUrl, nodeMajor >= 24 ? { exports: mockedRouter } : { namedExports: mockedRouter });
 
+// THE SIDEBAR SEAM. The usage sidebar's text is a closure (`sidebarText`), reachable only
+// through getters on the elements the `sidebar_content` slot factory builds -- and the real
+// @opentui/solid runtime throws "No renderer found" the instant it is called outside a live TUI,
+// so invoking that factory from a test is impossible with the real runtime. It is replaced here
+// with one that returns a plain object carrying the SAME property descriptors, so
+// `element.content` still re-reads the closure on every access. Nothing in tui.js is restructured
+// for testability: a test drives the exact factory opencode drives, with the exact getters.
+const jsxUrl = import.meta.resolve("@opentui/solid/jsx-runtime");
+const recordingJsx = (type, props = {}) => {
+  const element = { type };
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(props ?? {}))) {
+    Object.defineProperty(element, key, { ...descriptor, configurable: true });
+  }
+  return element;
+};
+const recordingRuntime = { jsx: recordingJsx, jsxs: recordingJsx, Fragment: "fragment" };
+mock.module(jsxUrl, nodeMajor >= 24 ? { exports: recordingRuntime } : { namedExports: recordingRuntime });
+
 const tuiUrl = new URL("../tui.js", import.meta.url).href;
 const plugin = await import(tuiUrl);
 let harnessQueue = Promise.resolve();
@@ -133,6 +151,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
   const toasts = [];
   const navigations = [];
   const switchedModels = [];
+  const slotRegistrations = [];
   let layer = null;
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
@@ -206,7 +225,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       current: { name: "session", params: { sessionID: "ses-1" } },
       navigate: (name, params) => { navigations.push({ name, params }); },
     },
-    slots: { register: () => {} },
+    slots: { register: (registration) => { slotRegistrations.push(registration); } },
     state: {
       path: { directory: "/tmp/hud-test" },
       session: {
@@ -237,6 +256,18 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       if (refreshTimer) await refreshTimer.fn();
     };
     const key = () => handlers.get("key")?.[0];
+    const runBudgetPoll = async () => {
+      const budgetTimer = intervals.find((entry) => entry.ms === 30_000);
+      if (budgetTimer) await budgetTimer.fn();
+    };
+    // The sidebar BODY element, built by the same `sidebar_content` factory opencode calls. Its
+    // `content` getter re-reads the live closure, so one capture keeps reporting what a user sees.
+    const sidebarBody = () => {
+      const registration = slotRegistrations.find((entry) => entry?.slots?.sidebar_content);
+      assert.ok(registration, "the HUD registered no sidebar_content slot");
+      const box = registration.slots.sidebar_content();
+      return box.children[1];
+    };
     const cleanup = async () => {
       if (cleaned) return;
       cleaned = true;
@@ -248,8 +279,9 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
         releaseHarness();
       }
     };
-    return { api, emit, key, runAgentPoll, runRefresh, pushes, releases, consumes, switches, cycles,
-      replies, toasts, navigations, switchedModels, cleanup, get layer() { return layer; } };
+    return { api, emit, key, runAgentPoll, runRefresh, runBudgetPoll, sidebarBody, pushes, releases,
+      consumes, switches, cycles, replies, toasts, navigations, switchedModels, cleanup,
+      get layer() { return layer; } };
   } catch (error) {
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;
@@ -770,6 +802,107 @@ test("a vision allocation waits on its own sentence, which promises nothing it c
       await broker.close();
     }
   });
+
+// ---- a lapsed subscription is not a provider in use ------------------------------------------
+// When alibaba-token-plan's plan lapsed, the broker parked it behind a `provider:` circuit and
+// routed around it -- but /status keeps reporting its budget for diagnostics, so the sidebar went
+// on showing a percentage and a circuit note for a subscription nobody holds. Only `plan-lapsed`
+// hides a provider. A quota stop or a bench is a lane still IN USE and its note is the only
+// warning anyone gets that routing is avoiding it, so widening this filter to "has any circuit"
+// is how openai sits excluded for a day again.
+const LAPSED = () => ({ kind: "quota", reason: "plan-lapsed", until: Date.now() + 3_600_000, updatedAt: Date.now() });
+const learnedWindow = (spent) => ({ windows: [{ id: "week", spent, capacity: 100, source: "learned" }] });
+const withStatus = (status) => {
+  routerHooks.brokerRequest = async (path) => {
+    if (path === "/status") return status;
+    if (path === "/preview") return { preview: {} };
+    return {};
+  };
+};
+
+test("a plan-lapsed provider leaves the usage sidebar entirely while every other note stays", async () => {
+  withStatus({
+    budgets: {
+      "alibaba-token-plan": learnedWindow(50),
+      anthropic: learnedWindow(25),
+      openai: learnedWindow(10),
+    },
+    health: { providers: {
+      // The lapsed provider is quarantined too: its health note must go with it.
+      "alibaba-token-plan": { state: "quarantined" },
+      google: { state: "probation" },
+      zai: { state: "quarantined" },
+    } },
+    circuits: {
+      "provider:alibaba-token-plan": LAPSED(),
+      "provider:openai": { kind: "quota", reason: "quota", until: Date.now() + 3_600_000, updatedAt: Date.now() },
+    },
+  });
+  const h = await withTuiHarness();
+  try {
+    const body = h.sidebarBody();
+    await h.runBudgetPoll();
+    await waitFor(() => body.content.includes("anthropic"));
+    const text = body.content;
+    assert.ok(!/alibaba|token-plan/.test(text),
+      `a lapsed plan must appear nowhere -- no row, no note:\n${text}`);
+    assert.match(text, /anthropic\s+wk 25%/, "a live provider still gets its row");
+    assert.match(text, /openai\s+wk 10%/, "a quota-stopped provider is still a provider in use");
+    assert.match(text, /openai\s+\u26d4 circuit til \d\d:\d\d/,
+      "a non-lapsed circuit note is load-bearing and must survive the filter");
+    assert.match(text, /google\s+\u26d4 probation/, "probation is not a lapse");
+    assert.match(text, /zai\s+\u26d4 quarantined/,
+      "a non-lapsed quarantine is load-bearing and must survive the filter");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the sidebar says so when every budgeted provider is lapsed, instead of rendering an empty block", async () => {
+  withStatus({
+    budgets: { "alibaba-token-plan": learnedWindow(50) },
+    health: { providers: {} },
+    circuits: { "provider:alibaba-token-plan": LAPSED() },
+  });
+  const h = await withTuiHarness();
+  try {
+    const body = h.sidebarBody();
+    await h.runBudgetPoll();
+    // The broker ANSWERED, so "no broker data yet" would be a lie; the filter emptied the list.
+    await waitFor(() => body.content !== " (no broker data yet)");
+    assert.equal(body.content, " (no active providers)");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a failed poll marks an all-lapsed sidebar stale without hiding its empty state", async () => {
+  const originalNow = Date.now;
+  withStatus({
+    budgets: { "alibaba-token-plan": learnedWindow(50) },
+    health: { providers: {} },
+    circuits: { "provider:alibaba-token-plan": LAPSED() },
+  });
+  const h = await withTuiHarness();
+  try {
+    const body = h.sidebarBody();
+    await h.runBudgetPoll();
+    assert.equal(body.content, " (no active providers)");
+
+    routerHooks.brokerRequest = async () => { throw new Error("broker unavailable"); };
+    Date.now = () => originalNow() + 7 * 60_000;
+    await h.runBudgetPoll();
+
+    assert.match(body.content, /^ \(stale 7m\)$/m);
+    assert.match(body.content, /^ \(no active providers\)$/m);
+  } finally {
+    Date.now = originalNow;
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
 
 // ---- opencode-guard is optional --------------------------------------------------------------
 // The keymap layer the plugin registers, as the harness captured it.
