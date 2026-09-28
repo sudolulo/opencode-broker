@@ -635,7 +635,14 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         await client.session.prompt({
           path: { id: sessionID },
           query: { directory },
-          body: { parts: [{ type: "text", text: REENGAGE_TEXT, synthetic: true }] },
+          // Carry the session's own agent: an agent-less prompt runs as the pane's default
+          // (`smart`), which turned a re-engaged subagent into a primary on another tier.
+          body: {
+            ...(typeof sessions.get(sessionID)?.agent === "string" && sessions.get(sessionID).agent
+              ? { agent: sessions.get(sessionID).agent }
+              : {}),
+            parts: [{ type: "text", text: REENGAGE_TEXT, synthetic: true }],
+          },
         });
         report("info", `${sessionID}: re-engaged after ${kind} failure`);
       } catch (error) {
@@ -689,6 +696,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // the persisted user message and before it resolves the provider model.
     const agent = typeof agentHint === "string" && agentHint ? agentHint : session.agent;
     if (agent !== session.agent) session = { ...session, agent };
+    // ☠️ A SUBAGENT NEVER PICKS ITS OWN MODEL, so a message's model is not its preference.
+    // A prompt that names no model (a re-engage, a steering message, an oc_send) is stamped
+    // with the pane's default -- on 2026-09-28 that was Opus, and a gpt-5.6-sol
+    // sp-implementer 24 steps into its run was re-leased onto it as "the session's preferred
+    // model": a 170k-token cold write on another provider for a subagent nobody moved. Once
+    // routed, a subagent's preference is the model it is already on.
+    if (session.parentID) {
+      const current = routes.get(sessionID)?.target?.model;
+      if (current?.providerID && current?.id) {
+        preferredModel = {
+          providerID: current.providerID,
+          id: current.id,
+          ...(typeof current.variant === "string" && current.variant ? { variant: current.variant } : {}),
+        };
+      }
+    }
     return route(session, preferredModel);
   };
 
@@ -824,6 +847,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       if (!session?.id) return;
       output.headers["x-opencode-session-kind"] = session.parentID ? "subagent" : "primary";
+      // Lets the proxy's prompt fingerprints compare consecutive requests of one session.
+      output.headers["x-opencode-session-id"] = session.id;
     },
     "chat.params": async (input) => {
       const sessionID = input?.sessionID;

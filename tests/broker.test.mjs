@@ -1776,7 +1776,9 @@ test("with no resolver view on disk /inventory admits nothing and the static pin
   const lease = await request(socketPath, "/lease", {
     sessionID: "ses-ingest-no-snapshot", profile: "auto", tier: "deep", replace: true,
   });
-  assert.equal(lease.target.model.id, "claude-fable-5-1");
+  // Any of the deep tier's static pins proves the tier is not stranded; which one goes
+  // first is the provider rotation's business, not this test's.
+  assert.ok(["claude-fable-5-1", "qwen3.8-max", "gpt-5.6-sol"].includes(lease.target.model.id), lease.target.model.id);
 }, { resolvableModels: null }));
 
 test("an ingest drop is reported, never swallowed", async () => withBroker(async ({ socketPath, stderr }) => {
@@ -1904,7 +1906,7 @@ test("with no resolver view on disk a stored inventory is not reloaded and the s
     const lease = await request(socketPath, "/lease", {
       sessionID: "ses-load-no-snapshot", profile: "auto", tier: "deep", replace: true,
     });
-    assert.equal(lease.target.model.id, "claude-fable-5-1");
+    assert.ok(["claude-fable-5-1", "qwen3.8-max", "gpt-5.6-sol"].includes(lease.target.model.id), lease.target.model.id);
   }, { resolvableModels: null });
 });
 

@@ -358,7 +358,8 @@ test("equal-utilization Smart tie break follows configured order then cursor", (
   });
   assert.equal(first.target.id, "gpt-flagship");
   assert.deepEqual(first.decision.balancedTargetIDs, ["gpt-flagship", "claude-opus-5"]);
-  assert.ok(first.decision.reasons.includes("round-robin-tiebreak"));
+  // Tied providers take turns (configured order first), rather than a fit picking one.
+  assert.ok(first.decision.reasons.includes("provider-rotation-at-equal-headroom"), String(first.decision.reasons));
 
   const second = R.chooseTarget({
     profile: "auto", tier: "smart", localModels: new Set(), contextTokens: 1000,
@@ -1640,4 +1641,16 @@ test("a classifier lane keeps its pinned model and takes only the tier's reasoni
   assert.equal(applyClassifierVariant(undefined), null);
   assert.equal(applyClassifierVariant({}), null);
   assert.equal(applyClassifierVariant({ model: {} }), null);
+});
+
+test("review alternates providers at equal headroom instead of letting a model's fit take the tier", () => {
+  const base = {
+    profile: "auto", tier: "review", localModels: new Set(), contextTokens: 1000,
+    circuits: { "provider:alibaba-token-plan": { kind: "quota", until: null } },
+  };
+  const first = R.chooseTarget(base);
+  const second = R.chooseTarget({ ...base, cursors: { [first.cursorKey]: first.nextCursor } });
+  assert.notEqual(first.target.providerID, second.target.providerID,
+    `${first.target.id} then ${second.target.id}: both leases went to one provider`);
+  assert.ok(first.decision.reasons.includes("provider-rotation-at-equal-headroom"), String(first.decision.reasons));
 });

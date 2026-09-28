@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] — 2026-09-28
+
+### Changed
+
+- **Every tier balances across providers.** At equal headroom (within the 2% epsilon, which is
+  every provider early in a week) the old tiebreak let a model's tier fit pick the provider, so a
+  whole tier went to one: all 11 new review leases since 14:29 on 2026-09-28 went to
+  claude-sonnet-4-6 (review fit 1.4) over an idle gpt-terra, draining the anthropic 5h window.
+  Tied providers now take turns for new sessions, in configured order. The order of tiebreaks is
+  headroom, then a configured `tierProviderWeights` lean, then an active usage deal, then the
+  provider rotation, then model fit within the chosen provider. Fit no longer scales the
+  utilization providers are compared on. Decisions report `provider-rotation-at-equal-headroom`.
+- **A burst window binds when it is on pace to run out,** not only past `burstFence`: spent share
+  divided by the elapsed share of the window, from one fifth of the way in. Anthropic's 5h at 41%
+  with 54% elapsed stays on the weekly figure; 60% at 40% elapsed now steers new sessions away.
+
+### Fixed
+
+- **A subagent is no longer moved to another provider by a message it did not choose.** A prompt
+  that names no model is stamped with the pane default, and the router passed that as the
+  session's preferred model: a gpt-5.6-sol `sp-implementer` 24 steps in was re-leased onto Opus,
+  a 170k-token cold write. Once routed, a subagent's preference is the model it is already on.
+  Re-engage prompts also carry the session's own agent instead of falling back to `smart`.
+
+### Added
+
+- **`x-opencode-session-id` on anthropic requests**, beside the session kind, so claude-proxy can
+  fingerprint prompts per session and name the part that changed when a request misses the cache.
+
 ## [1.17.0] — 2026-09-28
 
 ### Added

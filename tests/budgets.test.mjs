@@ -122,3 +122,18 @@ test("high-risk content raises the tier floor deterministically", async () => {
   assert.equal(raiseTier("deep", "smart"), "deep", "never lower a deep session to smart");
   assert.equal(raiseTier("build", null), "build");
 });
+
+test("a burst window on pace to run out before it resets binds the balancer", async () => {
+  const { effectiveUtilization } = await import("../lib/budgets.js");
+  const now = Date.parse("2026-09-28T15:00:00Z");
+  const at = (hours) => new Date(now + hours * 3_600_000).toISOString();
+  // 41% of the 5h spent with 2.3h left (54% elapsed): on pace for ~76% -- weekly still decides.
+  const onTrack = { windows: [{ id: "5h", percent: 41, resetsAt: at(2.3) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
+  assert.equal(effectiveUtilization({}, "anthropic", now, undefined, onTrack), 0.05);
+  // 60% spent with 3h left (40% elapsed): on pace to run out -- the burst binds.
+  const burning = { windows: [{ id: "5h", percent: 60, resetsAt: at(3) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
+  assert.equal(effectiveUtilization({}, "anthropic", now, undefined, burning), 0.6);
+  // The first fifth of a window is too noisy to extrapolate from.
+  const early = { windows: [{ id: "5h", percent: 15, resetsAt: at(4.5) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
+  assert.equal(effectiveUtilization({}, "anthropic", now, undefined, early), 0.05);
+});
