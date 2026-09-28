@@ -1926,3 +1926,54 @@ test("a clean restart reports no load-time drops", async () => {
       "a normal start has nothing to report and must stay quiet");
   });
 });
+
+// ☠️ The 2026-09-24 wedge. Clients give up after 2.5 s and retry, leaving their request queued;
+// parseBody then waited on each dead socket until the 30 s handler deadline, so the chain
+// drained one abandoned request per 30 s while retries refilled it and the broker went mute
+// for days. An abandoned request must cost nothing when it reaches the head of the queue.
+test("requests abandoned while queued are skipped, not charged the handler deadline", async () => withBroker(async ({ socketPath }) => {
+  const net = await import("node:net");
+  // Hold the head of the queue: headers promise a body that has not been sent yet.
+  const stall = net.connect(socketPath);
+  await new Promise((resolve) => stall.once("connect", resolve));
+  stall.write("POST /status HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const abandonedCount = 5;
+  await Promise.all(Array.from({ length: abandonedCount }, () => new Promise((resolve) => {
+    const req = http.request({ socketPath, path: "/status", method: "POST", timeout: 100,
+      headers: { "content-type": "application/json", "content-length": 2 } });
+    req.on("timeout", () => req.destroy(new Error("broker timeout")));
+    req.on("error", resolve);
+    req.on("response", (res) => { res.resume(); resolve(); });
+    req.end("{}");
+  })));
+
+  stall.end("{}");
+  const started = Date.now();
+  const status = await request(socketPath, "/status");
+  assert.ok(Date.now() - started < 5000, `status took ${Date.now() - started} ms behind abandoned requests`);
+  assert.equal(status.queue.abandoned, abandonedCount);
+  assert.equal(status.queue.deadlineHits, 0);
+  stall.destroy();
+}));
+
+test("health reports ok on a responsive broker and unhealthy when nothing answers", async () => withBroker(async ({ home }) => {
+  const run = (env) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [brokerScript, "health", "1000"], { env: { ...process.env, ...env } });
+    let out = "";
+    child.stdout.on("data", (chunk) => { out += chunk; });
+    child.on("close", (code) => resolve({ code, out }));
+  });
+  const ok = await run({ HOME: home });
+  assert.equal(ok.code, 0, ok.out);
+  assert.match(ok.out, /^ok: queue depth/);
+  const emptyHome = mkdtempSync(join(tmpdir(), "fleet-model-broker-nobroker-"));
+  try {
+    const down = await run({ HOME: emptyHome });
+    assert.equal(down.code, 1);
+    assert.match(down.out, /^unhealthy: \/status did not answer/);
+  } finally {
+    rmSync(emptyHome, { recursive: true, force: true });
+  }
+}));

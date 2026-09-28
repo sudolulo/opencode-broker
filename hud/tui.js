@@ -859,12 +859,16 @@ export default {
     const budgetUtil = new Map();
     const laneNotes = new Map();
     let budgetAt = 0;
+    // When /status started failing, or null while it answers. Two misses in a row (the poll
+    // runs every 30 s) turn the badge into BROKER DOWN -- see fallbackBadge.
+    let brokerFailingSince = null;
     let budgetPolling = false;
     const pollBudgets = async () => {
       if (budgetPolling) return;
       budgetPolling = true;
       try {
         const status = await brokerRequest("/status", {}, { timeout: 1500 });
+        brokerFailingSince = null;
         budgetUtil.clear();
         for (const [providerID, report] of Object.entries(status?.budgets ?? {})) {
           // A provider that reports its own plan usage is EXACT: those numbers
@@ -918,7 +922,10 @@ export default {
             if (target?.model?.id) routePreview.set(tier, target.model.id + (target.model.variant ? " \u00b7 " + target.model.variant : ""));
           }
         } catch { /* preview is decoration; usage numbers stand alone */ }
-      } catch { /* broker down: values age out */ }
+      } catch {
+        // broker down: values age out, and the badge says so (fallbackBadge)
+        if (brokerFailingSince === null) brokerFailingSince = Date.now();
+      }
       finally { budgetPolling = false; }
     };
     void pollBudgets();
@@ -1107,6 +1114,10 @@ export default {
       // The router plugin writes a marker when a lease landed on a fallback
       // target and clears it on the next healthy lease. A degraded route the
       // user cannot see is how a session quietly runs on the emergency model.
+      // ☠️ A mute broker must outrank the marker. Only a healthy lease clears it, so with the
+      // broker wedged a session showed FALLBACK:qwen-max for four days after the provider it
+      // fell back from had recovered -- a true-looking badge naming the wrong problem.
+      if (brokerFailingSince !== null && Date.now() - brokerFailingSince >= 30_000) return " · BROKER DOWN";
       if (!id) return "";
       try {
         const marker = readFallbackMarker(id);

@@ -20,6 +20,7 @@ import {
   cloudTargetAdmitted,
   chooseTarget,
   classifyRoutingFailure,
+  isPlanLapsed,
   contextFits,
   ensureRoutingStateDir,
   localContextEligible,
@@ -54,7 +55,9 @@ import {
   cachedPlanUsage,
   fetchPlanUsage,
   planUsageConfigured,
-  planUsageResetAt, planUsageSnapshot, seedPlanUsageCache } from "../lib/plan-usage.js";
+  freshPlanUsage, planUsageResetAt, planUsageSnapshot, seedPlanUsageCache } from "../lib/plan-usage.js";
+import { applyProviderCheck, checkProvider, LAPSED_HOLD_MS, PLAN_LAPSED_REASON,
+  planUsageResult, PROVIDER_CHECK_INTERVAL_MS, providerCheckConfigured } from "../lib/provider-check.js";
 import {
   markProbationSuccessHealthy,
   normalizeHealth,
@@ -82,6 +85,13 @@ const notifyBurn = (alert) => {
     console.error(`[opencode-broker] burn alert failed: ${error?.message ?? error}`);
   }
 };
+// The request queue's health, reported on /status and read by `opencode-broker health`.
+// A queue wait past QUEUE_WAIT_ALERT_MS already means callers are timing out (the client
+// gives up at 2.5 s), so it is worth a notification; alerts are rate-limited to one per
+// STALL_ALERT_INTERVAL_MS, while every occurrence still reaches the journal.
+const QUEUE_WAIT_ALERT_MS = 10_000;
+const STALL_ALERT_INTERVAL_MS = 600_000;
+const queueStats = { depth: 0, abandoned: 0, slowWaits: 0, deadlineHits: 0, lastDeadlineAt: null, lastAlertAt: 0 };
 const localProviderIDs = (targets) => new Set(Object.values(targets)
   .filter((target) => target?.kind === "local").map((target) => target.providerID));
 
@@ -319,9 +329,24 @@ const refreshPlanUsage = (state) => Promise.all(Object.entries(PROVIDER_BUDGETS)
     const report = await fetchPlanUsage(providerID, providerConfig);
     if (!report) return;
     applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
+    // The same reading also settles a failure-reported quota stop or a lapse.
+    applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
     writeState(state);
   } catch {}
 }));
+
+// One provider-check result onto the provider circuit, with the transition logged and
+// pushed. Shared by the usage refresh above and the timer for providers without one.
+const applyCheckResult = (state, providerID, result) => {
+  const now = Date.now();
+  const change = applyProviderCheck(state.circuits, providerCircuitID(providerID), result, now);
+  if (!change) return;
+  writeState(state);
+  logDecision({ at: now, sessionID: null, targetID: null, policy: `provider-check-${change}`, reasons: [providerID] });
+  notifyBurn(change === "lapsed"
+    ? { title: `${providerID} plan lapsed`, body: "Held out of routing; it returns on its own once the plan is renewed." }
+    : { title: `${providerID} is usable again`, body: "The provider check lifted its hold; it is back in routing." });
+};
 
 // A one-shot assignment belongs to a session id that is minted per REQUEST and never reused,
 // so once its lease is gone nothing can read it back. Callers declare it on /lease, but the
@@ -1047,17 +1072,25 @@ const acquire = async (state, request) => {
   return { target: choice.target, existing: false };
 };
 
+// ☠️ `close` IS NOT OPTIONAL. A request whose client hung up before this ran never emits `end`
+// or `error` -- its socket is destroyed, the body is unreadable, and a promise listening for
+// only those two sits pending forever (measured on node 24: still pending after 5 s). The
+// serial chain's deadline then charges that dead request the full 30 s. See `abandoned` below.
 const parseBody = (request) => new Promise((resolve, reject) => {
   let text = "";
+  let ended = false;
+  if (request.destroyed) return reject(new Error("client disconnected"));
   request.setEncoding("utf8");
   request.on("data", (chunk) => {
     text += chunk;
     if (text.length > 64 * 1024) request.destroy(new Error("request too large"));
   });
   request.on("end", () => {
+    ended = true;
     try { resolve(text ? JSON.parse(text) : {}); } catch { reject(new Error("invalid JSON")); }
   });
   request.on("error", reject);
+  request.on("close", () => { if (!ended) reject(new Error("client disconnected")); });
 });
 
 const reply = (response, code, value) => {
@@ -1210,9 +1243,13 @@ const serve = async () => {
             const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
             circuitUntil = planUsageResetAt(report);
           }
-          if (!circuitUntil) circuitUntil = Date.now() + QUOTA_REPROBE_MS;
+          // A lapsed plan has no reset coming: hold it until the background provider
+          // check sees the renewal (lib/provider-check.js), not for a fixed re-probe.
+          const lapsed = isPlanLapsed(error);
+          if (!circuitUntil) circuitUntil = Date.now() + (lapsed ? LAPSED_HOLD_MS : QUOTA_REPROBE_MS);
           state.circuits[providerCircuitID(target)] = {
             kind,
+            ...(lapsed ? { reason: PLAN_LAPSED_REASON } : {}),
             until: circuitUntil,
             updatedAt: Date.now(),
           };
@@ -1388,7 +1425,7 @@ const serve = async () => {
       }
       if (request.url === "/status") {
         writeState(state);
-        return reply(response, 200, publicState(state));
+        return reply(response, 200, { ...publicState(state), queue: { ...queueStats } });
       }
       if (request.url === "/preview") {
         // Side-effect-free selection: what WOULD each tier get right now. No
@@ -1546,11 +1583,43 @@ const serve = async () => {
   // than any legitimate handler (the slowest, a plan-usage refresh, is capped at 20s) and
   // the caller gets an honest 503 rather than a socket that never answers. A wedged
   // handler costs one slow request now, not the whole fleet's ability to route.
+  // ☠️ THE DEADLINE ALONE STILL WEDGED IT, for four and a half days from 2026-09-24 01:46.
+  // Clients give up after 2.5 s (lib/client.js) and retry; the request they abandoned stays
+  // queued. When it reached the head, parseBody waited on a dead socket until this deadline
+  // fired, so each abandoned request cost 30 s -- and once the queue was 2.5 s deep, every
+  // request behind it was abandoned too, and every retry added another. The chain drained
+  // one request per 30 s while callers filled it far faster: alive, idle in epoll, mute.
+  // ☆ So a request whose client is already gone is dropped at the head of the queue for
+  // free, and every deadline hit is logged and notified instead of answered in silence.
   const HANDLER_DEADLINE_MS = 30_000;
-  const guarded = (request, response) => {
+  const abandoned = (request, response) => request.destroyed || response.destroyed ||
+    Boolean(request.socket?.destroyed);
+  const alertStall = (title, body) => {
+    const now = Date.now();
+    console.error(`[opencode-broker] ${title}: ${body}`);
+    if (now - queueStats.lastAlertAt < STALL_ALERT_INTERVAL_MS) return;
+    queueStats.lastAlertAt = now;
+    notifyBurn({ title, body, kind: "broker-stall" });
+  };
+  const guarded = (request, response, enqueuedAt) => {
+    queueStats.depth -= 1;
+    const waitedMs = Date.now() - enqueuedAt;
+    if (abandoned(request, response)) {
+      queueStats.abandoned += 1;
+      return Promise.resolve();
+    }
+    if (waitedMs >= QUEUE_WAIT_ALERT_MS) {
+      queueStats.slowWaits += 1;
+      alertStall("opencode-broker queue backed up",
+        `${request.url} waited ${Math.round(waitedMs / 1000)} s in the request queue (${queueStats.depth} still queued)`);
+    }
     let timer = null;
     const finished = new Promise((resolve) => {
       timer = setTimeout(() => {
+        queueStats.deadlineHits += 1;
+        queueStats.lastDeadlineAt = Date.now();
+        alertStall("opencode-broker handler deadline exceeded",
+          `${request.url} did not finish within ${HANDLER_DEADLINE_MS / 1000} s; answered 503 (${queueStats.depth} queued behind it)`);
         try {
           if (!response.writableEnded) {
             response.statusCode = 503;
@@ -1568,7 +1637,9 @@ const serve = async () => {
     return Promise.race([running.catch(() => {}), finished]).finally(() => clearTimeout(timer));
   };
   const server = createServer((request, response) => {
-    serial = serial.then(() => guarded(request, response), () => guarded(request, response));
+    const enqueuedAt = Date.now();
+    queueStats.depth += 1;
+    serial = serial.then(() => guarded(request, response, enqueuedAt), () => guarded(request, response, enqueuedAt));
   });
   const removeSocket = () => { try { unlinkSync(socketPath); } catch {} };
   server.on("close", removeSocket);
@@ -1577,6 +1648,18 @@ const serve = async () => {
     server.listen(socketPath, resolve);
     if (slotWatch) setInterval(() => { pollSlots().catch(() => {}); }, CONFIG.slotWatch.intervalMs).unref();
   });
+  // Providers with no usage reading (lib/provider-check.js) are checked on a timer. The
+  // network call runs OUTSIDE the serial queue, so a slow provider never delays a lease;
+  // only the circuit change is queued, where it cannot interleave with a handler.
+  const runProviderChecks = async () => {
+    for (const [providerID, providerConfig] of Object.entries(PROVIDER_BUDGETS)) {
+      if (!providerCheckConfigured(providerConfig)) continue;
+      const result = await checkProvider(providerID, providerConfig).catch(() => null);
+      if (result) serial = serial.then(() => applyCheckResult(state, providerID, result)).catch(() => {});
+    }
+  };
+  runProviderChecks().catch(() => {});
+  setInterval(() => { runProviderChecks().catch(() => {}); }, PROVIDER_CHECK_INTERVAL_MS).unref();
   process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
   for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);
   for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -1591,6 +1674,32 @@ const main = async () => {
   if (command === "serve") return serve();
   if (command === "status") {
     process.stdout.write(JSON.stringify(await brokerRequest("/status"), null, 2) + "\n");
+    return;
+  }
+  if (command === "health") {
+    // Liveness from the OUTSIDE, for a timer: a broker that is alive but mute looks perfectly
+    // healthy to systemd, which is how one sat wedged for days. Exit 0 when /status answers
+    // promptly and the queue is draining, 1 when it does not answer at all, 2 when it answers
+    // but the queue is backed up. Every outcome prints one line.
+    const timeoutMs = Number(targetID) > 0 ? Number(targetID) : 10_000;
+    let status;
+    try {
+      status = await brokerRequest("/status", {}, { timeout: timeoutMs });
+    } catch (error) {
+      process.stdout.write(`unhealthy: /status did not answer within ${timeoutMs / 1000} s (${error?.message ?? error})\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const queue = status?.queue ?? {};
+    const recentDeadline = Number(queue.lastDeadlineAt) > Date.now() - 300_000;
+    if (Number(queue.depth) > 20 || recentDeadline) {
+      process.stdout.write(`unhealthy: queue depth ${queue.depth ?? "?"}, ${queue.deadlineHits ?? 0} handler deadline(s) hit` +
+        (recentDeadline ? `, the last ${Math.round((Date.now() - queue.lastDeadlineAt) / 1000)} s ago` : "") + "\n");
+      // 2, not 1: it answers, so a restart would only lose state -- worth a look, not a kill.
+      process.exitCode = 2;
+      return;
+    }
+    process.stdout.write(`ok: queue depth ${queue.depth ?? 0}, ${queue.abandoned ?? 0} abandoned request(s) skipped\n`);
     return;
   }
   if (command === "selection") {
@@ -1661,7 +1770,7 @@ const main = async () => {
     }), null, 2) + "\n");
     return;
   }
-  throw new Error("usage: opencode-broker serve | status | selection | decisions [n] | usage [days] | rearm [target-or-provider] | quarantine provider:<id> [reason-code]");
+  throw new Error("usage: opencode-broker serve | status | health [timeout-ms] | selection | decisions [n] | usage [days] | rearm [target-or-provider] | quarantine provider:<id> [reason-code]");
 };
 
 main().catch((error) => {

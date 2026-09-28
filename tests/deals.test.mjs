@@ -84,6 +84,20 @@ test("entitlement denials classify as model failures, never provider failures", 
   assert.equal(R.classifyRoutingFailure({ statusCode: 429, code: "Throttling.AllocationQuota", message: "Your token-plan 1-week quota has been exhausted" }), "quota");
 });
 
+test("a lapsed plan is a provider-wide quota stop, even behind opencode's responseBody", () => {
+  const body = JSON.stringify({ code: "AccessDenied.Unpurchased", message: "Access to model denied. Please make sure you are eligible for using the model." });
+  // What the router plugin forwards: opencode's APIError, the provider code only inside the body string.
+  const pluginShape = { name: "APIError", data: { message: "Forbidden: Access to model denied. Please make sure you are eligible for using the model.", statusCode: 403, responseBody: body } };
+  assert.equal(R.classifyRoutingFailure(pluginShape), "quota");
+  assert.equal(R.isPlanLapsed(pluginShape), true);
+  // What the gateway forwards: the raw body as the message.
+  assert.equal(R.classifyRoutingFailure({ statusCode: 403, message: body }), "quota");
+  // A real per-model entitlement denial still fences only the model.
+  const modelOnly = { name: "APIError", data: { message: "Access to model denied", statusCode: 403, responseBody: JSON.stringify({ code: "AccessDenied.Model" }) } };
+  assert.equal(R.classifyRoutingFailure(modelOnly), "model");
+  assert.equal(R.isPlanLapsed(modelOnly), false);
+});
+
 test("capacities self-calibrate from provider complaints and raise on clean overshoot", async () => {
   const { learnCapacityFromFailure, capacityFor, budgetUtilization } = await import("../lib/budgets.js");
   const config = { openai: { windows: [

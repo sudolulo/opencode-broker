@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] — 2026-09-28
+
+### Fixed
+
+- **The broker no longer goes mute when clients give up on it.** It stayed `active (running)`
+  from 2026-09-24 01:46 to 09-28 13:25 while answering nothing, so every opencode session kept
+  its last fallback model (`FALLBACK:qwen-max`) long after Anthropic had recovered. The cause:
+  clients time out after 2.5 s and retry, but the request they abandon stays in the broker's
+  serial queue, and `parseBody` never settles on a dead socket — it waited for `end`/`error`,
+  neither of which fires. The 30 s handler deadline therefore charged every abandoned request
+  30 s, and once the queue was 2.5 s deep everything behind it was abandoned too, while retries
+  kept refilling it. Reproduced: five abandoned requests held one `/status` for 150 s. Requests
+  whose client has gone are now dropped at the head of the queue at no cost, and `parseBody`
+  rejects on `close`. The same scenario now answers in under half a second.
+- **A lapsed subscription plan idles its provider instead of failing one model at a time.**
+  An expired Alibaba token plan answers every model with 403 `AccessDenied.Unpurchased`,
+  "Access to model denied" — the same words as a per-model entitlement denial, and the code
+  was lost because opencode ships the provider body only as the `responseBody` string. It was
+  classified `model`: qwen-max was fenced permanently (never coming back after a renewal) and
+  every sibling model was left to fail in turn. The provider code is now read from
+  `responseBody`, and `Unpurchased` is a provider-wide `quota` stop held until the background
+  provider check below sees the renewal (6 hours is only the backstop).
+
+### Added
+
+- **Provider checks** (`lib/provider-check.js`). Each provider gets the best signal it offers,
+  so neither a lapse nor a recovery has to be discovered by a user's prompt. Providers with a
+  live usage reading are judged on the refresh every request already makes; only providers
+  without one are polled, every 5 minutes, outside the request queue:
+  - `budgets.<provider>.check: { type: "count-tokens", url, model }` — a free Anthropic-compatible
+    `count_tokens` call. Alibaba answers it 403 `AccessDenied.Unpurchased` on a lapsed plan and
+    200 on a live one (verified 2026-09-28). It can lift a lapse, never a window-quota stop,
+    since counting is not metered.
+  - Providers with a `planUsage` source use a *fresh* reading (never the cached last-good):
+    OpenAI's `plan_type: "free"` is a lapse, and an unlocked reading lifts a failure-reported
+    quota stop older than 15 minutes. On deployment this released an openai stop held on a
+    guessed 17:05 reset while its own usage API already said `allowed: true`.
+  - Transitions are logged (`provider-check-lapsed` / `provider-check-recovered`) and pushed
+    through `burnWatch.notifyCommand`.
+- **Stalls are visible.** A request that waited 10 s or more in the queue, or hit the handler
+  deadline, is logged to the journal and sent through `burnWatch.notifyCommand` (at most one
+  push per 10 minutes). `/status` now reports `queue`: depth, abandoned requests skipped, slow
+  waits, deadline hits and when the last one happened.
+- **`opencode-broker health [timeout-ms]`**: a liveness check for timers. Exits 0 when `/status`
+  answers and the queue is draining, 1 when nothing answers, 2 when it answers but is backed up.
+- **The HUD shows `BROKER DOWN`** once `/status` has failed for 30 s, instead of the session's
+  stale `FALLBACK:` badge (the marker is cleared only by a healthy lease, so a mute broker left
+  it naming the wrong problem).
+
 ## [1.15.1] — 2026-09-24
 
 ### Fixed
