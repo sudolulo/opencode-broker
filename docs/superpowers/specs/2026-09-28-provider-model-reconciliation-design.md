@@ -2,7 +2,7 @@
 
 Status: proposed
 Date: 2026-09-28
-Repo: opencode-broker (1.19.0)
+Repo: opencode-broker (1.19.1 baseline)
 
 ## Problem
 
