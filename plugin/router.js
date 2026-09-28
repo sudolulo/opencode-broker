@@ -809,6 +809,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         if (applied) report("info", `${sessionID}: classifier lane at reasoning effort "${applied}"`);
       }
     },
+    // Cache lifetime hint for claude-proxy, matching what Claude Code does on the same plan:
+    // a ROOT session can sit idle for many minutes (a human thinking, or a parent waiting on
+    // a subagent) and gets the 1-hour cache; a SUBAGENT runs back to back and then ends, so the
+    // 5-minute cache is enough and its writes cost 1.25x instead of 2x. Measured over 60k Claude
+    // Code requests on 2026-09-28: 97% of main-session writes were 1h, 99.9% of subagent writes
+    // 5m. Only sent to the anthropic provider (the proxy); an unknown session sends nothing and
+    // the proxy keeps the safe 1-hour default.
+    "chat.headers": async (input, output) => {
+      if (input?.model?.providerID !== "anthropic" || !input?.sessionID || !output?.headers) return;
+      let session = sessions.get(input.sessionID);
+      if (!session) {
+        try { session = await getSession(input.sessionID); } catch { return; }
+      }
+      if (!session?.id) return;
+      output.headers["x-opencode-session-kind"] = session.parentID ? "subagent" : "primary";
+    },
     "chat.params": async (input) => {
       const sessionID = input?.sessionID;
       if (!sessionID) return;

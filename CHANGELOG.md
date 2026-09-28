@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] — 2026-09-28
+
+### Added
+
+- **Cache lifetime hint for claude-proxy.** The router plugin's new `chat.headers` hook sends
+  `x-opencode-session-kind: primary | subagent` on anthropic requests, so the proxy writes
+  1-hour cache entries for root sessions (which sit idle while a human thinks or a subagent
+  runs) and 5-minute entries for subagents (which run back to back, then end). This matches
+  Claude Code on the same plan: over 60k requests, 97% of its main-session cache writes were
+  1-hour and 99.9% of its subagent writes 5-minute. Other providers get no header, and an
+  unknown session sends none, leaving the proxy's 1-hour default.
+
 ## [1.16.0] — 2026-09-28
 
 ### Fixed
