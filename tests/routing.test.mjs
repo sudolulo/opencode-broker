@@ -813,6 +813,91 @@ test("an unusable resolver listing fails loudly instead of writing an empty view
   assert.equal(existsSync(routing.resolvableModelsPath()), false);
 }));
 
+// CRITICAL: FAMILY_TIERS is DERIVED from the provider-role registry (lib/model-roles.js) instead of
+// being typed here, and the derivation has to reproduce the shipped table exactly -- keys and
+// order included. lib/watch.js publishes Object.keys(FAMILY_TIERS) as MAPPED_FAMILY_KEYS, so a
+// dropped or renamed key silently changes which families the watch job can report a release
+// for, and a changed `fit` silently re-weights a lane.
+const EXPECTED_FAMILY_TIERS = {
+  "anthropic:claude-opus": { tiers: ["build", "smart"], fit: { build: 1.5 } },
+  "anthropic:claude-sonnet": { tiers: ["build", "review"], fit: { review: 1.4 } },
+  "anthropic:claude-fable": { tiers: ["deep"], fit: { deep: 1.5 } },
+  "anthropic:claude-haiku": { tiers: ["worker", "classifier"], fit: {} },
+  "openai:gpt-astra": { tiers: ["deep"], fit: {} },
+  "openai:gpt-sol": { tiers: ["smart"], fit: {} },
+  "openai:gpt-terra": { tiers: ["build"], fit: {} },
+  "openai:gpt-luna": { tiers: ["worker"], fit: {} },
+};
+
+test("the derived family-tier table is byte-for-byte the shipped discovery policy", () => {
+  assert.deepEqual(R.FAMILY_TIERS, EXPECTED_FAMILY_TIERS);
+  assert.deepEqual(Object.keys(R.FAMILY_TIERS), Object.keys(EXPECTED_FAMILY_TIERS));
+});
+
+// CRITICAL: A host override is allowed to change policy; a MALFORMED one is not allowed to change
+// anything. The shapes below are the ones that look like deletions -- null, false, an empty
+// object, an empty tier list, an empty family list, a key that is not provider:role -- and
+// every one of them must leave Opus in build/smart and Luna out of the classifier lane.
+test("an invalid modelRoles override cannot alter the derived family-tier table", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-model-roles-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      targets: {},
+      modelRoles: {
+        "anthropic:claude-opus": null,
+        "anthropic:claude-sonnet": false,
+        "anthropic:claude-fable": {},
+        "anthropic:claude-haiku": { tiers: [] },
+        // Luna cannot appoint itself to the security-sensitive classifier lane through an
+        // override the validator rejects.
+        "openai:gpt-luna": { tiers: ["classifier"], families: [] },
+        "not a role key": { tiers: ["deep"] },
+      },
+    }));
+    const script = `
+      const R = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+      console.log(JSON.stringify(R.FAMILY_TIERS));
+    `;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, OPENCODE_BROKER_CONFIG: configPath },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), EXPECTED_FAMILY_TIERS);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The same registry a valid override CAN reach: a host that means it moves the lane, and the
+// derived table is what discovery then routes on.
+test("a valid modelRoles override moves the lane it names and leaves the rest alone", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-model-roles-valid-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      targets: {},
+      modelRoles: { "anthropic:claude-fable": { tiers: ["smart"], fit: { smart: 1.1 } } },
+    }));
+    const script = `
+      const R = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+      console.log(JSON.stringify(R.FAMILY_TIERS));
+    `;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, OPENCODE_BROKER_CONFIG: configPath },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), {
+      ...EXPECTED_FAMILY_TIERS,
+      "anthropic:claude-fable": { tiers: ["smart"], fit: { smart: 1.1 } },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ☠️ An OAuth provider nobody has MAPPED gets no lane. Tier roles are a deployment
 // decision, so an unmapped family is invisible rather than guessed at from the words in
 // its name -- "Example Max" no longer talks its way into the smart tier.
@@ -895,6 +980,38 @@ test("mapped OpenAI families are discovered on the same path as Anthropic famili
   });
   assert.equal(Object.values(discovery.targets)[0].source, "subscription-oauth");
   assert.ok(Object.keys(discovery.targets).every((id) => id.startsWith("subscription-openai-")));
+});
+
+// The Anthropic half of the same table, asserted on the discovery path rather than on the
+// table: tiers AND the measured `fit` have to survive the move to the role registry, because
+// `fit` is what makes Opus outrank Sonnet in build without a second config knob.
+test("mapped Anthropic families keep their shipped tiers and fit through discovery", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["anthropic"],
+    all: [{
+      id: "anthropic",
+      models: {
+        "claude-opus-9": { id: "claude-opus-9", status: "active", tool_call: true,
+          family: "claude-opus", release_date: "2026-09-04" },
+        "claude-sonnet-9": { id: "claude-sonnet-9", status: "active", tool_call: true,
+          family: "claude-sonnet", release_date: "2026-09-04" },
+        "claude-fable-9": { id: "claude-fable-9", status: "active", tool_call: true,
+          family: "claude-fable", release_date: "2026-09-04" },
+        "claude-haiku-9": { id: "claude-haiku-9", status: "active", tool_call: true,
+          family: "claude-haiku", release_date: "2026-09-04" },
+        // Unmapped: a family nobody gave a role to takes no lane.
+        "claude-nimbus-9": { id: "claude-nimbus-9", status: "active", tool_call: true,
+          family: "claude-nimbus", release_date: "2026-09-04" },
+      },
+    }],
+  }, { anthropic: "oauth" }, {});
+  assert.deepEqual(Object.fromEntries(Object.values(discovery.targets)
+    .map((target) => [target.modelID, { tiers: target.tiers, fit: target.fit ?? null }])), {
+    "claude-opus-9": { tiers: ["build", "smart"], fit: { build: 1.5 } },
+    "claude-sonnet-9": { tiers: ["build", "review"], fit: { review: 1.4 } },
+    "claude-fable-9": { tiers: ["deep"], fit: { deep: 1.5 } },
+    "claude-haiku-9": { tiers: ["worker", "classifier"], fit: null },
+  });
 });
 
 // A pin covers aliases of its release, not the whole family line.
