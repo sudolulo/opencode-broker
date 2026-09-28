@@ -110,3 +110,35 @@ test("a routed subagent keeps its model when a message arrives stamped with anot
   assert.equal(last?.providerID, "openai", JSON.stringify(result.leases));
   assert.equal(last?.id, "gpt-5.6-sol");
 });
+
+// ☠️ The same stamp on a ROOT (2026-09-28): a background-job notice named no model,
+// arrived stamped with the pane default, and re-leased a gpt-5.6-sol root onto claude-opus-5
+// while the pane still showed Sol -- after which every turn failed "routed model mismatch".
+const rootSend = `
+  const send = (model, parts) => hooks["chat.message"](
+    { sessionID: "ses-root", agent: "smart", model },
+    { message: { agent: "smart", model: { providerID: model.providerID, modelID: model.id } }, parts },
+  );
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-root", agent: "smart" } } } });
+  await send({ providerID: "openai", id: "gpt-5.6-sol" }, [{ type: "text", text: "start the task" }]);
+`;
+
+test("a synthetic prompt keeps a routed root on its model", () => {
+  const result = runPlugin(rootSend + `
+    await send({ providerID: "anthropic", id: "claude-opus-5" }, [{ type: "text", text: "[background job bg002 finished]", synthetic: true }]);
+    console.log(JSON.stringify({ leases: leases.map((lease) => lease.preferredModel ?? null) }));
+  `);
+  const last = result.leases.at(-1);
+  assert.equal(last?.providerID, "openai", JSON.stringify(result.leases));
+  assert.equal(last?.id, "gpt-5.6-sol");
+});
+
+test("a root's own typed prompt still carries the user's model choice", () => {
+  const result = runPlugin(rootSend + `
+    await send({ providerID: "anthropic", id: "claude-opus-5" }, [{ type: "text", text: "switch to opus please" }]);
+    console.log(JSON.stringify({ leases: leases.map((lease) => lease.preferredModel ?? null) }));
+  `);
+  const last = result.leases.at(-1);
+  assert.equal(last?.providerID, "anthropic", JSON.stringify(result.leases));
+  assert.equal(last?.id, "claude-opus-5");
+});

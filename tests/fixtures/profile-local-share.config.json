@@ -1,0 +1,15 @@
+{
+  "targets": {
+    "lan-memory": { "providerID": "llamacpp", "modelID": "lan-9b", "kind": "local", "capacity": 2, "context": 131072, "outputReserve": 49152 },
+    "gpt-luna": { "providerID": "openai", "modelID": "gpt-5.6-luna", "kind": "cloud" },
+    "qwen-flash": { "providerID": "alibaba-token-plan", "modelID": "qwen3.6-flash", "kind": "cloud" },
+    "haiku": { "providerID": "anthropic", "modelID": "claude-haiku-4-5", "kind": "cloud" }
+  },
+  "tiers": { "worker": ["gpt-luna", "qwen-flash", "haiku"] },
+  "profiles": {
+    "memory": ["lan-memory", "gpt-luna", "qwen-flash", "haiku"],
+    "mixed-unshared": ["lan-memory", "gpt-luna"]
+  },
+  "profileCloudEgress": ["memory", "mixed-unshared"],
+  "profileLocalShare": { "memory": 2, "mixed-unshared": 1, "no-such-profile": 2 }
+}

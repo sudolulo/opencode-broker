@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] — 2026-09-28
+
+### Added
+
+- **`profileLocalShare`**: a named profile whose lane mixes local and cloud targets can now be
+  balanced like `auto` worker routing -- one in N leases to its local target when it has a free
+  slot, the rest by weighted depletion across the cloud providers, and a full local target sends
+  the lease to cloud instead of waiting. Without it such a profile only ever reached its local
+  target once every cloud target was out. Built for an ingestion lane (supermemory) that had been
+  local-first with a single cloud overflow rung.
+
+### Fixed
+
+- **A synthetic prompt no longer moves a root session onto the pane's default model.** A
+  background-job notice, re-engage or `oc_send` names no model, so opencode stamps it with the
+  pane default, and the router passed that on as the session's preference. On 2026-09-28 a job
+  notice moved a gpt-5.6-sol root onto claude-opus-5 while the pane still showed Sol, and each
+  side's next turn then failed `routed model mismatch`, back and forth. A prompt with no
+  user-authored text now keeps a routed root on its current model, as subagents already were;
+  a typed prompt still carries the user's model choice.
+
 ## [1.18.0] — 2026-09-28
 
 ### Changed

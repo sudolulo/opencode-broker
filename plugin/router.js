@@ -791,6 +791,20 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         : output?.message?.model?.providerID && output?.message?.model?.modelID
           ? { providerID: output.message.model.providerID, id: output.message.model.modelID, ...(typeof output.message.model.variant === "string" && output.message.model.variant ? { variant: output.message.model.variant } : {}) }
           : null;
+      // ☠️ A SYNTHETIC PROMPT DOES NOT PICK A MODEL EITHER. A background-job notice, a
+      // re-engage or an oc_send names no model, so opencode stamps it with the pane's default,
+      // and passing that on as the session's preference re-leased a ROOT onto it. Measured
+      // 2026-09-28: a job notice stamped Opus moved a gpt-5.6-sol session to
+      // claude-opus-5 while the pane still showed Sol, and each side's next turn then failed
+      // "routed model mismatch" in turn. ensure() already keeps a subagent on its route for
+      // the same reason; a prompt with no user-authored text keeps the root on its route too.
+      const parts = Array.isArray(output?.parts) ? output.parts : [];
+      const syntheticOnly = parts.some((part) => part?.type === "text" && part.synthetic === true) &&
+        !parts.some((part) => part?.type === "text" && part.synthetic !== true);
+      const routedModel = routes.get(sessionID)?.target?.model;
+      const preferredModel = syntheticOnly && routedModel?.providerID && routedModel?.id
+        ? { providerID: routedModel.providerID, id: routedModel.id, ...(typeof routedModel.variant === "string" && routedModel.variant ? { variant: routedModel.variant } : {}) }
+        : currentModel;
       const resolved = resolveProfile({ sessionID, parentID: session?.parentID, agent });
       // ☠️ Ask what the profile can REACH, not what it is called. A profile granted
       // `profileCloudEgress` is still one of the restrictive four by name while holding
@@ -809,11 +823,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       let routed;
       try {
-        routed = await ensure(sessionID, agent, currentModel);
+        routed = await ensure(sessionID, agent, preferredModel);
       } catch (error) {
         if (!needsInventory || (!/provider inventory is stale/.test(String(error?.message ?? error)) && !isAuthRevisionRaceError(error))) throw error;
         await refreshInventory();
-        routed = await ensure(sessionID, agent, currentModel);
+        routed = await ensure(sessionID, agent, preferredModel);
       }
       applyMessageModel(output?.message, routed, sessionID);
       // The forked engine reads this field and binds the turn to it. A pane still running

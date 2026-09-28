@@ -113,6 +113,7 @@ so nothing is ever spent on a provider you did not list.
 | `localModelsUrl` | The local server's model list (llama.cpp router mode `/v1/models`), polled to see what is loaded. |
 | `localContextHeadroom` | Fraction of a local window the router will lease into (default 0.6) when a target declares no `outputReserve`. |
 | `workerLocalShareDenominator` | One in N `auto` worker assignments goes to a local target (default 4; 1 disables). |
+| `profileLocalShare` | The same one-in-N local share for a named profile whose lane mixes local and cloud targets, e.g. `{ "memory": 2 }` (integer >= 2; default none, which keeps such a profile cloud-first). |
 | `burstFence` | How full a short window must be before it counts as a balancing input (default 0.9). |
 | `watch.notifyCommand` | argv that `opencode-broker-watch` runs when the catalog changes. `{title}`, `{body}` and `{kind}` in it are replaced; a command naming neither `{title}` nor `{body}` gets the title and body appended. No shell is involved. |
 | `burnWatch` | The [burn watch](#the-burn-watch): `enabled` (default `true`), `notifyCommand` (argv like `watch.notifyCommand`, which it defaults to; `[]` only logs) and the thresholds listed there. |
