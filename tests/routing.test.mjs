@@ -732,6 +732,81 @@ test("a malformed catalog model id is skipped and the worker tier keeps its next
   assert.equal(choice.target.modelID, "gpt-5.6-luna");
 });
 
+// CRITICAL: the id-shape guard and the speed-variant test are now SHARED with
+// lib/model-candidates.js, so discovery and the reconciler cannot disagree about which catalog
+// ids are addressable or which ids are a fast lane. These pin discovery's side of that
+// contract at the boundaries where a loosened helper would change routing silently:
+//   - "-fast" must be a whole hyphen-delimited segment. A helper matching bare /fast/i would
+//     strip "gpt-6-fastball" of its lane, and the tier would fall through to an older model
+//     with nothing in the logs to say why.
+//   - a config pin on a fast variant must NOT suppress the standard model of the same family
+//     release, which is the only reason SPEED_VARIANT appears in the pinnedLines filter.
+test("a standard model whose id merely contains fast keeps its lane, and a real speed variant takes none", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      models: {
+        "gpt-6-fastball-sol": { id: "gpt-6-fastball-sol", status: "active", tool_call: true,
+          family: "gpt-sol", release_date: "2026-09-22" },
+        "gpt-6-sol-fast": { id: "gpt-6-sol-fast", status: "active", tool_call: true,
+          family: "gpt-sol", release_date: "2026-09-22" },
+        // Upper case in a catalog id is still a speed variant.
+        "gpt-6-luna-FAST": { id: "gpt-6-luna-FAST", status: "active", tool_call: true,
+          family: "gpt-luna", release_date: "2026-09-22" },
+      },
+    }],
+  }, { openai: "oauth" }, {}, {
+    resolvableModels: ["openai/gpt-6-fastball-sol", "openai/gpt-6-sol-fast", "openai/gpt-6-luna-FAST"],
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID),
+    ["gpt-6-fastball-sol"]);
+  // Excluded before the admission gate, so a speed variant is not reported as a skip either.
+  assert.deepEqual(discovery.skipped, []);
+});
+
+test("a pinned fast variant does not suppress the standard model of the same family release", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["anthropic"],
+    all: [{
+      id: "anthropic",
+      models: {
+        "claude-opus-5-fast": { id: "claude-opus-5-fast", status: "active", tool_call: true,
+          family: "claude-opus", release_date: "2026-08-21" },
+        "claude-opus-5-turbo": { id: "claude-opus-5-turbo", status: "active", tool_call: true,
+          family: "claude-opus", release_date: "2026-08-21" },
+      },
+    }],
+  }, { anthropic: "oauth" }, R.TARGETS, {
+    resolvableModels: ["anthropic/claude-opus-5-fast", "anthropic/claude-opus-5-turbo"],
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID),
+    ["claude-opus-5-turbo"]);
+});
+
+// The other half of the shared guard: every character class the id shape accepts, and the
+// length boundary. A tightened helper would drop a legitimate dated alias from its lane.
+test("discovery admits the full catalog id shape and rejects what can never resolve", () => {
+  const models = {};
+  const resolvable = [];
+  const ids = ["gpt-6.1_sol:preview-20260922", "g", "gpt-6-sol", `${"g".repeat(179)}x`];
+  for (const id of ids) {
+    models[id] = { id, status: "active", tool_call: true, family: "gpt-sol", release_date: "2026-09-22" };
+    resolvable.push(`openai/${id}`);
+  }
+  for (const id of ["gpt/6-sol", "gpt 6 sol", "gpt-6-sol\n", "g".repeat(181)]) {
+    models[id] = { id, status: "active", tool_call: true, family: "gpt-sol", release_date: "2026-09-22" };
+    resolvable.push(`openai/${id}`);
+  }
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["openai"], all: [{ id: "openai", models }],
+  }, { openai: "oauth" }, {}, { resolvableModels: resolvable });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID).sort(),
+    [...ids].sort());
+  assert.deepEqual(discovery.skipped.map((skip) => skip.reason),
+    ["invalid-model-id", "invalid-model-id", "invalid-model-id", "invalid-model-id"]);
+});
+
 test("cached inventory publishes only models OpenCode can resolve", async () => withTempHome(async (home) => {
   const routing = await freshRouting();
   const authDir = join(home, ".local/share/opencode");
