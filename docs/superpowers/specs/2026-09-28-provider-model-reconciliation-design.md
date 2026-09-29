@@ -615,3 +615,38 @@ The implementation spans two repositories in one coordinated release batch:
 - Keep ntfy for alerts while retiring the existing ad-hoc model notifications.
 - Open one Gitea issue per unresolved proposal and close it through reconciliation.
 - Cover all OAuth/subscription providers; keep API-key and local providers pinned.
+
+## Inbound from the per-turn-effort workstream (2026-09-29)
+
+Left here rather than sent, because this is the document Package 3 will be planned from. Not a
+decision on this design -- information, and one request.
+
+**`CONFIG.modelVariants` is slated for deletion.** Package 1 threaded `configuredModelVariants`
+through `buildCachedSubscriptionInventory` and pinned the configured-variant merge in
+`tests/routing.test.mjs`. The effort-alignment work intends to remove that merge outright: variant
+capability would come from discovery alone, with a separate policy-only ceiling key for the four
+entries that are really "never run this model above X".
+
+Why it is worth knowing before Packages 3 and 4 build on it:
+
+- The union lets config declare a level the catalog cannot derive, and on the live AI SDK path an
+  unresolvable variant is dropped **silently** -- `request.ts:80-83` indexes `model.variants[name]`
+  with no validation and `mergeOptions` merges `source ?? {}`. No error, no log line. The config can
+  claim an effort that never applies. `VariantUnavailableError` is native-v2-only and that runtime
+  is not enabled here, so nothing catches it today.
+- A real instance was found and removed: `claude-haiku-4-5` has no effort axis at all (models.dev
+  exposes `budget_tokens` only, so OpenCode derives exactly `high` and `max`), while the config
+  named `none`/`low`/`medium` for it. Removed in devbox `19c81ef`.
+- A guard now exists in devbox `tests/fleet-config.test.mjs` ("every configured effort level is one
+  OpenCode can actually resolve") that compares every configured level against the catalog
+  derivation. That closes the silent-divergence hole, which was the main safety argument for
+  keeping the runtime merge.
+
+**The request:** if `configuredModelVariants` survives Package 3, please keep it a single injection
+point rather than spreading the merge across the reconciler, so removing it later is one edit and
+not a refactor. If it does not need to survive, saying so early saves building and test-pinning
+something that is then deleted.
+
+Full reasoning: `docs/superpowers/specs/2026-09-28-per-turn-effort-design.md` on branch
+`feat/per-turn-effort` (worktree `/home/dev/opencode-broker-per-turn-effort`). That branch touches
+only `plugin/router.js` and its own docs, so it does not overlap this work.
