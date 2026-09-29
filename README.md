@@ -473,7 +473,14 @@ gateway reads it at all.)
   "profile": "auto",
   "providers": {                      // the lanes the gateway can forward to
     "llamacpp": { "baseUrl": "http://localhost:8080/v1", "timeoutMs": 15000 },
-    "deepseek": { "baseUrl": "https://api.deepseek.com/v1", "authRef": "deepseek" }
+    "deepseek": { "baseUrl": "https://api.deepseek.com/v1", "authRef": "deepseek" },
+    "anthropic-proxy": {
+      "baseUrl": "http://127.0.0.1:8791/anthropic/v1",
+      "chatApi": true,
+      "messagesApi": true,
+      "responsesApi": true,
+      "keyFile": "/run/user/1000/llm-auth-proxy-key"
+    }
   },
   "modelProfiles": {                  // model names a client may ask for
     "local-27b": { "profile": "local", "maxContextTokens": 32768, "timeoutMs": 60000 }
@@ -482,18 +489,31 @@ gateway reads it at all.)
 }
 ```
 
-`authRef` names an entry in opencode's `auth.json`; provider keys are read per
-request and never logged. Per provider you can also set `headers`,
+`authRef` names an entry in opencode's `auth.json` for an ordinary provider. A proxy provider can
+instead name `keyFile`: the gateway reads it per request, requires a non-empty regular file with no
+group or world permission bits, and sends its value only as `x-api-key`. This keeps the proxy key
+and provider OAuth state out of OpenCode's auth store. Provider keys are never logged. Per provider
+you can also set `headers`,
 `bodyExtras`, `dropBodyKeys` (for a lane that rejects a parameter the client
-sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"`, `responsesApi: true` and
+sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"`, `chatApi`, `messagesApi`, `responsesApi` and
 `mirrorTextFormat: true` (copy a /responses `text.format` into `response_format`,
 for llama.cpp, which enforces only the latter).
 
-It serves `POST /v1/chat/completions` and `POST /v1/responses` (the OpenAI
-Responses API, which the Vercel AI SDK's OpenAI provider uses by default).
-A /responses request is offered only to providers with `responsesApi: true`
-(llama.cpp serves it natively), and otherwise behaves like chat: same leasing,
-extras, failover and usage accounting.
+It serves `POST /v1/chat/completions`, `POST /v1/responses` (the OpenAI Responses API, which the
+Vercel AI SDK's OpenAI provider uses by default), and native Anthropic `POST /v1/messages`.
+Chat is offered to every provider except one with `chatApi: false`; Responses and Messages are
+offered only to providers with `responsesApi: true` and `messagesApi: true`, respectively. If no
+configured provider can serve the requested API, the gateway returns a capability-specific `502`
+without contacting the broker or an upstream.
+
+Native Messages rewrites only `model` and preserves all other request fields. The gateway accepts
+its caller key as either `Authorization: Bearer` or `x-api-key`, but forwards neither client header.
+Messages requests forward only `Content-Type`, `anthropic-version`, `anthropic-beta`, explicitly
+configured provider headers, and the proxy provider's own `x-api-key`. Buffered status, content type,
+and body pass through unchanged on successful upstream responses. Streaming relays Anthropic events
+verbatim through the terminal
+`message_stop`, never adds `[DONE]`, retries only before the first committed event, honors downstream
+backpressure, and reports input, output, cache-read, and cache-write usage.
 
 - **A client's `model` is a routing request, not an order.** A name listed in
   `modelProfiles` leases that profile; anything else routes on the configured

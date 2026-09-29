@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] — 2026-09-29
+
+### Added
+
+- **Native Anthropic Messages gateway protocol.** `POST /v1/messages` now leases only providers
+  with `messagesApi: true`, rewrites only the leased model, preserves native request and response
+  shapes, relays Anthropic SSE through `message_stop` without an OpenAI `[DONE]`, and accounts for
+  input, output, cache-read, and cache-write tokens.
+- **Explicit per-API provider capabilities.** Chat remains enabled unless `chatApi: false` is set,
+  while Messages and Responses require `messagesApi: true` and `responsesApi: true`; a request with
+  no capable provider fails before the broker or any upstream is contacted.
+
+### Security
+
+- **Proxy-provider keys are isolated from OpenCode auth state.** A provider `keyFile` is validated
+  as a non-empty regular file with no group or world permission bits and read for each request.
+  Proxy requests replace either inbound gateway authentication form with `x-api-key`, forward only
+  the native Anthropic header allowlist plus configured headers, and never relay client credentials.
+
 ## [1.22.0] — 2026-09-29
 
 ### Added

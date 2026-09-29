@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
 
@@ -1545,6 +1547,665 @@ test("without waitForLocal, a missing local model is still reported at once", as
     assert.equal(response.status, 502);
   });
   assert.equal(leases, 1, "no wait, no re-lease");
+});
+
+// ── native Anthropic Messages and per-API capabilities ───────────────────────
+
+const providerKeyFixture = (content = "proxy-front-door-key", mode = 0o600) => {
+  const dir = mkdtempSync(join(tmpdir(), "gateway-provider-key-"));
+  const path = join(dir, "key");
+  writeFileSync(path, content, { mode });
+  return { dir, path };
+};
+
+const askMessages = (base, body = {}, headers = {}) => fetch(`${base}/v1/messages`, {
+  method: "POST",
+  headers: {
+    "x-api-key": "gw-secret",
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+    ...headers,
+  },
+  body: JSON.stringify({
+    model: "memory",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hi" }],
+    ...body,
+  }),
+});
+
+const MSG_START = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","usage":{"input_tokens":2,"cache_read_input_tokens":5,"cache_creation_input_tokens":7}}}\n\n';
+const MSG_BLOCK_START = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n';
+const MSG_TEXT = 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\n';
+const MSG_TOOL = 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"NYC\\"}"}}\n\n';
+const MSG_DELTA = 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}\n\n';
+const MSG_STOP = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+const MSG_ERROR = 'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream detail must not escape"}}\n\n';
+
+test("keyFile proxy authentication isolates headers, preserves Messages, and rejects unsafe files", async () => {
+  const key = providerKeyFixture();
+  const seen = [];
+  const brokerCalls = [];
+  const leases = [
+    { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } },
+    { target: { model: { providerID: "openai", id: "gpt-5.4" } } },
+  ];
+  const rawMessage = '{ "type": "message", "content": [], "usage": { "input_tokens": 2, "output_tokens": 3, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 7 } }';
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker",
+      profile: "auto",
+      providers: {
+        anthropic: {
+          baseUrl: "http://127.0.0.1:8791/anthropic/v1",
+          chatApi: true,
+          messagesApi: true,
+          responsesApi: true,
+          keyFile: key.path,
+          headers: { "x-provider-tag": "anthropic" },
+        },
+        openai: {
+          baseUrl: "http://127.0.0.1:8791/openai/v1",
+          chatApi: false,
+          responsesApi: true,
+          keyFile: key.path,
+        },
+      },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease" ? leases.shift() : { ok: true };
+    },
+    fetchImpl: async (url, options) => {
+      seen.push({ url, headers: new Headers(options.headers), body: JSON.parse(options.body) });
+      return url.endsWith("/messages")
+        ? new Response(rawMessage, { status: 201, headers: { "content-type": "application/vnd.anthropic+json" } })
+        : new Response(JSON.stringify({ id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+    },
+  });
+
+  try {
+    await withServer(handler, async (base) => {
+      const message = await askMessages(base, {
+        system: "keep this",
+        tools: [{ name: "weather", description: "look up weather", input_schema: { type: "object" } }],
+        metadata: { user_id: "local-user" },
+      }, {
+        authorization: "Bearer client-credential-must-not-forward",
+        "anthropic-beta": "tools-2024-04-04",
+        cookie: "session=must-not-forward",
+      });
+      assert.equal(message.status, 201, "the native upstream status is preserved");
+      assert.equal(message.headers.get("content-type"), "application/vnd.anthropic+json");
+      assert.equal(await message.text(), rawMessage, "the native body is not normalized or reserialized");
+
+      const response = await fetch(`${base}/v1/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "reasoning", input: "hi" }),
+      });
+      assert.equal(response.status, 200);
+    });
+
+    assert.equal(seen[0].url, "http://127.0.0.1:8791/anthropic/v1/messages");
+    assert.equal(seen[1].url, "http://127.0.0.1:8791/openai/v1/responses");
+    for (const call of seen) {
+      assert.equal(call.headers.get("x-api-key"), "proxy-front-door-key", "both proxy providers read the same keyFile");
+      assert.equal(call.headers.get("authorization"), null, "neither inbound gateway auth form reaches the proxy");
+      assert.equal(call.headers.get("cookie"), null);
+    }
+    assert.equal(seen[0].headers.get("anthropic-version"), "2023-06-01");
+    assert.equal(seen[0].headers.get("anthropic-beta"), "tools-2024-04-04");
+    assert.equal(seen[0].headers.get("x-provider-tag"), "anthropic");
+    assert.deepEqual(seen[0].body, {
+      model: "claude-haiku-4-5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "hi" }],
+      system: "keep this",
+      tools: [{ name: "weather", description: "look up weather", input_schema: { type: "object" } }],
+      metadata: { user_id: "local-user" },
+    }, "Messages fields are untouched except for the leased model");
+    const usage = brokerCalls.find((call) => call.route === "/usage" && call.body.providerID === "anthropic");
+    assert.deepEqual(usage.body.tokens, { input: 2, output: 3, cacheRead: 5, cacheWrite: 7 });
+  } finally {
+    rmSync(key.dir, { recursive: true, force: true });
+  }
+
+  const unsafe = providerKeyFixture("must-not-leak", 0o644);
+  const empty = providerKeyFixture("", 0o600);
+  const nonFile = { dir: mkdtempSync(join(tmpdir(), "gateway-provider-key-dir-")) };
+  const invalid = [
+    { label: "unsafe", path: unsafe.path, secret: "must-not-leak" },
+    { label: "empty", path: empty.path, secret: null },
+    { label: "non-file", path: nonFile.dir, secret: null },
+    { label: "blank path", path: "", secret: null },
+  ];
+  try {
+    for (const fixture of invalid) {
+      let brokerCallsForFixture = 0;
+      let upstreamCalls = 0;
+      const invalidHandler = createGatewayHandler({
+        config: { tier: "worker", profile: "auto", providers: {
+          anthropic: { baseUrl: "http://127.0.0.1:8791/anthropic/v1", messagesApi: true, keyFile: fixture.path },
+        } },
+        gatewayKey: "gw-secret",
+        brokerRequest: async (route) => {
+          if (route === "/lease") {
+            brokerCallsForFixture += 1;
+            return { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } };
+          }
+          return { ok: true };
+        },
+        fetchImpl: async () => { upstreamCalls += 1; throw new Error("must not forward"); },
+      });
+      await withServer(invalidHandler, async (base) => {
+        const response = await askMessages(base);
+        assert.equal(response.status, 502, `${fixture.label} keyFile fails closed`);
+        const body = await response.text();
+        if (fixture.secret) assert.doesNotMatch(body, new RegExp(fixture.secret), "key material never reaches the response");
+      });
+      assert.equal(brokerCallsForFixture, 1, "the unusable credential is discovered only after its lease");
+      assert.equal(upstreamCalls, 0);
+    }
+  } finally {
+    rmSync(unsafe.dir, { recursive: true, force: true });
+    rmSync(empty.dir, { recursive: true, force: true });
+    rmSync(nonFile.dir, { recursive: true, force: true });
+  }
+});
+
+test("API capability appends the exact operation path for every proxy provider route", async () => {
+  const key = providerKeyFixture();
+  const cases = [
+    { providerID: "anthropic", requestPath: "/v1/messages", operation: "/messages", body: { max_tokens: 16, messages: [] } },
+    { providerID: "anthropic", requestPath: "/v1/chat/completions", operation: "/chat/completions", body: { messages: [] } },
+    { providerID: "anthropic", requestPath: "/v1/responses", operation: "/responses", body: { input: "hi" } },
+    { providerID: "openai", requestPath: "/v1/responses", operation: "/responses", body: { input: "hi" } },
+  ];
+  try {
+    for (const fixture of cases) {
+      let upstreamUrl = null;
+      const handler = createGatewayHandler({
+        config: { tier: "worker", profile: "auto", providers: {
+          anthropic: { baseUrl: "http://127.0.0.1:8791/anthropic/v1", chatApi: true, messagesApi: true, responsesApi: true, keyFile: key.path },
+          openai: { baseUrl: "http://127.0.0.1:8791/openai/v1", chatApi: false, responsesApi: true, keyFile: key.path },
+        } },
+        gatewayKey: "gw-secret",
+        brokerRequest: async (route) => route === "/lease"
+          ? { target: { model: { providerID: fixture.providerID, id: "leased-model" } } }
+          : { ok: true },
+        fetchImpl: async (url) => {
+          upstreamUrl = url;
+          const payload = fixture.requestPath.endsWith("/messages")
+            ? { type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } }
+            : fixture.requestPath.endsWith("/responses")
+              ? { id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } }
+              : { choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } };
+          return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+        },
+      });
+      await withServer(handler, async (base) => {
+        const response = await fetch(`${base}${fixture.requestPath}`, {
+          method: "POST",
+          headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({ model: "client-label", ...fixture.body }),
+        });
+        assert.equal(response.status, 200);
+      });
+      assert.equal(upstreamUrl, `http://127.0.0.1:8791/${fixture.providerID}/v1${fixture.operation}`);
+    }
+  } finally {
+    rmSync(key.dir, { recursive: true, force: true });
+  }
+});
+
+test("API capability filters each lease and short-circuits when no provider can serve it", async () => {
+  const leases = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", chatApi: true, messagesApi: true, responsesApi: true },
+      openai: { baseUrl: "http://openai.example/v1", chatApi: false, messagesApi: false, responsesApi: true },
+      legacy: { baseUrl: "http://legacy.example/v1" },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      if (route !== "/lease") return { ok: true };
+      leases.push(body);
+      const providerID = body.providers[0];
+      return { target: { model: { providerID, id: "leased-model" } } };
+    },
+    fetchImpl: async (url) => {
+      const payload = url.endsWith("/messages")
+        ? { type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } }
+        : url.endsWith("/responses")
+          ? { id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } }
+          : { choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } };
+      return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askMessages(base)).status, 200);
+    assert.equal((await fetch(`${base}/v1/chat/completions`, {
+      method: "POST", headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" }, body: "{}",
+    })).status, 200);
+    assert.equal((await fetch(`${base}/v1/responses`, {
+      method: "POST", headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" }, body: "{}",
+    })).status, 200);
+  });
+  assert.deepEqual(leases.map((lease) => lease.providers), [
+    ["anthropic"],
+    ["anthropic", "legacy"],
+    ["anthropic", "openai"],
+  ]);
+
+  const noneCases = [
+    { path: "/v1/messages", provider: { messagesApi: false }, body: { max_tokens: 1, messages: [] } },
+    { path: "/v1/chat/completions", provider: { chatApi: false }, body: { messages: [] } },
+    { path: "/v1/responses", provider: { responsesApi: false }, body: { input: "hi" } },
+  ];
+  for (const fixture of noneCases) {
+    let brokerCalls = 0;
+    let upstreamCalls = 0;
+    const none = createGatewayHandler({
+      config: { tier: "worker", profile: "auto", providers: {
+        unsupported: { baseUrl: "http://unsupported.example/v1", ...fixture.provider },
+      } },
+      gatewayKey: "gw-secret",
+      brokerRequest: async () => { brokerCalls += 1; return { ok: true }; },
+      fetchImpl: async () => { upstreamCalls += 1; throw new Error("must not forward"); },
+    });
+    await withServer(none, async (base) => {
+      const response = await fetch(`${base}${fixture.path}`, {
+        method: "POST",
+        headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+        body: JSON.stringify(fixture.body),
+      });
+      assert.equal(response.status, 502);
+      assert.match((await response.json()).error.message, new RegExp(fixture.path.replaceAll("/", "\\/")));
+    });
+    assert.equal(brokerCalls, 0, `${fixture.path} fails before asking the broker`);
+    assert.equal(upstreamCalls, 0, `${fixture.path} never reaches an upstream`);
+  }
+});
+
+test("Anthropic Messages SSE relays native text and tool events with four-class usage and no DONE", async () => {
+  const frames = [MSG_START, MSG_BLOCK_START, MSG_TEXT, MSG_TOOL, MSG_DELTA, MSG_STOP];
+  const seen = [];
+  const upstream = await sseUpstream(frames, { seen });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: upstream.base, messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease" ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } } : { ok: true };
+    },
+  });
+  let text;
+  try {
+    await withServer(handler, async (base) => {
+      const response = await askMessages(base, { stream: true });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type"), /text\/event-stream/);
+      text = await drain(response);
+    });
+  } finally {
+    await upstream.close();
+  }
+  assert.equal(text, frames.join(""), "native Anthropic event framing and order are unchanged");
+  assert.doesNotMatch(text, /\[DONE\]/);
+  assert.equal(seen[0].stream, true);
+  assert.equal(seen[0].stream_options, undefined, "OpenAI stream options never enter a Messages body");
+  const usage = brokerCalls.find((call) => call.route === "/usage");
+  assert.deepEqual(usage.body.tokens, { input: 2, output: 3, cacheRead: 5, cacheWrite: 7 });
+  assert.ok(brokerCalls.some((call) => call.route === "/complete"));
+});
+
+test("Anthropic Messages SSE retries before commitment and emits only safe native errors after it", async () => {
+  const dead = await sseUpstream([MSG_ERROR]);
+  const liveFrames = [MSG_START, MSG_TEXT, MSG_DELTA, MSG_STOP];
+  const live = await sseUpstream(liveFrames);
+  const brokerCalls = [];
+  const failover = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      dead: { baseUrl: dead.base, messagesApi: true },
+      live: { baseUrl: live.base, messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route !== "/lease") return { ok: true };
+      const providerID = brokerCalls.filter((call) => call.route === "/lease").length === 1 ? "dead" : "live";
+      return { target: { model: { providerID, id: "claude-haiku-4-5" } } };
+    },
+  });
+  let text;
+  try {
+    await withServer(failover, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  } finally {
+    await dead.close();
+    await live.close();
+  }
+  assert.equal(text, liveFrames.join(""), "the uncommitted error is hidden and the fresh lease answers");
+  assert.equal(brokerCalls.filter((call) => call.route === "/lease").length, 2);
+  assert.doesNotMatch(JSON.stringify(brokerCalls), /upstream detail must not escape/);
+
+  const dying = await sseUpstream([MSG_START, MSG_TEXT, MSG_ERROR]);
+  const committedCalls = [];
+  const committed = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { anthropic: { baseUrl: dying.base, messagesApi: true } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      committedCalls.push({ route, body });
+      return route === "/lease" ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } } : { ok: true };
+    },
+  });
+  try {
+    await withServer(committed, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  } finally {
+    await dying.close();
+  }
+  assert.ok(text.startsWith(MSG_START + MSG_TEXT));
+  assert.match(text, /event: error\ndata: \{"type":"error","error":\{"type":"api_error","message":"gateway: Anthropic upstream stream failed"/);
+  assert.doesNotMatch(text, /upstream detail must not escape|message_stop|\[DONE\]/);
+  assert.equal(committedCalls.filter((call) => call.route === "/lease").length, 1, "committed output is never spliced to a retry");
+  assert.ok(committedCalls.some((call) => call.route === "/failure"));
+
+  const truncated = await sseUpstream([MSG_START, MSG_TEXT]);
+  const truncatedCalls = [];
+  const missingTerminal = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { anthropic: { baseUrl: truncated.base, messagesApi: true } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      truncatedCalls.push({ route, body });
+      return route === "/lease" ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } } : { ok: true };
+    },
+  });
+  try {
+    await withServer(missingTerminal, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  } finally {
+    await truncated.close();
+  }
+  assert.ok(text.startsWith(MSG_START + MSG_TEXT));
+  assert.match(text, /event: error/);
+  assert.doesNotMatch(text, /message_stop|\[DONE\]/, "a clean close cannot be promoted to a successful terminal event");
+  assert.ok(truncatedCalls.some((call) => call.route === "/failure"));
+});
+
+test("Anthropic Messages client disconnect aborts upstream and releases without indictment", async () => {
+  let clientGotFirst;
+  const relayed = new Promise((resolve) => { clientGotFirst = resolve; });
+  let upstreamClosed;
+  const closed = new Promise((resolve) => { upstreamClosed = resolve; });
+  const upstream = await sseUpstream([MSG_START], {
+    afterFirst: async (_request, response) => {
+      response.on("close", upstreamClosed);
+      await relayed;
+      await closed;
+    },
+  });
+  const brokerCalls = [];
+  let released;
+  const releaseSeen = new Promise((resolve) => { released = resolve; });
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { anthropic: { baseUrl: upstream.base, messagesApi: true } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/release") released();
+      return route === "/lease" ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } } : { ok: true };
+    },
+  });
+  try {
+    await withServer(handler, async (base) => {
+      const abort = new AbortController();
+      const response = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": "gw-secret", "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ max_tokens: 16, messages: [], stream: true }),
+        signal: abort.signal,
+      });
+      try {
+        await drain(response, (soFar) => {
+          if (soFar.includes("message_start")) {
+            clientGotFirst();
+            abort.abort();
+          }
+        });
+      } catch { /* this test deliberately aborts its own fetch */ }
+      await Promise.race([
+        releaseSeen,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("gateway did not release after client disconnect")), 500)),
+      ]);
+    });
+  } finally {
+    await upstream.close();
+  }
+  assert.ok(brokerCalls.some((call) => call.route === "/release"));
+  assert.ok(!brokerCalls.some((call) => call.route === "/failure"));
+});
+
+test("Anthropic Messages relay waits for downstream backpressure before reading the next frame", async () => {
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => route === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+      : { ok: true },
+    fetchImpl: async () => new Response(MSG_START + MSG_TEXT + MSG_DELTA + MSG_STOP, {
+      status: 200, headers: { "content-type": "text/event-stream" },
+    }),
+  });
+  const request = Readable.from([JSON.stringify({ max_tokens: 16, messages: [], stream: true })]);
+  request.method = "POST";
+  request.url = "/v1/messages";
+  request.headers = { "x-api-key": "gw-secret", "content-type": "application/json", "anthropic-version": "2023-06-01" };
+  request.socket = { remoteAddress: "127.0.0.1" };
+
+  const response = new EventEmitter();
+  response.headersSent = false;
+  response.writableEnded = false;
+  response.destroyed = false;
+  response.socket = { setNoDelay() {} };
+  response.writeHead = () => { response.headersSent = true; };
+  const writes = [];
+  let firstWrite;
+  const firstWriteSeen = new Promise((resolve) => { firstWrite = resolve; });
+  response.write = (text) => {
+    writes.push(text);
+    if (writes.length === 1) firstWrite();
+    return writes.length !== 1;
+  };
+  response.end = () => { response.writableEnded = true; };
+
+  const running = handler(request, response);
+  await Promise.race([
+    firstWriteSeen,
+    running.then(() => { throw new Error("handler ended before relaying a Messages frame"); }),
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writes.length, 1, "the parser pauses inside a multi-frame upstream chunk when write() returns false");
+  response.emit("drain");
+  await running;
+  assert.equal(writes.join(""), MSG_START + MSG_TEXT + MSG_DELTA + MSG_STOP);
+});
+
+test("Anthropic Messages preserves explicit stream false", async () => {
+  let forwarded;
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => route === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+      : { ok: true },
+    fetchImpl: async (_url, options) => {
+      forwarded = JSON.parse(options.body);
+      return new Response(JSON.stringify({ type: "message", content: [], usage: {} }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askMessages(base, { stream: false })).status, 200);
+  });
+  assert.equal(forwarded.stream, false, "every native field except model is preserved");
+});
+
+test("Anthropic Messages preserves buffered status and content type despite holdOpen config", async () => {
+  const raw = '{ "type": "message", "content": [], "usage": {} }';
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker",
+      profile: "auto",
+      providers: { anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true } },
+      modelProfiles: { memory: { profile: "memory", holdOpenMs: 5 } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => route === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+      : { ok: true },
+    fetchImpl: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return new Response(raw, { status: 201, headers: { "content-type": "application/vnd.anthropic+json" } });
+    },
+  });
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base);
+    assert.equal(response.status, 201);
+    assert.equal(response.headers.get("content-type"), "application/vnd.anthropic+json");
+    assert.equal(await response.text(), raw);
+  });
+});
+
+test("Anthropic Messages stops relaying at message_stop", async () => {
+  const upstream = await sseUpstream([MSG_START, MSG_STOP, MSG_TEXT]);
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: upstream.base, messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => route === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+      : { ok: true },
+  });
+  let text;
+  try {
+    await withServer(handler, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  } finally {
+    await upstream.close();
+  }
+  assert.equal(text, MSG_START + MSG_STOP, "message_stop is terminal and later upstream bytes are ignored");
+});
+
+test("Anthropic Messages malformed SSE retries before commitment and fails safely after it", async () => {
+  const malformed = "event: content_block_delta\ndata: not-json\n\n";
+  const valid = MSG_START + MSG_DELTA + MSG_STOP;
+  const failoverCalls = [];
+  let forwards = 0;
+  const failover = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      dead: { baseUrl: "http://dead.example/v1", messagesApi: true },
+      live: { baseUrl: "http://live.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      failoverCalls.push({ route, body });
+      if (route !== "/lease") return { ok: true };
+      const providerID = failoverCalls.filter((call) => call.route === "/lease").length === 1 ? "dead" : "live";
+      return { target: { model: { providerID, id: "claude-haiku-4-5" } } };
+    },
+    fetchImpl: async () => new Response(forwards++ === 0 ? malformed : valid, {
+      status: 200, headers: { "content-type": "text/event-stream" },
+    }),
+  });
+  let text;
+  await withServer(failover, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  assert.equal(text, valid, "a malformed event on a clean wire is hidden behind a fresh lease");
+  assert.equal(failoverCalls.filter((call) => call.route === "/lease").length, 2);
+
+  const committedCalls = [];
+  const committed = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      committedCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(MSG_START + malformed, {
+      status: 200, headers: { "content-type": "text/event-stream" },
+    }),
+  });
+  await withServer(committed, async (base) => { text = await drain(await askMessages(base, { stream: true })); });
+  assert.ok(text.startsWith(MSG_START));
+  assert.match(text, /event: error/);
+  assert.doesNotMatch(text, /not-json|message_stop|\[DONE\]/);
+  assert.equal(committedCalls.filter((call) => call.route === "/lease").length, 1);
+  assert.ok(committedCalls.some((call) => call.route === "/failure"));
+});
+
+test("Anthropic Messages buffered upstream errors never echo provider details", async () => {
+  const privateDetail = "upstream-private-detail";
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(privateDetail, {
+      status: 500, headers: { "content-type": "application/json" },
+    }),
+  });
+  let responseText;
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base);
+    assert.equal(response.status, 502);
+    responseText = await response.text();
+  });
+  assert.doesNotMatch(responseText, new RegExp(privateDetail));
+  assert.doesNotMatch(JSON.stringify(brokerCalls), new RegExp(privateDetail));
+  assert.ok(brokerCalls.some((call) => call.route === "/failure"));
+});
+
+test("Anthropic Messages names its own path when a streamed upstream answers JSON", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ type: "message", content: [], usage: {} }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await askMessages(base, { stream: true })).status, 502);
+  });
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.match(failure.body.error.message, /streamed \/messages request/);
+  assert.doesNotMatch(failure.body.error.message, /\/responses/);
 });
 
 // ── /v1/responses ────────────────────────────────────────────────────────────
