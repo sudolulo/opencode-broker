@@ -699,6 +699,9 @@ test("the human report names freshness, counts, every candidate, skips and the l
     assert.match(text, /resolver: .*fresh/);
     assert.match(text, /auth revision: unchanged/);
     assert.match(text, /evidence-pending 3/);
+    // The two Package 2 additions an operator would otherwise only see with --json.
+    assert.match(text, /evidence queue: \d+ pending, \d+ claimed, \d+ failed/);
+    assert.match(text, /^superseded: none$/m);
     assert.match(text, /openai\/gpt-6-sol -> evidence-pending \(openai:gpt-sol\)/);
     assert.match(text, /openai\/gpt-6-luna -> blocked-unresolvable \(openai:gpt-luna\)/);
     assert.match(text, /example\/conflict -> blocked-conflict \(unknown example:example-alpha\)/);

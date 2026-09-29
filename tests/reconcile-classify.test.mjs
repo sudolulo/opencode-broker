@@ -276,6 +276,16 @@ test("supporting claims alone are never enough", () => {
   }
 });
 
+test("a policy claim set aside for review is named in the reason", () => {
+  // A known role holding only a new-role claim is correctly held for a human. The reason must say
+  // the claim was set aside, not that nothing was accepted, or debugging starts at the collector.
+  const { state, reason } = classifyEvidencedRecord(roleRecord({
+    evidence: [policyClaim("new-role")] }), { roles: TEST_ROLES });
+  assert.equal(state, "awaiting-approval");
+  assert.match(reason, /no official successor/i);
+  assert.match(reason, /policy claims set aside for review: new-role/);
+});
+
 test("a contradiction, a role-change, or an unknown role requires approval", () => {
   assert.equal(classifyEvidencedRecord(roleRecord({
     evidence: [policyClaim("successor"), policyClaim("role-change")] }),
