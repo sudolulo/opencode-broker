@@ -40,11 +40,18 @@ const withServer = async (handler, fn) => {
 
 // A reservations file in a temp dir: the real one lives under
 // $XDG_STATE_HOME/llamacpp-model-swap/ and belongs to the live host.
+// ☆ ONE exit listener for ALL temp dirs, not one per file: node warns at 11 listeners on a
+// single emitter, and a per-call listener made the suite print a MaxListenersExceededWarning
+// once the file passed ten tests. The warning is noise that hides a real one.
+const tempDirs = [];
+process.on("exit", () => {
+  for (const dir of tempDirs) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
+});
 const reservationsFile = (contents) => {
   const dir = mkdtempSync(join(tmpdir(), "gw-tenant-"));
   const path = join(dir, "reservations.json");
   if (contents !== undefined) writeFileSync(path, JSON.stringify(contents));
-  process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
+  tempDirs.push(dir);
   return path;
 };
 
@@ -151,7 +158,14 @@ test("a model-swap that exits 0 while REFUSING reports held:false", async () => 
   assert.equal(calls.length, 1, "the refusal still came from a real attempt");
 });
 
-test("release runs release --no-stop and leaves the tenant running", async () => {
+test("release runs release --no-stop and leaves the tenant running, logging nothing", async (t) => {
+  // ☠️ `held` is not a success flag, it is a reading of the reservation file, and the two
+  // actions want OPPOSITE readings: acquire succeeded when the reservation appeared, release
+  // succeeded when it is GONE. A guard written `if (!held) console.error(...)` therefore fires
+  // on every clean release and never on a stuck one -- exactly inverted. The spy is what makes
+  // that visible: without it this test passes while the log lies on the happy path, and an
+  // operator chasing "tenant comfyui release: held=false" is chasing the case that worked.
+  const errors = t.mock.method(console, "error");
   const { handler, calls } = tenantHandler({
     reservations: { comfyui: { card: 1, mib: 24576 } },
     onRun: ({ reservationsPath }) => writeFileSync(reservationsPath, JSON.stringify({})),
@@ -162,6 +176,24 @@ test("release runs release --no-stop and leaves the tenant running", async () =>
     assert.deepEqual(result.body, { held: false });
   });
   assert.deepEqual(calls[0].args, ["release", "comfyui", "--no-stop"]);
+  assert.deepEqual(errors.mock.calls.map((call) => call.arguments), [],
+    "a release that gave the card back is the happy path and must not log an error");
+});
+
+test("a release that did NOT give the card back is logged", async (t) => {
+  // The negative control for the test above: the cure for "logs on success" must not be
+  // "delete the log". A release whose reservation is still on file afterwards means the 27b
+  // never comes home to card 1 and nothing else will notice -- that one must reach the log.
+  const errors = t.mock.method(console, "error");
+  // No onRun: model-swap exits 0 but the reservation survives.
+  const { handler } = tenantHandler({ reservations: { comfyui: { card: 1, mib: 24576 } } });
+  await withServer(handler, async (base) => {
+    const result = await ask(base, "/tenant/comfyui/release", { token: TENANT_SECRET });
+    assert.equal(result.status, 200, "still a verdict, not a transport error");
+    assert.deepEqual(result.body, { held: true }, "the caller is told the truth: it still holds the card");
+  });
+  assert.equal(errors.mock.calls.length, 1, "a stuck release must be logged exactly once");
+  assert.match(String(errors.mock.calls[0].arguments[0]), /tenant comfyui release/);
 });
 
 test("GET /tenant/:id reports what is held without running anything", async () => {

@@ -31,6 +31,13 @@ All notable changes to this project are documented here. The format is based on
   instead of presenting as a silent 401 on every job. No token file, no `tenants` block or an
   empty `allowFrom` all mean closed: there is no permissive default. The routes are dispatched
   ahead of every other URL, so a tenant path can never fall through into a completion.
+- **`opencode-broker-tenant-token`** creates that token as the drop file the deploy needs:
+  256 bits of `base64url` (an alphabet no shell, YAML or systemd file can mangle) written
+  `root:<group>` mode `0640`, staged and renamed so a chown it cannot perform leaves no
+  half-deployed file, and the path reported instead of the value so the secret never reaches
+  scrollback or a deploy log. It **refuses to overwrite an existing token** unless `--force`:
+  the tenant reads its bind-mounted copy when the container starts, so a rotation has to be
+  paired with restarting the tenant and must never be a side effect of re-running a deploy.
 
 ## [1.19.1] — 2026-09-28
 

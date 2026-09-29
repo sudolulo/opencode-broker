@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+// opencode-broker-tenant-token: create the GPU-tenant control surface's bearer token as a
+// root-owned drop file.
+//
+// Why a drop file and not a secret store call: the gateway is a long-running service, and a
+// service that fetches its credential at startup cannot come up while the vault is locked. So
+// the token is generated ONCE here, at deploy time, written to a file owned by root and readable
+// by one group, and bind-mounted read-only into the tenant's container. It is never in the
+// container's environment, never in gateway.json, never in git, and never printed.
+//
+// Usage:
+//   opencode-broker-tenant-token [--path FILE] [--owner USER|UID] [--group GROUP|GID] [--force]
+//
+//   --path   where to write it (default $OPENCODE_BROKER_TENANT_TOKEN_FILE, else
+//            ~/.config/opencode-broker/tenant-token -- for a system deploy pass
+//            /etc/opencode-broker/tenant-token explicitly)
+//   --owner  owning user (default root)
+//   --group  owning group (default root; set it to the group the container's uid maps into)
+//   --force  rotate an existing token. See the warning below.
+import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmodSync, chownSync, closeSync, existsSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+
+import { DEFAULT_GATEWAY_CONFIG } from "../lib/gateway.js";
+
+const MODE = 0o640;
+// 32 bytes is 256 bits. base64url, not base64: the alphabet is [A-Za-z0-9_-], so the token
+// needs no shell quoting and cannot be mangled by a double-quoted string, a YAML scalar or a
+// systemd EnvironmentFile on the way to wherever an operator pastes it.
+const TOKEN_BYTES = 32;
+
+const fail = (message) => {
+  console.error(`opencode-broker-tenant-token: ${message}`);
+  process.exit(1);
+};
+
+const args = process.argv.slice(2);
+const options = { path: null, owner: "root", group: "root", force: false };
+for (let i = 0; i < args.length; i += 1) {
+  const arg = args[i];
+  if (arg === "--force") { options.force = true; continue; }
+  if (arg === "--help" || arg === "-h") {
+    console.log("usage: opencode-broker-tenant-token [--path FILE] [--owner USER|UID] [--group GROUP|GID] [--force]");
+    process.exit(0);
+  }
+  const name = arg.startsWith("--") ? arg.slice(2) : null;
+  if (!name || !(name in options)) fail(`unknown argument ${arg}`);
+  const value = args[i += 1];
+  if (value === undefined) fail(`${arg} needs a value`);
+  options[name] = value;
+}
+
+// A name is resolved through the host's own user database rather than parsed out of
+// /etc/passwd: a deploy target may use LDAP or sss, and `id`/`getent` are the interfaces that
+// see those. A name that does not resolve is a stop, never a guess -- writing the file to
+// whoever happens to be running the deploy is the failure this whole script exists to prevent.
+const resolveId = (value, kind) => {
+  if (/^\d+$/.test(value)) return Number(value);
+  try {
+    if (kind === "user") return Number(execFileSync("id", ["-u", value], { encoding: "utf8" }).trim());
+    const line = execFileSync("getent", ["group", value], { encoding: "utf8" }).trim();
+    const gid = Number(line.split(":")[2]);
+    if (!Number.isInteger(gid)) throw new Error(`getent group ${value} returned "${line}"`);
+    return gid;
+  } catch (error) {
+    fail(`cannot resolve ${kind} "${value}": ${error.message}`);
+  }
+};
+
+const path = options.path
+  ?? process.env.OPENCODE_BROKER_TENANT_TOKEN_FILE
+  ?? join(dirname(DEFAULT_GATEWAY_CONFIG), "tenant-token");
+const uid = resolveId(options.owner, "user");
+const gid = resolveId(options.group, "group");
+
+// ☠️ ROTATION IS NEVER A SIDE EFFECT OF RE-RUNNING A DEPLOY. The container reads its mounted
+// copy of this token when IT starts; replacing the file underneath it leaves the tenant
+// presenting a stale credential and every acquire 401ing, with both halves looking correctly
+// configured. Overwriting therefore has to be asked for, and asking for it means also
+// restarting the tenant.
+if (existsSync(path) && !options.force) {
+  fail(`${path} already exists. Re-run with --force to ROTATE it, and restart every tenant that mounts it.`);
+}
+
+const dir = dirname(path);
+if (!existsSync(dir)) fail(`${dir} does not exist: create it first (mkdir -p ${dir}) so its ownership is a deliberate choice`);
+
+// Written to a sibling temp file and renamed into place, so a failure at any step -- most
+// likely the chown, which needs root -- leaves NO file at the target. A half-deployed token is
+// worse than an absent one: absent means the tenant surface is closed and says so, whereas a
+// token nobody mounted means a gateway that looks deployed and refuses every render.
+const staging = join(dir, `.${basename(path)}.new.${process.pid}`);
+const token = randomBytes(TOKEN_BYTES).toString("base64url");
+let handle;
+try {
+  handle = openSync(staging, "wx", 0o600);
+  writeSync(handle, token);
+} catch (error) {
+  fail(`cannot write ${staging}: ${error.message}`);
+} finally {
+  if (handle !== undefined) closeSync(handle);
+}
+try {
+  chownSync(staging, uid, gid);
+  // Explicit chmod rather than trusting the open mode: umask does not apply to chmod, and on a
+  // --force rotation the target's own mode is replaced along with its contents.
+  chmodSync(staging, MODE);
+  renameSync(staging, path);
+} catch (error) {
+  try { unlinkSync(staging); } catch { /* nothing to clean up */ }
+  fail(`cannot give ${path} owner ${options.owner}:${options.group} with mode ${MODE.toString(8)}: ${error.message}`
+    + " -- run this under sudo, or pass --owner/--group you can set");
+}
+
+// The path, the mode and the owner: everything the operator needs to mount it, and nothing that
+// would put the secret itself into scrollback or a deploy log.
+const stat = statSync(path);
+console.log(`opencode-broker-tenant-token: wrote ${path} mode ${(stat.mode & 0o777).toString(8)} owner ${stat.uid}:${stat.gid}`);
+console.log("opencode-broker-tenant-token: mount it read-only into the tenant and restart the gateway to load it.");

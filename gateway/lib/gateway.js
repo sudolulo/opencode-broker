@@ -1156,8 +1156,13 @@ export const createGatewayHandler = ({
       // toast the HUD -- so the exit code is not the postcondition. Read the reservation back
       // and report what is ACTUALLY held; the caller decides what to do about it.
       const held = reservationHeld(reservationsPath, id);
-      if (result?.code !== 0 || !held) {
-        console.error(`opencode-broker-gateway: tenant ${id} ${action}: exit ${result?.code}, held=${held}: ${result?.output ?? ""}`.trim());
+      // ☆ The two actions want OPPOSITE readings, so `held` alone is never the verdict:
+      // acquire worked when the reservation APPEARED, release worked when it is GONE. Comparing
+      // against the action's intent is what keeps a clean release out of the log and a stuck
+      // one in it.
+      const wantedHeld = action === "acquire";
+      if (result?.code !== 0 || held !== wantedHeld) {
+        console.error(`opencode-broker-gateway: tenant ${id} ${action}: exit ${result?.code}, held=${held} (wanted ${wantedHeld}): ${result?.output ?? ""}`.trim());
       }
       return respondJson(response, 200, { held });
     }

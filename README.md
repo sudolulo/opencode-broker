@@ -441,14 +441,21 @@ This surface is separate from the OpenAI one in every way that matters:
 }
 ```
 
-Create the token as a root-owned drop file at deploy time and mount it read-only where the
-tenant can read it -- never in the container's environment, never in the config file, never in
-git:
+Create the token with `opencode-broker-tenant-token`, then mount it read-only where the tenant
+can read it -- never in the container's environment, never in the config file, never in git:
 
 ```sh
-install -m 0640 -o root -g "$TENANT_GROUP" /dev/null /etc/opencode-broker/tenant-token
-head -c 32 /dev/urandom | base64 | tr -d '\n' | sudo tee /etc/opencode-broker/tenant-token >/dev/null
+sudo mkdir -p /etc/opencode-broker
+sudo opencode-broker-tenant-token \
+  --path /etc/opencode-broker/tenant-token \
+  --group "$TENANT_GROUP"
 ```
+
+It writes 256 bits of `base64url` (an alphabet no shell, YAML or systemd file can mangle) as
+`root:$TENANT_GROUP` mode `0640`, prints the path and never the value, and **refuses to
+overwrite an existing token** -- the tenant reads its mounted copy when the container starts, so
+a rotation is `--force` plus a restart of every tenant, never a side effect of re-running the
+deploy. Then restart the gateway: the token is read once at startup.
 
 ## The HUD
 
