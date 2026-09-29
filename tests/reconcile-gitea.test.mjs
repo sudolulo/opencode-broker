@@ -509,6 +509,23 @@ test("the instructional comment is retried until it lands, and never repeated af
   assert.equal(settled.calls.some((call) => call.method === "PATCH"), false);
 });
 
+// The exact sequence the separate markers exist for: the comment failed, the operator closed the
+// issue again, and the reconciler must not reopen an issue they have now closed twice.
+test("a close that follows a failed reopen comment is not reopened a second time", async () => {
+  const store = storeWithIssue();
+  const issue = { state: "closed", labels: [PROPOSAL_LABEL] };
+  await project({ store, client: forgeWith({ issue, failComment: new Error("502 bad gateway") }).client });
+
+  const again = forgeWith({ issue });
+  const result = await project({ store, client: again.client, now: () => NOW + 1000 });
+  assert.deepEqual(result.reopened, []);
+  assert.equal(again.calls.some((call) => call.method === "PATCH"), false,
+    "the reopen already happened, whatever became of the comment that was owed after it");
+  assert.equal(again.calls.some((call) => call.path.endsWith("/comments")), false,
+    "an issue closed undecided again is not being reopened, so nothing announces one");
+  assert.equal(store.read().roles["openai:gpt-sol"].state, "awaiting-approval");
+});
+
 test("a second undecided close is not reopened again and gets no second comment", async () => {
   const store = storeWithIssue();
   const issue = { state: "closed", labels: [PROPOSAL_LABEL] };
