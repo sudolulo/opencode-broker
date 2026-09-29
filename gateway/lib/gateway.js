@@ -117,7 +117,7 @@ const modelRoute = (config, requested) => {
   // that would rather be told now: a chat model is worth three minutes, a wiki lookup is not.
   // ☆ >= 0, not > 0: 0 means DO NOT WAIT and must survive, so this cannot reuse the
   // "falsy means default" idiom the provider caps use.
-  const wait = Number(typeof entry === "string" ? Number.NaN : entry?.prepareWaitMs);
+  const wait = entry?.prepareWaitMs == null ? Number.NaN : Number(entry.prepareWaitMs);
   // ☆ Same shape of problem as maxContextTokens, different axis: `timeoutMs` is
   // per-PROVIDER while how long a generation TAKES is per-model and per-task. One
   // local lane serves a small model a latency-critical caller wants to give up on

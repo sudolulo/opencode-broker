@@ -53,6 +53,27 @@ const mockedRouter = {
 const nodeMajor = Number(process.versions.node.split(".")[0]);
 mock.module(routerUrl, nodeMajor >= 24 ? { exports: mockedRouter } : { namedExports: mockedRouter });
 
+// Swap-back is an external process boundary. Record that boundary rather than running even the
+// fixture's harmless `true` command: the behavior under test is whether cleanup launches an
+// awaited or detached restore at all.
+const childProcessUrl = "node:child_process";
+const realChildProcess = await import(childProcessUrl);
+const swapBackCalls = [];
+const resetSwapBackCalls = () => { swapBackCalls.length = 0; };
+const mockedChildProcess = {
+  ...realChildProcess,
+  execFile: (command, args, options, callback) => {
+    swapBackCalls.push({ kind: "awaited", command, args });
+    callback(null, "", "");
+  },
+  spawn: (command, args, options) => {
+    swapBackCalls.push({ kind: "detached", command, args });
+    return { unref() {} };
+  },
+};
+mock.module(childProcessUrl,
+  nodeMajor >= 24 ? { exports: mockedChildProcess } : { namedExports: mockedChildProcess });
+
 // THE SIDEBAR SEAM. The usage sidebar's text is a closure (`sidebarText`), reachable only
 // through getters on the elements the `sidebar_content` slot factory builds -- and the real
 // @opentui/solid runtime throws "No renderer found" the instant it is called outside a live TUI,
@@ -169,6 +190,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
   const switchedModels = [];
   const slotRegistrations = [];
   let layer = null;
+  let dialog = null;
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
   let cleaned = false;
@@ -256,7 +278,12 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
     },
     theme: {},
     ui: {
-      dialog: { open: false, clear: () => {}, replace: () => {}, setSize: () => {} },
+      dialog: {
+        open: false,
+        clear: () => { dialog = null; },
+        replace: (factory) => { dialog = typeof factory === "function" ? factory() : factory; },
+        setSize: () => {},
+      },
       toast: (t) => { toasts.push(t); },
     },
   };
@@ -297,7 +324,8 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
     };
     return { api, emit, key, runAgentPoll, runRefresh, runBudgetPoll, sidebarBody, pushes, releases,
       consumes, switches, cycles, replies, toasts, navigations, switchedModels, cleanup,
-      get layer() { return layer; } };
+      get layer() { return layer; },
+      get dialog() { return dialog; } };
   } catch (error) {
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;
@@ -490,6 +518,72 @@ test("staying on a native tier-switch question does not switch the agent", async
 
 // ---- the broker owns the swap in; the HUD waits for it -------------------------------------
 
+test("deleting a session this HUD did not swap does not launch an awaited restore", async () => {
+  const h = await withTuiHarness();
+  try {
+    resetSwapBackCalls();
+    await h.emit("session.deleted", { sessionID: "session-owned-by-another-process" });
+    assert.deepEqual(swapBackCalls, []);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("disposing a HUD that owns no swapped sessions does not launch a detached restore", async () => {
+  const h = await withTuiHarness();
+  resetSwapBackCalls();
+  await h.cleanup();
+  assert.deepEqual(swapBackCalls, []);
+});
+
+test("deleting a session this HUD swapped still launches the awaited restore", async () => {
+  routerHooks.resolveProfile = () => ({ profile: "uncensored" });
+  routerHooks.brokerRequest = async (path) => path === "/lease" ? LEASED_TARGET : { ok: true };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: "owned-delete", agent: "build" } });
+    await waitFor(() => h.switchedModels.length > 0);
+    resetSwapBackCalls();
+
+    await h.emit("session.deleted", { sessionID: "owned-delete" });
+
+    assert.deepEqual(swapBackCalls, [{ kind: "awaited", command: "true", args: ["default"] }]);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("explicitly leaving a swapped profile still launches the awaited restore", async () => {
+  let profile = "auto";
+  routerHooks.resolveProfile = () => ({ profile });
+  routerHooks.brokerRequest = async (path) => path === "/lease" ? LEASED_TARGET : { ok: true };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    const chooseProfile = h.layer.commands.find((command) => command.name === "hud.routing.profile");
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "uncensored" });
+    h.dialog.onSelect({ value: "switch" });
+    await waitFor(() => h.switchedModels.length > 0);
+
+    profile = "uncensored";
+    resetSwapBackCalls();
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "manual" });
+    h.dialog.onSelect({ value: "switch" });
+    await waitFor(() => swapBackCalls.length > 0);
+
+    assert.deepEqual(swapBackCalls, [{ kind: "awaited", command: "true", args: ["default"] }]);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
 test("the lease wait polls while the broker's code says the target is preparing", async () => {
   const told = [];
   let attempts = 0;
@@ -592,6 +686,7 @@ test("an uncensored allocation waits out a target-preparing refusal and then pin
       assert.equal(swapToasts[0].message, "Swapping GPU 1 to the uncensored 27b -- 1-3 minutes.");
     } finally {
       resetRouterHooks();
+      await h.emit("session.deleted", { sessionID: "ses-unc" });
       await h.cleanup();
       await broker.close();
     }
@@ -757,6 +852,7 @@ test("an uncensored-70b allocation waits out the prepare and names ITS cost, not
         "\u2620\ufe0f the 27b's sentence must never be shown for a swap that is not the 27b's");
     } finally {
       resetRouterHooks();
+      await h.emit("session.deleted", { sessionID: "ses-70b" });
       await h.cleanup();
       await broker.close();
     }
@@ -973,5 +1069,25 @@ test("guard detection: explicit settings win, and a bare machine detects nothing
     assert.equal(detectGuard({ ...base, setting: false }).present, false, "an explicit false still hides it");
   } finally {
     rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+test("disposing a HUD that owns a swapped session still launches a detached restore", async () => {
+  routerHooks.resolveProfile = () => ({ profile: "uncensored" });
+  routerHooks.brokerRequest = async (path) => path === "/lease" ? LEASED_TARGET : { ok: true };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: "owned-dispose", agent: "build" } });
+    await waitFor(() => h.switchedModels.length > 0);
+    resetSwapBackCalls();
+
+    await h.cleanup();
+
+    assert.deepEqual(swapBackCalls, [{ kind: "detached", command: "true", args: ["default"] }]);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
   }
 });

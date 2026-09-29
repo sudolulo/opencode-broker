@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.1] — 2026-09-29
+
+### Fixed
+
+- **Gateway wait inheritance.** Mapped models without their own `prepareWaitMs` now inherit the global wait after
+  config loading, while an explicit zero still disables waiting.
+- **Swap restoration ownership.** The HUD now restores displaced models only for swapped sessions owned by that OpenCode
+  process, so unrelated session deletion and process exit cannot interrupt gateway-only model loads.
+
 ## [1.21.0] — 2026-09-29
 
 ### Added

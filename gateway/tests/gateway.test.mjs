@@ -845,6 +845,41 @@ test("a mapped name with no budget of its own still waits", async () => {
   assert.equal(leases.length, 2, "it must retry, not give up on the first refusal");
 });
 
+test("a loaded mapped route with no budget of its own inherits the global wait", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gw-cfg-"));
+  const path = join(dir, "config.json");
+  writeFileSync(path, JSON.stringify({
+    tier: "worker",
+    profile: "auto",
+    providers: { llamacpp: { baseUrl: "http://local.example/v1" } },
+    modelProfiles: { [NAMED]: { profile: "uncensored" } },
+    prepareWaitMs: 50,
+    prepareRetryMs: 5,
+  }));
+  const answers = [preparingRefusal(), { target: { model: { providerID: "llamacpp", id: NAMED } } }];
+  const leases = [];
+  const handler = createGatewayHandler({
+    config: loadGatewayConfig(path),
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => {
+      if (route !== "/lease") return { ok: true };
+      leases.push(1);
+      const next = answers.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) }),
+  });
+  try {
+    await withServer(handler, async (base) => {
+      assert.equal((await askModel(base, { model: NAMED })).status, 200);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(leases.length, 2, "the loaded route must retry under the global budget");
+});
+
 test("prepareWaitMs 0 answers now, with the broker's own refusal", async () => {
   // A wiki lookup is not worth three minutes. The broker cannot tell a swap in progress from a
   // swap its prepareCommand already DECLINED (model-swap's in-use guard exits 0, spawned

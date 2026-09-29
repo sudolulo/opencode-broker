@@ -126,7 +126,7 @@ const ownSwapped = new Set();
 // Module scope on purpose: the session.deleted subscription is registered near the top of the
 // tui closure, long before a function declared further down would leave its temporal dead zone.
 const restoreOnSessionClose = (closedID) => {
-  ownSwapped.delete(closedID);
+  if (!ownSwapped.delete(closedID)) return;
   if (!swapBackActive()) return;
   const remaining = sessionsOnProfiles(SWAP_BACK_PROFILES).filter((other) => other !== closedID);
   if (remaining.length) return;
@@ -544,6 +544,7 @@ export default {
     // profile, so shutdown is where the resting models usually have to be put back.
     api.lifecycle?.onDispose?.(() => {
       try {
+        if (!ownSwapped.size) return;
         if (!swapBackActive()) return;
         // ☠️ Our own sessions must not veto this. Their profile records outlive the process, so
         // counting them would make the swap-back impossible on exactly the path that needs it.
