@@ -1,0 +1,84 @@
+#!/usr/bin/env node
+// opencode-broker-reconcile: the operator surface of the model reconciler's DRY RUN.
+//
+// Two commands, and both of them are safe by construction:
+//   dry-run  refresh isolated catalog/resolver views, record candidate observations in the
+//            reconciliation ledger, and report what the broker WOULD be handed;
+//   status   print the bounded projection of that ledger.
+//
+// CRITICAL: THIS FILE IS DELIBERATELY THIN, AND THAT IS THE SAFETY PROPERTY. Every rule worth
+// trusting -- the scratch XDG_CACHE_HOME the refresh runs under, the 48h/72h stale gates, the
+// conflict and unresolvable classifications, the mkdir lock, the atomic ledger write -- lives in
+// lib/model-reconcile.js and lib/reconcile-state.js, where it is unit-tested without a
+// subprocess. Catalog, state or routing logic added here would be logic no such test covers, and
+// the CLI is the one caller a human runs by hand against live state.
+//
+// CRITICAL: NOTHING IS PUBLISHED. There is no flag that makes this apply anything: it posts no
+// inventory to the broker, alters no routing, sends no notification and opens no issue. Evidence
+// collection, approvals, probes, probation and the deployment cutover are Packages 2-4, and each
+// of them is part of what makes publication safe -- so an `--apply` bolted on here would activate
+// a model no human has looked at. opencode-broker-watch remains the live publisher.
+import { CONFIG_ERROR } from "../lib/config.js";
+import {
+  formatDryRunReport,
+  formatReconciliationStatus,
+  readReconciliationStatus,
+  runDryReconciliation,
+} from "../lib/model-reconcile.js";
+import { createReconciliationStore } from "../lib/reconcile-state.js";
+
+const USAGE = "usage: opencode-broker-reconcile dry-run [--json] | status [--json]";
+
+// 0 completed (a report full of blocked candidates is still a completed report), 1 something was
+// wrong with the state, the config or the sources, 2 the command line itself.
+const EXIT_OK = 0;
+const EXIT_ERROR = 1;
+const EXIT_USAGE = 2;
+
+const complain = (message) => process.stderr.write(`opencode-broker-reconcile: ${message}\n`);
+
+const run = (argv) => {
+  const [command, ...flags] = argv;
+  if (command !== "dry-run" && command !== "status") {
+    complain(`${command === undefined ? "no command given" : `unknown command "${command}"`}\n${USAGE}`);
+    return EXIT_USAGE;
+  }
+  let json = false;
+  for (const flag of flags) {
+    // Exactly one flag is recognized, and an unrecognized one is REFUSED rather than ignored: a
+    // caller who typed --apply or --publish must never have it silently dropped and come away
+    // believing this command can do either.
+    if (flag === "--json") { json = true; continue; }
+    complain(`unknown option "${flag}"\n${USAGE}`);
+    return EXIT_USAGE;
+  }
+
+  // A config that failed to parse leaves routing with NO targets, so every cataloged model would
+  // look like an unmapped novelty with no incumbent to beat. Those findings would all be
+  // artifacts of the broken config, which is worse than no findings.
+  if (CONFIG_ERROR) {
+    complain(`refusing to reconcile against an unusable config: ${CONFIG_ERROR}`);
+    return EXIT_ERROR;
+  }
+
+  try {
+    // Defaults all the way down: the state root from the environment, the registry and the
+    // pinned targets from config, the sources from the isolating collector.
+    const store = createReconciliationStore();
+    if (command === "dry-run") {
+      const report = runDryReconciliation({ store });
+      process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${formatDryRunReport(report)}\n`);
+      return EXIT_OK;
+    }
+    const status = readReconciliationStatus(store);
+    process.stdout.write(json ? `${JSON.stringify(status, null, 2)}\n` : `${formatReconciliationStatus(status)}\n`);
+    return EXIT_OK;
+  } catch (error) {
+    complain(error?.message ?? String(error));
+    return EXIT_ERROR;
+  }
+};
+
+// exitCode rather than process.exit(): a report is large enough to still be draining down a pipe
+// when the process ends, and process.exit() would truncate it.
+process.exitCode = run(process.argv.slice(2));

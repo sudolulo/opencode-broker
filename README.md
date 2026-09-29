@@ -305,6 +305,47 @@ fraction). That is the number to size a slot's context and a server's slot count
 names each model's top callers: `opencode` for routed sessions, and for the gateway the client
 address and the model name it asked for.
 
+## Model discovery and the reconciliation dry run
+
+Discovery adopts a newer model in a family the broker already routes on, but only what the
+family table maps and only what this host can actually address. `opencode-broker-watch`
+refreshes both inputs -- opencode's models.dev cache and the resolver view
+(`resolvable-models.json`) -- republishes the broker's inventory, and notifies about anything a
+human still has to judge. **It remains the live publisher.**
+
+`opencode-broker-reconcile` is the review side of the same question, and it publishes nothing:
+
+```sh
+opencode-broker-reconcile dry-run [--json]   # refresh isolated inputs, record observations, report
+opencode-broker-reconcile status [--json]    # the bounded projection of what was recorded
+```
+
+- **The ledger is the only thing it writes.** `dry-run` records candidate observations in
+  `model-reconciliation.json` in the routing state directory (see
+  [docs/STATE.md](docs/STATE.md)), under an exclusive mkdir lock, and mutates nothing else.
+- **It does not publish inventory or alter routing.** It computes the inventory the broker
+  *would* be handed, through the same pure builder live publication uses, and returns it for
+  review. It posts nothing to the broker, changes no target's eligibility, sends no
+  notification and opens no issue. Evidence collection, approval, probing and probation are
+  later packages; until they exist, nothing here can activate a model.
+- **Its refreshes are isolated.** `opencode models` is run against a scratch `XDG_CACHE_HOME`
+  that is deleted afterwards, and `opencode models --pure` is parsed in memory, so neither the
+  live models.dev cache nor `resolvable-models.json` is touched -- not their bytes, not their
+  mtimes. A failed refresh falls back to reading those live files, read-only, so stale
+  observation still produces findings; a refresh and a fallback that both fail is a collection
+  failure the command exits 1 on, never a candidate reported as blocked.
+- **Stale means 48 hours for the catalog and 72 for the resolver view.** The thresholds differ
+  because the catalog is a vendor feed that moves daily while the resolver view is this host's
+  provider config. The boundary itself is fresh: only an age *past* the threshold is stale, and
+  an age that cannot be established is treated as stale.
+- **`reviewed-models.json` is left intact.** The dry run reads the watch job's ledger and
+  reports which of its keys a future import would cover; the import and the deletion of that
+  file happen in a later package.
+
+Exit codes: `0` the command completed (a report full of blocked candidates is still a completed
+report), `1` corrupt state, unusable config, or no readable source at all, `2` a bad command or
+flag.
+
 ## The gateway
 
 Services that only speak `OPENAI_BASE_URL + key + model` (a chat UI, a voice
@@ -530,6 +571,7 @@ share records.
 |---|---|
 | `bin/opencode-broker` | The daemon and its CLI: `serve`, `status`, `selection`, `decisions [n]`, `rearm [target or provider:<id>]`, `quarantine provider:<id>`. |
 | `bin/opencode-broker-watch` | Run daily: refreshes opencode's model catalog and its resolver view (`opencode models --pure`, stored as `resolvable-models.json` in the routing state directory), republishes the broker's inventory, and reports new models and newer releases of the ones you pin through `watch.notifyCommand`. Catalog discovery admits only models present in that resolver view, so a catalog entry this host cannot address never becomes a routing target; until the first run writes the view, discovery admits nothing and every tier stays on its configured targets. |
+| `bin/opencode-broker-reconcile` | The reconciliation dry run: `dry-run [--json]` and `status [--json]`. Refreshes isolated catalog and resolver views, records provider-role candidate observations in `model-reconciliation.json`, and reports stale or unresolved blockers plus the proposed inventory -- without publishing inventory or altering routing. |
 | `plugin/router.js` | Leases a model at `chat.message`, tracks each session's context size, reports usage and failures, enforces profile tool rules, waits out a busy or loading local model, and stops a turn the burn watch flags. |
 | `plugin/model-default.js`, `tui/` | Start new sessions on the model you last picked by hand. |
 | `plugin/compaction-guard.js` | Works around three compaction failures seen with opencode 1.18: a resumed summary parented to the wrong message (so the next turn resends the whole history), overflow and auto-compaction repeating without end, and a context-pruning plugin treating a cancelled compaction as a finished one. It uses only stock hooks and routes. |

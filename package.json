@@ -32,6 +32,7 @@
   "bin": {
     "opencode-broker": "bin/opencode-broker",
     "opencode-broker-watch": "bin/opencode-broker-watch",
+    "opencode-broker-reconcile": "bin/opencode-broker-reconcile",
     "opencode-broker-gateway": "gateway/bin/opencode-broker-gateway",
     "opencode-broker-tenant-token": "gateway/bin/opencode-broker-tenant-token"
   },

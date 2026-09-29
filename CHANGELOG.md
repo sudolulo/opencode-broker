@@ -38,6 +38,11 @@ All notable changes to this project are documented here. The format is based on
   scrollback or a deploy log. It **refuses to overwrite an existing token** unless `--force`:
   the tenant reads its bind-mounted copy when the container starts, so a rotation has to be
   paired with restarting the tenant and must never be a side effect of re-running a deploy.
+- **Provider model reconciliation now has a safe dry-run foundation.** A validated provider-role
+  registry drives the existing family-tier discovery policy, and `opencode-broker-reconcile dry-run`
+  refreshes isolated catalog/resolver inputs, records idempotent candidate observations, reports stale
+  or unresolved blockers, and previews the legacy reviewed-model import without publishing inventory
+  or changing routing.
 
 ## [1.19.1] — 2026-09-28
 
