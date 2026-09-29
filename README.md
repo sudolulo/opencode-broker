@@ -391,6 +391,12 @@ human.
 external write at all. `project --dry-run` reports what each would do from the ledger alone -- no
 forge request, no notifier subprocess, no write.
 
+**Turning the Gitea projection on means naming the forge.** `reconcile.gitea.enabled: true`
+requires `baseURL`, `owner` and `repo`, all non-empty; there is no default destination, because a
+projection that filed issues about your models into a repository you never named would be a leak
+nothing would point you at. Omit any of them and the projection stays off, with a startup line
+naming exactly the fields that are missing.
+
 - **One issue per open proposal**, keyed by proposal revision. Decide it by applying exactly ONE
   label: `decision/approved` applies the proposal exactly as the ledger stored it, and
   `decision/rejected` records the rejection and stops proposing that candidate.
@@ -401,7 +407,16 @@ forge request, no notifier subprocess, no write.
   first wins.
 - **Closing an issue is not approval.** An issue closed with no decision label is reopened exactly
   once, with instructions; closed undecided again it stays closed, and the proposal stays
-  undecided in the ledger.
+  undecided in the ledger. The reopen and its instructional comment carry separate markers, so a
+  comment that fails is retried on the next run while the reopen still counts as done -- a forge
+  error between the two can never buy the issue a second reopen.
+- **A decision made locally while a `project` run is in flight wins.** The comment and the close
+  happen outside the ledger lock, and an `approve` or `reject` that lands in that window is kept.
+  The label decision is then reported as not recorded, because the issue has already been closed
+  as though it had been applied and only a human can reconcile that.
+- **An issue deleted on the forge is not a decision either.** A `GET` that 404s clears that pointer
+  and reports it, and the next run opens a fresh issue for the proposal; any other forge failure
+  leaves the pointer exactly where it is.
 - **An unmapped candidate cannot be approved from either surface.** `decision/approved` on one is
   refused with a comment naming the `amend` that supplies the mapping.
 - **Five notification events**, one push each, through the same `notifyCommand` argv the watch jobs
@@ -412,7 +427,9 @@ forge request, no notifier subprocess, no write.
   state creates no second issue, comment or push. A crash *between* an external write and the
   ledger marker that records it can duplicate one issue or one push on restart; closing that window
   needs an issue search keyed by proposal revision or an ntfy idempotency key, and neither exists
-  yet. The blast radius is one extra issue or push, and the decision logic is unaffected.
+  yet. The blast radius is one extra issue or push, and the decision logic is unaffected. The
+  reopen is the exception: its marker is persisted before the comment it is followed by, so no
+  crash or forge error in that sequence produces a second reopen.
 
 `approve`, `reject` and `amend` are the same decisions made locally, for when the forge is
 unreachable or the projection is still off. They write `approval.source: "cli"`, refuse a record
@@ -444,6 +461,12 @@ HOST=0.0.0.0 PORT=8790 node ~/opencode-broker/gateway/bin/opencode-broker-gatewa
 It reads `~/.config/opencode-broker/gateway.json` (or `OPENCODE_BROKER_GATEWAY_CONFIG`)
 and refuses to start without a key file (`OPENCODE_BROKER_GATEWAY_KEY_FILE`).
 It listens on 127.0.0.1 unless `HOST` says otherwise.
+
+The `chmod 600` above is enforced, not advice: this key fronts paid quota, so the gateway refuses
+to start when the key file is missing, empty, not a regular file, or carries **any** group or other
+permission bit. The error names the path and the mode and never the key. (The tenant token is
+separate and deliberately looser -- it is a root-owned `0640` drop file whose group is how the
+gateway reads it at all.)
 
 ```jsonc
 {

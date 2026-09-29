@@ -7,7 +7,10 @@
 //   HOST                               listen address (default 127.0.0.1; set 0.0.0.0 for LAN clients)
 //   OPENCODE_BROKER_GATEWAY_CONFIG     config file (default ~/.config/opencode-broker/gateway.json)
 //   OPENCODE_BROKER_GATEWAY_KEY_FILE   file holding the bearer key clients must present
-//                                      (default ~/.config/opencode-broker/gateway-key; required)
+//                                      (default ~/.config/opencode-broker/gateway-key; required).
+//                                      Must be a non-empty regular file with NO group or other
+//                                      permission bits -- chmod 600. Startup refuses anything
+//                                      looser, because this key fronts paid quota.
 //   OPENCODE_BROKER_TENANT_TOKEN_FILE  file holding the bearer token the GPU-tenant control
 //                                      routes require (default
 //                                      ~/.config/opencode-broker/tenant-token; optional --
@@ -17,7 +20,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { DEFAULT_GATEWAY_CONFIG, createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
+import { DEFAULT_GATEWAY_CONFIG, createGatewayHandler, loadGatewayConfig, readGatewayKeyFile } from "../lib/gateway.js";
 import { brokerRequest } from "../../lib/client.js";
 
 const deprecations = [];
@@ -43,15 +46,20 @@ const configPath = (() => {
 const keyPath = setting("OPENCODE_BROKER_GATEWAY_KEY_FILE", "OPENCODE_FLEET_GATEWAY_KEY_FILE")
   ?? join(dirname(DEFAULT_GATEWAY_CONFIG), "gateway-key");
 
-// This endpoint fronts paid quota: no key, no server.
-const gatewayKey = readFileSync(keyPath, "utf8").trim();
-if (!gatewayKey) throw new Error(`${keyPath} is empty: the gateway refuses to run without a key`);
+// This endpoint fronts paid quota: no key, no server. readGatewayKeyFile also refuses a key
+// file another account on the host can read -- a 0640 drop file is a deploy fault, and one
+// that stays invisible for as long as nobody abuses it.
+const gatewayKey = readGatewayKeyFile(keyPath);
 // The tenant surface's own credential, read ONCE here at startup. ☠️ A long-running service
 // never calls rbw: the vault may be locked when it restarts, and a gateway that cannot come
 // up is worse than one without a tenant surface. The token is generated and written to a
 // root-owned 0640 drop file at deploy time and bind-mounted read-only into the tenant's
 // container -- never in the compose env, never in config, never in git.
 // ☆ Absent is a valid deployment: the routes then refuse every caller (fail closed).
+// ☠️ This one deliberately does NOT go through readGatewayKeyFile. That reader refuses any
+// group bit, and this token's documented deployment is a ROOT-OWNED 0640 file whose group is
+// how the gateway's own account reads it at all. Tightening it to 0600 root-owned would make
+// the tenant surface unreadable on every real install.
 const tenantTokenPath = process.env.OPENCODE_BROKER_TENANT_TOKEN_FILE
   ?? join(dirname(DEFAULT_GATEWAY_CONFIG), "tenant-token");
 const tenantToken = existsSync(tenantTokenPath) ? readFileSync(tenantTokenPath, "utf8").trim() || null : null;

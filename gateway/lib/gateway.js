@@ -22,9 +22,10 @@
 // auth store at request time and never logged.
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 // Constant-time comparison of the presented bearer header with the expected one. Hashing
 // first gives both sides the same length, which timingSafeEqual requires.
@@ -222,6 +223,44 @@ const reservationHeld = (path, id) => {
   return Boolean(entry) && typeof entry === "object" && "card" in entry && "mib" in entry;
 };
 
+// How much of a child's chatter the gateway is willing to hold. ☠️ This is a DIAGNOSTIC
+// ceiling, not a transcript: the captured text has exactly one consumer, the stderr line the
+// tenant handler writes when a swap does not end how the action wanted. 32 KiB is several
+// screens of a model-swap failure -- far more than the one line that usually matters -- while
+// staying small enough that a swap stuck in a retry loop cannot grow the heap of a process
+// that is concurrently serving paid requests.
+export const MODEL_SWAP_OUTPUT_LIMIT = 32 * 1024;
+
+// The bounded capture behind spawnModelSwap, separated so the bound can be observed WHILE
+// chunks arrive rather than only in the resolved value. Two properties it exists to hold:
+//
+//  1. The retained text is trimmed after EVERY chunk. Trimming once at exit -- which is what
+//     `output.slice(-4000)` on close did -- bounds the reported string and nothing else: the
+//     process still holds everything the child ever printed for as long as it runs.
+//  2. Each stream decodes through its OWN StringDecoder. A UTF-8 character straddling two
+//     chunks arrives as a partial byte sequence, and stringifying each Buffer alone turns it
+//     into U+FFFD -- garbling the error line exactly when someone is trying to read it. The
+//     decoders cannot be shared between stdout and stderr either: they are independent byte
+//     streams, so one stream's held partial character would corrupt the other's next chunk.
+//
+// The TAIL is what survives a trim, because a failing command's last words are its reason. A
+// trailing partial character (a child killed mid-write) is simply dropped rather than flushed
+// as U+FFFD: end() is never called.
+export const createModelSwapCapture = (limit = MODEL_SWAP_OUTPUT_LIMIT) => {
+  let text = "";
+  return {
+    // One sink per stream, each with its own decoder.
+    sink: () => {
+      const decoder = new StringDecoder("utf8");
+      return (chunk) => {
+        text += decoder.write(chunk);
+        if (text.length > limit) text = text.slice(-limit);
+      };
+    },
+    text: () => text,
+  };
+};
+
 // Spawn `model-swap` and WAIT for it. ☠️ This is deliberately not the bin's prepareCommand
 // spawn (bin/opencode-broker:587-598), which is detached, stdio-ignored and unref'd because
 // nothing there wants an answer. Here the whole point is the answer: the caller may not start
@@ -230,23 +269,69 @@ const reservationHeld = (path, id) => {
 // No server-side deadline: the client owns that (the ComfyUI node passes an explicit
 // aiohttp.ClientTimeout), and a `reserve --wait-active 60` legitimately runs minutes when it
 // triggers a real swap. A client that gives up disconnects; model-swap finishes its own
-// transaction either way, which is what keeps the reservation file honest.
-const spawnModelSwap = (command, args) => new Promise((resolve) => {
+// transaction either way, which is what keeps the reservation file honest. What IS bounded is
+// how much it may print at us while it does: see createModelSwapCapture.
+export const spawnModelSwap = (command, args) => new Promise((resolve) => {
   const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-  let output = "";
-  const collect = (chunk) => { output += chunk; };
-  child.stdout?.on("data", collect);
-  child.stderr?.on("data", collect);
+  const capture = createModelSwapCapture();
+  child.stdout?.on("data", capture.sink());
+  child.stderr?.on("data", capture.sink());
   // An ENOENT on the command is a deployment fault, not a refusal: it must be visible in the
   // gateway's log rather than looking like a tenant that declined.
   child.on("error", (error) => resolve({ code: null, output: String(error?.message ?? error) }));
-  child.on("close", (code) => resolve({ code, output: output.slice(-4000) }));
+  child.on("close", (code) => resolve({ code, output: capture.text() }));
 });
 
 const advertisedModelIDs = (config) => {
   const routedID = config.routedModelId ?? DEFAULT_ROUTED_MODEL_ID;
   return [routedID, ...Object.keys(config.modelProfiles ?? {})]
     .filter((id, index, ids) => ids.indexOf(id) === index);
+};
+
+// Group and other bits, all three triads. Any one of them set means an account that is not
+// the gateway's own can read the key.
+const SHARED_MODE_BITS = 0o077;
+
+// The ONE reader of the gateway key, and the reason the bin does not call readFileSync itself.
+//
+// ☠️ This endpoint fronts PAID QUOTA. The key in this file is the whole boundary between a
+// local account and someone else's provider bill, so it is held to exactly the standard
+// lib/reconcile-secrets.js holds the reconciler's Gitea write token to: a regular file, mode
+// 0600, non-empty. A gateway key read from a group-readable file while a forge token refuses
+// to be was the asymmetry this closes.
+//
+// Every refusal is LOUD and happens before listen(), never a downgrade to "no key": the auth
+// gate treats a falsy key as "refuse every caller", which is indistinguishable from a broken
+// deploy once the process is up. And no message ever quotes the key -- startup errors land in
+// journals that are not themselves 0600.
+//
+// ☆ statSync FOLLOWS the symlink on purpose. A link's own mode is 0777 on Linux and always
+// will be, so checking it would refuse every legitimate indirection; the mode that protects
+// the bytes is the target's.
+export const readGatewayKeyFile = (keyPath) => {
+  if (typeof keyPath !== "string" || keyPath === "") {
+    throw new Error("no gateway key file was named: the gateway refuses to run without a key");
+  }
+
+  let stats;
+  try {
+    stats = statSync(keyPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`${keyPath} does not exist: the gateway refuses to run without a key`);
+    }
+    throw error;
+  }
+  if (!stats.isFile()) throw new Error(`${keyPath} is not a regular file`);
+
+  const mode = stats.mode & 0o777;
+  if (mode & SHARED_MODE_BITS) {
+    throw new Error(`${keyPath} is group- or world-readable (mode ${mode.toString(8).padStart(4, "0")}); chmod 600 it`);
+  }
+
+  const key = readFileSync(keyPath, "utf8").trim();
+  if (key === "") throw new Error(`${keyPath} is empty: the gateway refuses to run without a key`);
+  return key;
 };
 
 export const loadGatewayConfig = (path = DEFAULT_GATEWAY_CONFIG) => {

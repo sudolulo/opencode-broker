@@ -16,6 +16,44 @@ All notable changes to this project are documented here. The format is based on
   whose `decision/approved` or `decision/rejected` label is authoritative -- closing it is not
   approval, and both labels at once changes nothing. Every transition pushes exactly one ntfy
   event. Routing is still untouched: nothing is published, probed or activated.
+- The Gitea projection holds its ground against everything that can happen to an issue between two
+  runs. A decision made with `opencode-broker-reconcile approve|reject` while a projection is
+  mid-flight is kept, and the label decision that would have overwritten it is reported instead of
+  applied. An issue closed without a decision label is reopened **once** even if the instructional
+  comment that follows fails: the reopen and the comment carry separate durable markers, so the
+  comment is retried alone and a second undecided close stays closed. An issue an operator deleted
+  is detected from the forge's own 404, clears only that pointer, and is proposed again on the next
+  run, while any other forge failure leaves the pointer untouched. A 2xx answer whose body is not
+  JSON -- a proxy or a login page in front of the forge -- now fails with the method, path and
+  status and never the body it came with.
+
+### Security
+
+- **The gateway key file is now held to the same standard as the reconciler's forge token.** This
+  endpoint fronts paid quota, and the key was being read with a plain `readFileSync` -- a `0640`
+  drop file left by a deploy script was accepted in silence, while the Gitea token already refused
+  one. Startup now requires a non-empty regular file with no group or other permission bits and
+  stops with the path and the mode named, and never the key, when it is anything else. The check
+  follows symlinks on purpose: a link is `0777` on Linux and always will be, so the mode that
+  matters is the target's. The tenant token is deliberately exempt -- its documented deployment is
+  a root-owned `0640` file whose group is how the gateway reads it at all.
+- **`reconcile.gitea.enabled: true` now requires `baseURL`, `owner` and `repo`.** Omitting them
+  fell through to a destination the code picked, so a deployment that turned the projection on
+  without naming a forge would have filed issues about its models into a repository its operator
+  never chose -- and had no reason to go looking at. An incomplete destination now leaves the
+  projection OFF and reports `reconcile.gitea.configError` plus one startup line naming exactly
+  the missing fields. It reports rather than throws because routing, the plugin and the TUI all
+  import the config module, and a misconfigured publisher must not become an outage.
+
+### Fixed
+
+- **A `model-swap` child can no longer grow the gateway's heap without bound.** The tenant routes
+  await the child and captured everything it printed, trimming to the last 4 KB only once it
+  exited -- so a swap stuck in a retry loop held every byte it had ever written, inside a process
+  concurrently serving paid requests. Capture is now trimmed after every chunk to a documented
+  32 KiB diagnostic tail. Each stream also decodes through its own `StringDecoder`, so a UTF-8
+  character split across two chunks no longer arrives as `U+FFFD` -- which garbled the error line
+  exactly when someone was reading it to find out what the swap refused.
 
 ## [1.20.0] — 2026-09-29
 

@@ -239,12 +239,59 @@ test("reconcile projections default to off, and notifyCommand falls back to watc
     repo: "models",
     tokenPath: "/var/lib/opencode-broker/gitea-token",
     enabled: true,
+    configError: null,
   });
 
   // `enabled` is strictly a boolean opt-in: a truthy string must not turn a publisher on.
   const junk = (await loadConfig(`{ "reconcile": { "gitea": { "enabled": "yes", "owner": 7 } } }`)).CONFIG.reconcile;
   assert.equal(junk.gitea.enabled, false);
   assert.equal(junk.gitea.owner, null);
+  assert.equal(junk.gitea.configError, null, "never opted in, so nothing is misconfigured");
+});
+
+// ☠️ `enabled: true` with no destination used to mean "publish to whatever forge the code
+// defaults to". A projection that files issues about a deployment's models into a repository
+// its operator never named is a data leak with a friendly UI, and the operator would have no
+// reason to look for it. Naming the forge is now part of turning the publisher on.
+test("an enabled Gitea projection must name its own baseURL, owner and repo", async () => {
+  const enable = (gitea) => loadConfig(`{ "reconcile": { "gitea": ${JSON.stringify({ enabled: true, ...gitea })} } }`);
+  const COMPLETE = { baseURL: "https://git.example.test", owner: "flan", repo: "models" };
+
+  const good = (await enable(COMPLETE)).CONFIG.reconcile.gitea;
+  assert.equal(good.enabled, true);
+  assert.equal(good.configError, null);
+
+  for (const field of ["baseURL", "owner", "repo"]) {
+    const partial = { ...COMPLETE };
+    delete partial[field];
+    const gitea = (await enable(partial)).CONFIG.reconcile.gitea;
+
+    // Fail CLOSED: an incomplete destination publishes nothing rather than guessing one.
+    assert.equal(gitea.enabled, false, `omitting ${field} must not leave the projection on`);
+    assert.ok(gitea.configError, `omitting ${field} must be reported`);
+    assert.ok(
+      gitea.configError.includes(`gitea.${field}`),
+      `the error must name the missing field, got: ${gitea.configError}`,
+    );
+    // The two fields that WERE given are not the operator's problem; naming them would send
+    // them hunting through a config that is already correct there.
+    for (const present of Object.keys(partial)) {
+      assert.ok(!gitea.configError.includes(`gitea.${present}`), `${present} is present, so it must not be listed`);
+    }
+  }
+
+  // An empty string is an omission written out longhand.
+  const blank = (await enable({ ...COMPLETE, owner: "" })).CONFIG.reconcile.gitea;
+  assert.equal(blank.enabled, false);
+  assert.ok(blank.configError.includes("gitea.owner"));
+
+  // All three missing: one message that names all three, so the operator fixes the config once
+  // instead of restarting into the next complaint.
+  const bare = (await enable({})).CONFIG.reconcile.gitea;
+  assert.equal(bare.enabled, false);
+  for (const field of ["gitea.baseURL", "gitea.owner", "gitea.repo"]) {
+    assert.ok(bare.configError.includes(field), `all three are missing, got: ${bare.configError}`);
+  }
 });
 
 // The shipped examples are documentation; a typo in one would teach every new install a
