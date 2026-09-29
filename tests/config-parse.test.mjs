@@ -203,6 +203,50 @@ test("burnWatch defaults to on, takes its thresholds from config, and borrows wa
   assert.deepEqual((await loadConfig(`{}`)).CONFIG.burnWatch.notifyCommand, [], "no notifier anywhere: log only");
 });
 
+// The reconciliation projections ship OFF. A fresh install must open no Gitea issue and send no
+// notification until an operator names a repository and sets `enabled: true` -- a default-ON
+// publisher here would file issues about candidates nobody has looked at.
+test("reconcile projections default to off, and notifyCommand falls back to watch's", async () => {
+  const { CONFIG } = await loadConfig(`{}`);
+  assert.equal(CONFIG.reconcile.gitea.enabled, false);
+  assert.equal(CONFIG.reconcile.gitea.baseURL, null);
+  assert.equal(CONFIG.reconcile.gitea.owner, null);
+  assert.equal(CONFIG.reconcile.gitea.repo, null);
+  assert.match(CONFIG.reconcile.gitea.tokenPath, /opencode-broker\/gitea-token$/);
+  assert.deepEqual(CONFIG.reconcile.notifyCommand, []);
+
+  const inherited = (await loadConfig(`{ "watch": { "notifyCommand": ["/usr/local/bin/notify"] } }`)).CONFIG.reconcile;
+  assert.deepEqual(inherited.notifyCommand, ["/usr/local/bin/notify"],
+    "one notifier serves the watch and the reconciler unless the reconciler names its own");
+
+  const declared = (await loadConfig(`{
+    "watch": { "notifyCommand": ["/usr/local/bin/notify"] },
+    "reconcile": {
+      "notifyCommand": ["/usr/local/bin/alert", "{title}", "{body}", "{kind}"],
+      "gitea": {
+        "baseURL": "https://git.example.test",
+        "owner": "flan",
+        "repo": "models",
+        "tokenPath": "/var/lib/opencode-broker/gitea-token",
+        "enabled": true
+      }
+    }
+  }`)).CONFIG.reconcile;
+  assert.deepEqual(declared.notifyCommand, ["/usr/local/bin/alert", "{title}", "{body}", "{kind}"]);
+  assert.deepEqual({ ...declared.gitea }, {
+    baseURL: "https://git.example.test",
+    owner: "flan",
+    repo: "models",
+    tokenPath: "/var/lib/opencode-broker/gitea-token",
+    enabled: true,
+  });
+
+  // `enabled` is strictly a boolean opt-in: a truthy string must not turn a publisher on.
+  const junk = (await loadConfig(`{ "reconcile": { "gitea": { "enabled": "yes", "owner": 7 } } }`)).CONFIG.reconcile;
+  assert.equal(junk.gitea.enabled, false);
+  assert.equal(junk.gitea.owner, null);
+});
+
 // The shipped examples are documentation; a typo in one would teach every new install a
 // config that silently routes nothing.
 test("the shipped example configs parse and declare targets", async () => {

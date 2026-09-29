@@ -1,0 +1,123 @@
+#!/usr/bin/env node
+// opencode-broker-evidence: run up to N evidence collection jobs, one at a time.
+//
+// CRITICAL: THIS FILE IS DELIBERATELY THIN, AND THAT IS THE SAFETY PROPERTY. The claim lease, the
+// scrubbed child environment, the single-JSON-object parse, the domain allowlist, the identity
+// match against the claimed request and the forbidden-string refusal all live in
+// lib/reconcile-collector.js and lib/reconcile-evidence.js, where they are unit-tested without a
+// subprocess. Validation logic added here would be logic no such test covers.
+//
+// CRITICAL: NOTHING IS PUBLISHED AND NOTHING IS DECIDED. This command stores validated evidence
+// against a queued candidate and stops. It opens no issue, sends no notification, changes no
+// routing and activates no model. The researcher it spawns is read-only and receives no
+// credential: not in its environment, not in its argv, and it has no write path into the ledger.
+//
+// The ONE thing this process does hold is the deployment's Gitea write token, read once at
+// startup, so that lib/reconcile-evidence.js can REFUSE a researcher payload that quotes it. That
+// is our own deterministic code holding it, never the model.
+import { CONFIG, CONFIG_ERROR } from "../lib/config.js";
+import { collectEvidenceOnce } from "../lib/reconcile-collector.js";
+import { readGiteaTokenIfPresent } from "../lib/reconcile-secrets.js";
+import { createReconciliationStore } from "../lib/reconcile-state.js";
+
+const USAGE = "usage: opencode-broker-evidence [--json] [--max N]";
+const MAX_JOBS = 5;
+
+// 0 a request was collected or nothing was due, 1 a collection failed after being recorded
+// against its request, 2 the command line itself.
+const EXIT_OK = 0;
+const EXIT_ERROR = 1;
+const EXIT_USAGE = 2;
+
+const complain = (message) => process.stderr.write(`opencode-broker-evidence: ${message}\n`);
+
+const parseArgs = (argv) => {
+  let json = false;
+  let max = 1;
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    // Exactly two flags are recognized, and an unrecognized one is REFUSED rather than ignored:
+    // a caller who typed --apply or --approve must never have it silently dropped and come away
+    // believing this command can do either.
+    if (flag === "--json") { json = true; continue; }
+    if (flag === "--max") {
+      const value = argv[index + 1];
+      index += 1;
+      if (!/^[0-9]+$/.test(String(value ?? ""))) return { error: `--max needs a whole number from 1 to ${MAX_JOBS}` };
+      max = Number(value);
+      if (max < 1 || max > MAX_JOBS) return { error: `--max must be from 1 to ${MAX_JOBS}` };
+      continue;
+    }
+    return { error: `unknown option "${flag}"` };
+  }
+  return { json, max };
+};
+
+const run = (argv) => {
+  const options = parseArgs(argv);
+  if (options.error) {
+    complain(`${options.error}\n${USAGE}`);
+    return EXIT_USAGE;
+  }
+
+  // A config that failed to parse leaves the role registry and the evidence domain allowlist
+  // derived from a file nobody could read, so every claim would be judged against the wrong
+  // domains. Refuse rather than store evidence validated against the wrong allowlist.
+  if (CONFIG_ERROR) {
+    complain(`refusing to collect evidence against an unusable config: ${CONFIG_ERROR}`);
+    return EXIT_ERROR;
+  }
+
+  let forbiddenStrings;
+  try {
+    // Read ONCE, here, and passed into every collection so a payload quoting it is refused. The
+    // reader throws on a group- or world-readable file; the message names the path, never the
+    // contents. No token deployed is legitimate -- the projections ship off.
+    const token = readGiteaTokenIfPresent(CONFIG.reconcile.gitea.tokenPath);
+    forbiddenStrings = token ? [token] : [];
+  } catch (error) {
+    complain(error?.message ?? String(error));
+    return EXIT_ERROR;
+  }
+
+  const results = [];
+  try {
+    const store = createReconciliationStore();
+    for (let attempt = 0; attempt < options.max; attempt += 1) {
+      const result = collectEvidenceOnce({ store, forbiddenStrings });
+      if (!result.collected && result.reason === "nothing-due") break;
+      results.push(result);
+    }
+  } catch (error) {
+    complain(error?.message ?? String(error));
+    return EXIT_ERROR;
+  }
+
+  const collected = results.filter((result) => result.collected);
+  const failed = results.filter((result) => !result.collected);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({
+      max: options.max,
+      attempted: results.length,
+      collected: collected.length,
+      failed: failed.length,
+      results,
+    }, null, 2)}\n`);
+  } else if (!results.length) {
+    process.stdout.write("nothing due\n");
+  } else {
+    const lines = [`${collected.length} collected, ${failed.length} failed, ${results.length} attempted`];
+    for (const result of results) {
+      lines.push(result.collected
+        ? `collected ${result.transitionID}: ${result.accepted} claim${result.accepted === 1 ? "" : "s"}`
+        : `failed ${result.transitionID}: ${result.reason}`);
+    }
+    process.stdout.write(`${lines.join("\n")}\n`);
+  }
+
+  return failed.length ? EXIT_ERROR : EXIT_OK;
+};
+
+// exitCode rather than process.exit(): a summary can still be draining down a pipe when the
+// process ends, and process.exit() would truncate it.
+process.exitCode = run(process.argv.slice(2));
