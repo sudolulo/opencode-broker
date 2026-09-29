@@ -50,12 +50,12 @@ test("with no agentTiers, opencode's built-in agents get sensible tiers", () => 
   assert.deepEqual(results.filter((r) => r.inherits).map((r) => r.agent), ["general", "general", "general"]);
 });
 
-test("opencode-guard's classifier agents are classifier lanes by default, and are never leased on that lane", () => {
+test("opencode-guard's classifier agents are classifier lanes by default", () => {
   const { results } = evaluate({}, [["fleet-classifier"], ["fleet-classifier-local"], ["classifier-ish"]]);
-  assert.deepEqual(results.map((r) => [r.agent, r.classifier, r.tier]), [
-    ["fleet-classifier", true, "worker"],
-    ["fleet-classifier-local", true, "worker"],
-    ["classifier-ish", false, "worker"],
+  assert.deepEqual(results.map((r) => [r.agent, r.classifier]), [
+    ["fleet-classifier", true],
+    ["fleet-classifier-local", true],
+    ["classifier-ish", false],
   ]);
 });
 

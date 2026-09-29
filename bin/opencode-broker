@@ -707,7 +707,7 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
     ? request.fallbackTargetID
     : null;
   // A caller that deliberately wants the session re-decided (the plugin's restore-home after
-  // a provider displacement) says so; every other lease keeps the session's pinned model.
+  // a provider displacement) says so; every other lease keeps the session's sticky assignment.
   const releasePin = request.releasePin === true;
   // A caller whose session id is minted per REQUEST and never reused -- the gateway, which
   // builds `gw-<time36>-<rand>` for each client call -- declares it here. It changes nothing

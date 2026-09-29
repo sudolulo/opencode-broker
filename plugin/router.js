@@ -10,7 +10,6 @@ import {
   isClassifierAgent,
   modelIsLocalTarget,
   isOfflineProfile,
-  manualModelLock,
   listPendingForgetRecords,
   profileConfinesToLan,
   profileReachesCloud,
@@ -32,7 +31,6 @@ import {
   raiseTier,
 } from "../lib/routing.js";
 import {
-  applyClassifierVariant,
   applyMessageModel,
   applyOutputModel,
   cleanupDeletedSession,
@@ -49,6 +47,10 @@ const LOCAL_CHILD_INACTIVITY_TIMEOUT = "LOCAL_INACTIVITY_TIMEOUT";
 // gets updated and one that quietly does not.
 const sessionLifecycleTypes = new Set(["session.created", "session.deleted", "session.updated", "session.status", "session.error", "session.idle"]);
 const localChildProgressEventTypes = new Set(["session.status", "message.updated", "message.part.updated", "message.part.delta"]);
+const classifierTierReachesCloud = () => [
+  ...(CONFIG.tiers.classifier ?? []),
+  ...(CONFIG.fallbacks.classifier ?? []).flat(),
+].some((targetID) => CONFIG.targets[targetID]?.kind === "cloud");
 
 const providerErrorFrom = (...values) => {
   for (const value of values) {
@@ -298,7 +300,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   };
   const clearLocalChildInFlightTools = (sessionID) => localChildInFlightTools.delete(sessionID);
   const isLocalChildRoute = (sessionID, session = sessions.get(sessionID)) =>
-    Boolean(session?.parentID && routes.get(sessionID)?.target?.kind === "local");
+    Boolean(session?.parentID && !isClassifierAgent(session.agent) && routes.get(sessionID)?.target?.kind === "local");
   const failInactiveLocalChild = (sessionID) => {
     const existing = localChildInactivityCleanups.get(sessionID);
     if (existing) return existing;
@@ -385,53 +387,19 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
 
   const route = async (session, preferredModel = null) => {
     if (!session?.id) return null;
-    // ☠️ A classifier lane agent is PINNED to its own model in frontmatter and must not be
-    // routed at all -- routing overrides that pin, and under the manual profile hands it
-    // the parent's INTERACTIVE model (0.21.1). Two things still have to happen here.
-    //
-    // 1. "Not routed" must be RECORDED, not merely returned. chat.params refuses to let a
-    //    turn proceed when the session has no route entry, so returning null threw
-    //    "route unavailable; resend the prompt" at chat.params on EVERY classification
-    //    from the moment the prefix skip landed -- and the guard fails closed on an
-    //    unreachable classifier, so it denied the user's shell commands. Observed
-    //    2026-09-07: five classifier sessions dying that way in 30 seconds.
-    //    ☆ A declined record carries no model, which every consumer already reads as
-    //    "nothing to apply" (applyMessageModel, startHeartbeat and chat.params all key off
-    //    target/model) -- the same shape the manual-lock branch has always returned.
-    //
-    // 2. The lane does not inherit the session's PROFILE (it classifies a shell command,
-    //    not the conversation) but it does inherit the session's EGRESS BOUNDARY, because
-    //    that command line is still the user's content -- and a command line is where
-    //    secrets travel inline. Enforced WITHOUT routing it: the classifier tier is
-    //    local-first, so the guard only dispatches a cloud-pinned lane when no local
-    //    classifier target was eligible, which is exactly the case a confined session must
-    //    refuse. Blocking the pin therefore suppresses that cloud rung for restrictive
-    //    profiles and leaves it intact under `auto`, where the deployment configured it on
-    //    purpose.
-    //    ☆ And it costs no lease: re-routing the child would take a SECOND slot on a
-    //    capacity-2 local target for one classification, which is how a privacy rule turns
-    //    into the outage it was meant to prevent.
-    if (isClassifierAgent(session.agent)) {
-      // ☆ Self-heal, and it must run BEFORE the boundary is read: before 0.28.0
-      // session.created wrote the PARENT's profile onto the child, and that record
-      // outlives the child by up to MAX_PROFILE_AGE_MS -- long enough for
-      // sessionsOnProfiles() to believe a dead classifier still holds the uncensored
-      // model. Cleared first, so the answer below comes from the OWNER, not a stale copy.
+    const classifier = isClassifierAgent(session.agent);
+    if (classifier) {
+      // Old builds persisted the parent's profile onto the child. Remove it before reading
+      // the owner so a stale child record cannot widen or narrow the inherited boundary.
       try { removeSessionProfile(session.id); } catch {}
-      const ownerProfile = resolveProfile({ sessionID: session.id, parentID: session.parentID }).profile;
-      if (profileConfinesToLan(ownerProfile) && !modelIsLocalTarget(preferredModel)) {
-        // ☠️ Deliberately leaves NO route record. chat.message throwing should end the
-        // turn, and if a host ever carries on regardless chat.params then refuses it for
-        // want of a route -- two refusals beat one command line reaching a cloud provider.
-        failLease({ profile: ownerProfile }, new Error(
-          `the command classifier is pinned to ${preferredModel?.providerID ?? "an unknown provider"}/${preferredModel?.id ?? preferredModel?.modelID ?? "an unknown model"}, which is not one of this deployment's local targets`));
-      }
-      const declined = { declined: true, profile: "auto", explicit: false };
-      routes.set(session.id, declined);
-      return declined;
     }
-    const resolved = resolveProfile({ sessionID: session.id, parentID: session.parentID, agent: session.agent });
-    let tier = await routeTierForSession({
+    const owner = classifier
+      ? resolveProfile({ sessionID: session.id, parentID: session.parentID })
+      : null;
+    const resolved = classifier
+      ? { profile: "auto", explicit: false }
+      : resolveProfile({ sessionID: session.id, parentID: session.parentID, agent: session.agent });
+    let tier = classifier ? "classifier" : await routeTierForSession({
       agent: session.agent,
       parentID: session.parentID,
       sessionID: session.id,
@@ -439,21 +407,20 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       sessions,
       getSession,
     });
+    const localOnly = classifier && profileConfinesToLan(owner.profile);
     // High-risk content raises the tier floor: a medical/safety/legal/financial
     // question where being wrong is dangerous is served from a strong model no
     // matter what agent the session is on. Deterministic escalation, not a
     // nudge that can be ignored or fail to apply.
-    tier = raiseTier(tier, riskFloors.get(session.id));
+    if (!classifier) tier = raiseTier(tier, riskFloors.get(session.id));
     // A deployment may fold one tier into another (config `tierAliases`). Where two lanes
     // resolve to the same model the split buys nothing and only multiplies the lanes a
     // session can be moved between -- measured: build and smart leasing the same model
     // 96% of the time each, so `{ "build": "smart" }` makes every path that lands on
     // `build` lease the smart lane. Applied after the risk floor, so a floor can never be
     // undercut by an alias.
-    tier = CONFIG.tierAliases[tier] ?? tier;
-    // Preserve the source distinction: an implicit Auto record does not override the
-    // user's model-default lock, while F11's explicit Auto selection does.
-    writeSessionProfile(session.id, resolved.profile, { explicit: resolved.explicit });
+    if (!classifier) tier = CONFIG.tierAliases[tier] ?? tier;
+    if (!classifier) writeSessionProfile(session.id, resolved.profile, { explicit: resolved.explicit });
     if (resolved.profile === "manual") {
       // A child continues the parent model selected by the user. A root keeps its
       // current model; neither case asks the broker to make a model decision.
@@ -487,15 +454,6 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       routes.set(session.id, locked);
       return locked;
     }
-    const rootManualLock = !session.parentID && resolved.profile === "auto" &&
-      !resolved.explicit && resolved.source === "default" && manualModelLock();
-    if (rootManualLock) {
-      const locked = { locked: true, profile: resolved.profile, explicit: resolved.explicit, tier };
-      clearLocalChildInactivityWatchdog(session.id);
-      routes.set(session.id, locked);
-      return locked;
-    }
-
     let lease;
     try {
       const contextTokens = await sessionContextTokens(session.id);
@@ -524,7 +482,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         profile: resolved.profile,
         tier,
         replace: true,
-        ...(!rebalanceFallback && seasoned && preferredModel?.providerID && preferredModel?.id ? { preferredModel } : {}),
+        ...(classifier ? { localOnly } : {}),
+        ...(!classifier && !rebalanceFallback && seasoned && preferredModel?.providerID && preferredModel?.id ? { preferredModel } : {}),
         // The broker pins every session to its model; the one time this plugin WANTS the
         // session re-decided is restore-home after a displacement, so it says so.
         ...(restoreDue ? { releasePin: true } : {}),
@@ -561,6 +520,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (!target?.model?.providerID || !target?.model?.id) {
         throw new Error(lease?.error ?? lease?.reason ?? lease?.message ?? "broker returned no model target");
       }
+      if (localOnly && target.kind !== "local" && !modelIsLocalTarget(target.model)) {
+        throw new Error(`broker returned non-local classifier target ${target.id ?? `${target.model.providerID}/${target.model.id}`} for a local-only lease`);
+      }
       // A degraded route must be VISIBLE: log it where the opencode log shows it,
       // and mark it where the hud renders it. A non-fallback lease clears the mark.
       const policy = lease?.decision?.policy ?? null;
@@ -594,7 +556,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // safer than silently spending an API-key provider after broker failure.
       clearLocalChildInactivityWatchdog(session.id);
       routes.delete(session.id);
-      failLease(resolved, error);
+      failLease(classifier ? owner : resolved, error);
     }
   };
 
@@ -699,7 +661,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // chat.message carries the authoritative agent while OpenCode is still building
     // the persisted user message and before it resolves the provider model.
     const agent = typeof agentHint === "string" && agentHint ? agentHint : session.agent;
-    if (agent !== session.agent) session = { ...session, agent };
+    if (agent !== session.agent) {
+      session = { ...session, agent };
+      sessions.set(session.id, session);
+    }
     // ☠️ A SUBAGENT NEVER PICKS ITS OWN MODEL, so a message's model is not its preference.
     // A prompt that names no model (a re-engage, a steering message, an oc_send) is stamped
     // with the pane's default -- on 2026-09-28 that was Opus, and a gpt-5.6-sol
@@ -809,14 +774,23 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const preferredModel = syntheticOnly && routedModel?.providerID && routedModel?.id
         ? { providerID: routedModel.providerID, id: routedModel.id, ...(typeof routedModel.variant === "string" && routedModel.variant ? { variant: routedModel.variant } : {}) }
         : currentModel;
-      const resolved = resolveProfile({ sessionID, parentID: session?.parentID, agent });
+      const classifier = isClassifierAgent(agent);
+      if (classifier) {
+        try { removeSessionProfile(sessionID); } catch {}
+      }
+      const owner = classifier
+        ? resolveProfile({ sessionID, parentID: session?.parentID })
+        : null;
+      const resolved = classifier
+        ? { profile: "auto", explicit: false }
+        : resolveProfile({ sessionID, parentID: session?.parentID, agent });
       // ☠️ Ask what the profile can REACH, not what it is called. A profile granted
       // `profileCloudEgress` is still one of the restrictive four by name while holding
       // a cloud fallback rung, and skipping admission work on the name would leave that
       // rung permanently unadmitted -- an opt-in that silently does nothing.
-      // ☆ A classifier lane is not routed at all, so inventory for it is pure work --
-      // on the guard's gate, one refresh per bash command.
-      const needsInventory = !isClassifierAgent(agent) && profileReachesCloud(resolved.profile);
+      const needsInventory = classifier
+        ? !profileConfinesToLan(owner.profile) && classifierTierReachesCloud()
+        : profileReachesCloud(resolved.profile);
       if (needsInventory) {
         try {
           await refreshInventory();
@@ -838,17 +812,6 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // stock 1.18.22 ignores it and relies on the mutation above. Ceiling: drop the
       // mutation once every pane runs the fork.
       applyOutputModel(output, routed);
-      // A classifier lane keeps its pinned model and takes only the tier's reasoning effort.
-      // Without this the pin runs at the model's default effort, and a thinking model spends
-      // its whole output budget reasoning and returns no verdict at all -- which the guard
-      // reads as "classifier returned no text" and fails the command closed.
-      if (isClassifierAgent(agent)) {
-        // Config's own modelVariants is the source here, not the live inventory: this path
-        // takes no lease, so it holds no inventory snapshot -- and modelRefForTier unions the
-        // configured list in anyway. The fleet declares luna's levels there explicitly.
-        const applied = applyClassifierVariant(output?.message);
-        if (applied) report("info", `${sessionID}: classifier lane at reasoning effort "${applied}"`);
-      }
     },
     // Cache lifetime hint for claude-proxy, matching what Claude Code does on the same plan:
     // a ROOT session can sit idle for many minutes (a human thinking, or a parent waiting on
@@ -972,6 +935,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           const parkedTooLong = parkedMs > RETRY_WAIT_CUMULATIVE_MS;
           if (singleTooLong || parkedTooLong) {
             const targetID = routes.get(sessionID).target.id;
+            const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
             retryWaits.delete(sessionID);
             if (!singleTooLong) {
               report("warn", `${sessionID}: ${waits.length} provider retries totalling ${Math.round(parkedMs / 1000)}s within ${RETRY_WINDOW_MS / 1000}s -- failing over from ${targetID}`);
@@ -991,9 +955,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
                   : `provider retry waits totalled ${Math.round(parkedMs / 1000)}s within the failover window`)) },
               });
             } catch {}
-            markDisplaced(sessionID, targetID, failure);
-            try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
-            if (failure?.kind && failure.kind !== "abort") scheduleReengage(sessionID, failure.kind);
+            if (!classifier) {
+              markDisplaced(sessionID, targetID, failure);
+              try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
+              if (failure?.kind && failure.kind !== "abort") scheduleReengage(sessionID, failure.kind);
+            }
             return;
           }
         }
@@ -1047,6 +1013,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         const failedTarget = routes.get(sessionID)?.target;
         const targetID = failedTarget?.id;
         const failedOnLocal = failedTarget?.kind === "local" || modelIsLocalTarget(failedTarget?.model);
+        const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
         routes.delete(sessionID);
         successCandidates.delete(sessionID);
         let failure = null;
@@ -1064,7 +1031,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         }
         // Seamless failover: only sessions this plugin actually routed, and
         // never for user aborts -- those end turns on purpose.
-        if (targetID && failure?.kind && failure.kind !== "abort") {
+        if (!classifier && targetID && failure?.kind && failure.kind !== "abort") {
           markDisplaced(sessionID, targetID, failure);
           // ☠️ A CLOUD CONTEXT OVERFLOW IS NOT A LANE TO FAIL OVER FROM. Re-engaging exists
           // to lift a session off a small LOCAL window; a cloud lane that says "prompt is
@@ -1121,7 +1088,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
               // The broker's burn watch (lib/burn-watch.js) judged this session a runaway.
               // This process owns it, so this is the one place that can stop it: abort the
               // turn and say why. Nothing is deleted, and continuing is the person's call.
-              if (!reply?.burn?.stop) return;
+              if (!reply?.burn?.stop || isClassifierAgent(sessions.get(sessionID)?.agent)) return;
               report("warn", `burn watch stopped session ${sessionID}: ${reply.burn.reason}`);
               client.session.abort({ path: { id: sessionID }, query: { directory } }).catch(() => {});
               client?.tui?.showToast?.({

@@ -20,11 +20,10 @@
 //                  at chat.params (plugin/router.js:623:30)
 //
 // Five classifier sessions died that way in 30 seconds, and the guard fails closed on an
-// unreachable classifier -- so it denied the user's shell commands. Two distinct defects:
-//   1. a classifier lane is deliberately NOT routed (it is pinned in its own frontmatter),
-//      and chat.params threw on the missing route entry;
-//   2. the classifier child inherited its parent's profile, so under `uncensored` it was
-//      aimed at one local model at capacity 1 that the user's own turn already held.
+// unreachable classifier -- so it denied the user's shell commands. The routed lane must
+// therefore lease its own classifier tier while inheriting only the owner's LAN boundary;
+// inheriting the owner's model-quality profile would aim it at the capacity-1 conversation
+// target already held by the user's turn.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -71,11 +70,23 @@ const FAKE_BROKER = `
       let body = {};
       try { body = payload ? JSON.parse(payload) : {}; } catch {}
       calls.push({ path: options.path, body });
-      const answer = options.path === "/lease"
-        ? { target: { id: "lan-uncensored", model: { providerID: "llamacpp", id: "lan-uncensored-27b" }, kind: "local" }, existing: false }
-        : { changed: false };
+      let statusCode = 200;
+      let answer = { accepted: true, changed: false };
+      if (options.path === "/lease") {
+        if (body.sessionID === "child-no-local") {
+          statusCode = 409;
+          answer = { error: "no eligible local classifier target", code: "no-eligible-local-target" };
+        } else if (body.tier === "classifier") {
+          const cloud = body.sessionID === "child-cloud-bug" || body.localOnly !== true;
+          answer = cloud
+            ? { target: { id: "cloud-worker", model: { providerID: "openai", id: "cloud-worker-1" }, kind: "cloud" }, existing: false }
+            : { target: { id: "lan-classifier", model: { providerID: "llamacpp", id: "lan-small-4b" }, kind: "local" }, existing: false };
+        } else {
+          answer = { target: { id: "lan-uncensored", model: { providerID: "llamacpp", id: "lan-uncensored-27b" }, kind: "local" }, existing: false };
+        }
+      }
       const response = new EventEmitter();
-      response.statusCode = 200;
+      response.statusCode = statusCode;
       response.setEncoding = () => {};
       callback(response);
       response.emit("data", JSON.stringify(answer));
@@ -132,7 +143,7 @@ test("a classifier lane resolves before every profile record; compaction does no
   assert.equal(result.secondConsume, null, "and nothing after it");
 });
 
-test("☠️ a classifier lane keeps its pin AND its turn survives chat.params", () => {
+test("a confined classifier leases its own tier once and applies the broker target", () => {
   const result = inTempHome(`
     ${FAKE_BROKER}
     import { resolveProfile, writeSessionProfile } from ${JSON.stringify(routingUrl)};
@@ -153,31 +164,34 @@ test("☠️ a classifier lane keeps its pin AND its turn survives chat.params",
     // still writes, and check the first dispatch clears it -- a record left behind makes
     // sessionsOnProfiles() believe a dead classifier is still holding the shared model.
     writeSessionProfile("ses-classifier", "uncensored", { explicit: false });
-    const output = { message: { model: { providerID: "llamacpp", modelID: "lan-small-4b" } }, parts: [] };
+    const output = { message: { model: { providerID: "pane-default", modelID: "pane-default-model" } }, parts: [] };
     await hooks["chat.message"]({
       sessionID: "ses-classifier", agent: "fleet-classifier-local",
-      model: { providerID: "llamacpp", id: "lan-small-4b" },
+      model: { providerID: "pane-default", id: "pane-default-model" },
     }, output);
     let paramsError = "";
     try {
       await hooks["chat.params"]({
         sessionID: "ses-classifier",
-        model: { providerID: "llamacpp", id: "lan-small-4b" },
-        message: { model: { providerID: "llamacpp", modelID: "lan-small-4b" } },
+        model: { providerID: output.message.model.providerID, id: output.message.model.modelID },
+        message: output.message,
       });
     } catch (error) { paramsError = String(error.message); }
     process.stdout.write(JSON.stringify({
       paramsError,
       model: output.message.model,
-      calls: calls.map((call) => call.path),
+      calls,
       afterCreated,
       childRecord: resolveProfile({ sessionID: "ses-classifier" }),
     }));
   `);
   assert.equal(result.paramsError, "", "the classifier turn must not be aborted by the router");
-  assert.deepEqual(result.model, { providerID: "llamacpp", modelID: "lan-small-4b" },
-    "the frontmatter pin is still what runs");
-  assert.deepEqual(result.calls, [], "a lane that is not routed asks the broker for nothing");
+  assert.deepEqual(result.model, { providerID: "llamacpp", modelID: "lan-small-4b" });
+  const leases = result.calls.filter((call) => call.path === "/lease");
+  assert.equal(leases.length, 1);
+  assert.equal(leases[0].body.tier, "classifier");
+  assert.equal(leases[0].body.profile, "auto");
+  assert.equal(leases[0].body.localOnly, true);
   assert.equal(result.afterCreated.source, "default",
     "session.created must leave a lane session with NO profile record of its own");
   assert.equal(result.childRecord.source, "default",
@@ -213,76 +227,84 @@ test("☠️ compaction leases the profile's OWN target, not a censored one", ()
   assert.equal(result.stillUncensored.explicit, true, "the explicit F11 selection survives");
 });
 
-test("☠️ a restrictive profile does NOT let the classifier reach cloud", () => {
+test("classifier leases inherit only the owner's egress boundary and fail closed", () => {
   const result = inTempHome(`
     ${FAKE_BROKER}
     import { writeSessionProfile } from ${JSON.stringify(routingUrl)};
     import { ModelRouter } from ${JSON.stringify(pluginUrl)};
-    // Each profile gets a parent and a classifier child dispatched on the CLOUD lane agent
-    // -- which is what the guard picks when no local classifier target was eligible.
     const profiles = ["private", "uncensored-offline", "local", "uncensored", "uncensored-70b", "vision"];
     const sessions = {};
     for (const profile of profiles) {
       writeSessionProfile("parent-" + profile, profile, { explicit: true });
       sessions["parent-" + profile] = { id: "parent-" + profile, agent: "standard" };
-      sessions["child-" + profile] = { id: "child-" + profile, parentID: "parent-" + profile, agent: "fleet-classifier-haiku" };
+      sessions["child-" + profile] = { id: "child-" + profile, parentID: "parent-" + profile, agent: "fleet-classifier" };
     }
     // Controls: no profile at all, and manual. The cloud rung the deployment configured on
     // the classifier tier must still work for both.
     sessions["parent-auto"] = { id: "parent-auto", agent: "standard" };
-    sessions["child-auto"] = { id: "child-auto", parentID: "parent-auto", agent: "fleet-classifier-haiku" };
+    sessions["child-auto"] = { id: "child-auto", parentID: "parent-auto", agent: "fleet-classifier" };
     writeSessionProfile("parent-manual", "manual", { explicit: true });
     sessions["parent-manual"] = { id: "parent-manual", agent: "standard" };
-    sessions["child-manual"] = { id: "child-manual", parentID: "parent-manual", agent: "fleet-classifier-haiku" };
+    sessions["child-manual"] = { id: "child-manual", parentID: "parent-manual", agent: "fleet-classifier" };
+    sessions["child-no-local"] = { id: "child-no-local", parentID: "parent-private", agent: "fleet-classifier" };
+    sessions["child-cloud-bug"] = { id: "child-cloud-bug", parentID: "parent-private", agent: "fleet-classifier" };
     const hooks = await ModelRouter({ client: { session: {
       get: async ({ path }) => sessions[path.id],
       messages: async () => ({ data: [] }),
     } }, directory: process.env.HOME });
     const out = {};
     for (const key of [...profiles, "auto", "manual"]) {
-      const output = { message: { model: { providerID: "openai", modelID: "cloud-worker-1" } }, parts: [] };
+      const output = { message: { model: { providerID: "pane-default", modelID: "pane-default-model" } }, parts: [] };
       try {
         await hooks["chat.message"]({
-          sessionID: "child-" + key, agent: "fleet-classifier-haiku",
-          model: { providerID: "openai", id: "cloud-worker-1" },
+          sessionID: "child-" + key, agent: "fleet-classifier",
+          model: { providerID: "pane-default", id: "pane-default-model" },
         }, output);
         out[key] = { blocked: false, model: output.message.model };
       } catch (error) { out[key] = { blocked: true, error: String(error.message) }; }
     }
-    // The LOCAL lane agent under the strictest profile: nothing to block.
-    sessions["child-lan"] = { id: "child-lan", parentID: "parent-uncensored-offline", agent: "fleet-classifier-local" };
-    const lanOut = { message: { model: { providerID: "llamacpp", modelID: "lan-small-4b" } }, parts: [] };
-    try {
-      await hooks["chat.message"]({
-        sessionID: "child-lan", agent: "fleet-classifier-local",
-        model: { providerID: "llamacpp", id: "lan-small-4b" },
-      }, lanOut);
-      out.lanLane = { blocked: false, model: lanOut.message.model };
-    } catch (error) { out.lanLane = { blocked: true, error: String(error.message) }; }
-    out.calls = calls.map((call) => call.path);
+    for (const sessionID of ["child-no-local", "child-cloud-bug"]) {
+      const output = { message: { model: { providerID: "pane-default", modelID: "pane-default-model" } }, parts: [] };
+      let error = "";
+      let paramsError = "";
+      try {
+        await hooks["chat.message"]({ sessionID, agent: "fleet-classifier" }, output);
+      } catch (value) { error = String(value.message); }
+      try {
+        await hooks["chat.params"]({ sessionID, model: { providerID: "pane-default", id: "pane-default-model" } });
+      } catch (value) { paramsError = String(value.message); }
+      out[sessionID] = { error, paramsError, model: output.message.model };
+    }
+    out.calls = calls;
     process.stdout.write(JSON.stringify(out));
   `);
-  // ☆ `vision` is in this list to prove the boundary is about RESTRICTIVENESS and not about
-  // being an uncensored lane: it holds the general 27b, nothing about it is uncensored, and it
-  // confines the session's content exactly as `local` and `private` do -- with no special case
-  // anywhere, because the predicate reads the profile's configured lane rather than its name.
+  const leases = result.calls.filter((call) => call.path === "/lease");
   for (const profile of ["private", "uncensored-offline", "local", "uncensored", "uncensored-70b", "vision"]) {
-    assert.equal(result[profile].blocked, true,
-      `${profile} must not let a command line be classified off the LAN`);
-    assert.ok(result[profile].error.startsWith(`[opencode-broker] ${profile} profile blocked: `),
-      `the refusal must name the profile that caused it, not the lane's auto: ${result[profile].error}`);
-    assert.match(result[profile].error, /not one of this deployment's local targets/);
+    assert.equal(result[profile].blocked, false, `${profile} may use the eligible LAN classifier`);
+    assert.deepEqual(result[profile].model, { providerID: "llamacpp", modelID: "lan-small-4b" });
+    const lease = leases.find((call) => call.body.sessionID === `child-${profile}`);
+    assert.equal(lease.body.profile, "auto");
+    assert.equal(lease.body.tier, "classifier");
+    assert.equal(lease.body.localOnly, true);
   }
-  // ☆ Suppressed for restrictive profiles SPECIFICALLY, not deleted globally: under auto
-  // and manual the configured cloud rung is exactly right and stays untouched.
-  assert.equal(result.auto.blocked, false, "auto keeps the classifier's cloud rung");
+  assert.equal(result.auto.blocked, false);
   assert.deepEqual(result.auto.model, { providerID: "openai", modelID: "cloud-worker-1" });
-  assert.equal(result.manual.blocked, false, "manual keeps it too");
-  // The boundary is about where content GOES, not about refusing the gate: a LAN-pinned
-  // lane runs normally under the strictest profile there is.
-  assert.equal(result.lanLane.blocked, false);
-  assert.deepEqual(result.lanLane.model, { providerID: "llamacpp", modelID: "lan-small-4b" });
-  assert.deepEqual(result.calls, [], "and none of this costs a lease on a scarce local target");
+  assert.equal(leases.find((call) => call.body.sessionID === "child-auto").body.localOnly, false);
+  assert.equal(result.manual.blocked, false);
+  assert.deepEqual(result.manual.model, { providerID: "openai", modelID: "cloud-worker-1" });
+  assert.equal(leases.find((call) => call.body.sessionID === "child-manual").body.localOnly, false);
+  const manualLeaseIndex = result.calls.findIndex((call) => call.path === "/lease" && call.body.sessionID === "child-manual");
+  assert.ok(result.calls.slice(0, manualLeaseIndex).some((call) => call.path === "/inventory"),
+    "a Manual owner's classifier refreshes inventory when its own lane can reach cloud");
+
+  for (const sessionID of ["child-no-local", "child-cloud-bug"]) {
+    assert.match(result[sessionID].error, /\[opencode-broker\] private profile blocked:/);
+    assert.match(result[sessionID].paramsError, /route unavailable/);
+    assert.deepEqual(result[sessionID].model, { providerID: "pane-default", modelID: "pane-default-model" });
+    assert.equal(leases.find((call) => call.body.sessionID === sessionID).body.localOnly, true);
+  }
+  assert.match(result["child-no-local"].error, /no eligible local classifier target/);
+  assert.match(result["child-cloud-bug"].error, /non-local/);
 });
 
 // ☠️ A NEW UNCENSORED PROFILE INHERITS THE WHOLE RULE, OR IT INHERITS NONE OF IT. `uncensored-70b`
@@ -305,9 +327,7 @@ test("☠️ uncensored-70b behaves exactly like uncensored on both machine-disp
     for (const profile of profiles) {
       writeSessionProfile("user-" + profile, profile, { explicit: true });
       sessions["user-" + profile] = { id: "user-" + profile, agent: "standard" };
-      // The CLOUD classifier lane agent -- what the guard picks when no local classifier
-      // target was eligible, and the only one there is anything to block.
-      sessions["cls-" + profile] = { id: "cls-" + profile, parentID: "user-" + profile, agent: "fleet-classifier-haiku" };
+      sessions["cls-" + profile] = { id: "cls-" + profile, parentID: "user-" + profile, agent: "fleet-classifier" };
     }
     const hooks = await ModelRouter({ client: { session: {
       get: async ({ path }) => sessions[path.id],
@@ -322,12 +342,12 @@ test("☠️ uncensored-70b behaves exactly like uncensored on both machine-disp
       const lease = calls.filter((call) => call.path === "/lease").pop()?.body ?? null;
       // Lane two: the classifier processes a SHELL COMMAND, so it takes its own tier rather
       // than the profile -- but the command line is still the user's content and stays on the LAN.
-      const clsOut = { message: { model: { providerID: "openai", modelID: "cloud-worker-1" } }, parts: [] };
+      const clsOut = { message: { model: { providerID: "pane-default", modelID: "pane-default-model" } }, parts: [] };
       let classifier;
       try {
         await hooks["chat.message"]({
-          sessionID: "cls-" + profile, agent: "fleet-classifier-haiku",
-          model: { providerID: "openai", id: "cloud-worker-1" },
+          sessionID: "cls-" + profile, agent: "fleet-classifier",
+          model: { providerID: "pane-default", id: "pane-default-model" },
         }, clsOut);
         classifier = { blocked: false, model: clsOut.message.model };
       } catch (error) { classifier = { blocked: true, error: String(error.message) }; }
@@ -356,15 +376,8 @@ test("☠️ uncensored-70b behaves exactly like uncensored on both machine-disp
   assert.equal(subject.compaction.localOnly, null,
     "and it needs no egress flag either: the profile's own lane is already the boundary");
 
-  // -- the classifier is refused the cloud under both ----------------------------------------
-  assert.equal(control.classifier.blocked, true);
-  assert.equal(subject.classifier.blocked, true,
-    "☠️ isLocalOnlyProfile must know this profile, or a command line leaves the LAN under it");
-  assert.ok(subject.classifier.error.startsWith("[opencode-broker] uncensored-70b profile blocked: "),
-    `the refusal must name the profile that caused it: ${subject.classifier.error}`);
-  // The two refusals differ only in the profile name they quote -- which is the whole claim.
-  assert.equal(
-    subject.classifier.error.replace("uncensored-70b", "uncensored"),
-    control.classifier.error,
-    "any difference beyond the profile's name is a lane that has started special-casing profiles");
+  assert.equal(control.classifier.blocked, false);
+  assert.equal(subject.classifier.blocked, false);
+  assert.deepEqual(subject.classifier.model, control.classifier.model);
+  assert.deepEqual(subject.classifier.model, { providerID: "llamacpp", modelID: "lan-small-4b" });
 });

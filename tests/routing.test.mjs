@@ -1475,7 +1475,7 @@ test("API-key and unknown providers remain quarantined after discovery", () => {
   assert.deepEqual(discovery.targets, {});
 });
 
-test("discovered workers are not assigned to the pinned classifier lane", () => {
+test("discovered workers are not auto-adopted by the explicit classifier lane", () => {
   const targets = {
     ...R.TARGETS,
     "subscription-anthropic-claude-haiku-4-5-worker": {
@@ -1488,8 +1488,8 @@ test("discovered workers are not assigned to the pinned classifier lane", () => 
       tiers: ["worker", "classifier"],
     },
   };
-  // The lane is local-only now, which makes the pinning property sharper: a discovered
-  // cloud model must not be appended to it even when it names the classifier tier.
+  // Classifier targets are explicit security policy: a discovered cloud model must not be
+  // appended to the lane merely because catalog role metadata names the classifier tier.
   assert.deepEqual(R.targetIDsFor("auto", "classifier", targets), ["local-classifier"]);
 });
 
@@ -2037,36 +2037,6 @@ test("only the gateway may take the GPUs from a live conversation", async () => 
   assert.equal(R.swapRequesterYields({ sessionID: "" }), true);
   // ☠️ Not a loose substring match -- a session merely CONTAINING "gw-" is not the gateway.
   assert.equal(R.swapRequesterYields({ sessionID: "ses_gw-not-the-gateway" }), true);
-});
-
-// ☠️ The classifier lane is deliberately NOT routed -- its agent is pinned in frontmatter and
-// overriding that pin was its own bug -- so applyMessageModel returns early and nothing on that
-// path ever touched the message. The lane's configured reasoning effort therefore reached
-// nothing, and a thinking model ran at its default: 155 empty responses in 161 gpt-luna leases,
-// each failing an ordinary command CLOSED. This pins that the EFFORT still arrives while the
-// PIN is left alone.
-test("a classifier lane keeps its pinned model and takes only the tier's reasoning effort", async () => {
-  const { applyClassifierVariant } = await import("../lib/router-core.js");
-
-  const message = { model: { providerID: "openai", modelID: "gpt-5.6-luna" } };
-  const applied = applyClassifierVariant(message, { "openai/gpt-5.6-luna": ["none", "low"] });
-  assert.equal(applied, "none");
-  assert.equal(message.model.providerID, "openai", "☠️ the agent's pin must survive untouched");
-  assert.equal(message.model.modelID, "gpt-5.6-luna", "☠️ the agent's pin must survive untouched");
-  assert.equal(message.model.variant, "none");
-
-  // A model offering neither level is left entirely alone rather than given a substitute.
-  const plain = { model: { providerID: "openai", modelID: "gpt-imaginary" } };
-  assert.equal(applyClassifierVariant(plain, { "openai/gpt-imaginary": ["high"] }), null);
-  assert.equal(plain.model.variant, undefined);
-
-  // Idempotent: re-applying the same effort is not a change worth reporting.
-  assert.equal(applyClassifierVariant(message, { "openai/gpt-5.6-luna": ["none"] }), null);
-
-  // Never throws on a message with no model to speak of.
-  assert.equal(applyClassifierVariant(undefined), null);
-  assert.equal(applyClassifierVariant({}), null);
-  assert.equal(applyClassifierVariant({ model: {} }), null);
 });
 
 test("review alternates providers at equal headroom instead of letting a model's fit take the tier", () => {

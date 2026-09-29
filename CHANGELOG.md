@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] — 2026-09-29
+
+### Added
+
+- **Catalog-native reasoning capability and policy ceilings.** Reasoning variants now come from OpenCode's
+  `reasoning_options` catalog data, including synthesized fast/standard model IDs, while per-target
+  `effortCeiling` limits deployment policy without mirroring capability lists in config.
+
+### Changed
+
+- **Classifier children now use one broker-owned lease.** The routed `classifier` tier selects and applies the
+  model and variant, inherits only the owner's LAN egress boundary, refreshes cloud inventory when eligible,
+  keeps heartbeat coverage, and leaves abort/retry lifecycle ownership with the guard.
+- **Implicit Auto always routes through the broker.** A saved default model no longer locks an implicit-Auto
+  root outside routing; explicit Manual Model remains the sole intentional broker bypass.
+
+### Security
+
+- **Inventory publishers are fenced by the exact loaded config bytes.** Full and auth-only publications carry
+  the import-time config fingerprint, so stale panes cannot restore old admission or capability state.
+- **Abandoned lease acquisition cannot mutate broker state.** The daemon rechecks client abandonment after
+  probes and immediately before cursor, assignment, or lease mutations, and local-only requests skip cloud
+  plan refreshes.
+
 ## [1.21.1] — 2026-09-29
 
 ### Fixed

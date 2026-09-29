@@ -920,6 +920,162 @@ test("local-only dispatch does not require cloud inventory", async () => withTem
   }
 }));
 
+test("classifier failures report without arming the local watchdog, aborting, or re-engaging", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { target: { id: "local-classifier", kind: "local", model: { providerID: "llamacpp", id: "qwen3.5-4b" } } }
+          : options.path === "/failure" ? { kind: "overload" }
+            : options.path === "/usage" ? { burn: { stop: true, reason: "test burn stop" } }
+              : {};
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    const intervals = [];
+    globalThis.setInterval = (callback, delay) => {
+      const timer = { callback, delay, unref() {} };
+      intervals.push(timer);
+      return timer;
+    };
+    globalThis.clearInterval = (timer) => { timer.cleared = true; };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const { writeSessionProfile } = await import(${JSON.stringify(routingUrl)});
+    writeSessionProfile("classifier-owner", "local", { explicit: true });
+    const sessions = new Map([
+      ["classifier-owner", { id: "classifier-owner", agent: "standard" }],
+      // session.created can omit the agent; chat.message is authoritative and must update
+      // lifecycle/watchdog classification for the rest of this process.
+      ["classifier-error", { id: "classifier-error", parentID: "classifier-owner" }],
+      ["classifier-retry", { id: "classifier-retry", parentID: "classifier-owner" }],
+      ["classifier-burn", { id: "classifier-burn", parentID: "classifier-owner" }],
+    ]);
+    const timers = [];
+    const aborts = [];
+    const prompts = [];
+    const hooks = await ModelRouter({ client: { session: {
+      get: async ({ path }) => sessions.get(path.id),
+      messages: async () => ({ data: [] }),
+      abort: async (request) => { aborts.push(request); },
+      prompt: async (request) => { prompts.push(request); },
+    } }, directory: process.env.HOME }, {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { timer.cleared = true; },
+    });
+    for (const sessionID of ["classifier-error", "classifier-retry", "classifier-burn"]) {
+      await hooks["chat.message"]({ sessionID, agent: "fleet-classifier" }, { message: {}, parts: [] });
+      await hooks.event({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } });
+    }
+    const timersBeforeFailure = timers.length;
+    await hooks.event({ event: { type: "session.error", properties: {
+      sessionID: "classifier-error", error: { message: "provider failed" },
+    } } });
+    await hooks.event({ event: { type: "session.status", properties: {
+      sessionID: "classifier-retry", status: { type: "retry", next: Date.now() + 60_000, message: "provider retry" },
+    } } });
+    await hooks.event({ event: { type: "message.updated", properties: {
+      sessionID: "classifier-burn", info: { id: "classifier-burn-message", role: "assistant", providerID: "llamacpp", modelID: "qwen3.5-4b" },
+    } } });
+    await hooks.event({ event: { type: "message.part.updated", properties: {
+      sessionID: "classifier-burn", part: { type: "step-finish", id: "classifier-burn-step", messageID: "classifier-burn-message", tokens: { input: 1, output: 1 } },
+    } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    process.stdout.write(JSON.stringify({ requests, intervals, timers, timersBeforeFailure, aborts, prompts }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.equal(result.requests.filter((request) => request.path === "/lease").length, 3);
+  assert.equal(result.requests.filter((request) => request.path === "/failure").length, 2);
+  assert.equal(result.timersBeforeFailure, 0, "classifier children do not arm the local inactivity watchdog");
+  assert.equal(result.intervals.length, 3, "classifier leases retain ordinary heartbeat coverage");
+  assert.deepEqual(result.timers, [], "classifier failures never schedule generic re-engagement");
+  assert.deepEqual(result.aborts, [], "generic retry and burn handling never abort the guard-owned child");
+  assert.deepEqual(result.prompts, []);
+}));
+
+test("explicit Manual remains unleased while implicit Auto with a saved default leases", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { target: { id: "broker-target", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } } }
+          : { accepted: true, changed: false };
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/model-default.json"), JSON.stringify({ providerID: "openai", id: "gpt-5.6-sol" }));
+    const { writeSessionProfile } = await import(${JSON.stringify(routingUrl)});
+    writeSessionProfile("manual-root", "manual", { explicit: true });
+    const sessions = new Map([
+      ["manual-root", { id: "manual-root", agent: "standard" }],
+      ["manual-child", { id: "manual-child", parentID: "manual-root", agent: "scout" }],
+      ["auto-root", { id: "auto-root", agent: "standard" }],
+    ]);
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client: { session: {
+      get: async ({ path }) => sessions.get(path.id),
+      messages: async () => ({ data: [] }),
+    } }, directory: process.env.HOME });
+    const manualRoot = { message: { model: { providerID: "openai", modelID: "gpt-5.6-sol" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: "manual-root", agent: "standard", model: { providerID: "openai", id: "gpt-5.6-sol" } }, manualRoot);
+    const manualChild = { message: { model: { providerID: "pane-default", modelID: "pane-default" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: "manual-child", agent: "scout" }, manualChild);
+    const autoRoot = { message: { model: { providerID: "openai", modelID: "gpt-5.6-sol" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: "auto-root", agent: "standard", model: { providerID: "openai", id: "gpt-5.6-sol" } }, autoRoot);
+    process.stdout.write(JSON.stringify({ requests, manualRoot: manualRoot.message.model, manualChild: manualChild.message.model, autoRoot: autoRoot.message.model }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  const leases = result.requests.filter((request) => request.path === "/lease");
+  assert.equal(leases.length, 1);
+  assert.equal(leases[0].body.sessionID, "auto-root");
+  assert.deepEqual(result.manualRoot, { providerID: "openai", modelID: "gpt-5.6-sol" });
+  assert.deepEqual(result.manualChild, { providerID: "openai", modelID: "gpt-5.6-sol" });
+  assert.deepEqual(result.autoRoot, { providerID: "anthropic", modelID: "claude-opus-5" });
+}));
+
 test("local child tools suspend the watchdog, then rearm and fail over once", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
@@ -1330,38 +1486,60 @@ test("router messages go to the server log, and only errors also reach stderr", 
     "a rejected log falls back to stderr without throwing inside the hook");
 }));
 
-test("every fleet-classifier lane agent keeps its own pin instead of the manual parent's model", async () => withTempHome(async (home) => {
+test("a Manual owner's classifier leases its broker lane instead of inheriting the parent's model", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { target: { id: "gpt-luna", kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna", variant: "none" } } }
+          : { accepted: true, changed: false };
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }));
     import { writeSessionProfile } from ${JSON.stringify(routingUrl)};
     import { ModelRouter } from ${JSON.stringify(pluginUrl)};
-    // The user is on Manual with a LOCAL THINKING model. A classifier child must not
-    // inherit it: on 2026-09-06 fleet-classifier-haiku was missing from the lane list,
-    // ran on llamacpp/qwen3.8-27b, spent its whole output budget on reasoning and
-    // returned no SAFE/RISKY text -- three bash commands were denied as a result.
     writeSessionProfile("parent-manual", "manual", { explicit: true });
-    const lanes = ["fleet-classifier", "fleet-classifier-qwen", "fleet-classifier-haiku", "fleet-classifier-future"];
-    const sessions = { "parent-manual": { id: "parent-manual", agent: "standard", model: { providerID: "llamacpp", id: "qwen3.8-27b" } } };
-    for (const agent of lanes) sessions[agent] = { id: agent, parentID: "parent-manual", agent };
+    const sessions = {
+      "parent-manual": { id: "parent-manual", agent: "standard", model: { providerID: "llamacpp", id: "qwen3.8-27b" } },
+      "classifier": { id: "classifier", parentID: "parent-manual", agent: "fleet-classifier" },
+    };
     const hooks = await ModelRouter({ client: { session: {
       get: async ({ path }) => sessions[path.id],
       messages: async () => ({ data: [] }),
     } }, directory: process.env.HOME });
-    const results = {};
-    for (const agent of lanes) {
-      const output = { message: { model: { providerID: "anthropic", modelID: "claude-haiku-4-5" } }, parts: [] };
-      await hooks["chat.message"]({ sessionID: agent, agent }, output);
-      results[agent] = output.message.model;
-    }
-    process.stdout.write(JSON.stringify(results));
+    const output = { message: { model: { providerID: "pane-default", modelID: "pane-default" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: "classifier", agent: "fleet-classifier" }, output);
+    process.stdout.write(JSON.stringify({ requests, model: output.message.model }));
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout);
-  for (const agent of ["fleet-classifier", "fleet-classifier-qwen", "fleet-classifier-haiku", "fleet-classifier-future"]) {
-    assert.deepEqual(result[agent], { providerID: "anthropic", modelID: "claude-haiku-4-5" },
-      `${agent} must keep its frontmatter pin, not the manual parent's llamacpp model`);
-  }
+  const leases = result.requests.filter((request) => request.path === "/lease");
+  assert.equal(leases.length, 1);
+  assert.equal(leases[0].body.tier, "classifier");
+  assert.equal(leases[0].body.profile, "auto");
+  assert.equal(leases[0].body.localOnly, false);
+  assert.deepEqual(result.model, { providerID: "openai", modelID: "gpt-5.6-luna", variant: "none" });
 }));
 
 test("a Manual child inherits the parent's live model, not stale session metadata", async () => withTempHome(async (home) => {
