@@ -666,7 +666,14 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   return true;
 };
 
-const acquire = async (state, request) => {
+const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
+  const ensureActive = () => {
+    if (!isAbandoned()) return;
+    const error = new Error("request abandoned");
+    error.code = "request-abandoned";
+    throw error;
+  };
+  ensureActive();
   const { sessionID, profile, tier = "worker", replace = false } = request;
   if (!validSessionID(sessionID)) throw new Error("invalid session id");
   if (!isProfile(profile)) throw new Error("invalid routing profile");
@@ -777,6 +784,7 @@ const acquire = async (state, request) => {
       let availableModels;
       if (target?.kind === "local") {
         try { availableModels = await localModels(); } catch { availableModels = null; }
+        ensureActive();
       }
       // A held lease on an outgrown window falls through to fresh selection so
       // context pressure can move the session up before the host compacts it.
@@ -785,6 +793,7 @@ const acquire = async (state, request) => {
         Number.isFinite(heldDeclared) && heldDeclared > 0 &&
         Number(contextTokens) > heldDeclared * CONTEXT_PRESSURE;
       if (target && !heldOutgrown && targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, targets, sessionID)) {
+        ensureActive();
         state.leases[sessionID].touchedAt = Date.now();
         recordDecision(state, {
           at: Date.now(),
@@ -801,9 +810,13 @@ const acquire = async (state, request) => {
         return { target, existing: true };
       }
     }
+    ensureActive();
     delete state.leases[sessionID];
   }
-  if (existing && replace) delete state.leases[sessionID];
+  if (existing && replace) {
+    ensureActive();
+    delete state.leases[sessionID];
+  }
   const selection = {
     profile,
     tier,
@@ -837,6 +850,7 @@ const acquire = async (state, request) => {
   let availableModels;
   if (includesLocal) {
     try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+    ensureActive();
     // A prepare is finished the moment its model reports resident, and the in-flight mark has to
     // go THEN, not when its TTL expires. Otherwise a model that lands and is evicted again inside
     // the TTL -- a cardmate swapping back, another session leaving the profile -- reads as "still
@@ -848,6 +862,7 @@ const acquire = async (state, request) => {
   }
   // Free any slot whose holder has gone quiet BEFORE deciding, so a full scarce target is
   // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
+  ensureActive();
   reclaimIdleLeases(state, admittedTargets, sessionID);
   const ordinaryChoice = chooseTarget({
     ...selection,
@@ -1046,8 +1061,13 @@ const acquire = async (state, request) => {
     throw refusal(reason, code, subject);
   }
 
-  if (choice.cursorKey) state.cursors[choice.cursorKey] = choice.nextCursor;
+  if (choice.cursorKey) {
+    ensureActive();
+    state.cursors[choice.cursorKey] = choice.nextCursor;
+  }
+  ensureActive();
   state.leases[sessionID] = { targetID: choice.target.id, touchedAt: Date.now(), profile, tier };
+  ensureActive();
   state.assignments[sessionID] = {
     targetID: choice.target.id,
     profile,
@@ -1144,11 +1164,17 @@ const serve = async () => {
         // window to admit against, and a due refresh can take seconds (one provider's usage API
         // is allowed 20 s) -- time a latency-critical local caller, such as a command classifier
         // with a 25 s budget that fails closed, cannot spare. LAN-only leases go straight on.
-        if (profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto")) await planRefresh;
+        if (body.localOnly !== true && profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto")) {
+          await planRefresh;
+        }
         const caller = sanitizeCaller(body.caller);
         leaseCaller = caller && typeof body.sessionID === "string" ? { sessionID: body.sessionID, caller } : null;
         let lease;
-        try { lease = await acquire(state, body); } finally { leaseCaller = null; }
+        try {
+          lease = await acquire(state, body, { isAbandoned: () => abandoned(request, response) });
+        } finally {
+          leaseCaller = null;
+        }
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
@@ -1559,6 +1585,10 @@ const serve = async () => {
       }
       return reply(response, 404, { error: "unknown broker endpoint" });
     } catch (error) {
+      if (error?.code === "request-abandoned" || abandoned(request, response)) {
+        response.destroy();
+        return;
+      }
       // Additive: `error` is unchanged, and a code is published only when it is one of
       // the closed set this file assigned.
       const code = REFUSAL_CODES.has(error?.refusalCode) ? error.refusalCode : null;
@@ -1595,8 +1625,12 @@ const serve = async () => {
   // ☆ So a request whose client is already gone is dropped at the head of the queue for
   // free, and every deadline hit is logged and notified instead of answered in silence.
   const HANDLER_DEADLINE_MS = 30_000;
-  const abandoned = (request, response) => request.destroyed || response.destroyed ||
-    Boolean(request.socket?.destroyed);
+  // IncomingMessage.destroyed becomes true after a normally completed request body on
+  // Unix sockets, while its response and socket are still live. Treat it as abandonment
+  // only when the body itself was cut short; completed requests are fenced by the actual
+  // response/socket state.
+  const abandoned = (request, response) => (request.destroyed && !request.complete) ||
+    response.destroyed || Boolean(request.socket?.destroyed);
   const alertStall = (title, body) => {
     const now = Date.now();
     console.error(`[opencode-broker] ${title}: ${body}`);

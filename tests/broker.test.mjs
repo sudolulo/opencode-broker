@@ -1720,6 +1720,132 @@ test("the first lease waits for a due plan refresh before admitting an exhausted
   }
 }));
 
+test("a local-only lease does not await a due cloud-plan refresh", async () => withTempHome(async (home) => {
+  const share = join(home, ".local/share/opencode");
+  const bin = join(home, ".local/bin");
+  mkdirSync(share, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(share, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+
+  const planPidPath = join(home, "plan-refresh.pid");
+  const planPid = () => {
+    try {
+      const value = Number(readFileSync(planPidPath, "utf8").trim());
+      return Number.isInteger(value) && value > 1 ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const bl = join(bin, "bl");
+  writeFileSync(bl, `#!/bin/sh\nprintf '%s\\n' "$$" > "${planPidPath}"\nexec sleep 20\n`);
+  chmodSync(bl, 0o755);
+
+  const config = JSON.parse(readFileSync(process.env.OPENCODE_BROKER_CONFIG, "utf8").replace(/^\s*\/\/.*$/gm, ""));
+  config.budgets.anthropic.planUsage = { type: "bailian-cli" };
+  const configPath = join(home, "router-config.json");
+  writeFileSync(configPath, JSON.stringify(config));
+
+  const modelsServer = await startModelsServer(["qwen3.5-9b-coder"]);
+  let child;
+  let timer;
+  try {
+    const started = await startBroker(home, {
+      OPENCODE_BROKER_CONFIG: configPath,
+      OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url,
+    });
+    child = started.child;
+    const lease = await Promise.race([
+      request(started.socketPath, "/lease", {
+        sessionID: "ses-local-only-plan-refresh", profile: "auto", tier: "worker",
+        contextTokens: 100, replace: true, localOnly: true,
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("local-only lease awaited cloud plan refresh")), 1000);
+      }),
+    ]);
+    clearTimeout(timer);
+    timer = null;
+    assert.equal(lease.target.id, "local-coder");
+    await waitFor(() => planPid() !== null, "the cloud plan refresh to be in flight");
+  } finally {
+    if (timer) clearTimeout(timer);
+    const pid = planPid();
+    if (pid) try { process.kill(pid, "SIGKILL"); } catch {}
+    if (child) await stopBroker(child);
+    await modelsServer.stop();
+  }
+}));
+
+test("a lease abandoned after its local probe leaves routing state unchanged", async () => withTempHome(async (home) => {
+  let releaseProbe;
+  let markProbeStarted;
+  let rejectProbeStarted;
+  const probeStarted = new Promise((resolve, reject) => {
+    markProbeStarted = resolve;
+    rejectProbeStarted = reject;
+  });
+  const modelsServer = http.createServer((req, res) => {
+    if (req.url !== "/v1/models") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    releaseProbe = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [{ id: "qwen3.5-9b-coder" }] }));
+    };
+    markProbeStarted();
+  });
+  await new Promise((resolve) => modelsServer.listen(0, "127.0.0.1", resolve));
+  const localModelsURL = `http://127.0.0.1:${modelsServer.address().port}/v1/models`;
+
+  const now = Date.now();
+  const statePath = seedState(home, {
+    cursors: { sentinel: 7 },
+    assignments: {
+      ses_existing: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now },
+    },
+    leases: {
+      ses_existing: { targetID: "gpt-luna", profile: "auto", tier: "worker", touchedAt: now },
+    },
+  });
+  const { child, socketPath } = await startBroker(home, { OPENCODE_BROKER_LOCAL_MODELS_URL: localModelsURL });
+  try {
+    const body = JSON.stringify({
+      sessionID: "ses-abandoned-post-probe", profile: "local", tier: "worker",
+      contextTokens: 100, replace: true,
+    });
+    const leaseRequest = http.request({
+      socketPath,
+      path: "/lease",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    });
+    let disconnected = false;
+    leaseRequest.on("error", (error) => {
+      if (!disconnected) rejectProbeStarted(error);
+    });
+    leaseRequest.end(body);
+    await probeStarted;
+
+    disconnected = true;
+    leaseRequest.destroy(new Error("test disconnect after local probe"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const before = JSON.parse(readFileSync(statePath, "utf8"));
+    const snapshots = Object.fromEntries(["cursors", "assignments", "leases"]
+      .map((key) => [key, JSON.stringify(before[key])]));
+
+    releaseProbe();
+    const after = await request(socketPath, "/status");
+    for (const key of ["cursors", "assignments", "leases"]) {
+      assert.equal(JSON.stringify(after[key]), snapshots[key], `${key} changed after the request was abandoned`);
+    }
+  } finally {
+    await stopBroker(child);
+    await new Promise((resolve) => modelsServer.close(resolve));
+  }
+}));
+
 // CRITICAL: THE DAEMON DOES NOT TRUST A PUBLISHER. Model admission (drop anything this host
 // cannot resolve) was first implemented in the PUBLISHER -- plugin/router.js, which every
 // opencode process loads at spawn and which re-publishes on every chat.message. A pane
