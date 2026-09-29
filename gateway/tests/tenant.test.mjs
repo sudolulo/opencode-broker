@@ -47,11 +47,16 @@ const tempDirs = [];
 process.on("exit", () => {
   for (const dir of tempDirs) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
 });
-const reservationsFile = (contents) => {
-  const dir = mkdtempSync(join(tmpdir(), "gw-tenant-"));
-  const path = join(dir, "reservations.json");
-  if (contents !== undefined) writeFileSync(path, JSON.stringify(contents));
+// EVERY temp dir in this file comes from here, so the listener above stays the only one.
+// A test that mkdtemps and registers its own cleanup is what the count above exists to prevent.
+const tempDir = (prefix) => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
   tempDirs.push(dir);
+  return dir;
+};
+const reservationsFile = (contents) => {
+  const path = join(tempDir("gw-tenant-"), "reservations.json");
+  if (contents !== undefined) writeFileSync(path, JSON.stringify(contents));
   return path;
 };
 
@@ -283,9 +288,7 @@ test("a url that merely starts with /tenant is not the tenant surface", async ()
 });
 
 test("the config loader keeps a tenant's address list and command, and rejects a malformed one", () => {
-  const dir = mkdtempSync(join(tmpdir(), "gw-tenant-cfg-"));
-  process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
-  const path = join(dir, "gateway.json");
+  const path = join(tempDir("gw-tenant-cfg-"), "gateway.json");
   const write = (extra) => writeFileSync(path, JSON.stringify({
     providers: { llamacpp: { baseUrl: "http://x/v1" } }, ...extra,
   }));
