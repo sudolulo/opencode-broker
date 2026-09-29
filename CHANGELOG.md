@@ -47,6 +47,36 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **The reconciliation ledger's lock can no longer be stolen from a live writer.** It was a
+  mkdir that published an empty directory and recorded its owner immediately afterwards, so for
+  the microseconds in between a live holder looked ownerless -- and the recovery path for an
+  ownerless lock is to take it. Worse, a writer that proved an owner dead then deleted *whatever*
+  occupied the lock path, which by then could be the live instance that had replaced it: a
+  textbook time-of-check/time-of-use window onto two writers inside one read-modify-write of the
+  file that records which models were approved. The lock is now published by renaming a fully
+  built private directory onto the lock path, so its `owner` record is already inside it the
+  instant it is visible; a rename onto a populated directory fails and moves nothing, which makes
+  the `instance.<pid>.<uuid>` file inside the lock the thing that holds it. A reclaim is a single
+  unlink of the *exact* instance that was observed dead, and an `ENOENT` there is read as "another
+  actor won, touch nothing else". The lock directory is never deleted recursively again.
+- **A recycled pid no longer reads as a live lock owner.** Liveness was `kill(pid, 0)` alone, which
+  answers "live" for whatever unrelated process inherited that number after a reboot or a pid
+  wraparound -- so a lock nobody held could be honoured until it timed out, and on the other side
+  a genuinely dead writer's lock could be waited on forever. The owner record now also carries the
+  Linux boot id and the process start time from `/proc/<pid>/stat`, and a mismatch in either is
+  proof the recorded writer is gone. Anything unreadable -- `EPERM`, a missing field, no `/proc` --
+  still reads as live, because guessing wrong in that direction costs a decision. Locks written by
+  an older build are still understood, and an empty lock directory, which is all a writer killed
+  mid-acquisition can leave, is now taken over at once instead of after the full wait.
+- **A ledger mutation that succeeded is no longer reported as failed.** The rename is the commit
+  point, but the `fsync` of the directory entry and a `chmod` came after it and threw on failure --
+  so a full disk or an I/O error at that moment told the caller its write had failed while the new
+  ledger was already on disk, and a caller that believes that re-runs or misreports a decision.
+  The file mode is now enforced on the temp before it is committed, the post-rename `chmod` is
+  gone, and a post-commit `fsync` failure reports the committed state and warns. Lock release
+  errors, which were swallowed entirely, are reported the same way -- including the one that
+  matters most, a release finding its own instance file gone, which means the lock was not
+  exclusive while the ledger was being written.
 - **A `model-swap` child can no longer grow the gateway's heap without bound.** The tenant routes
   await the child and captured everything it printed, trimming to the last 4 KB only once it
   exited -- so a swap stuck in a retry loop held every byte it had ever written, inside a process

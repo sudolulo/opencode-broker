@@ -18,7 +18,8 @@ if a file is not here, the router does not own it.
 | `fallbacks/<sessionID>.json` | router plugin | hud, router plugin | Fallback/displacement marker; `policy: "provider-displaced"` carries `restoreAt` -- stickiness is released once it passes, and a healthy lease clears every other kind |
 | `reviewed-models.json` | opencode-broker-watch | opencode-broker-watch | Catalog model ids already seen/assessed, so each new model notifies exactly once. `opencode-broker-reconcile` READS it and reports which keys a future import would cover; the import itself, and the deletion of this file, belong to a later package |
 | `model-reconciliation.json` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence`, operator tooling | Versioned provider-role candidate observations, the evidence request queue, and proposal presentation state. Those two commands are its ONLY writers; see the field inventory below |
-| `.model-reconciliation.lock/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence` | Ephemeral mkdir lock and owner record serializing every reconciliation-ledger mutation; removed when the writer exits |
+| `.model-reconciliation.lock/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence` | The ephemeral lock serializing every reconciliation-ledger mutation. Holds an `owner` identity record and an `instance.<pid>.<uuid>` file; see the protocol below. Removed when the writer exits |
+| `.model-reconciliation.lock.<pid>.<uuid>/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | same | A lock directory being built, before publication. Exists only between its mkdir and the rename that publishes it; a writer killed in that window leaves one behind, and the next writer to hold the public lock sweeps it — only on proof the identity inside is dead |
 
 ## Inside `model-reconciliation.json`
 
@@ -54,6 +55,33 @@ observation, written by `dry-run`:
 
 Nothing here is routing state. No field in this file makes a model eligible, and
 the broker never reads it.
+
+## The reconciliation ledger lock
+
+The lock is **published by renaming** a fully built private
+`.model-reconciliation.lock.<pid>.<uuid>` directory onto `.model-reconciliation.lock`,
+not by mkdir. A rename onto an *empty* directory succeeds; onto a *populated* one it
+fails and moves nothing. So the `instance.<pid>.<uuid>` file inside the lock is what
+makes the lock held, and the complete `owner` record is already inside the directory
+the instant it becomes visible — there is no window in which a live holder looks
+ownerless and can be stolen.
+
+`owner` stays readable by older builds: `pid` and `acquiredAt` still mean what they
+did, alongside `uuid`, the Linux `bootId` and the `/proc/<pid>/stat` `starttime` when
+those are readable. A contender is reclaimed **only on proof it is dead** — `ESRCH`
+from `kill(pid, 0)`, a boot id that is not this boot, or a start time that does not
+match the record — and the reclaim is a single unlink of that *exact* observed
+instance file. `ENOENT` there means another actor already won, and nothing else is
+touched. `.model-reconciliation.lock` itself is never deleted recursively: removing the
+entries an identity owns is what frees it, and the empty directory left behind is what
+the next rename takes over. An unreadable pid, `EPERM`, a missing `/proc` field or any
+other error reads as live, because a stolen lock means two writers in one
+read-modify-write and a lost decision.
+
+An empty `.model-reconciliation.lock` carries no identity, so nobody can be holding it:
+it is taken over immediately, by rename, deleting nothing. The ledger's own write is
+committed by the rename of its temp: a durability `fsync` that fails *after* that point
+is reported as a warning, never as a failed mutation.
 
 Outside that directory:
 
