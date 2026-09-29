@@ -14,6 +14,7 @@ process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.me
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const brokerScript = join(repoRoot, "bin/opencode-broker");
+const { CONFIG_FINGERPRINT } = await import(new URL("../lib/config.js", import.meta.url).href);
 
 const withTempHome = async (fn) => {
   const originalHome = process.env.HOME;
@@ -171,6 +172,7 @@ const inventory = (providers) => {
       "alibaba-token-plan/deepseek-v4-flash-0731": 1000,
     },
     authRevision: `${Math.trunc(stat.mtimeMs)}:${stat.size}:${createHash("sha256").update(contents).digest("hex")}`,
+    configFingerprint: CONFIG_FINGERPRINT,
   };
 };
 
@@ -591,6 +593,51 @@ test("inventory rejects a stale auth revision before publishing admission", asyn
   }), authRevision: "stale" }), /auth revision changed before inventory publication/);
 }));
 
+test("inventory rejects missing or stale config fingerprints without mutating full or auth-only state", async () => withBroker(async ({ socketPath }) => {
+  const seededBody = inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  });
+  const seeded = await request(socketPath, "/inventory", seededBody);
+  assert.equal(seeded.accepted, true);
+  const originalInventory = (await request(socketPath, "/status")).inventory;
+
+  const { configFingerprint: _missing, ...missingFingerprint } = inventory({
+    openai: { authType: "api", connected: false, classification: "static", models: 0 },
+  });
+  assert.deepEqual(await request(socketPath, "/inventory", missingFingerprint), {
+    accepted: false,
+    reason: "config-fingerprint-mismatch",
+  });
+  assert.deepEqual((await request(socketPath, "/status")).inventory, originalInventory,
+    "a rejected full publication must not update data or timestamps");
+
+  const changedProviders = {
+    openai: { authType: "api", connected: false, classification: "static", models: 0 },
+  };
+  assert.deepEqual(await request(socketPath, "/inventory", {
+    providers: changedProviders,
+    authOnly: true,
+    authRevision: seededBody.authRevision,
+    configFingerprint: "stale-config",
+  }), {
+    accepted: false,
+    reason: "config-fingerprint-mismatch",
+  });
+  assert.deepEqual((await request(socketPath, "/status")).inventory, originalInventory,
+    "a rejected auth-only publication must not change provider admission");
+
+  const accepted = await request(socketPath, "/inventory", {
+    providers: changedProviders,
+    authOnly: true,
+    authRevision: seededBody.authRevision,
+    configFingerprint: CONFIG_FINGERPRINT,
+  });
+  assert.equal(accepted.accepted, true);
+  assert.deepEqual((await request(socketPath, "/status")).inventory.providers, {
+    openai: { authType: "api", connected: false, admission: "admitted", models: 0 },
+  });
+}));
+
 test("broker applies only advertised tier variants and auth-only refresh preserves catalog data", async () => withBroker(async ({ socketPath }) => {
   const full = inventory({ openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 } });
   full.modelContexts["openai/gpt-5.6-luna"] = 12345;
@@ -609,6 +656,7 @@ test("broker applies only advertised tier variants and auth-only refresh preserv
     providers: { openai: { authType: "oauth", connected: true, classification: "static", models: 0 } },
     authOnly: true,
     authRevision: full.authRevision,
+    configFingerprint: full.configFingerprint,
   });
   const status = await request(socketPath, "/status");
   assert.equal(status.inventory.modelContexts["openai/gpt-5.6-luna"], 12345);

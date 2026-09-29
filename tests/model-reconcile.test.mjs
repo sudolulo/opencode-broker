@@ -26,6 +26,14 @@ const { createReconciliationStore, emptyReconciliationState } =
 const HOUR = 3600_000;
 const NOW = 1_800_000_000_000;
 
+test("model reconciliation imports no inventory publication primitive", () => {
+  const source = readFileSync(new URL("../lib/model-reconcile.js", import.meta.url), "utf8");
+  const routingImport = source.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/routing\.js";/);
+  assert.ok(routingImport, "model reconciliation must keep an explicit routing import boundary");
+  assert.doesNotMatch(routingImport[1], /\bpublish(?:CachedSubscription|Auth)Inventory\b/,
+    "reconciliation is dry-run only and must not acquire an inventory publication capability");
+});
+
 // Two roles under the SAME provider whose family list and id matchers disagree about the model
 // id "conflict": the family says alpha, the id shape says beta. Whichever matcher "wins" would
 // put a real model in the wrong lane, so the reconciler has to block instead.

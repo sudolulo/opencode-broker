@@ -1,8 +1,71 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.meta.url).pathname;
 const { normalizeModelLine, watchReport, formatReport } = await import("../lib/watch.js");
+const watchScript = new URL("../bin/opencode-broker-watch", import.meta.url).pathname;
+
+const runWatch = async ({ brokerResponse, startBroker = true } = {}) => {
+  const home = mkdtempSync(join(tmpdir(), "opencode-broker-watch-"));
+  const cacheDir = join(home, ".cache/opencode");
+  const authDir = join(home, ".local/share/opencode");
+  const routingDir = join(authDir, "model-routing");
+  const binDir = join(home, "bin");
+  const socketPath = join(routingDir, "broker.sock");
+  mkdirSync(cacheDir, { recursive: true });
+  mkdirSync(routingDir, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(join(cacheDir, "models.json"), "{}\n");
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
+  const opencode = join(binDir, "opencode");
+  writeFileSync(opencode, `#!/usr/bin/env node\nif (process.argv.includes("--pure")) process.stdout.write("openai/test\\n");\n`);
+  chmodSync(opencode, 0o755);
+
+  let server;
+  if (startBroker) {
+    server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(brokerResponse) + "\n");
+      });
+    });
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+  }
+
+  try {
+    const child = spawn(process.execPath, [watchScript], {
+      env: {
+        ...process.env,
+        HOME: home,
+        XDG_CACHE_HOME: join(home, ".cache"),
+        OPENCODE_MODEL_BROKER_SOCKET: socketPath,
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    const status = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code));
+    });
+    return { status, stdout, stderr };
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    rmSync(home, { recursive: true, force: true });
+  }
+};
 
 test("line normalization groups versions and snapshots, separates products", () => {
   assert.equal(normalizeModelLine("qwen3.8-flash"), normalizeModelLine("qwen3.9-flash"));
@@ -51,4 +114,20 @@ test("watch reports new models once, newer line-mates, and unmapped families", (
   const lines = formatReport(first);
   assert.ok(lines.some((line) => line.includes("NEW FAMILY anthropic:claude-nova")));
   assert.ok(lines.some((line) => line.includes("qwen3.9-flash")));
+});
+
+test("watch exits nonzero and omits success when the broker rejects publication", async () => {
+  const result = await runWatch({
+    brokerResponse: { accepted: false, reason: "config-fingerprint-mismatch" },
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.doesNotMatch(result.stdout, /broker inventory republished from the fresh cache/);
+  assert.match(result.stderr, /config-fingerprint-mismatch/);
+});
+
+test("watch exits nonzero and omits success when inventory publication throws", async () => {
+  const result = await runWatch({ startBroker: false });
+  assert.equal(result.status, 1, result.stderr);
+  assert.doesNotMatch(result.stdout, /broker inventory republished from the fresh cache/);
+  assert.match(result.stderr, /inventory republish skipped/);
 });

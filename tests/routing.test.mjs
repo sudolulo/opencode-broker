@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -11,6 +12,7 @@ process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.me
 
 const R = await import(new URL("../lib/routing.js", import.meta.url).href);
 const C = await import(new URL("../lib/router-core.js", import.meta.url).href);
+const { CONFIG_FINGERPRINT } = await import(new URL("../lib/config.js", import.meta.url).href);
 
 const parseScalar = (raw) => {
   const value = raw.trim();
@@ -592,6 +594,7 @@ test("inventory publication sends the current auth revision before a cloud lease
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, "/inventory");
   assert.match(calls[0].body.authRevision, /^\d+:\d+:[a-f0-9]{64}$/);
+  assert.equal(calls[0].body.configFingerprint, CONFIG_FINGERPRINT);
   assert.equal(calls[0].body.providers.openai.authType, "oauth");
 }));
 
@@ -616,6 +619,91 @@ test("auth inventory admits static OAuth targets without provider catalog access
   assert.equal(calls[0].body.providers.anthropic.authType, "oauth");
   assert.equal(Object.hasOwn(calls[0].body, "targets"), false);
   assert.match(calls[0].body.authRevision, /^\d+:\d+:[a-f0-9]{64}$/);
+  assert.equal(calls[0].body.configFingerprint, CONFIG_FINGERPRINT);
+}));
+
+test("inventory publishers keep the fingerprint of the exact config bytes loaded at import", async () => withTempHome(async (home) => {
+  const configPath = join(home, "config.json");
+  const configA = Buffer.from('{\n  "targets": { "cloud": { "providerID": "openai", "modelID": "gpt", "kind": "cloud" } }\n}\n');
+  const configB = Buffer.from('{"targets":{}}\n');
+  writeFileSync(configPath, configA);
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { writeFileSync } from "node:fs";
+    process.env.OPENCODE_BROKER_CONFIG = ${JSON.stringify(configPath)};
+    const { publishAuthInventory } = await import(${JSON.stringify(routingUrl)});
+    writeFileSync(${JSON.stringify(configPath)}, ${JSON.stringify(configB.toString("utf8"))});
+    let published;
+    await publishAuthInventory({ request: async (_path, body) => {
+      published = body;
+      return { accepted: true };
+    } });
+    process.stdout.write(JSON.stringify(published));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const published = JSON.parse(child.stdout);
+  assert.equal(published.configFingerprint, createHash("sha256").update(configA).digest("hex"));
+  assert.notEqual(published.configFingerprint, createHash("sha256").update(configB).digest("hex"),
+    "publication must not re-read rewritten config bytes");
+}));
+
+test("chat logs a fingerprint rejection and continues routing on daemon inventory", async () => withTempHome(async (home) => {
+  const cacheDir = join(home, ".cache/opencode");
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(cacheDir, { recursive: true });
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(cacheDir, "models.json"), "{}\n");
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    const http = createRequire(import.meta.url)("node:http");
+    const paths = [];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = () => {
+        paths.push(options.path);
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        response.emit("data", JSON.stringify(options.path === "/inventory"
+          ? { accepted: false, reason: "config-fingerprint-mismatch" }
+          : { target: { id: "daemon-current", kind: "cloud", model: { providerID: "openai", id: "gpt-daemon" } } }));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    const logged = [];
+    const session = { id: "stale-pane", agent: "standard" };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({
+      client: {
+        app: { log: async (entry) => { logged.push(entry.body); } },
+        session: {
+          get: async () => session,
+          messages: async () => ({ data: [] }),
+        },
+      },
+      directory: process.env.HOME,
+    });
+    const output = { message: {}, parts: [{ type: "text", text: "hello" }] };
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, output);
+    process.stdout.write(JSON.stringify({ paths, logged, model: output.message.model }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout);
+  assert.deepEqual(result.paths, ["/inventory", "/lease"]);
+  assert.deepEqual(result.model, { providerID: "openai", modelID: "gpt-daemon" });
+  assert.ok(result.logged.some((entry) => entry.level === "warn" && /config-fingerprint-mismatch/.test(entry.message)),
+    "a stale chat publisher is visible without aborting the turn");
 }));
 
 test("cached inventory publishes only authenticated catalog providers", async () => withTempHome(async (home) => {
@@ -642,6 +730,7 @@ test("cached inventory publishes only authenticated catalog providers", async ()
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, "/inventory");
+  assert.equal(calls[0].body.configFingerprint, CONFIG_FINGERPRINT);
   assert.deepEqual(Object.keys(calls[0].body.providers), ["anthropic"]);
   assert.equal(Object.values(calls[0].body.targets)[0].modelID, "claude-fable-5");
 }));
@@ -884,7 +973,11 @@ test("the pure inventory builder produces exactly the body the publisher posts",
     listResolvableModels: () => INPUTS.resolvableModels,
     request: async (path, body) => { calls.push({ path, body }); return { changed: true }; },
   });
-  assert.deepEqual(calls[0].body, { ...publishedFields, authRevision: calls[0].body.authRevision });
+  assert.deepEqual(calls[0].body, {
+    ...publishedFields,
+    authRevision: calls[0].body.authRevision,
+    configFingerprint: CONFIG_FINGERPRINT,
+  });
   assert.equal(typeof calls[0].body.authRevision, "string");
   assert.deepEqual(result.skipped, skipped);
   // Hand-derived: only the resolvable, mapped, unpinned, tool-calling model takes a lane, and

@@ -49,7 +49,7 @@ import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
 import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js";
 import { notifyArgv } from "../lib/notify.js";
-import { DEPRECATIONS, envSetting } from "../lib/config.js";
+import { CONFIG_FINGERPRINT, DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
@@ -1498,6 +1498,9 @@ const serve = async () => {
         return reply(response, 200, { lastDecision: publicState(state).lastDecision });
       }
       if (request.url === "/inventory") {
+        if (body.configFingerprint !== CONFIG_FINGERPRINT) {
+          return reply(response, 200, { accepted: false, reason: "config-fingerprint-mismatch" });
+        }
         // The router checked this before discovery; repeat it at the mutation boundary so
         // an OAuth-to-API-key change cannot publish stale automatic admission.
         if (typeof body.authRevision !== "string" || !body.authRevision || body.authRevision !== authRevision()) {
@@ -1529,7 +1532,7 @@ const serve = async () => {
           JSON.stringify(state.inventory.modelContexts) + JSON.stringify(state.inventory.modelOutputs) +
           JSON.stringify(state.inventory.modelVariants);
         writeState(state);
-        return reply(response, 200, { ok: true, changed: previous !== next, inventory: state.inventory });
+        return reply(response, 200, { accepted: true, ok: true, changed: previous !== next, inventory: state.inventory });
       }
       if (request.url === "/rearm") {
         const targets = allTargets(state);
