@@ -279,28 +279,6 @@
     ]
   },
   "localContextHeadroom": 0.6,
-  "modelVariants": {
-    "openai/gpt-5.6-sol": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-terra": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-luna": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.5-pro": [
-      "high",
-      "low",
-      "medium"
-    ]
-  },
   // The agent names this deployment uses beyond opencode's built-ins; see
   // lib/config.js DEFAULT_AGENT_TIERS for what is already mapped.
   "agentTiers": {

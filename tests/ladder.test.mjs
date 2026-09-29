@@ -3,6 +3,7 @@ import test from "node:test";
 
 process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.meta.url).pathname;
 const R = await import("../lib/routing.js");
+const { CONFIG } = await import("../lib/config.js");
 
 test("the tier ladder is a cost ladder", () => {
   assert.equal(R.tierForAgent("scout"), "worker");
@@ -35,6 +36,41 @@ test("the tier ladder is a cost ladder", () => {
   // is what makes a REASONING model usable on this lane at all, with `low` for a model that
   // does not offer it. modelRefForTier takes the first the model advertises.
   assert.deepEqual(R.desiredVariantForTier("classifier"), ["none", "low"]);
+});
+
+test("effortCeiling caps advertised capability before tier selection", () => {
+  const target = {
+    providerID: "anthropic",
+    modelID: "claude-fable-5-1",
+    effortCeiling: "xhigh",
+  };
+  assert.equal(R.modelRefForTier(target, "deep", {
+    "anthropic/claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],
+  }).variant, "xhigh");
+});
+
+test("effortCeiling removes advertised levels above the cap", () => {
+  const target = {
+    providerID: "example",
+    modelID: "reasoner",
+    effort: { deep: "max" },
+    effortCeiling: "xhigh",
+  };
+  const inventory = R.normalizeDiscoveredInventory({
+    modelVariants: { "example/reasoner": ["low", "medium", "high", "xhigh", "max"] },
+  });
+  assert.equal(R.modelRefForTier(target, "deep", inventory.modelVariants).variant, undefined);
+});
+
+test("an underivable effortCeiling fails loudly", () => {
+  const target = { providerID: "anthropic", modelID: "example", effortCeiling: "max" };
+  assert.throws(() => R.modelRefForTier(target, "deep", {
+    "anthropic/example": ["low", "medium", "high"],
+  }), /effortCeiling.*max.*not advertised/);
+});
+
+test("reasoning capability is not mirrored into normalized config", () => {
+  assert.equal(CONFIG.modelVariants, undefined);
 });
 
 test("fable discovery lands in deep only; sonnet serves build and review", () => {

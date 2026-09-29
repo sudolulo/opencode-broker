@@ -603,7 +603,8 @@ test("broker applies only advertised tier variants and auth-only refresh preserv
   const smart = await request(socketPath, "/lease", {
     sessionID: "ses-variant-smart", profile: "auto", tier: "smart", replace: true,
   });
-  assert.equal(smart.target.model.variant, "high", "config-declared variants apply even when the catalog advertises none");
+  assert.equal(smart.target.model.variant, undefined,
+    "a tier cannot select capability the catalog did not advertise");
   await request(socketPath, "/inventory", {
     providers: { openai: { authType: "oauth", connected: true, classification: "static", models: 0 } },
     authOnly: true,

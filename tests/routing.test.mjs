@@ -138,13 +138,16 @@ test("explicit static Anthropic targets cover every routing role", () => {
     fit: { review: 1.4 },
     effort: { review: "medium" },
   });
-  assert.deepEqual(R.modelRefForTier(R.TARGETS["claude-sonnet-4-6"], "review"), {
+  assert.deepEqual(R.modelRefForTier(R.TARGETS["claude-sonnet-4-6"], "review", {
+    "anthropic/claude-sonnet-4-6": ["medium", "high", "max"],
+  }), {
     providerID: "anthropic",
     id: "claude-sonnet-4-6",
     variant: "medium",
   });
   assert.deepEqual(R.TARGETS.haiku.fit, { worker: 1.0, classifier: 1.3 });
   assert.equal(R.TARGETS["claude-fable-5-1"].fit.deep, 1.5);
+  assert.equal(R.TARGETS["claude-fable-5-1"].effortCeiling, "xhigh");
   assert.equal(R.desiredVariantForTier("review"), null);
 });
 
@@ -693,10 +696,12 @@ test("catalog metadata for an unresolvable model stays out of the inventory", ()
       models: {
         "gpt-5.6-luna": { id: "gpt-5.6-luna", status: "active", tool_call: true,
           family: "gpt-luna", release_date: "2026-07-09",
-          limit: { context: 1050000, output: 128000 }, variants: { fast: {} } },
+          limit: { context: 1050000, output: 128000 },
+          reasoning_options: [{ type: "effort", values: ["low"] }] },
         "gpt-6-luna": { id: "gpt-6-luna", status: "active", tool_call: true,
           family: "gpt-luna", release_date: "2026-09-22",
-          limit: { context: 1050000, output: 128000 }, variants: { fast: {} } },
+          limit: { context: 1050000, output: 128000 },
+          reasoning_options: [{ type: "effort", values: ["low"] }] },
       },
     }],
   }, { openai: "oauth" }, {}, { resolvableModels: ["openai/gpt-5.6-luna"] });
@@ -854,7 +859,8 @@ test("the pure inventory builder produces exactly the body the publisher posts",
   const catalog = {
     openai: { id: "openai", models: {
       "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true,
-        limit: { context: 400000, output: 128000 }, variants: { fast: {} } },
+        limit: { context: 400000, output: 128000 },
+        reasoning_options: [{ type: "effort", values: ["low"] }] },
       "gpt-6-luna": { id: "gpt-6-luna", family: "gpt-luna", release_date: "2026-09-22", tool_call: true },
     } },
     // API-key auth, so it is quarantined out of the catalog before discovery sees it.
@@ -866,7 +872,6 @@ test("the pure inventory builder produces exactly the body the publisher posts",
     // config.js is cached for this file, so the static pins come from the loaded fixture.
     staticTargets: routing.TARGETS,
     resolvableModels: new Set(["openai/gpt-6-sol"]),
-    configuredModelVariants: { "openai/gpt-5.6-sol": ["high", "low"] },
   };
   const calls = [];
   const built = routing.buildCachedSubscriptionInventory(INPUTS);
@@ -877,7 +882,6 @@ test("the pure inventory builder produces exactly the body the publisher posts",
   const result = await routing.publishCachedSubscriptionInventory({
     cachePath,
     listResolvableModels: () => INPUTS.resolvableModels,
-    configuredModelVariants: INPUTS.configuredModelVariants,
     request: async (path, body) => { calls.push({ path, body }); return { changed: true }; },
   });
   assert.deepEqual(calls[0].body, { ...publishedFields, authRevision: calls[0].body.authRevision });
@@ -892,11 +896,8 @@ test("the pure inventory builder produces exactly the body the publisher posts",
   assert.deepEqual(Object.keys(built.providers), ["openai"]);
   assert.deepEqual(built.modelContexts, { "openai/gpt-6-sol": 400000 });
   assert.deepEqual(built.modelOutputs, { "openai/gpt-6-sol": 128000 });
-  // The configured-variant merge happens from the ARGUMENT, so a dry run can ask what a
-  // different declaration would publish; the catalog's own variants still win the same key.
   assert.deepEqual(built.modelVariants, {
-    "openai/gpt-5.6-sol": ["high", "low"],
-    "openai/gpt-6-sol": ["fast"],
+    "openai/gpt-6-sol": ["low"],
   });
   // `skipped` is return-only and never rides into the broker's inventory.
   assert.equal(Object.hasOwn(calls[0].body, "skipped"), false);
@@ -917,7 +918,6 @@ test("an injected trusted-provider set moves admission but discovers no API-key 
     authTypes: { metered: "api" },
     staticTargets: {},
     resolvableModels: ["metered/gpt-6-sol"],
-    configuredModelVariants: {},
   };
   const untrusted = R.buildCachedSubscriptionInventory(inputs);
   assert.deepEqual(untrusted.providers, {});
@@ -1753,26 +1753,22 @@ test("catalog variants are normalized and only exact tier variants are selected"
   const discovered = R.discoverSubscriptionTargets({
     connected: ["openai"],
     all: [{ id: "openai", models: {
-      "gpt-5.6-luna": { id: "gpt-5.6-luna", variants: { low: {}, high: {}, "bad variant": {} } },
+      "gpt-5.6-luna": { id: "gpt-5.6-luna", reasoning_options: [{ type: "effort", values: ["low", "high"] }] },
     } }],
   }, { openai: "oauth" });
-  assert.deepEqual(discovered.modelVariants, { "openai/gpt-5.6-luna": ["high", "low"] });
+  assert.deepEqual(discovered.modelVariants, { "openai/gpt-5.6-luna": ["low", "high"] });
   const normalized = R.normalizeDiscoveredInventory({ modelVariants: {
     "openai/gpt-5.6-luna": ["low", "low", 1, "bad variant"],
     malformed: ["high"],
   } });
   assert.deepEqual(normalized.modelVariants, { "openai/gpt-5.6-luna": ["low"] });
-  // modelRefForTier UNIONs the discovered variants with the fleet-configured
-  // ones, so a configured effort is applied even when discovery is limited.
-  // The fixture pins gpt-luna's worker effort to "low"; the smart-tier default
-  // is "high", which is in the configured variant list. Both resolve despite
-  // discovery only naming "low" — worker from its per-target effort, smart from
-  // the union making the desired "high" available.
+  // The fixture pins gpt-luna's worker effort to "low". Catalog inventory only
+  // advertises that level here, so Smart cannot borrow a configured capability.
   assert.deepEqual(R.modelRefForTier(R.TARGETS["gpt-luna"], "worker", normalized.modelVariants), {
     providerID: "openai", id: "gpt-5.6-luna", variant: "low",
   });
   assert.deepEqual(R.modelRefForTier(R.TARGETS["gpt-luna"], "smart", normalized.modelVariants), {
-    providerID: "openai", id: "gpt-5.6-luna", variant: "high",
+    providerID: "openai", id: "gpt-5.6-luna",
   });
   assert.deepEqual(R.desiredVariantForTier("classifier"), ["none", "low"],
     "one-word verdicts need no reasoning budget -- ask for none, settle for low");
@@ -1784,10 +1780,8 @@ test("catalog variants are normalized and only exact tier variants are selected"
     "none", "a reasoning model on this lane must be driven to no reasoning");
   assert.equal(R.modelRefForTier(luna, "classifier", { "openai/gpt-5.6-luna": ["low", "high"] }).variant,
     "low", "and settles for low when `none` is not offered");
-  // ☆ A model the config knows nothing about, so the union adds nothing: advertising neither
-  // level leaves it at its own default rather than a substituted one. (luna cannot show this
-  // -- modelRefForTier unions the CONFIGURED list in, and the fixture declares `low` for it,
-  // which is the documented behaviour and not a leak.)
+  // Advertising neither requested level leaves the model at its own default rather than a
+  // substituted one.
   assert.equal(R.modelRefForTier({ providerID: "openai", modelID: "gpt-imaginary" }, "classifier",
     { "openai/gpt-imaginary": ["high"] }).variant,
     undefined, "never substitute an unrequested effort -- the model runs at its own default");

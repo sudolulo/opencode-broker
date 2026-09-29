@@ -91,7 +91,7 @@ so nothing is ever spent on a provider you did not list.
 
 | Key | Meaning |
 |---|---|
-| `targets` | The models. Each has `providerID`, `modelID` and `kind` (`cloud` or `local`). Local targets add `capacity` (the server's `--parallel`), `context` (tokens per slot) and optionally `prepareCommand` (argv, run when the model is not loaded), `minContextTokens`, `outputReserve`, `contextHeadroom` and `modelCapacity`. Any target may add `fit` (per-tier preference weight) and `effort` (per-tier reasoning variant). |
+| `targets` | The models. Each has `providerID`, `modelID` and `kind` (`cloud` or `local`). Local targets add `capacity` (the server's `--parallel`), `context` (tokens per slot) and optionally `prepareCommand` (argv, run when the model is not loaded), `minContextTokens`, `outputReserve`, `contextHeadroom` and `modelCapacity`. Any target may add `fit` (per-tier preference weight), `effort` (per-tier reasoning variant), and `effortCeiling` (highest catalog-advertised reasoning level policy may select). |
 | `targets.*.modelCapacity` | For local targets that share one model (say a coder lane and a classifier lane on the same server model): how many leases the *model* may already carry, summed over every target that names it, for this target to take another. A second limit next to `capacity`, which still caps the target's own share. Set it below `--parallel` on one target to keep slots free for the others, or for callers that reach the model server without a lease. Unset: only `capacity` applies. |
 | `tiers` | Ordered target lists for `deep`, `smart`, `build`, `fast-build`, `review`, `worker` and `classifier`. |
 | `fallbacks` | Per tier, ordered groups consulted only when the tier's own list has nothing eligible. |
@@ -109,7 +109,6 @@ so nothing is ever spent on a provider you did not list.
 | `deals` | Time-limited discounts (`providerID`, `multiplier`, optional `modelPrefix`, `daily`, `window`) the balancer leans into. |
 | `tierProviderWeights` | Per tier, a provider preference weight (>1 leans toward, <1 saves for other tiers). |
 | `trustedSubscriptionProviders` | Providers admitted without proving OAuth (flat-rate plans that use API keys). |
-| `modelVariants` | `"provider/model": ["low", "high", ...]` reasoning variants known to work, when the catalog does not advertise them. |
 | `localModelsUrl` | The local server's model list (llama.cpp router mode `/v1/models`), polled to see what is loaded. |
 | `localContextHeadroom` | Fraction of a local window the router will lease into (default 0.6) when a target declares no `outputReserve`. |
 | `workerLocalShareDenominator` | One in N `auto` worker assignments goes to a local target (default 4; 1 disables). |

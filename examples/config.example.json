@@ -471,27 +471,5 @@
       "command": ["/usr/local/bin/model-swap", "default"],
       "activeMarker": "~/.local/state/model-swap/active"
     }
-  },
-  "modelVariants": {
-    "openai/gpt-5.6-sol": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-terra": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-luna": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.5-pro": [
-      "high",
-      "low",
-      "medium"
-    ]
   }
 }

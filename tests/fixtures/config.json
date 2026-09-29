@@ -207,7 +207,8 @@
       },
       "effort": {
         "deep": "xhigh"
-      }
+      },
+      "effortCeiling": "xhigh"
     }
   },
   "tiers": {
@@ -374,68 +375,6 @@
     ]
   },
   "localContextHeadroom": 0.6,
-  "modelVariants": {
-    "openai/gpt-5.6-sol": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-terra": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.6-luna": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "openai/gpt-5.5-pro": [
-      "high",
-      "low",
-      "medium"
-    ],
-    "anthropic/claude-opus-5": [
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max"
-    ],
-    "anthropic/claude-opus-4-8": [
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max"
-    ],
-    "anthropic/claude-opus-5-fast": [
-      "low",
-      "medium",
-      "high"
-    ],
-    "anthropic/claude-opus-4-8-fast": [
-      "low",
-      "medium",
-      "high"
-    ],
-    "anthropic/claude-sonnet-4-6": [
-      "low",
-      "medium",
-      "high"
-    ],
-    "anthropic/claude-haiku-4-5": [
-      "none",
-      "low",
-      "medium"
-    ],
-    "anthropic/claude-fable-5-1": [
-      "low",
-      "medium",
-      "high",
-      "xhigh"
-    ]
-  },
   // The agent names this deployment uses beyond opencode's built-ins; see
   // lib/config.js DEFAULT_AGENT_TIERS for what is already mapped.
   "agentTiers": {

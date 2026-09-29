@@ -3,9 +3,11 @@ import test from "node:test";
 
 import { DEFAULT_MODEL_ROLES, normalizeModelRoles } from "../lib/model-roles.js";
 import {
+  catalogModelForID,
   isSpeedVariant,
   normalizeCatalogCandidates,
   normalizeCatalogModel,
+  reasoningVariants,
 } from "../lib/model-candidates.js";
 
 // The registry a conflict needs: two roles under the same provider whose family list and id
@@ -23,6 +25,26 @@ const CONFLICTING_ROLES = normalizeModelRoles({
   },
 }, { warn: () => {} });
 
+test("reasoningVariants reads effort, budget and null-as-none", () => {
+  assert.deepEqual(reasoningVariants({
+    reasoning_options: [{ type: "effort", values: [null, "low", "high"] }],
+  }), ["none", "low", "high"]);
+  assert.deepEqual(reasoningVariants({
+    reasoning_options: [{ type: "budget_tokens", min: 1024 }],
+  }), ["high", "max"]);
+  assert.deepEqual(reasoningVariants({ reasoning: false }), []);
+});
+
+test("synthesized fast and standard IDs inherit base capability", () => {
+  const models = {
+    "claude-opus-5-5": {
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    },
+  };
+  assert.equal(catalogModelForID(models, "claude-opus-5-5-fast"), models["claude-opus-5-5"]);
+  assert.equal(catalogModelForID(models, "claude-opus-5-5-standard"), models["claude-opus-5-5"]);
+});
+
 test("normalizes provider metadata without making a quality decision", () => {
   const candidate = normalizeCatalogModel("openai", {
     id: "gpt-6-sol",
@@ -31,7 +53,7 @@ test("normalizes provider metadata without making a quality decision", () => {
     status: "active",
     tool_call: true,
     limit: { context: 1_050_000, output: 128_000 },
-    variants: { low: {}, medium: {}, high: {} },
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
   }, {
     roles: DEFAULT_MODEL_ROLES,
     resolvableModels: new Set(["openai/gpt-6-sol"]),
@@ -49,7 +71,7 @@ test("normalizes provider metadata without making a quality decision", () => {
     capabilities: { toolCall: true },
     context: 1_050_000,
     output: 128_000,
-    variants: ["high", "low", "medium"],
+    variants: ["low", "medium", "high"],
     resolverKey: "openai/gpt-6-sol",
     resolvable: true,
     active: true,
@@ -169,12 +191,12 @@ test("a non-positive or non-numeric window is dropped and a fractional one is fl
   assert.equal(read({ context: 200_000.7, output: 64_000.9 }).output, 64_000);
 });
 
-test("variant names are deduplicated, sorted, and screened for shape", () => {
+test("catalog candidates use reasoning_options for variants", () => {
   const candidate = normalizeCatalogModel("openai", {
     id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22",
-    variants: { medium: {}, "not a variant": {}, high: {}, "": {}, low: {}, ["x".repeat(101)]: {} },
+    reasoning_options: [{ type: "effort", values: ["medium", null, "high", "medium"] }],
   }, { roles: DEFAULT_MODEL_ROLES, resolvableModels: new Set(["openai/gpt-6-sol"]) });
-  assert.deepEqual(candidate.variants, ["high", "low", "medium"]);
+  assert.deepEqual(candidate.variants, ["medium", "none", "high"]);
 });
 
 // The shape guard routing already applies at admission, reported rather than enforced here:
@@ -287,7 +309,7 @@ test("candidates sort by provider, family, release date then model id", () => {
 
 test("the candidate list and every candidate in it are frozen", () => {
   const candidates = normalizeCatalogCandidates({
-    openai: { id: "openai", models: { "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", variants: { high: {} } } } },
+    openai: { id: "openai", models: { "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", reasoning_options: [{ type: "effort", values: ["high"] }] } } },
   }, { providerIDs: ["openai"], roles: DEFAULT_MODEL_ROLES, resolvableModels: null });
   assert.equal(Object.isFrozen(candidates), true);
   assert.equal(Object.isFrozen(candidates[0]), true);
