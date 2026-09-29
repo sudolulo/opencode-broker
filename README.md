@@ -395,6 +395,61 @@ extras, failover and usage accounting.
   than holding a client that did not ask for that model. A model whose slots
   are all busy (`target-busy`) is waited out for every request.
 
+### GPU tenant control
+
+A **tenant** is an app outside the router that needs a whole GPU card for a while -- an image
+generator, a training run -- and cannot rearrange the resident set itself, because it is a
+container with no access to the swap tooling or its state. The gateway can: it already spawns
+`model-swap` for `prepareCommand`, and it already runs on the host that owns the reservation
+file. So it exposes three routes for that, and nothing else:
+
+| Route | Effect |
+|---|---|
+| `POST /tenant/<id>/acquire` | `model-swap reserve <id> --no-start --wait-active 60`, then reports the reservation |
+| `POST /tenant/<id>/release` | `model-swap release <id> --no-stop`, then reports the reservation |
+| `GET /tenant/<id>` | reports the reservation, runs nothing |
+
+All three answer `{"held": true|false}` -- whether the reservation is **actually on file** after
+the call. This is not the child's exit code: `model-swap` prints a refusal and exits 0 by
+design, so a caller that read the exit code would believe it owns a card it does not own, start
+work, and get a silently spilled card instead of an error. Read `held`.
+
+This surface is separate from the OpenAI one in every way that matters:
+
+- **Its own credential.** It requires `OPENCODE_BROKER_TENANT_TOKEN_FILE` (default
+  `~/.config/opencode-broker/tenant-token`), not the gateway key, and the gateway key does not
+  authorize it. A tenant is typically a container running third-party code: it gets a token
+  that can move a local model off a card and cannot spend a cent of paid quota. The token is
+  read once at startup, so a service restart never needs a secret store to be unlocked.
+- **Pinned to an address.** Each tenant declares `allowFrom`; a token presented from anywhere
+  else is refused, and the observed address is logged so a wrong list is one request to
+  diagnose rather than a silent 401 per render.
+- **Closed by default.** No token file, or no `tenants` block, means every tenant request is
+  401 or 404. There is no permissive default and no empty-`allowFrom` wildcard.
+- **Never the model router.** The routes are dispatched ahead of everything else, so a tenant
+  URL cannot fall through into a completion, and they inherit no part of the request path --
+  no leases, no failover, no `holdOpenMs`.
+
+```jsonc
+{
+  "tenants": {
+    "comfyui": {
+      "allowFrom": ["192.168.50.1"],                  // the addresses this tenant may call from
+      "command": ["/path/to/tools/model-swap"]        // argv prefix; the subcommand is appended
+    }
+  }
+}
+```
+
+Create the token as a root-owned drop file at deploy time and mount it read-only where the
+tenant can read it -- never in the container's environment, never in the config file, never in
+git:
+
+```sh
+install -m 0640 -o root -g "$TENANT_GROUP" /dev/null /etc/opencode-broker/tenant-token
+head -c 32 /dev/urandom | base64 | tr -d '\n' | sudo tee /etc/opencode-broker/tenant-token >/dev/null
+```
+
 ## The HUD
 
 `hud/tui.js` is a TUI plugin that keeps the routing state on screen:

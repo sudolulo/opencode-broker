@@ -8,6 +8,10 @@
 //   OPENCODE_BROKER_GATEWAY_CONFIG     config file (default ~/.config/opencode-broker/gateway.json)
 //   OPENCODE_BROKER_GATEWAY_KEY_FILE   file holding the bearer key clients must present
 //                                      (default ~/.config/opencode-broker/gateway-key; required)
+//   OPENCODE_BROKER_TENANT_TOKEN_FILE  file holding the bearer token the GPU-tenant control
+//                                      routes require (default
+//                                      ~/.config/opencode-broker/tenant-token; optional --
+//                                      absent means the tenant surface is closed)
 import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -42,6 +46,19 @@ const keyPath = setting("OPENCODE_BROKER_GATEWAY_KEY_FILE", "OPENCODE_FLEET_GATE
 // This endpoint fronts paid quota: no key, no server.
 const gatewayKey = readFileSync(keyPath, "utf8").trim();
 if (!gatewayKey) throw new Error(`${keyPath} is empty: the gateway refuses to run without a key`);
+// The tenant surface's own credential, read ONCE here at startup. ☠️ A long-running service
+// never calls rbw: the vault may be locked when it restarts, and a gateway that cannot come
+// up is worse than one without a tenant surface. The token is generated and written to a
+// root-owned 0640 drop file at deploy time and bind-mounted read-only into the tenant's
+// container -- never in the compose env, never in config, never in git.
+// ☆ Absent is a valid deployment: the routes then refuse every caller (fail closed).
+const tenantTokenPath = process.env.OPENCODE_BROKER_TENANT_TOKEN_FILE
+  ?? join(dirname(DEFAULT_GATEWAY_CONFIG), "tenant-token");
+const tenantToken = existsSync(tenantTokenPath) ? readFileSync(tenantTokenPath, "utf8").trim() || null : null;
+// An empty file is a deploy that half-happened; saying so beats silently serving 401s.
+if (existsSync(tenantTokenPath) && !tenantToken) {
+  console.error(`opencode-broker-gateway: ${tenantTokenPath} is empty: the tenant control routes stay closed`);
+}
 const config = loadGatewayConfig(configPath);
 for (const note of deprecations) console.error(`opencode-broker-gateway: deprecated: ${note}`);
 // A crash strands one-shot gw- leases for the broker's full 2h TTL, and ONE
@@ -55,7 +72,7 @@ try {
     }
   }
 } catch { /* broker down: nothing to sweep */ }
-const handler = createGatewayHandler({ config, brokerRequest, gatewayKey });
+const handler = createGatewayHandler({ config, brokerRequest, gatewayKey, tenantToken });
 const port = Number(process.env.PORT) || 8790;
 const host = process.env.HOST || "127.0.0.1";
 createServer((request, response) => { void handler(request, response); }).listen(port, host, () => {

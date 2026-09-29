@@ -20,6 +20,7 @@
 // Auth: every request must present the gateway key (a 0600 drop file) --
 // this endpoint fronts paid quota. Provider keys are read from opencode's
 // auth store at request time and never logged.
+import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -176,6 +177,72 @@ export const DEFAULT_GATEWAY_CONFIG = join(process.env.XDG_CONFIG_HOME || join(h
 // client's model picker shows.
 const DEFAULT_ROUTED_MODEL_ID = "routed";
 
+// ── the tenant control surface ───────────────────────────────────────────────
+// A GPU tenant is an app outside the router that needs a whole card for a while: ComfyUI
+// wants 24,576 MiB of card 1 for the length of a render. It cannot take that itself -- it is
+// a container with no midclt, no router and no state dir -- so it asks the gateway, which
+// already spawns `model-swap` and already runs on the host that owns the reservation state.
+//
+// ☠️ THIS SURFACE IS NOT THE OPENAI SURFACE AND SHARES NO CREDENTIAL WITH IT. The gateway key
+// fronts paid quota; the tenant token can only move a local model off a card. The container
+// runs third-party custom nodes, so it holds the narrow one and nothing else -- which is why
+// the dispatch below sits BEFORE the gateway-key gate rather than after it. Neither secret is
+// accepted in place of the other, and a request that presents the wrong one gets 401.
+//
+// The route shape, and the reason the id charset is narrow: an id is a path segment and a
+// `model-swap` argv word, so it may not contain anything that reads as either a path
+// traversal or a flag.
+const TENANT_ROUTE = /^\/tenant\/([a-z0-9-]+)(?:\/(acquire|release))?$/;
+const TENANT_ID = /^[a-z0-9-]+$/;
+// How long `reserve` may wait for an in-use model to go quiet before it overrides the
+// ACTIVITY guard (never feasibility). 60s chosen in the 2026-09-28 design: long enough for an
+// ordinary Frigate or paperless request on the 27b to finish, short enough that a render does
+// not sit behind a chat session indefinitely.
+const TENANT_WAIT_ACTIVE_SECONDS = "60";
+// Where `model-swap` keeps its reservations (tools/model-swap:260). Read, never written here:
+// the gateway's job is to ask model-swap to change it and then report what it says.
+const DEFAULT_RESERVATIONS_PATH = join(
+  process.env.XDG_STATE_HOME || join(homedir(), ".local/state"),
+  "llamacpp-model-swap/reservations.json",
+);
+
+// Exactly model-swap's own read_reservations() rule (tools/model-swap:263-274): an entry
+// counts only if it is an object carrying BOTH "card" and "mib". Anything else -- no file,
+// unparseable JSON, a half-formed entry -- reads as NOT held.
+//
+// ☆ Reading "not held" when a reservation does exist costs at worst a redundant reserve.
+// Reading "held" when it does not would let a render start on a card the 27b still occupies,
+// and llama.cpp answers that by partial-offloading to a no-AVX2 CPU at 0.88 tok/s with an
+// HTTP 200 -- a silent failure. So every ambiguous read resolves to false.
+const reservationHeld = (path, id) => {
+  let blob;
+  try { blob = JSON.parse(readFileSync(path, "utf8")); } catch { return false; }
+  if (!blob || typeof blob !== "object") return false;
+  const entry = blob[id];
+  return Boolean(entry) && typeof entry === "object" && "card" in entry && "mib" in entry;
+};
+
+// Spawn `model-swap` and WAIT for it. ☠️ This is deliberately not the bin's prepareCommand
+// spawn (bin/opencode-broker:587-598), which is detached, stdio-ignored and unref'd because
+// nothing there wants an answer. Here the whole point is the answer: the caller may not start
+// rendering until the reservation has actually been taken, so the child must be awaited.
+//
+// No server-side deadline: the client owns that (the ComfyUI node passes an explicit
+// aiohttp.ClientTimeout), and a `reserve --wait-active 60` legitimately runs minutes when it
+// triggers a real swap. A client that gives up disconnects; model-swap finishes its own
+// transaction either way, which is what keeps the reservation file honest.
+const spawnModelSwap = (command, args) => new Promise((resolve) => {
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  const collect = (chunk) => { output += chunk; };
+  child.stdout?.on("data", collect);
+  child.stderr?.on("data", collect);
+  // An ENOENT on the command is a deployment fault, not a refusal: it must be visible in the
+  // gateway's log rather than looking like a tenant that declined.
+  child.on("error", (error) => resolve({ code: null, output: String(error?.message ?? error) }));
+  child.on("close", (code) => resolve({ code, output: output.slice(-4000) }));
+});
+
 const advertisedModelIDs = (config) => {
   const routedID = config.routedModelId ?? DEFAULT_ROUTED_MODEL_ID;
   return [routedID, ...Object.keys(config.modelProfiles ?? {})]
@@ -199,7 +266,28 @@ export const loadGatewayConfig = (path = DEFAULT_GATEWAY_CONFIG) => {
     if (!route) throw new Error(`modelProfiles["${name}"] must name a routing profile`);
     modelProfiles[name] = route;
   }
+  // Which tenants exist, which address each may call from, and which command serves them are
+  // all DEPLOYMENT DATA -- the same reason no profile name may appear in this file. A gateway
+  // with no `tenants` block has no tenant surface at all, and every id is a 404.
+  const tenants = {};
+  for (const [id, entry] of Object.entries(raw.tenants && typeof raw.tenants === "object" ? raw.tenants : {})) {
+    // An id the route regex cannot match would be a tenant nothing could ever call. Rejecting
+    // it at load beats a silently unreachable reservation path.
+    if (!TENANT_ID.test(id)) throw new Error(`tenants["${id}"] must match ${TENANT_ID} to be reachable as a route`);
+    const command = Array.isArray(entry?.command) && entry.command.length
+      && entry.command.every((word) => typeof word === "string" && word)
+      ? [...entry.command] : null;
+    if (!command) throw new Error(`tenants["${id}"] needs a command: the argv of the model-swap that serves it`);
+    // ☠️ An absent or empty allowFrom would mean "any address on the LAN may evict the
+    // household's vision model". There is no permissive default here on purpose.
+    const allowFrom = Array.isArray(entry?.allowFrom) && entry.allowFrom.length
+      && entry.allowFrom.every((address) => typeof address === "string" && address)
+      ? [...entry.allowFrom] : null;
+    if (!allowFrom) throw new Error(`tenants["${id}"] needs a non-empty allowFrom: the addresses it may call from`);
+    tenants[id] = { allowFrom, command };
+  }
   return {
+    tenants,
     tier: typeof raw.tier === "string" ? raw.tier : DEFAULT_TIER,
     profile: typeof raw.profile === "string" ? raw.profile : "auto",
     providers,
@@ -431,6 +519,15 @@ export const createGatewayHandler = ({
   // Injected beside `now` so a test can advance the SAME clock the wait arithmetic reads.
   // Production passes neither and behaves exactly as before.
   sleepImpl = sleep,
+  // The tenant surface's bearer token, read ONCE at startup from a root-owned drop file by
+  // the bin. A long-running service must never call rbw -- the vault may be locked when it
+  // restarts -- and the token must never be in the compose env, in config, or in git.
+  // Absent means the surface is closed, not open.
+  tenantToken = null,
+  reservationsPath = DEFAULT_RESERVATIONS_PATH,
+  // Injected so no test can spawn a real model-swap. On 2026-09-07 a test run in the llamacpp
+  // repo fired a real swap and pulled a model out from under a live session.
+  runModelSwap = spawnModelSwap,
 }) => {
   const allowedProviders = Object.keys(config.providers);
 
@@ -993,14 +1090,83 @@ export const createGatewayHandler = ({
     };
   };
 
+  const respondJson = (response, status, payload) => {
+    response.writeHead(status, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(payload));
+  };
+
+  // The caller's address as the socket sees it, with the IPv4-mapped IPv6 prefix stripped --
+  // the same normalization the OpenAI path's `caller` uses.
+  const callerAddress = (request) => String(request.socket?.remoteAddress ?? "").replace(/^::ffff:/, "") || null;
+
+  // Authorization is BOTH halves: the right token AND the right source address. The token
+  // alone is a bearer credential bind-mounted into a container running third-party code;
+  // pinning the address means a leaked copy is not usable from anywhere else on the LAN.
+  // ☆ An absent token is a closed surface, never an open one: a gateway deployed before its
+  // drop file exists must refuse every caller.
+  const tenantPresented = (request) => Boolean(tenantToken)
+    && sameSecret(request.headers.authorization ?? "", `Bearer ${tenantToken}`);
+
+  const tenantFromAllowedAddress = (request, tenant) => {
+    const address = callerAddress(request);
+    if (tenant.allowFrom.includes(address)) return true;
+    // ☆ The observed address is logged because it is the one thing a deployment cannot know in
+    // advance: which source address a container's traffic arrives from depends on its network
+    // mode, and a wrong `allowFrom` otherwise presents as every render silently 401ing with no
+    // way to find the right value. A correct token from an unexpected address is exactly the
+    // case worth naming. The token itself is never logged.
+    console.error(`opencode-broker-gateway: tenant request from ${address} is not in allowFrom [${tenant.allowFrom.join(", ")}]`);
+    return false;
+  };
+
   const handle = async (request, response) => {
+    const url = (request.url ?? "/").split("?")[0];
+    // ── tenant control ─────────────────────────────────────────────────────────────────────
+    // ☠️ DISPATCHED BEFORE THE GATEWAY-KEY GATE, AND BEFORE EVERY ROUTE. A sibling surface
+    // that happens to share this process: it deliberately does NOT inherit the gateway key,
+    // the OpenAI request path, the model router or holdOpenMs. The only things it shares are
+    // that the broker already spawns model-swap and already runs on the host holding its
+    // state. Placing it first is what guarantees a tenant URL can never fall through into the
+    // model router, and what keeps the container's credential narrow.
+    const tenantMatch = TENANT_ROUTE.exec(url);
+    if (tenantMatch) {
+      const [, id, action] = tenantMatch;
+      // ☆ Order matters: the TOKEN is checked before the id is resolved, so an
+      // unauthenticated prober cannot enumerate which tenants this gateway serves by telling
+      // a 404 from a 401. Only a caller that already holds the token learns that much.
+      if (!tenantPresented(request)) return respondJson(response, 401, { error: "unauthorized" });
+      const tenant = config.tenants?.[id] ?? null;
+      if (!tenant) return respondJson(response, 404, { error: "unknown tenant" });
+      if (!tenantFromAllowedAddress(request, tenant)) return respondJson(response, 401, { error: "unauthorized" });
+      if (request.method === "GET" && !action) {
+        return respondJson(response, 200, { held: reservationHeld(reservationsPath, id) });
+      }
+      const swapArgs = request.method === "POST" && action === "acquire"
+        // --no-start: the tenant's lifecycle is managed outside this tool (ComfyUI runs
+        // permanently under `restart: unless-stopped`), so reserve must take the room and
+        // evict without trying to start anything.
+        ? ["reserve", id, "--no-start", "--wait-active", TENANT_WAIT_ACTIVE_SECONDS]
+        // --no-stop: give the room back, leave the app up.
+        : request.method === "POST" && action === "release" ? ["release", id, "--no-stop"]
+        : null;
+      if (!swapArgs) return respondJson(response, 405, { error: "method not allowed" });
+      const [command, ...fixedArgs] = tenant.command;
+      const result = await runModelSwap(command, [...fixedArgs, ...swapArgs]);
+      // ☠️ `model-swap` EXITS 0 ON A REFUSAL BY DESIGN -- a correct policy decline must not
+      // toast the HUD -- so the exit code is not the postcondition. Read the reservation back
+      // and report what is ACTUALLY held; the caller decides what to do about it.
+      const held = reservationHeld(reservationsPath, id);
+      if (result?.code !== 0 || !held) {
+        console.error(`opencode-broker-gateway: tenant ${id} ${action}: exit ${result?.code}, held=${held}: ${result?.output ?? ""}`.trim());
+      }
+      return respondJson(response, 200, { held });
+    }
     const authHeader = request.headers.authorization ?? "";
     if (!gatewayKey || !sameSecret(authHeader, `Bearer ${gatewayKey}`)) {
       response.writeHead(401, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: "missing or invalid gateway key" } }));
       return;
     }
-    const url = (request.url ?? "/").split("?")[0];
     if (request.method === "GET" && url === "/v1/models") {
       // ☆ An interactive client builds its model picker from here, so this list
       // is the gateway's answer to "what may I ask for". The routed id comes

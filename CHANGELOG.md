@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.20.0] — 2026-09-29
+
+### Added
+
+- **GPU tenant control routes on the gateway.** `POST /tenant/<id>/acquire`,
+  `POST /tenant/<id>/release` and `GET /tenant/<id>` let an app that needs a whole card for a
+  while -- an image generator, a training run -- have the resident set rearranged on its behalf.
+  It cannot do that itself: it is typically a container with no access to the swap tooling, the
+  router or its state directory, while the gateway already spawns `model-swap` for
+  `prepareCommand` and already runs on the host that owns the reservation file. `acquire` runs
+  `reserve <id> --no-start --wait-active 60` and `release` runs `release <id> --no-stop`, so the
+  tenant's own lifecycle stays outside the swap tool's business.
+- All three routes answer `{"held": true|false}` -- whether the reservation is **actually on
+  file** afterwards, which is deliberately not the child's exit code. `model-swap` prints a
+  refusal and exits 0 by design, so a caller trusting the exit code would believe it owns a card
+  it does not own; the failure mode that follows is not an error but a silently spilled card,
+  where llama.cpp partial-offloads to CPU and still answers HTTP 200.
+- The surface has **its own credential and shares nothing with the OpenAI path**. It requires a
+  bearer token from `OPENCODE_BROKER_TENANT_TOKEN_FILE` (default
+  `~/.config/opencode-broker/tenant-token`), read once at startup so a restart never depends on
+  an unlocked secret store, and the gateway key does not authorize it -- a container running
+  third-party code gets a token that can move a local model off a card and cannot spend paid
+  quota. Each tenant also declares `allowFrom`, and a token presented from any other address is
+  refused with the observed address logged, so a wrong list costs one request to diagnose
+  instead of presenting as a silent 401 on every job. No token file, no `tenants` block or an
+  empty `allowFrom` all mean closed: there is no permissive default. The routes are dispatched
+  ahead of every other URL, so a tenant path can never fall through into a completion.
+
 ## [1.19.1] — 2026-09-28
 
 ### Fixed
