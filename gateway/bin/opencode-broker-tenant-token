@@ -92,14 +92,37 @@ if (!existsSync(dir)) fail(`${dir} does not exist: create it first (mkdir -p ${d
 // token nobody mounted means a gateway that looks deployed and refuses every render.
 const staging = join(dir, `.${basename(path)}.new.${process.pid}`);
 const token = randomBytes(TOKEN_BYTES).toString("base64url");
+
+// ☠️ CLEANUP RUNS BEFORE fail(), NEVER IN A finally. fail() calls process.exit(), and
+// process.exit does not run pending finally blocks -- which is how a failed write used to leave
+// `.<name>.new.<pid>` on disk. Those droppings accumulate one per failed attempt beside a live
+// credential, and a 0600 file whose name says "new token" invites someone to mount the empty one.
+// Best effort by design: the file is what matters, so a close that fails cannot stop the unlink.
+const discardStaging = (handle) => {
+  if (handle !== undefined) {
+    try { closeSync(handle); } catch { /* the fd dies with the process; the file does not */ }
+  }
+  try {
+    unlinkSync(staging);
+  } catch (error) {
+    // ENOENT means the open never produced a file, so there is nothing to clean up. Anything
+    // else is an orphaned staging file, and that is an operator signal rather than silence --
+    // reported by PATH only, never by content, and never in place of the failure below.
+    if (error?.code !== "ENOENT") {
+      console.error(`opencode-broker-tenant-token: could not remove staging file ${staging}: ${error?.message ?? error}`);
+    }
+  }
+};
+
 let handle;
 try {
   handle = openSync(staging, "wx", 0o600);
   writeSync(handle, token);
+  closeSync(handle);
+  handle = undefined;
 } catch (error) {
+  discardStaging(handle);
   fail(`cannot write ${staging}: ${error.message}`);
-} finally {
-  if (handle !== undefined) closeSync(handle);
 }
 try {
   chownSync(staging, uid, gid);
@@ -108,7 +131,7 @@ try {
   chmodSync(staging, MODE);
   renameSync(staging, path);
 } catch (error) {
-  try { unlinkSync(staging); } catch { /* nothing to clean up */ }
+  discardStaging(undefined);
   fail(`cannot give ${path} owner ${options.owner}:${options.group} with mode ${MODE.toString(8)}: ${error.message}`
     + " -- run this under sudo, or pass --owner/--group you can set");
 }

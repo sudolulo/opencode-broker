@@ -12,9 +12,9 @@
 // owns. It never reaches a GPU, a router, or midclt.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 const SCRIPT = new URL("../bin/opencode-broker-tenant-token", import.meta.url).pathname;
@@ -37,6 +37,18 @@ const run = (args) => {
   return { code: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 };
 const runAsMe = (args) => run([...args, "--owner", String(process.getuid()), "--group", String(process.getgid())]);
+
+// ☆ A REAL write failure, not a mocked one: RLIMIT_FSIZE 0 lets the staging `openSync(.., "wx")`
+// succeed -- creating a zero-length file is within the limit -- and makes the very next
+// `writeSync` of the token fail with EFBIG. That is the exact shape of the failure this path
+// exists for (a full or quota-exhausted deploy target), reached without mocking node:fs and
+// without a privileged mount, so the script under test is the shipped script.
+const runWithNoWritableBytes = (args) => {
+  const argv = [...args, "--owner", String(process.getuid()), "--group", String(process.getgid())];
+  const result = spawnSync("/bin/sh", ["-c", 'ulimit -f 0; exec "$0" "$@"', process.execPath, SCRIPT, ...argv],
+    { encoding: "utf8" });
+  return { code: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+};
 
 test("writes a 0640 drop file and never prints the token", () => {
   const path = tempPath();
@@ -87,6 +99,23 @@ test("--force rotates the token to a different value", () => {
   const second = readFileSync(path, "utf8");
   assert.notEqual(second, first, "a rotation that produced the same token would not be a rotation");
   assert.equal(statSync(path).mode & 0o777, 0o640, "rotating must not relax the mode of an existing file");
+});
+
+test("a failed token write leaves no staging file behind", () => {
+  // ☠️ A deploy step that dies mid-write must not seed the config directory with
+  // `.tenant-token.new.<pid>` droppings. They accumulate one per failed attempt, they sit next to
+  // a live credential in a directory an operator greps when a tenant 401s, and a 0600 file whose
+  // name says "new token" invites someone to mount the empty one. The chown path already cleans
+  // up after itself; the write path must too.
+  const path = tempPath();
+  const dir = dirname(path);
+  const result = runWithNoWritableBytes(["--path", path]);
+  assert.match(result.stderr, /cannot write/,
+    "the write must actually have been forced to fail -- otherwise this test proves nothing");
+  assert.notEqual(result.code, 0, "a deploy that wrote no token must not claim success");
+  assert.throws(() => statSync(path), /ENOENT/, "no drop file may be left at the target path");
+  assert.deepEqual(readdirSync(dir), [],
+    "a failed write must leave the directory exactly as it found it, staging file included");
 });
 
 test("a chown it cannot perform fails loudly and leaves no partial drop file", () => {
