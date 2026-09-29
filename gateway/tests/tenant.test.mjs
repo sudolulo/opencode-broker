@@ -260,8 +260,14 @@ test("a caller from an address the tenant does not allow is 401", async () => {
   assert.deepEqual(calls, []);
 });
 
-test("with no token configured the tenant surface is closed, not open", async () => {
+test("with no token configured the tenant surface is closed, not open, and says so once at startup", async (t) => {
   // A gateway deployed before the drop file exists must refuse, never default to allowing.
+  // ☆ And it must SAY so, once, when it starts: a `tenants` block with no token is a deploy
+  // that half-happened, and its only other symptom is every render 401ing with NOTHING in
+  // this log -- the address log fires after the token check, so it never sees these. The
+  // deploy this guards against ran live for ten days once (env var and device_ids disagreeing,
+  // 2026-09) because nothing said anything.
+  const errors = t.mock.method(console, "error");
   const calls = [];
   const handler = createGatewayHandler({
     config: CONFIG,
@@ -270,11 +276,32 @@ test("with no token configured the tenant surface is closed, not open", async ()
     reservationsPath: reservationsFile({}),
     runModelSwap: async (command, args) => { calls.push({ command, args }); return { code: 0 }; },
   });
+  assert.equal(errors.mock.calls.length, 1, "a configured tenant with no token is logged exactly once, at construction");
+  assert.match(String(errors.mock.calls[0].arguments[0]), /tenants? \[comfyui\]/);
+  assert.match(String(errors.mock.calls[0].arguments[0]), /no tenant token/);
   await withServer(handler, async (base) => {
     assert.equal((await ask(base, "/tenant/comfyui/acquire", { token: TENANT_SECRET })).status, 401);
     assert.equal((await ask(base, "/tenant/comfyui/acquire")).status, 401);
   });
   assert.deepEqual(calls, []);
+  // Once at startup, not once per request: an unauthenticated prober must not be able to
+  // fill the log by hitting a closed surface.
+  assert.equal(errors.mock.calls.length, 1, "refused requests on a closed surface add nothing to the log");
+});
+
+test("a gateway with no tenants block and no token is the ordinary deployment and logs nothing", (t) => {
+  // The negative control: every gateway on the fleet today has neither, and a warning on
+  // each of them would be noise that hides the one that matters.
+  const errors = t.mock.method(console, "error");
+  const { tenants: _unused, ...withoutTenants } = CONFIG;
+  createGatewayHandler({
+    config: withoutTenants,
+    brokerRequest: async () => { throw new Error("unreachable"); },
+    gatewayKey: GATEWAY_SECRET,
+    reservationsPath: reservationsFile({}),
+    runModelSwap: async () => { throw new Error("unreachable"); },
+  });
+  assert.deepEqual(errors.mock.calls.map((call) => call.arguments), []);
 });
 
 test("a url that merely starts with /tenant is not the tenant surface", async () => {

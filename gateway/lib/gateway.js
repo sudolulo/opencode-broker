@@ -1106,6 +1106,16 @@ export const createGatewayHandler = ({
   // drop file exists must refuse every caller.
   const tenantPresented = (request) => Boolean(tenantToken)
     && sameSecret(request.headers.authorization ?? "", `Bearer ${tenantToken}`);
+  // ☆ Said ONCE, here at construction, never per request: a `tenants` block with no token is a
+  // deploy that half-happened -- the drop file was never written, or the service restarted
+  // before it was -- and its only other symptom is every render 401ing with nothing in this
+  // log, because the address log below runs AFTER the token check and so never sees these.
+  // Per-request would let an unauthenticated prober fill the log. The ordinary deployment
+  // (no tenants block, no token) stays silent.
+  const configuredTenants = Object.keys(config.tenants ?? {});
+  if (configuredTenants.length && !tenantToken) {
+    console.error(`opencode-broker-gateway: tenants [${configuredTenants.join(", ")}] are configured but no tenant token is loaded: every tenant request is 401 until the drop file exists and the gateway restarts`);
+  }
 
   const tenantFromAllowedAddress = (request, tenant) => {
     const address = callerAddress(request);

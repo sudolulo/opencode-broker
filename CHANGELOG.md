@@ -29,8 +29,11 @@ All notable changes to this project are documented here. The format is based on
   quota. Each tenant also declares `allowFrom`, and a token presented from any other address is
   refused with the observed address logged, so a wrong list costs one request to diagnose
   instead of presenting as a silent 401 on every job. No token file, no `tenants` block or an
-  empty `allowFrom` all mean closed: there is no permissive default. The routes are dispatched
-  ahead of every other URL, so a tenant path can never fall through into a completion.
+  empty `allowFrom` all mean closed: there is no permissive default. A `tenants` block with no
+  token file is logged once at startup, naming the tenants nothing can reach, because its only
+  other symptom is every request 401ing with nothing in the log -- the address log runs after
+  the token check and never sees those. The routes are dispatched ahead of every other URL, so
+  a tenant path can never fall through into a completion.
 - **`opencode-broker-tenant-token`** creates that token as the drop file the deploy needs:
   256 bits of `base64url` (an alphabet no shell, YAML or systemd file can mangle) written
   `root:<group>` mode `0640`, staged and renamed so a chown it cannot perform leaves no
