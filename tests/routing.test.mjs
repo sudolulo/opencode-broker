@@ -838,6 +838,108 @@ test("cached inventory publishes only models OpenCode can resolve", async () => 
   ]);
 }));
 
+// CRITICAL: THE DRY RUN MUST SEE EXACTLY WHAT PUBLICATION WOULD SEND, WITHOUT SENDING IT. The
+// reconciler proposes an inventory before anyone approves it, so the computation has to be
+// separable from the publication. If the two paths can drift, a dry run reviews one inventory
+// and the scheduled run publishes another, and the review means nothing. Parity is asserted on
+// the whole request body rather than a field or two, so a divergence anywhere fails here.
+test("the pure inventory builder produces exactly the body the publisher posts", async () => withTempHome(async (home) => {
+  const routing = await freshRouting();
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({
+    openai: { type: "oauth" },
+    metered: { type: "api" },
+  }) + "\n");
+  const catalog = {
+    openai: { id: "openai", models: {
+      "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true,
+        limit: { context: 400000, output: 128000 }, variants: { fast: {} } },
+      "gpt-6-luna": { id: "gpt-6-luna", family: "gpt-luna", release_date: "2026-09-22", tool_call: true },
+    } },
+    // API-key auth, so it is quarantined out of the catalog before discovery sees it.
+    metered: { id: "metered", models: { expensive: { id: "expensive", tool_call: true } } },
+  };
+  const INPUTS = {
+    catalog,
+    authTypes: { openai: "oauth", metered: "api" },
+    // config.js is cached for this file, so the static pins come from the loaded fixture.
+    staticTargets: routing.TARGETS,
+    resolvableModels: new Set(["openai/gpt-6-sol"]),
+    configuredModelVariants: { "openai/gpt-5.6-sol": ["high", "low"] },
+  };
+  const calls = [];
+  const built = routing.buildCachedSubscriptionInventory(INPUTS);
+  assert.equal(calls.length, 0, "the pure builder publishes nothing");
+  const { skipped, ...publishedFields } = built;
+  const cachePath = join(home, "models.json");
+  writeFileSync(cachePath, JSON.stringify(catalog));
+  const result = await routing.publishCachedSubscriptionInventory({
+    cachePath,
+    listResolvableModels: () => INPUTS.resolvableModels,
+    configuredModelVariants: INPUTS.configuredModelVariants,
+    request: async (path, body) => { calls.push({ path, body }); return { changed: true }; },
+  });
+  assert.deepEqual(calls[0].body, { ...publishedFields, authRevision: calls[0].body.authRevision });
+  assert.equal(typeof calls[0].body.authRevision, "string");
+  assert.deepEqual(result.skipped, skipped);
+  // Hand-derived: only the resolvable, mapped, unpinned, tool-calling model takes a lane, and
+  // the one the host cannot address is a reported skip rather than a target.
+  assert.deepEqual(Object.values(built.targets).map((target) => target.modelID), ["gpt-6-sol"]);
+  assert.deepEqual(built.skipped, [
+    { providerID: "openai", modelID: "gpt-6-luna", tiers: ["worker"], reason: "unresolvable" },
+  ]);
+  assert.deepEqual(Object.keys(built.providers), ["openai"]);
+  assert.deepEqual(built.modelContexts, { "openai/gpt-6-sol": 400000 });
+  assert.deepEqual(built.modelOutputs, { "openai/gpt-6-sol": 128000 });
+  // The configured-variant merge happens from the ARGUMENT, so a dry run can ask what a
+  // different declaration would publish; the catalog's own variants still win the same key.
+  assert.deepEqual(built.modelVariants, {
+    "openai/gpt-5.6-sol": ["high", "low"],
+    "openai/gpt-6-sol": ["fast"],
+  });
+  // `skipped` is return-only and never rides into the broker's inventory.
+  assert.equal(Object.hasOwn(calls[0].body, "skipped"), false);
+}));
+
+// CRITICAL: the reconciler asks what a candidate registry and a candidate trusted-provider set
+// WOULD discover, without editing the deployment to find out -- so both are injected. The rule
+// neither injection may loosen: trust admits a PROVIDER, it never discovers a model. Only OAuth
+// models are ever dynamically discovered, so a trusted API-key provider earns a summary and
+// exactly zero targets.
+test("an injected trusted-provider set moves admission but discovers no API-key model", () => {
+  const inputs = {
+    catalog: {
+      metered: { id: "metered", models: {
+        "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true },
+      } },
+    },
+    authTypes: { metered: "api" },
+    staticTargets: {},
+    resolvableModels: ["metered/gpt-6-sol"],
+    configuredModelVariants: {},
+  };
+  const untrusted = R.buildCachedSubscriptionInventory(inputs);
+  assert.deepEqual(untrusted.providers, {});
+  assert.deepEqual(untrusted.targets, {});
+  const trusted = R.buildCachedSubscriptionInventory({ ...inputs, trustedProviderIDs: ["metered"] });
+  assert.deepEqual(trusted.providers, {
+    metered: { authType: "api", connected: true, admission: "admitted", models: 0 },
+  });
+  assert.deepEqual(trusted.targets, {});
+});
+
+test("provider admission reads the injected trusted-provider set, not the module's own", () => {
+  const inventory = {
+    connected: ["metered"],
+    all: [{ id: "metered", models: { "gpt-6-sol": { id: "gpt-6-sol", tool_call: true } } }],
+  };
+  assert.equal(R.discoverSubscriptionTargets(inventory, { metered: "api" }, {}).providers.metered.admission,
+    "quarantined-auth");
+  assert.equal(R.discoverSubscriptionTargets(inventory, { metered: "api" }, {},
+    { trustedProviderIDs: ["metered"] }).providers.metered.admission, "admitted");
+});
+
 // CRITICAL: FAIL CLOSED. With no resolver view on disk the broker knows nothing about what this
 // host can address, so it admits nothing from the catalog and every tier stays on its
 // hand-pinned config targets. The opposite default -- no view, admit the whole catalog --
@@ -886,6 +988,51 @@ test("an unusable resolver listing fails loudly instead of writing an empty view
     /opencode models --pure.*not found/);
   assert.throws(() => routing.refreshResolvableModels({ exec: () => "\n" }), /empty resolver view/);
   assert.equal(existsSync(routing.resolvableModelsPath()), false);
+}));
+
+// The resolver parser, separated from the file write so a dry run can read `opencode models
+// --pure` without ever touching the live snapshot. Same whitelist either way: a blank line, a
+// prose line and a malformed reference are not model keys, and a duplicate is one model.
+test("resolver output parses to the unique model references it names and nothing else", () => {
+  assert.deepEqual([...R.parseResolvableModelsOutput(
+    "openai/gpt-6-sol\n\nanthropic/claude-opus-5\nopenai/gpt-6-sol\nno slash here\na/b/c\n  openai/gpt-6-luna  \n",
+  )].sort(), ["anthropic/claude-opus-5", "openai/gpt-6-luna", "openai/gpt-6-sol"]);
+  assert.equal(R.parseResolvableModelsOutput("").size, 0);
+});
+
+// CRITICAL: the snapshot's AGE is what the reconciler's stale gate runs on, and `null` is its
+// only "cannot be established" signal -- a missing, malformed or ageless snapshot must all
+// report null rather than a number the gate would read as fresh.
+test("the resolver snapshot reader exposes an age and reports an unusable snapshot as ageless", async () => withTempHome(async (home) => {
+  const routing = await freshRouting();
+  const path = join(home, "snapshot.json");
+  assert.deepEqual(routing.readResolvableModelsSnapshot(path), { updatedAt: null, models: new Set() });
+  writeFileSync(path, "{ not json");
+  assert.deepEqual(routing.readResolvableModelsSnapshot(path), { updatedAt: null, models: new Set() });
+  writeFileSync(path, JSON.stringify({ models: ["openai/gpt-6-sol"] }));
+  assert.deepEqual(routing.readResolvableModelsSnapshot(path), {
+    updatedAt: null, models: new Set(["openai/gpt-6-sol"]),
+  });
+  writeFileSync(path, JSON.stringify({ updatedAt: 1_700_000_000_000, models: ["openai/gpt-6-sol", "not a key"] }));
+  assert.deepEqual(routing.readResolvableModelsSnapshot(path), {
+    updatedAt: 1_700_000_000_000, models: new Set(["openai/gpt-6-sol"]),
+  });
+  // The fail-closed read still hands its caller the model set and nothing else.
+  assert.deepEqual(routing.readResolvableModels(path), new Set(["openai/gpt-6-sol"]));
+}));
+
+// The models.dev cache location, exported so the reconciler's live fallback and the watch job
+// cannot disagree about which file "the catalog" is.
+test("the model cache path follows XDG_CACHE_HOME", async () => withTempHome(async (home) => {
+  const original = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = join(home, "xdg-cache");
+  try {
+    const routing = await freshRouting();
+    assert.equal(routing.modelCachePath(), join(home, "xdg-cache/opencode/models.json"));
+  } finally {
+    if (original === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = original;
+  }
 }));
 
 // CRITICAL: FAMILY_TIERS is DERIVED from the provider-role registry (lib/model-roles.js) instead of
