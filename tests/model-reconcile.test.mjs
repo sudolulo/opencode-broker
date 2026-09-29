@@ -204,9 +204,11 @@ test("the report and every branch of it is frozen and carries no publisher surfa
     assert.deepEqual(Object.keys(report).sort(), [
       "admissionSkipped", "authRevisionChanged", "byModel", "counts", "dryRun", "effects",
       "evidenceRequests", "incumbents", "ledger", "legacyMigration", "observedAt", "proposedTargets",
-      "providerIDs", "skipped", "sources",
+      "providerIDs", "skipped", "sources", "superseded",
     ]);
     assert.equal(Object.isFrozen(report), true);
+    assert.equal(Object.isFrozen(report.superseded), true);
+    assert.deepEqual(report.superseded, []);
     assert.equal(Object.isFrozen(report.byModel), true);
     assert.equal(Object.isFrozen(report.byModel["openai/gpt-6-sol"]), true);
     assert.equal(Object.isFrozen(report.effects), true);
