@@ -77,9 +77,12 @@ const FAKE_BROKER = `
           statusCode = 409;
           answer = { error: "no eligible local classifier target", code: "no-eligible-local-target" };
         } else if (body.tier === "classifier") {
-          const cloud = body.sessionID === "child-cloud-bug" || body.localOnly !== true;
+          const cloud = body.sessionID === "child-cloud-bug" || body.sessionID === "child-cloud-duplicate" || body.localOnly !== true;
+          const duplicateLocalIdentity = body.sessionID === "child-cloud-duplicate";
           answer = cloud
-            ? { target: { id: "cloud-worker", model: { providerID: "openai", id: "cloud-worker-1" }, kind: "cloud" }, existing: false }
+            ? { target: { id: "cloud-worker", model: duplicateLocalIdentity
+              ? { providerID: "llamacpp", id: "lan-small-4b" }
+              : { providerID: "openai", id: "cloud-worker-1" }, kind: "cloud" }, existing: false }
             : { target: { id: "lan-classifier", model: { providerID: "llamacpp", id: "lan-small-4b" }, kind: "local" }, existing: false };
         } else {
           answer = { target: { id: "lan-uncensored", model: { providerID: "llamacpp", id: "lan-uncensored-27b" }, kind: "local" }, existing: false };
@@ -248,6 +251,7 @@ test("classifier leases inherit only the owner's egress boundary and fail closed
     sessions["child-manual"] = { id: "child-manual", parentID: "parent-manual", agent: "fleet-classifier" };
     sessions["child-no-local"] = { id: "child-no-local", parentID: "parent-private", agent: "fleet-classifier" };
     sessions["child-cloud-bug"] = { id: "child-cloud-bug", parentID: "parent-private", agent: "fleet-classifier" };
+    sessions["child-cloud-duplicate"] = { id: "child-cloud-duplicate", parentID: "parent-private", agent: "fleet-classifier" };
     const hooks = await ModelRouter({ client: { session: {
       get: async ({ path }) => sessions[path.id],
       messages: async () => ({ data: [] }),
@@ -263,7 +267,7 @@ test("classifier leases inherit only the owner's egress boundary and fail closed
         out[key] = { blocked: false, model: output.message.model };
       } catch (error) { out[key] = { blocked: true, error: String(error.message) }; }
     }
-    for (const sessionID of ["child-no-local", "child-cloud-bug"]) {
+    for (const sessionID of ["child-no-local", "child-cloud-bug", "child-cloud-duplicate"]) {
       const output = { message: { model: { providerID: "pane-default", modelID: "pane-default-model" } }, parts: [] };
       let error = "";
       let paramsError = "";
@@ -297,7 +301,7 @@ test("classifier leases inherit only the owner's egress boundary and fail closed
   assert.ok(result.calls.slice(0, manualLeaseIndex).some((call) => call.path === "/inventory"),
     "a Manual owner's classifier refreshes inventory when its own lane can reach cloud");
 
-  for (const sessionID of ["child-no-local", "child-cloud-bug"]) {
+  for (const sessionID of ["child-no-local", "child-cloud-bug", "child-cloud-duplicate"]) {
     assert.match(result[sessionID].error, /\[opencode-broker\] private profile blocked:/);
     assert.match(result[sessionID].paramsError, /route unavailable/);
     assert.deepEqual(result[sessionID].model, { providerID: "pane-default", modelID: "pane-default-model" });
@@ -305,6 +309,8 @@ test("classifier leases inherit only the owner's egress boundary and fail closed
   }
   assert.match(result["child-no-local"].error, /no eligible local classifier target/);
   assert.match(result["child-cloud-bug"].error, /non-local/);
+  assert.match(result["child-cloud-duplicate"].error, /non-local/,
+    "a cloud target stays non-local even when it duplicates a configured local model identity");
 });
 
 // ☠️ A NEW UNCENSORED PROFILE INHERITS THE WHOLE RULE, OR IT INHERITS NONE OF IT. `uncensored-70b`

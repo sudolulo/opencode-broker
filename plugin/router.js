@@ -520,7 +520,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (!target?.model?.providerID || !target?.model?.id) {
         throw new Error(lease?.error ?? lease?.reason ?? lease?.message ?? "broker returned no model target");
       }
-      if (localOnly && target.kind !== "local" && !modelIsLocalTarget(target.model)) {
+      if (localOnly && target.kind !== "local") {
         throw new Error(`broker returned non-local classifier target ${target.id ?? `${target.model.providerID}/${target.model.id}`} for a local-only lease`);
       }
       // A degraded route must be VISIBLE: log it where the opencode log shows it,
