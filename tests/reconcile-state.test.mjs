@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,22 @@ const plantLock = (lockPath, owner, instanceNames = []) => {
 // Everything this module may leave under the shared state root: the public lock, a private
 // pre-publication lock directory, and ledger temps. The ledger itself has no leading dot.
 const lockDebris = (root) => readdirSync(root).filter((name) => name.startsWith(".model-reconciliation")).sort();
+
+// A warning sink that throws is somebody else's code failing: a logger writing to a closed
+// stream, a notifier that raises. The module's own fallback is stderr, so the fallback has to be
+// captured to be asserted on -- and capturing it keeps the test run's output clean.
+const withCapturedStderr = (run) => {
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => { lines.push(args.map((arg) => String(arg)).join(" ")); };
+  try {
+    return run(lines);
+  } finally {
+    console.error = original;
+  }
+};
+
+const explodingSink = () => { throw new Error("warning sink exploded"); };
 
 const waitFor = async (predicate, label) => {
   const deadline = Date.now() + 20_000;
@@ -227,6 +243,31 @@ test("a directory fsync failure after the rename reports the committed mutation,
   });
 });
 
+test("a warning sink that throws cannot turn a committed ledger write into a failure", () => {
+  withBase("throwing-sink-commit", (base, root) => {
+    withCapturedStderr((stderr) => {
+      const store = createReconciliationStore({
+        root,
+        now: () => 1_700_000_000_000,
+        // The warning here is raised PAST the rename that commits the decision. A sink that
+        // throws at that point propagates out of update and tells the caller its mutation
+        // failed, while the new ledger is already on disk -- the very failure the post-commit
+        // warning exists to prevent, reintroduced by the reporting channel itself.
+        onWarning: explodingSink,
+        fsyncDir: () => { throw new Error("simulated directory fsync failure"); },
+      });
+      const saved = store.update((state) => ({ ...state, roles: { "openai:gpt-sol": ROLE_RECORD } }));
+      assert.equal(saved.roles["openai:gpt-sol"].state, "evidence-pending");
+      assert.equal(JSON.parse(readFileSync(store.paths().state, "utf8")).roles["openai:gpt-sol"].state, "evidence-pending");
+      assert.deepEqual(lockDebris(root), []);
+      // Both halves reach the operator: what was being reported, and that their sink is broken.
+      assert.equal(stderr.length, 1);
+      assert.match(stderr[0], /warning sink exploded/);
+      assert.match(stderr[0], /was committed but its directory entry could not be made durable/);
+    });
+  });
+});
+
 test("a write that fails before the rename is fatal and leaves no temp behind", () => {
   withBase("pre-commit-failure", (base, root) => {
     const store = createReconciliationStore({ root });
@@ -263,6 +304,36 @@ test("release leaves a replacement lock untouched when this writer's instance is
     assert.equal(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).uuid, replacementUUID);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /no longer holds this writer's instance/);
+  });
+});
+
+test("a warning sink that throws on a lost lock neither fails the mutation nor touches the replacement", () => {
+  withBase("throwing-sink-release", (base, root) => {
+    withCapturedStderr((stderr) => {
+      const store = createReconciliationStore({ root, now: () => 1_700_000_000_000, onWarning: explodingSink });
+      const lock = store.paths().lock;
+      const replacementUUID = randomUUID();
+      const replacementInstance = `instance.${process.pid}.${replacementUUID}`;
+      // The same lost-lock scenario as above, with a sink that throws while reporting it. The
+      // warning is raised inside release, which runs in update's finally: a throw there both
+      // buries the committed state the caller was owed and abandons the rest of the release.
+      const saved = store.update((state) => {
+        rmSync(lock, { recursive: true, force: true });
+        plantLock(lock, {
+          pid: process.pid, acquiredAt: 1_700_000_000_000, uuid: replacementUUID,
+          bootId: currentBootID(), starttime: currentStartTime(process.pid),
+        }, [replacementInstance]);
+        return { ...state, roles: { "openai:gpt-sol": ROLE_RECORD } };
+      });
+      assert.equal(saved.roles["openai:gpt-sol"].state, "evidence-pending");
+      // Not one byte of the live replacement is removed, and nothing extra is left lying around.
+      assert.equal(existsSync(join(lock, replacementInstance)), true);
+      assert.equal(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).uuid, replacementUUID);
+      assert.deepEqual(lockDebris(root), [".model-reconciliation.lock"]);
+      assert.equal(stderr.length, 1);
+      assert.match(stderr[0], /warning sink exploded/);
+      assert.match(stderr[0], /no longer holds this writer's instance/);
+    });
   });
 });
 
@@ -477,6 +548,54 @@ test("a dead writer's private lock directory is swept once the public lock is he
   });
 });
 
+test("a warning sink that throws during the post-acquire sweep cannot leak the published lock", async () => {
+  await withBaseAsync("throwing-sink-sweep", async (base, root) => {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const dead = await deadPID();
+    const uuid = randomUUID();
+    const privateDir = join(root, `.model-reconciliation.lock.${dead}.${uuid}`);
+    plantLock(privateDir, { pid: dead, acquiredAt: 1_700_000_000_000, uuid, bootId: currentBootID(), starttime: "1" }, [`instance.${dead}.${uuid}`]);
+    // Readable, so the sweep proves the owner dead and tries to remove it -- and unremovable,
+    // because its own entries cannot be unlinked through a directory with no write bit. The
+    // sweep therefore warns, and it warns from INSIDE acquire, before the release function has
+    // been handed to anyone. A sink that throws there abandons a lock that is already published
+    // and that nothing will ever release: the ledger wedges until an operator clears it by hand.
+    chmodSync(privateDir, 0o500);
+    try {
+      withCapturedStderr((stderr) => {
+        const store = createReconciliationStore({ root, lockWaitMs: 50, onWarning: explodingSink });
+        assert.equal(store.update((state) => state).version, 1);
+        assert.equal(existsSync(store.paths().lock), false);
+        // The orphan it could not remove is still there and still reported, which is correct:
+        // only the reporting was made unable to fail.
+        assert.equal(existsSync(join(privateDir, "owner")), true);
+        assert.equal(stderr.some((line) => /warning sink exploded/.test(line)), true);
+        assert.equal(stderr.some((line) => /unable to remove the stale reconciliation lock directory/.test(line)), true);
+      });
+    } finally {
+      chmodSync(privateDir, 0o700);
+    }
+  });
+});
+
+test("a dead owner with a full identity and its own instance file is reclaimed leaving nothing behind", async () => {
+  await withBaseAsync("dead-identity-reclaim", async (base, root) => {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const store = createReconciliationStore({ root, lockWaitMs: 50 });
+    const dead = await deadPID();
+    const uuid = randomUUID();
+    // The complete thing a crashed writer of this vintage leaves behind: a full identity record
+    // AND the instance file that is what actually holds the lock, both belonging to a pid that
+    // is definitely gone. Every other reclaim case here is missing one of the three.
+    plantLock(store.paths().lock, { pid: dead, acquiredAt: 1_700_000_000_000, uuid, bootId: currentBootID(), starttime: "1" }, [`instance.${dead}.${uuid}`]);
+    const saved = store.update((state) => ({ ...state, roles: { "openai:gpt-sol": ROLE_RECORD } }));
+    assert.equal(saved.roles["openai:gpt-sol"].state, "evidence-pending");
+    assert.equal(existsSync(store.paths().lock), false);
+    assert.deepEqual(lockDebris(root), []);
+    assert.deepEqual(readdirSync(root).filter((name) => name.endsWith(".tmp")), []);
+  });
+});
+
 test("a live writer's private lock directory survives the sweep", () => {
   withBase("sweep-live", (base, root) => {
     mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -489,6 +608,53 @@ test("a live writer's private lock directory survives the sweep", () => {
     createReconciliationStore({ root }).update((state) => state);
     assert.equal(existsSync(join(privateDir, "owner")), true);
     assert.equal(existsSync(join(privateDir, instance)), true);
+  });
+});
+
+test("a private lock that fails mid-construction takes its own directory with it", () => {
+  withBase("private-build-failure", (base, root) => {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    // A pid JSON.stringify refuses. The identity record is serialized after the private
+    // directory exists and before either file inside it is written, so the failure lands in
+    // exactly the window that can orphan a private lock. Nothing ever comes back for one: the
+    // sweep deletes only on proof the identity inside is dead, and a directory with no readable
+    // owner record is the one case it correctly refuses to touch, so it accumulates forever.
+    const store = createReconciliationStore({ root, pid: 42n });
+    assert.throws(() => store.update((state) => state), /BigInt/);
+    assert.deepEqual(lockDebris(root), []);
+    assert.equal(existsSync(store.paths().state), false);
+  });
+});
+
+test("a private lock whose cleanup fails is reported without replacing the construction error", () => {
+  withBase("private-cleanup-failure", (base, root) => {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const warnings = [];
+    let built = null;
+    const store = createReconciliationStore({
+      root,
+      onWarning: (message) => warnings.push(message),
+      // Stands in for the permission tightening failing on the freshly created private
+      // directory -- EPERM, or a filesystem that refuses chmod. Taking write permission off the
+      // state root at the same moment makes the cleanup that follows fail for real (EACCES on
+      // the parent), which is the case where the caller must still be told what actually broke.
+      chmodLockDir: (dir) => {
+        built = dir;
+        chmodSync(root, 0o500);
+        throw new Error("simulated private lock chmod failure");
+      },
+    });
+    try {
+      assert.throws(() => store.update((state) => state), /simulated private lock chmod failure/);
+      // The orphan survives, so it has to be named: an operator is the only thing that can
+      // remove it now.
+      assert.equal(existsSync(built), true);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /unable to remove the partially built reconciliation lock directory/);
+      assert.equal(warnings[0].includes(built), true);
+    } finally {
+      chmodSync(root, 0o700);
+    }
   });
 });
 

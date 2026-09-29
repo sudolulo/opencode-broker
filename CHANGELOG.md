@@ -58,7 +58,11 @@ All notable changes to this project are documented here. The format is based on
   instant it is visible; a rename onto a populated directory fails and moves nothing, which makes
   the `instance.<pid>.<uuid>` file inside the lock the thing that holds it. A reclaim is a single
   unlink of the *exact* instance that was observed dead, and an `ENOENT` there is read as "another
-  actor won, touch nothing else". The lock directory is never deleted recursively again.
+  actor won, touch nothing else". The lock directory is never deleted recursively again. A
+  private directory whose construction fails partway -- after its `mkdir`, before its records
+  exist -- removes itself before the failure is reported, because the sweep that collects
+  abandoned ones only deletes on proof the identity inside is dead and a half-built directory has
+  no identity to prove anything with, so it would have accumulated under the state root forever.
 - **A recycled pid no longer reads as a live lock owner.** Liveness was `kill(pid, 0)` alone, which
   answers "live" for whatever unrelated process inherited that number after a reboot or a pid
   wraparound -- so a lock nobody held could be honoured until it timed out, and on the other side
@@ -76,7 +80,10 @@ All notable changes to this project are documented here. The format is based on
   gone, and a post-commit `fsync` failure reports the committed state and warns. Lock release
   errors, which were swallowed entirely, are reported the same way -- including the one that
   matters most, a release finding its own instance file gone, which means the lock was not
-  exclusive while the ledger was being written.
+  exclusive while the ledger was being written. Reporting cannot fail the mutation either: the
+  warning sink is wrapped where the store is created, so an injected logger that throws -- past
+  the commit point, inside release, or inside the sweep that runs before the release function
+  reaches the caller -- can no longer bury a committed decision or strand a published lock.
 - **A `model-swap` child can no longer grow the gateway's heap without bound.** The tenant routes
   await the child and captured everything it printed, trimming to the last 4 KB only once it
   exited -- so a swap stuck in a retry loop held every byte it had ever written, inside a process

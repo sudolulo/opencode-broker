@@ -83,6 +83,22 @@ it is taken over immediately, by rename, deleting nothing. The ledger's own writ
 committed by the rename of its temp: a durability `fsync` that fails *after* that point
 is reported as a warning, never as a failed mutation.
 
+A private `.model-reconciliation.lock.<pid>.<uuid>` that fails *while being built* —
+after its `mkdir`, before its records exist — removes itself before the failure is
+reported, because the sweep that would otherwise collect it only deletes on proof the
+identity inside is dead and a half-built directory carries no identity to prove
+anything with. Only that exact path is removed, and only when this process created it:
+a name collision at `mkdir` is somebody else's directory and is left alone. If the
+removal itself fails, the orphan is named in a warning and the original construction
+error is what the caller still receives.
+
+Every warning this module raises is **non-throwing by construction**: the sink is
+wrapped once where the store is created, and a sink that throws is caught and reported
+to stderr instead. Warnings are raised past the ledger's commit point, inside release,
+and inside the sweep that runs before the release function reaches the caller — a
+throwing sink at any of those points would report a committed decision as failed or
+strand a published lock that nothing will ever release.
+
 Outside that directory:
 
 | Path | Writer | Readers | Content |
