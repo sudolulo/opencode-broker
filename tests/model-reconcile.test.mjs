@@ -173,8 +173,8 @@ test("records known successors, unknown roles, conflicts, and unresolved models 
     assert.deepEqual(Object.keys(ledger.roles).sort(),
       ["anthropic:claude-opus", "openai:gpt-luna", "openai:gpt-sol"]);
     assert.equal(Object.keys(ledger.unknown).length, 2);
-    // Package 1 writes observations only: evidence collection is Package 2.
-    assert.deepEqual(ledger.evidenceRequests, {});
+    assert.equal(Object.keys(ledger.evidenceRequests).length, 3);
+    assert.deepEqual(report.evidenceRequests, { pending: 3, claimed: 0, failed: 0 });
   });
 });
 
@@ -203,8 +203,8 @@ test("the report and every branch of it is frozen and carries no publisher surfa
     const report = dryRun({ store });
     assert.deepEqual(Object.keys(report).sort(), [
       "admissionSkipped", "authRevisionChanged", "byModel", "counts", "dryRun", "effects",
-      "incumbents", "ledger", "legacyMigration", "observedAt", "proposedTargets", "providerIDs",
-      "skipped", "sources",
+      "evidenceRequests", "incumbents", "ledger", "legacyMigration", "observedAt", "proposedTargets",
+      "providerIDs", "skipped", "sources",
     ]);
     assert.equal(Object.isFrozen(report), true);
     assert.equal(Object.isFrozen(report.byModel), true);

@@ -197,6 +197,7 @@ test("dry-run JSON is machine-readable and cannot touch live routing inputs", ()
     assert.equal(report.byModel["openai/gpt-6-sol"].incumbentModelID, "gpt-5.6-sol");
     assert.equal(report.byModel["anthropic/claude-opus-5-5"].state, "evidence-pending");
     assert.deepEqual(report.counts, { "blocked-unresolvable": 1, "evidence-pending": 1 });
+    assert.deepEqual(report.evidenceRequests, { pending: 1, claimed: 0, failed: 0 });
 
     assert.deepEqual(readFileSync(fixture.liveCachePath), liveCacheBefore);
     assert.deepEqual(readFileSync(fixture.liveResolverPath), liveResolverBefore);
@@ -210,7 +211,7 @@ test("dry-run JSON is machine-readable and cannot touch live routing inputs", ()
     const ledger = JSON.parse(readFileSync(fixture.statePath, "utf8"));
     assert.equal(ledger.version, 1);
     assert.deepEqual(Object.keys(ledger.roles).sort(), ["anthropic:claude-opus", "openai:gpt-sol"]);
-    assert.deepEqual(ledger.evidenceRequests, {});
+    assert.equal(Object.keys(ledger.evidenceRequests).length, 1);
     assert.equal(statSync(fixture.statePath).mode & 0o777, 0o600);
 
     // Exactly one trailing newline, so the output pipes into jq and into a file diff cleanly.
