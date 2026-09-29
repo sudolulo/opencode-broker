@@ -23,6 +23,11 @@ All notable changes to this project are documented here. The format is based on
   Proxy requests replace either inbound gateway authentication form with `x-api-key`, forward only
   the native Anthropic header allowlist plus configured headers, and never relay client credentials.
 
+### Fixed
+
+- **Duplicate failure reports are idempotent.** Once a session failure consumes its lease, repeated
+  router/guard reports return the original result instead of extending or changing the circuit.
+
 ## [1.22.0] — 2026-09-29
 
 ### Added

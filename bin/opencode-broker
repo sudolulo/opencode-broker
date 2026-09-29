@@ -1203,10 +1203,27 @@ const serve = async () => {
         if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
         const lease = state.leases[body.sessionID];
         const assignment = state.assignments[body.sessionID];
+        // The router sees provider events while the guard sees the failed prompt result,
+        // so a routed classifier can report the same failed turn twice. The first report
+        // consumes the lease; preserve its reply on the sticky assignment so every later
+        // report for that settled turn is a no-op. A fresh lease replaces the assignment
+        // wholesale, which re-arms failure handling for the next turn.
+        if (!lease && assignment?.settledFailure &&
+          (!body.targetID || body.targetID === assignment.settledFailure.targetID)) {
+          return reply(response, 200, assignment.settledFailure.reply);
+        }
         const targetID = body.targetID || lease?.targetID || assignment?.targetID;
         const error = normalizeProviderError(body.error);
         const kind = classifyRoutingFailure(error);
         const target = targetForID(targetID, allTargets(state));
+        const settleFailure = (replyBody) => {
+          if (assignment && targetID && assignment.targetID === targetID) {
+            assignment.settledFailure = { targetID, reply: replyBody };
+          }
+          delete state.leases[body.sessionID];
+          writeState(state);
+          return reply(response, 200, replyBody);
+        };
         // A rate/quota complaint is the only capacity truth providers give us:
         // calibrate the window ceiling to the spend that triggered it.
         if (target && (kind === "quota" || kind === "rate")) {
@@ -1223,9 +1240,7 @@ const serve = async () => {
             at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
             policy: "failure-ignored", reasons: ["noop", error.message].filter(Boolean),
           });
-          delete state.leases[body.sessionID];
-          writeState(state);
-          return reply(response, 200, { ok: true, kind: "noop" });
+          return settleFailure({ ok: true, kind: "noop" });
         }
         if (kind === "payload") {
           // The REQUEST was malformed and the provider answered correctly by refusing
@@ -1238,9 +1253,7 @@ const serve = async () => {
             at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
             policy: "failure-payload", reasons: ["payload", error.message].filter(Boolean),
           });
-          delete state.leases[body.sessionID];
-          writeState(state);
-          return reply(response, 200, { ok: true, kind: "payload" });
+          return settleFailure({ ok: true, kind: "payload" });
         }
         if (kind === "context") {
           // The request did not FIT the target's window. The provider is
@@ -1253,9 +1266,7 @@ const serve = async () => {
             at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
             policy: "failure-context", reasons: ["context", error.message].filter(Boolean),
           });
-          delete state.leases[body.sessionID];
-          writeState(state);
-          return reply(response, 200, { ok: true, kind: "context" });
+          return settleFailure({ ok: true, kind: "context" });
         }
         if (target && kind === "quota") {
           // Subscription quota is shared across a provider's models. Leaving this
@@ -1334,9 +1345,7 @@ const serve = async () => {
           at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
           policy: "failure-reported", reasons: [kind, error.message].filter(Boolean),
         });
-        delete state.leases[body.sessionID];
-        writeState(state);
-        return reply(response, 200, { ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
+        return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
       }
       if (request.url === "/complete") {
         if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
