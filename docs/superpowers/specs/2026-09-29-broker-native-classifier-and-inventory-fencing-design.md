@@ -1,7 +1,7 @@
 # Broker-native classifier routing, zero model pins, and inventory publisher fencing
 
 Date: 2026-09-29
-Status: Design, awaiting review
+Status: Approved
 Repos touched: `opencode-broker`, `opencode-guard`, `devbox` (fleet config + tests)
 
 ## Problem
