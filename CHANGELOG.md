@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0] — 2026-09-29
+
+### Added
+
+- **Model reconciliation now collects official evidence and asks before it guesses.** A bounded
+  request queue feeds a read-only researcher run through the fleet gateway, whose output is
+  validated against the role's own official domains and the exact candidate model before it can be
+  stored. An unambiguous same-role successor becomes `auto-eligible` on its own; a new role, a
+  contradiction or a comparative-only claim becomes `awaiting-approval` and gets one Gitea issue
+  whose `decision/approved` or `decision/rejected` label is authoritative -- closing it is not
+  approval, and both labels at once changes nothing. Every transition pushes exactly one ntfy
+  event. Routing is still untouched: nothing is published, probed or activated.
+
 ## [1.20.0] — 2026-09-29
 
 ### Added

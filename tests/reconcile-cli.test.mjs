@@ -160,6 +160,76 @@ const runCLI = (fixture, args) => {
   });
 };
 
+// ---- proposal lifecycle fixtures ---------------------------------------------------------------
+// The decision commands act on a ledger that ALREADY holds an awaiting-approval proposal, and
+// reaching that state through a dry run would need collected evidence, a gateway and a researcher.
+// Seeding the ledger directly is what keeps these tests about the decision surface.
+const TRANSITION_ID = "a1b2c3d4e5f60718293a4b5c";
+const UNKNOWN_TRANSITION_ID = "0f1e2d3c4b5a69788796a5b4";
+
+// Exactly the shape lib/model-reconcile.js writes for a role record that evidence has carried to
+// `awaiting-approval`: a contradiction is one of the conditions that lands there.
+const AWAITING_ROLE_RECORD = Object.freeze({
+  transitionID: TRANSITION_ID,
+  roleKey: "openai:gpt-sol",
+  providerID: "openai",
+  roleID: "gpt-sol",
+  candidateModelID: "gpt-6-sol",
+  candidateFamily: "gpt-sol",
+  candidateReleaseDate: "2026-09-22",
+  candidateVersion: "6",
+  incumbentModelID: "gpt-5.6-sol",
+  proposedTiers: Object.freeze(["smart"]),
+  proposedFit: Object.freeze({}),
+  state: "awaiting-approval",
+  reason: "the collected evidence contradicts itself",
+  stateChangedAt: 1,
+  lastObservedAt: 1,
+  transitions: Object.freeze(["discovered", "evidence-pending", "awaiting-approval"]),
+  evidence: Object.freeze([]),
+  evidenceRevision: null,
+  evidenceCollectedAt: null,
+  evidenceContradiction: true,
+  approval: null,
+  issue: null,
+  notified: null,
+});
+
+// An unknown candidate: no roleKey and no proposedTiers, because Package 1 refuses to invent them.
+const UNMAPPED_RECORD = Object.freeze({
+  transitionID: UNKNOWN_TRANSITION_ID,
+  groupKey: "openai:gpt-nova",
+  providerID: "openai",
+  modelID: "gpt-1-nova",
+  family: "gpt-nova",
+  roleStatus: "unknown",
+  roleMatches: Object.freeze([]),
+  releaseDate: "2026-09-20",
+  version: "1",
+  state: "awaiting-approval",
+  reason: "the candidate is not mapped to a known role",
+  stateChangedAt: 1,
+  lastObservedAt: 1,
+  transitions: Object.freeze(["discovered", "evidence-pending", "awaiting-approval"]),
+  evidence: Object.freeze([]),
+  evidenceRevision: null,
+  evidenceCollectedAt: null,
+  evidenceContradiction: false,
+  approval: null,
+  issue: null,
+  notified: null,
+});
+
+const seedLedger = (fixture, { roles = {}, unknown = {}, evidenceRequests = {} } = {}) => {
+  writeFileSync(fixture.statePath,
+    JSON.stringify({ version: 1, updatedAt: 1, roles, unknown, evidenceRequests }) + "\n", { mode: 0o600 });
+};
+
+const seedAwaitingApproval = (fixture, overrides = {}) =>
+  seedLedger(fixture, { roles: { "openai:gpt-sol": { ...AWAITING_ROLE_RECORD, ...overrides } } });
+
+const readLedger = (fixture) => JSON.parse(readFileSync(fixture.statePath, "utf8"));
+
 // CRITICAL: A DRY RUN THAT MOVED EITHER LIVE INPUT WOULD NOT BE A DRY RUN. `opencode models`
 // rewrites the models.dev cache in place and the resolver refresh rewrites
 // resolvable-models.json; either one changes what the NEXT prompt's cached publication admits,
@@ -377,5 +447,279 @@ test("an unknown option exits 2 without running the command", () => {
     const onStatus = runCLI(fixture, ["status", "--verbose"]);
     assert.equal(onStatus.status, 2);
     assert.match(onStatus.stderr, /unknown option "--verbose"/);
+  });
+});
+
+// ---- the proposal lifecycle commands -------------------------------------------------------------
+
+// BOTH PROJECTIONS SHIP OFF, and a fresh install must therefore perform no external write at all.
+// `project` on that install is a completed run that did nothing, not an error and not a no-op that
+// quietly wrote a marker.
+test("project is a clean no-op when Gitea is disabled and no notifier is configured", () => {
+  withFixture("project-disabled", (fixture) => {
+    seedAwaitingApproval(fixture);
+    const before = readFileSync(fixture.statePath);
+
+    const result = runCLI(fixture, ["project", "--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.skipped, "gitea-disabled");
+    assert.equal(report.gitea.skipped, "gitea-disabled");
+    assert.equal(report.notify.skipped, "no-notify-command");
+    // The whole ledger must never reach stdout: projectProposals() returns it, and printing it
+    // would put evidence quotations and issue payloads into terminal scrollback and logs.
+    assert.equal(Object.hasOwn(report, "state"), false);
+    assert.equal(Object.hasOwn(report.gitea, "state"), false);
+
+    assert.deepEqual(readFileSync(fixture.statePath), before);
+  });
+});
+
+// `--dry-run` answers from the ledger alone: no forge request, no notifier subprocess, no write.
+// A proposal whose issue is current can only be resolved by reading its labels, so it is reported
+// as a check rather than as a decision this command could predict.
+test("project --dry-run reports what each projection would do and writes nothing", () => {
+  withFixture("project-plan", (fixture) => {
+    seedAwaitingApproval(fixture);
+    const before = readFileSync(fixture.statePath);
+
+    const result = runCLI(fixture, ["project", "--dry-run", "--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.dryRun, true);
+    assert.equal(report.gitea.enabled, false);
+    assert.deepEqual(report.gitea.create, [{ kind: "role", key: "openai:gpt-sol" }]);
+    assert.deepEqual(report.gitea.close, []);
+    assert.deepEqual(report.gitea.supersede, []);
+    assert.deepEqual(report.gitea.check, []);
+    assert.equal(report.notify.configured, false);
+    // `proposal-opened` is structurally gated on an issue link, so a proposal that has never been
+    // projected owes no push -- a notification with nothing actionable in it is worse than none.
+    assert.deepEqual(report.notify.push, []);
+
+    assert.deepEqual(readFileSync(fixture.statePath), before);
+  });
+});
+
+// The local decision surface exists because an operator has to be able to decide a proposal while
+// the forge is unreachable or the projection is still switched off. A decision is recorded ONCE:
+// the second one is refused, rather than overwriting the first.
+test("approve records a local decision and a decided proposal cannot be decided again", () => {
+  withFixture("approve", (fixture) => {
+    seedAwaitingApproval(fixture);
+
+    const approved = runCLI(fixture, ["approve", TRANSITION_ID, "--note", "checked the release notes"]);
+    assert.equal(approved.status, 0, approved.stderr);
+    const record = readLedger(fixture).roles["openai:gpt-sol"];
+    assert.equal(record.state, "approved");
+    assert.equal(record.approval.decision, "approved");
+    assert.equal(record.approval.source, "cli");
+    assert.equal(record.approval.note, "checked the release notes");
+    assert.equal(Number.isFinite(record.approval.at), true);
+    assert.equal(record.transitions.at(-1), "approved");
+    // Routing is untouched by a decision: it records policy in the ledger and nothing else.
+    assert.deepEqual(readdirSync(fixture.stateRoot).sort(),
+      ["model-reconciliation.json", "resolvable-models.json"]);
+
+    const again = runCLI(fixture, ["reject", TRANSITION_ID]);
+    assert.equal(again.status, 1);
+    assert.match(again.stderr, /not awaiting-approval/);
+    assert.equal(readLedger(fixture).roles["openai:gpt-sol"].approval.decision, "approved");
+  });
+});
+
+test("reject records a local rejection with no note", () => {
+  withFixture("reject", (fixture) => {
+    seedAwaitingApproval(fixture);
+    const result = runCLI(fixture, ["reject", TRANSITION_ID]);
+    assert.equal(result.status, 0, result.stderr);
+    const record = readLedger(fixture).roles["openai:gpt-sol"];
+    assert.equal(record.state, "rejected");
+    assert.equal(record.approval.decision, "rejected");
+    assert.equal(record.approval.source, "cli");
+    assert.equal(record.approval.note, null);
+  });
+});
+
+// A decided proposal must not leave an open issue asking a human for a label nothing reads: a label
+// applied to it afterwards would be a silent no-op. The pointer is MOVED so the next projection
+// closes it, which is also why the decision does not clear it outright.
+test("a local decision moves an open issue pointer so the projection can close it", () => {
+  withFixture("decide-issue", (fixture) => {
+    seedAwaitingApproval(fixture, {
+      issue: {
+        number: 77, url: "https://git.arch.fyi/opencode/opencode-broker/issues/77",
+        revision: "stale", createdAt: 1, commentedAt: null, reopenedAt: null, refusedAt: null, closedAt: null,
+      },
+    });
+    assert.equal(runCLI(fixture, ["reject", TRANSITION_ID]).status, 0);
+    const record = readLedger(fixture).roles["openai:gpt-sol"];
+    assert.equal(record.issue, null);
+    assert.equal(record.supersededIssue.number, 77);
+    assert.equal(record.supersededIssue.reason, "decided-rejected");
+    assert.equal(record.supersededIssue.commentedAt, null);
+  });
+});
+
+// An amendment is what an operator uses instead of editing the issue text, so it has to change the
+// stored proposal AND invalidate the decision the old text was asking for.
+test("amend changes the proposed tiers, clears the decision and bumps the proposal revision", () => {
+  withFixture("amend", (fixture) => {
+    seedAwaitingApproval(fixture, { approval: null });
+
+    const result = runCLI(fixture, ["amend", TRANSITION_ID, "--tiers", "smart,build"]);
+    assert.equal(result.status, 0, result.stderr);
+    const record = readLedger(fixture).roles["openai:gpt-sol"];
+    assert.deepEqual(record.proposedTiers, ["smart", "build"]);
+    assert.equal(record.state, "awaiting-approval");
+    assert.equal(record.approval, null);
+
+    // A successful amend always moves the revision, so an amend that would change nothing is
+    // refused rather than reported as a change that did not happen. A repeated tier carries no
+    // meaning, so restating the same list with one is still nothing.
+    const noop = runCLI(fixture, ["amend", TRANSITION_ID, "--tiers", "smart,build,build"]);
+    assert.equal(noop.status, 1);
+    assert.match(noop.stderr, /changes nothing/);
+  });
+});
+
+// Tier order IS part of the proposal: the tier list is ordered, so a reordering is an amendment and
+// has to supersede the open issue rather than reproduce its revision.
+test("amend treats a reordering as a change", () => {
+  withFixture("amend-order", (fixture) => {
+    seedAwaitingApproval(fixture, { proposedTiers: ["smart", "build"] });
+    assert.equal(runCLI(fixture, ["amend", TRANSITION_ID, "--tiers", "build,smart"]).status, 0);
+    assert.deepEqual(readLedger(fixture).roles["openai:gpt-sol"].proposedTiers, ["build", "smart"]);
+  });
+});
+
+// CRITICAL: NEITHER DECISION SURFACE MAY APPROVE A MAPPING THAT DOES NOT EXIST. An unknown
+// candidate names no role and no tiers, so approving it would mean guessing both. The mapping is
+// supplied by `amend`, and only then can the approval land.
+test("approve refuses an unmapped candidate until amend supplies the role and tiers", () => {
+  withFixture("approve-unmapped", (fixture) => {
+    seedLedger(fixture, { unknown: { [UNKNOWN_TRANSITION_ID]: UNMAPPED_RECORD } });
+
+    const refused = runCLI(fixture, ["approve", UNKNOWN_TRANSITION_ID]);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /no role mapping is proposed/);
+    assert.equal(readLedger(fixture).unknown[UNKNOWN_TRANSITION_ID].state, "awaiting-approval");
+    assert.equal(readLedger(fixture).unknown[UNKNOWN_TRANSITION_ID].approval, null);
+
+    const amended = runCLI(fixture,
+      ["amend", UNKNOWN_TRANSITION_ID, "--role", "openai:gpt-sol", "--tiers", "smart"]);
+    assert.equal(amended.status, 0, amended.stderr);
+    assert.equal(runCLI(fixture, ["approve", UNKNOWN_TRANSITION_ID]).status, 0);
+    const record = readLedger(fixture).unknown[UNKNOWN_TRANSITION_ID];
+    assert.equal(record.state, "approved");
+    assert.equal(record.roleKey, "openai:gpt-sol");
+    assert.equal(record.roleID, "gpt-sol");
+    assert.deepEqual(record.proposedTiers, ["smart"]);
+  });
+});
+
+// A role that belongs to a different provider would route an OpenAI model into an Anthropic lane
+// and judge its evidence against the wrong official domains.
+test("amend refuses a role from another provider and a role this deployment does not define", () => {
+  withFixture("amend-role-guard", (fixture) => {
+    seedLedger(fixture, { unknown: { [UNKNOWN_TRANSITION_ID]: UNMAPPED_RECORD } });
+
+    const wrongProvider = runCLI(fixture,
+      ["amend", UNKNOWN_TRANSITION_ID, "--role", "anthropic:claude-opus", "--tiers", "smart"]);
+    assert.equal(wrongProvider.status, 1);
+    assert.match(wrongProvider.stderr, /provider/);
+
+    const noSuchRole = runCLI(fixture,
+      ["amend", UNKNOWN_TRANSITION_ID, "--role", "openai:gpt-imaginary", "--tiers", "smart"]);
+    assert.equal(noSuchRole.status, 1);
+    assert.match(noSuchRole.stderr, /openai:gpt-imaginary/);
+
+    assert.equal(readLedger(fixture).unknown[UNKNOWN_TRANSITION_ID].roleKey, undefined);
+  });
+});
+
+// A tier name the registry does not define is a command line that cannot be carried out, and
+// accepting it would write a proposal whose approval promotes a model into a lane that does not
+// exist -- silently, because routing would simply never read it.
+test("amend refuses a tier the registry does not define", () => {
+  withFixture("amend-bad-tier", (fixture) => {
+    seedAwaitingApproval(fixture);
+    const result = runCLI(fixture, ["amend", TRANSITION_ID, "--tiers", "smart,frobnicate"]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /frobnicate/);
+    assert.match(result.stderr, /classifier/);
+    assert.deepEqual(readLedger(fixture).roles["openai:gpt-sol"].proposedTiers, ["smart"]);
+  });
+});
+
+test("a decision on an unknown proposal exits 1 and a malformed command line exits 2", () => {
+  withFixture("decide-usage", (fixture) => {
+    seedAwaitingApproval(fixture);
+
+    const missing = runCLI(fixture, ["approve", "ffffffffffffffffffffffff"]);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /ffffffffffffffffffffffff/);
+
+    assert.equal(runCLI(fixture, ["approve"]).status, 2);
+    assert.equal(runCLI(fixture, ["amend", TRANSITION_ID]).status, 2);
+    assert.equal(runCLI(fixture, ["amend", TRANSITION_ID, "--tiers"]).status, 2);
+    assert.equal(runCLI(fixture, ["approve", TRANSITION_ID, "--note"]).status, 2);
+    assert.equal(runCLI(fixture, ["frobnicate"]).status, 2);
+    assert.equal(runCLI(fixture, ["project", "--apply"]).status, 2);
+
+    // Not one of those attempts touched the record.
+    assert.equal(readLedger(fixture).roles["openai:gpt-sol"].state, "awaiting-approval");
+    assert.equal(readLedger(fixture).roles["openai:gpt-sol"].approval, null);
+  });
+});
+
+// The queue is a diagnostic an operator prints routinely, so it must be a pure read: a status
+// command that took the writer lock would block the collector it is being run to investigate.
+test("evidence-status reports the queue without taking the writer lock", () => {
+  withFixture("evidence-status", (fixture) => {
+    const empty = runCLI(fixture, ["evidence-status", "--json"]);
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.deepEqual(JSON.parse(empty.stdout), { requests: 0, pending: 0, claimed: 0, failed: 0 });
+    // Nothing reconciled yet is an ANSWER, not a reason to create the ledger.
+    assert.equal(existsSync(fixture.statePath), false);
+
+    assert.equal(runCLI(fixture, ["dry-run", "--json"]).status, 0);
+    const before = readFileSync(fixture.statePath);
+
+    const result = runCLI(fixture, ["evidence-status", "--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const status = JSON.parse(result.stdout);
+    assert.deepEqual(Object.keys(status).sort(), ["claimed", "failed", "pending", "requests"]);
+    assert.deepEqual(status, { requests: 1, pending: 1, claimed: 0, failed: 0 });
+
+    assert.deepEqual(readFileSync(fixture.statePath), before);
+    assert.deepEqual(readdirSync(fixture.stateRoot).sort(),
+      ["model-reconciliation.json", "resolvable-models.json"]);
+
+    const human = runCLI(fixture, ["evidence-status"]);
+    assert.equal(human.status, 0, human.stderr);
+    assert.equal(human.stdout, "1 request, 1 pending, 0 claimed, 0 failed\n");
+  });
+});
+
+// The Gitea token is the one credential in this package, and no command on this surface holds a
+// reason to print it or to name the endpoint it would travel to.
+test("no command prints a credential or names a network endpoint", () => {
+  withFixture("no-credential", (fixture) => {
+    seedAwaitingApproval(fixture);
+    for (const argv of [
+      ["status", "--json"],
+      ["project", "--json"],
+      ["project", "--dry-run", "--json"],
+      ["evidence-status", "--json"],
+      ["amend", TRANSITION_ID, "--tiers", "smart,build"],
+      ["approve", TRANSITION_ID],
+    ]) {
+      const result = runCLI(fixture, argv);
+      assert.equal(result.status, 0, `${argv.join(" ")}: ${result.stderr}`);
+      const output = `${result.stdout}\n${result.stderr}`;
+      assert.doesNotMatch(output, /token|Authorization/i, argv.join(" "));
+      assert.doesNotMatch(output, /https?:\/\//, argv.join(" "));
+    }
   });
 });

@@ -470,6 +470,22 @@ test("an issue already closed on the forge is cleared without a new comment", as
   assert.equal(store.read().roles["openai:gpt-sol"].supersededIssue, null);
 });
 
+// A pointer moved by `opencode-broker-reconcile approve|reject` is closed by the same pass, but it
+// must NOT be explained as a supersession: nothing was withdrawn and the proposal was decided, so
+// the supersession text ("nothing was applied", "the provider now publishes ...") would be untrue.
+test("an issue closed by a local decision says so instead of claiming a supersession", async () => {
+  const store = storeWithSupersededIssue({ reason: "decided-rejected" });
+  const forged = forge();
+  const result = await project({ store, client: forged.client });
+  assert.deepEqual(result.closed, [{ kind: "role", key: "openai:gpt-sol" }]);
+  const comment = forged.calls.find((call) => call.path.endsWith("/comments")).body.body;
+  assert.match(comment, /opencode-broker-reconcile reject/);
+  assert.doesNotMatch(comment, /superseded/i);
+  assert.doesNotMatch(comment, /no longer the one under consideration/);
+  assert.equal(forged.calls.find((call) => call.method === "PATCH").body.state, "closed");
+  assert.equal(store.read().roles["openai:gpt-sol"].supersededIssue, null);
+});
+
 test("a pointer with no issue number is never sent to the forge", async () => {
   const forged = forge();
   const record = awaitingRecord({ supersededIssue: null });

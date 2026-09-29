@@ -305,7 +305,7 @@ fraction). That is the number to size a slot's context and a server's slot count
 names each model's top callers: `opencode` for routed sessions, and for the gateway the client
 address and the model name it asked for.
 
-## Model discovery and the reconciliation dry run
+## Model discovery and the reconciliation lifecycle
 
 Discovery adopts a newer model in a family the broker already routes on, but only what the
 family table maps and only what this host can actually address. `opencode-broker-watch`
@@ -316,8 +316,14 @@ human still has to judge. **It remains the live publisher.**
 `opencode-broker-reconcile` is the review side of the same question, and it publishes nothing:
 
 ```sh
-opencode-broker-reconcile dry-run [--json]   # refresh isolated inputs, record observations, report
-opencode-broker-reconcile status [--json]    # the bounded projection of what was recorded
+opencode-broker-reconcile dry-run [--json]         # refresh isolated inputs, record observations
+opencode-broker-reconcile status [--json]          # the bounded projection of what was recorded
+opencode-broker-reconcile evidence-status [--json] # the evidence request queue
+opencode-broker-evidence [--json] [--max N]        # collect official evidence for queued candidates
+opencode-broker-reconcile project [--json] [--dry-run]   # present proposals, read decisions, announce
+opencode-broker-reconcile approve <transitionID> [--note TEXT]
+opencode-broker-reconcile reject  <transitionID> [--note TEXT]
+opencode-broker-reconcile amend   <transitionID> --tiers a,b [--role provider:roleID]
 ```
 
 - **The ledger is the only thing it writes.** `dry-run` records candidate observations in
@@ -325,9 +331,9 @@ opencode-broker-reconcile status [--json]    # the bounded projection of what wa
   [docs/STATE.md](docs/STATE.md)), under an exclusive mkdir lock, and mutates nothing else.
 - **It does not publish inventory or alter routing.** It computes the inventory the broker
   *would* be handed, through the same pure builder live publication uses, and returns it for
-  review. It posts nothing to the broker, changes no target's eligibility, sends no
-  notification and opens no issue. Evidence collection, approval, probing and probation are
-  later packages; until they exist, nothing here can activate a model.
+  review. It posts nothing to the broker, changes no target's eligibility and runs no probe. An
+  approval records that a human said yes, in the ledger, and stops there -- probing, probation
+  and the deployment cutover are later packages, so nothing here can activate a model.
 - **Its refreshes are isolated.** `opencode models` is run against a scratch `XDG_CACHE_HOME`
   that is deleted afterwards, and `opencode models --pure` is parsed in memory, so neither the
   live models.dev cache nor `resolvable-models.json` is touched -- not their bytes, not their
@@ -342,9 +348,84 @@ opencode-broker-reconcile status [--json]    # the bounded projection of what wa
   reports which of its keys a future import would cover; the import and the deletion of that
   file happen in a later package.
 
-Exit codes: `0` the command completed (a report full of blocked candidates is still a completed
-report), `1` corrupt state, unusable config, or no readable source at all, `2` a bad command or
-flag.
+Exit codes: `0` the command completed (a report full of blocked candidates, and a projection that
+is switched off, are still completed runs), `1` corrupt state, unusable config, no readable source,
+a projection failure, or a decision that could not be applied, `2` a bad command or flag.
+
+### Evidence, collected through the gateway
+
+A candidate sits at `evidence-pending` until the provider's own words justify it. `dry-run`
+queues one bounded request per candidate; `opencode-broker-evidence` claims one at a time under a
+30-minute lease and runs
+
+```sh
+opencode run --agent researcher --model fleet-gateway/smart
+```
+
+That agent is **read-only and holds no credential**: none in its environment, none in its argv,
+and no write path into the ledger. Its only channel is stdout, parsed by a separate process as
+exactly one JSON object. It is *not* filesystem-isolated -- it runs as the same user and can read,
+so no file mode hides anything from it, and this package claims no such isolation. What it cannot
+do is write: the Gitea token is write-scoped to issues on one repository, and a payload whose
+serialized form quotes the token value is refused outright.
+
+A claim is accepted only when it is HTTPS, on one of the matched role's own `evidenceDomains`, and
+names the exact candidate model, provider and role the request was raised for. A newer release
+date is never sufficient. Only `successor`, `recommended-replacement`, `new-role` and `role-change`
+can drive anything; `stronger`, `faster` and `cheaper` are stored as supporting quotes and never
+decide. Five attempts, with a 24-hour cooldown after a failure. `evidence-status` prints the queue
+without taking the writer lock, so it is safe to run while a collector holds a claim.
+
+### One automatic answer, and one question
+
+An unambiguous **same-role successor** the provider itself named becomes `auto-eligible` on its
+own. Everything else -- an unmapped candidate, a registry conflict, a claimed role change, evidence
+that contradicts itself, comparative quotes only -- becomes `awaiting-approval` and waits for a
+human.
+
+### Proposals, decisions and announcements
+
+`project` runs the Gitea projection and then the ntfy projection, in that order. **Both ship OFF**
+(`reconcile.gitea.enabled` defaults to `false`, and `reconcile.notifyCommand` defaults to
+`watch.notifyCommand`, which is itself empty unless you set it), so a fresh install performs no
+external write at all. `project --dry-run` reports what each would do from the ledger alone -- no
+forge request, no notifier subprocess, no write.
+
+- **One issue per open proposal**, keyed by proposal revision. Decide it by applying exactly ONE
+  label: `decision/approved` applies the proposal exactly as the ledger stored it, and
+  `decision/rejected` records the rejection and stops proposing that candidate.
+- **The label is the decision, and the issue text is not.** Editing the body changes nothing; an
+  operator who wants a different mapping uses `amend`, which bumps the revision and so supersedes
+  the issue the old text asked about.
+- **Both labels at once is a conflict that changes nothing** -- not a race whichever was read
+  first wins.
+- **Closing an issue is not approval.** An issue closed with no decision label is reopened exactly
+  once, with instructions; closed undecided again it stays closed, and the proposal stays
+  undecided in the ledger.
+- **An unmapped candidate cannot be approved from either surface.** `decision/approved` on one is
+  refused with a comment naming the `amend` that supplies the mapping.
+- **Five notification events**, one push each, through the same `notifyCommand` argv the watch jobs
+  use: `proposal-opened`, `auto-eligible`, `decision-applied`, `blocked` and `superseded`.
+  `proposal-opened` is gated on the issue link it carries, so enabling ntfy without Gitea drops
+  proposal alerts -- enable the two together.
+- **Duplicate suppression covers completed runs, not a crash mid-sequence.** A rerun over unchanged
+  state creates no second issue, comment or push. A crash *between* an external write and the
+  ledger marker that records it can duplicate one issue or one push on restart; closing that window
+  needs an issue search keyed by proposal revision or an ntfy idempotency key, and neither exists
+  yet. The blast radius is one extra issue or push, and the decision logic is unaffected.
+
+`approve`, `reject` and `amend` are the same decisions made locally, for when the forge is
+unreachable or the projection is still off. They write `approval.source: "cli"`, refuse a record
+that is not `awaiting-approval`, refuse to approve an unmapped candidate with the same message the
+label path gives, and move any open issue pointer so the next `project` run closes it with a
+comment saying which command decided it. `amend` validates its tiers against the registry's own
+tier names, refuses a role from another provider, clears the pending decision, and leaves the
+proposal `awaiting-approval`.
+
+The Gitea token is read from a deployment-provisioned mode-0600 drop file
+(`reconcile.gitea.tokenPath`, default `~/.config/opencode-broker/gitea-token`), never from a secret
+agent, and travels only in an `Authorization` header -- never in a URL, in argv, in issue text, in
+the ledger or in an error message.
 
 ## The gateway
 
@@ -571,7 +652,8 @@ share records.
 |---|---|
 | `bin/opencode-broker` | The daemon and its CLI: `serve`, `status`, `selection`, `decisions [n]`, `rearm [target or provider:<id>]`, `quarantine provider:<id>`. |
 | `bin/opencode-broker-watch` | Run daily: refreshes opencode's model catalog and its resolver view (`opencode models --pure`, stored as `resolvable-models.json` in the routing state directory), republishes the broker's inventory, and reports new models and newer releases of the ones you pin through `watch.notifyCommand`. Catalog discovery admits only models present in that resolver view, so a catalog entry this host cannot address never becomes a routing target; until the first run writes the view, discovery admits nothing and every tier stays on its configured targets. |
-| `bin/opencode-broker-reconcile` | The reconciliation dry run: `dry-run [--json]` and `status [--json]`. Refreshes isolated catalog and resolver views, records provider-role candidate observations in `model-reconciliation.json`, and reports stale or unresolved blockers plus the proposed inventory -- without publishing inventory or altering routing. |
+| `bin/opencode-broker-reconcile` | The reconciliation operator surface: `dry-run`, `status`, `evidence-status`, `project`, `approve`, `reject`, `amend`. Refreshes isolated catalog and resolver views, records provider-role candidate observations in `model-reconciliation.json`, presents open proposals as Gitea issues and announces each transition -- without publishing inventory, probing, or altering routing. |
+| `bin/opencode-broker-evidence` | Collects official provider evidence for queued candidates by running a read-only `researcher` agent through the fleet gateway, validating exactly one JSON object from its stdout against the role's own official domains, and storing the accepted claims. It holds the only credential in that sequence so a payload quoting it can be refused; the agent itself holds none and cannot write. |
 | `plugin/router.js` | Leases a model at `chat.message`, tracks each session's context size, reports usage and failures, enforces profile tool rules, waits out a busy or loading local model, and stops a turn the burn watch flags. |
 | `plugin/model-default.js`, `tui/` | Start new sessions on the model you last picked by hand. |
 | `plugin/compaction-guard.js` | Works around three compaction failures seen with opencode 1.18: a resumed summary parented to the wrong message (so the next turn resends the whole history), overflow and auto-compaction repeating without end, and a context-pruning plugin treating a cancelled compaction as a finished one. It uses only stock hooks and routes. |

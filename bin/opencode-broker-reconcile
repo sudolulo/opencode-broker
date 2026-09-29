@@ -1,78 +1,328 @@
 #!/usr/bin/env node
-// opencode-broker-reconcile: the operator surface of the model reconciler's DRY RUN.
+// opencode-broker-reconcile: the operator surface of the model reconciler.
 //
-// Two commands, and both of them are safe by construction:
-//   dry-run  refresh isolated catalog/resolver views, record candidate observations in the
-//            reconciliation ledger, and report what the broker WOULD be handed;
-//   status   print the bounded projection of that ledger.
+// Seven commands, and none of them touches routing:
+//   dry-run          refresh isolated catalog/resolver views, record candidate observations in the
+//                    reconciliation ledger, and report what the broker WOULD be handed;
+//   status           print the bounded projection of that ledger;
+//   evidence-status  print the evidence request queue;
+//   project          present open proposals as Gitea issues, read the decision labels back, then
+//                    push one ntfy event per transition. Both projections ship OFF;
+//   approve/reject   record a decision on a stored proposal from this terminal;
+//   amend            replace the role and tiers a proposal offers, and await a fresh decision.
 //
 // CRITICAL: THIS FILE IS DELIBERATELY THIN, AND THAT IS THE SAFETY PROPERTY. Every rule worth
 // trusting -- the scratch XDG_CACHE_HOME the refresh runs under, the 48h/72h stale gates, the
-// conflict and unresolvable classifications, the mkdir lock, the atomic ledger write -- lives in
-// lib/model-reconcile.js and lib/reconcile-state.js, where it is unit-tested without a
-// subprocess. Catalog, state or routing logic added here would be logic no such test covers, and
-// the CLI is the one caller a human runs by hand against live state.
+// conflict and unresolvable classifications, the mkdir lock, the atomic ledger write, the
+// awaiting-approval gate on a decision, the refusal to approve an unmapped candidate, the tier
+// validation, the issue idempotence markers -- lives in lib/model-reconcile.js,
+// lib/reconcile-state.js, lib/reconcile-gitea.js and lib/reconcile-notify.js, where it is
+// unit-tested without a subprocess. Catalog, state, decision or routing logic added here would be
+// logic no such test covers, and the CLI is the one caller a human runs by hand against live state.
 //
-// CRITICAL: NOTHING IS PUBLISHED. There is no flag that makes this apply anything: it posts no
-// inventory to the broker, alters no routing, sends no notification and opens no issue. Evidence
-// collection, approvals, probes, probation and the deployment cutover are Packages 2-4, and each
-// of them is part of what makes publication safe -- so an `--apply` bolted on here would activate
-// a model no human has looked at. opencode-broker-watch remains the live publisher.
-import { CONFIG_ERROR } from "../lib/config.js";
+// CRITICAL: NO INVENTORY IS PUBLISHED AND NO MODEL IS ACTIVATED. There is no flag that makes this
+// apply anything to routing: it posts no inventory to the broker, alters no target's eligibility,
+// runs no probe. An approval records that a human said yes, in the ledger, and stops there --
+// probing, probation and the deployment cutover are Packages 3 and 4, and each of them is part of
+// what makes publication safe. opencode-broker-watch remains the live publisher.
+import { CONFIG, CONFIG_ERROR } from "../lib/config.js";
 import {
   formatDryRunReport,
   formatReconciliationStatus,
   readReconciliationStatus,
   runDryReconciliation,
 } from "../lib/model-reconcile.js";
+import { evidenceQueueStatus } from "../lib/reconcile-evidence.js";
+import {
+  amendProposal,
+  applyLocalDecision,
+  createGiteaClient,
+  parseProposedTiers,
+  planProposalProjection,
+  projectProposals,
+} from "../lib/reconcile-gitea.js";
+import { deliverNotifications, pendingNotifications } from "../lib/reconcile-notify.js";
 import { createReconciliationStore } from "../lib/reconcile-state.js";
 
-const USAGE = "usage: opencode-broker-reconcile dry-run [--json] | status [--json]";
+const USAGE = [
+  "usage: opencode-broker-reconcile <command>",
+  "  dry-run [--json]                      refresh isolated inputs, record observations, report",
+  "  status [--json]                       the bounded projection of what was recorded",
+  "  evidence-status [--json]              the evidence request queue",
+  "  project [--json] [--dry-run]          project proposals to Gitea, then announce transitions",
+  "  approve <transitionID> [--note TEXT]  record a local approval of the stored proposal",
+  "  reject <transitionID> [--note TEXT]   record a local rejection of the stored proposal",
+  "  amend <transitionID> --tiers a,b [--role provider:roleID]",
+  "                                        replace the proposed mapping; a fresh decision is needed",
+].join("\n");
 
-// 0 completed (a report full of blocked candidates is still a completed report), 1 something was
-// wrong with the state, the config or the sources, 2 the command line itself.
+// 0 completed (a report full of blocked candidates, and a projection that is switched off, are
+// still completed runs), 1 something was wrong with the state, the config, the sources, the forge
+// or the decision, 2 the command line itself.
 const EXIT_OK = 0;
 const EXIT_ERROR = 1;
 const EXIT_USAGE = 2;
 
+// A transitionID is a 24-character sha256 prefix, exactly as the ledger, the issue title and the
+// notification body print it.
+const TRANSITION_ID = /^[0-9a-f]{24}$/;
+const ROLE_KEY = /^[a-z0-9][a-z0-9-]{0,99}:[a-z0-9][a-z0-9-]{0,99}$/;
+
 const complain = (message) => process.stderr.write(`opencode-broker-reconcile: ${message}\n`);
 
-const run = (argv) => {
-  const [command, ...flags] = argv;
-  if (command !== "dry-run" && command !== "status") {
-    complain(`${command === undefined ? "no command given" : `unknown command "${command}"`}\n${USAGE}`);
-    return EXIT_USAGE;
+// ---- argument parsing ---------------------------------------------------------------------------
+// Flags are recognized PER COMMAND, and an unrecognized one is REFUSED rather than ignored: a
+// caller who typed --apply or --publish must never have it silently dropped and come away believing
+// this command can do either.
+
+const FLAG_ONLY = Object.freeze({
+  "dry-run": ["--json"],
+  status: ["--json"],
+  "evidence-status": ["--json"],
+  project: ["--json", "--dry-run"],
+});
+const DECISIONS = Object.freeze({ approve: "approved", reject: "rejected" });
+
+const parseFlags = (command, argv) => {
+  const allowed = FLAG_ONLY[command];
+  const flags = { json: false, dryRun: false };
+  for (const flag of argv) {
+    if (!allowed.includes(flag)) return { error: `unknown option "${flag}"` };
+    if (flag === "--json") flags.json = true;
+    if (flag === "--dry-run") flags.dryRun = true;
   }
-  let json = false;
-  for (const flag of flags) {
-    // Exactly one flag is recognized, and an unrecognized one is REFUSED rather than ignored: a
-    // caller who typed --apply or --publish must never have it silently dropped and come away
-    // believing this command can do either.
-    if (flag === "--json") { json = true; continue; }
-    complain(`unknown option "${flag}"\n${USAGE}`);
+  return { command, ...flags };
+};
+
+const parseTransitionID = (value) => {
+  if (value === undefined) return { error: "a transition id is required" };
+  if (!TRANSITION_ID.test(value)) return { error: `"${value}" is not a transition id` };
+  return { transitionID: value };
+};
+
+const parseDecision = (command, argv) => {
+  const [id, ...flags] = argv;
+  const parsed = parseTransitionID(id);
+  if (parsed.error) return parsed;
+  let note = null;
+  for (let index = 0; index < flags.length; index += 1) {
+    if (flags[index] !== "--note") return { error: `unknown option "${flags[index]}"` };
+    note = flags[index + 1];
+    index += 1;
+    if (note === undefined) return { error: "--note needs the text to record" };
+  }
+  return { command, decision: DECISIONS[command], transitionID: parsed.transitionID, note };
+};
+
+const parseAmend = (argv) => {
+  const [id, ...flags] = argv;
+  const parsed = parseTransitionID(id);
+  if (parsed.error) return parsed;
+  let tiers;
+  let roleKey = null;
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index];
+    const value = flags[index + 1];
+    if (flag !== "--tiers" && flag !== "--role") return { error: `unknown option "${flag}"` };
+    if (value === undefined) return { error: `${flag} needs a value` };
+    index += 1;
+    if (flag === "--tiers") {
+      // Validated HERE, while parsing, so a tier the registry does not define is reported as the
+      // bad command line it is rather than as a proposal that failed to amend.
+      try {
+        tiers = parseProposedTiers(value);
+      } catch (error) {
+        return { error: `--tiers: ${error?.message ?? String(error)}` };
+      }
+      continue;
+    }
+    if (!ROLE_KEY.test(value)) return { error: `--role: "${value}" is not a providerID:roleID role key` };
+    roleKey = value;
+  }
+  if (tiers === undefined) return { error: "amend needs --tiers with the tiers the proposal should offer" };
+  return { command: "amend", transitionID: parsed.transitionID, tiers, roleKey };
+};
+
+const parseArgs = (argv) => {
+  const [command, ...rest] = argv;
+  if (command === undefined) return { error: "no command given" };
+  if (Object.hasOwn(FLAG_ONLY, command)) return parseFlags(command, rest);
+  if (Object.hasOwn(DECISIONS, command)) return parseDecision(command, rest);
+  if (command === "amend") return parseAmend(rest);
+  return { error: `unknown command "${command}"` };
+};
+
+// ---- the commands -------------------------------------------------------------------------------
+
+const write = (text) => process.stdout.write(`${text}\n`);
+
+const writeReport = (json, value, format) => write(json ? JSON.stringify(value, null, 2) : format(value));
+
+const formatQueue = (queue) =>
+  `${queue.requests} request${queue.requests === 1 ? "" : "s"}, ${queue.pending} pending, ` +
+  `${queue.claimed} claimed, ${queue.failed} failed`;
+
+const countEntries = (label, entries) => `${entries.length} ${label}`;
+
+const formatPlan = (report) => [
+  `project --dry-run: gitea ${report.gitea.enabled ? "enabled" : "disabled"}, ` +
+    `notifier ${report.notify.configured ? "configured" : "not configured"}`,
+  `gitea would: ${[
+    countEntries("issues created", report.gitea.create),
+    countEntries("superseded", report.gitea.supersede),
+    countEntries("closed", report.gitea.close),
+    countEntries("label reads", report.gitea.check),
+  ].join(", ")}`,
+  `notifications would push: ${report.notify.push.length}`,
+  ...report.notify.push.map((entry) => `  ${entry.event} ${entry.kind} ${entry.key}`),
+  ...report.gitea.errors.map((entry) => `  error ${entry.kind} ${entry.key}: ${entry.error}`),
+].join("\n");
+
+const formatProjection = (report) => [
+  ...(report.gitea.skipped ? [`gitea: skipped (${report.gitea.skipped})`] : [
+    `gitea: ${[
+      countEntries("created", report.gitea.created),
+      countEntries("closed", report.gitea.closed),
+      countEntries("superseded", report.gitea.superseded),
+      countEntries("reopened", report.gitea.reopened),
+      countEntries("conflicts", report.gitea.conflicts),
+      countEntries("errors", report.gitea.errors),
+    ].join(", ")}`,
+  ]),
+  ...report.gitea.conflicts.map((entry) => `  conflict ${entry.kind} ${entry.key}: two decision labels, nothing applied`),
+  ...report.gitea.errors.map((entry) => `  error ${entry.kind} ${entry.key}: ${entry.error}`),
+  ...(report.notify.skipped ? [`notifications: skipped (${report.notify.skipped})`] : [
+    `notifications: ${[
+      countEntries("delivered", report.notify.delivered),
+      countEntries("failed", report.notify.failed),
+      countEntries("retrying", report.notify.pending),
+    ].join(", ")}`,
+  ]),
+  ...report.notify.failed.map((entry) => `  gave up on ${entry.event} ${entry.kind} ${entry.key}: ${entry.error}`),
+].join("\n");
+
+const projectDryRun = (store, json) => {
+  // Read once and planned from those bytes: no forge request, no notifier subprocess, no write.
+  const state = store.read();
+  const report = {
+    dryRun: true,
+    gitea: planProposalProjection(state),
+    notify: {
+      configured: CONFIG.reconcile.notifyCommand.length > 0,
+      push: pendingNotifications(state).map(({ kind, key, event }) => ({ kind, key, event })),
+    },
+  };
+  writeReport(json, report, formatPlan);
+  return EXIT_OK;
+};
+
+const project = async (store, json) => {
+  const gitea = CONFIG.reconcile.gitea;
+  // Constructed only when the publisher is ON, so a deployment with the projection switched off
+  // never reads the token file and can make no request at all.
+  const client = gitea.enabled === true
+    ? createGiteaClient({
+      baseURL: gitea.baseURL,
+      owner: gitea.owner,
+      repo: gitea.repo,
+      tokenPath: gitea.tokenPath,
+    })
+    : null;
+
+  // Gitea FIRST: `proposal-opened` carries the issue link a human is meant to follow, so a
+  // notification run before the issue exists would produce nothing for exactly the proposals that
+  // need announcing.
+  const projection = await projectProposals({ store, client });
+  const notify = deliverNotifications({ store });
+
+  const report = {
+    dryRun: false,
+    // Both projections skipped is the DEFAULT shape of a fresh install, and the Gitea reason is the
+    // one reported: it is the upstream gate, so a deployment that enabled only the notifier would
+    // still announce no proposals. Each projection's own reason is on its own object.
+    skipped: projection.skipped !== null && notify.skipped !== null ? projection.skipped : null,
+    gitea: {
+      skipped: projection.skipped,
+      created: projection.created,
+      closed: projection.closed,
+      superseded: projection.superseded,
+      reopened: projection.reopened,
+      conflicts: projection.conflicts,
+      errors: projection.errors,
+    },
+    notify: {
+      skipped: notify.skipped,
+      delivered: notify.delivered,
+      failed: notify.failed,
+      pending: notify.pending,
+    },
+  };
+  // CRITICAL: `projection.state` -- the WHOLE ledger, with every evidence quotation and issue
+  // payload in it -- is deliberately not in that object. `status` is bounded for the same reason.
+  writeReport(json, report, formatProjection);
+
+  // A two-label conflict and a retrying notification are reported, not failures: the first
+  // deliberately changes nothing and the second is still in flight. An unreachable forge and a
+  // notification that hit its attempt cap are failures nothing will resolve on its own.
+  return projection.errors.length || notify.failed.length ? EXIT_ERROR : EXIT_OK;
+};
+
+const decide = (store, { decision, transitionID, note }) => {
+  const decided = applyLocalDecision(store, transitionID, { decision, note: note ?? null });
+  write(`${decision} ${transitionID} (${decided.kind} ${decided.key})`);
+  return EXIT_OK;
+};
+
+const amend = (store, { transitionID, tiers, roleKey }) => {
+  const amended = amendProposal(store, transitionID, { tiers, roleKey });
+  write([
+    `amended ${transitionID} (${amended.kind} ${amended.key})`,
+    `  role: ${amended.record.roleKey ?? "none"}`,
+    `  tiers: ${(amended.record.proposedTiers ?? []).join(", ")}`,
+    "  awaiting a fresh decision; any open issue is superseded on the next project run",
+  ].join("\n"));
+  return EXIT_OK;
+};
+
+const run = async (argv) => {
+  const options = parseArgs(argv);
+  if (options.error) {
+    complain(`${options.error}\n${USAGE}`);
     return EXIT_USAGE;
   }
 
-  // A config that failed to parse leaves routing with NO targets, so every cataloged model would
-  // look like an unmapped novelty with no incumbent to beat. Those findings would all be
-  // artifacts of the broken config, which is worse than no findings.
+  // A config that failed to parse leaves routing with NO targets and the role registry derived from
+  // a file nobody could read, so every cataloged model would look like an unmapped novelty with no
+  // incumbent to beat and every amendment would be validated against the wrong roles. Those
+  // findings would all be artifacts of the broken config, which is worse than no findings.
   if (CONFIG_ERROR) {
     complain(`refusing to reconcile against an unusable config: ${CONFIG_ERROR}`);
     return EXIT_ERROR;
   }
 
   try {
-    // Defaults all the way down: the state root from the environment, the registry and the
-    // pinned targets from config, the sources from the isolating collector.
+    // Defaults all the way down: the state root from the environment, the registry, the pinned
+    // targets and the projection settings from config, the sources from the isolating collector.
     const store = createReconciliationStore();
-    if (command === "dry-run") {
+    if (options.command === "dry-run") {
       const report = runDryReconciliation({ store });
-      process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${formatDryRunReport(report)}\n`);
+      writeReport(options.json, report, formatDryRunReport);
       return EXIT_OK;
     }
-    const status = readReconciliationStatus(store);
-    process.stdout.write(json ? `${JSON.stringify(status, null, 2)}\n` : `${formatReconciliationStatus(status)}\n`);
-    return EXIT_OK;
+    if (options.command === "status") {
+      writeReport(options.json, readReconciliationStatus(store), formatReconciliationStatus);
+      return EXIT_OK;
+    }
+    if (options.command === "evidence-status") {
+      // A pure read, deliberately: this is what an operator runs WHILE a collector holds a claim.
+      writeReport(options.json, evidenceQueueStatus(store.read()), formatQueue);
+      return EXIT_OK;
+    }
+    if (options.command === "project") {
+      return options.dryRun ? projectDryRun(store, options.json) : await project(store, options.json);
+    }
+    if (options.command === "amend") return amend(store, options);
+    return decide(store, options);
   } catch (error) {
     complain(error?.message ?? String(error));
     return EXIT_ERROR;
@@ -81,4 +331,4 @@ const run = (argv) => {
 
 // exitCode rather than process.exit(): a report is large enough to still be draining down a pipe
 // when the process ends, and process.exit() would truncate it.
-process.exitCode = run(process.argv.slice(2));
+process.exitCode = await run(process.argv.slice(2));
