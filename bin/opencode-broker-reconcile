@@ -185,10 +185,14 @@ const formatProjection = (report) => [
       countEntries("closed", report.gitea.closed),
       countEntries("superseded", report.gitea.superseded),
       countEntries("reopened", report.gitea.reopened),
+      countEntries("cleared", report.gitea.cleared),
       countEntries("conflicts", report.gitea.conflicts),
       countEntries("errors", report.gitea.errors),
     ].join(", ")}`,
   ]),
+  // Named per entry, not just counted: the next run opens a fresh issue for that proposal, and an
+  // operator who deleted the old one deserves to see why a new number appeared.
+  ...report.gitea.cleared.map((entry) => `  issue #${entry.number} for ${entry.kind} ${entry.key} no longer exists; the pointer was cleared`),
   ...report.gitea.conflicts.map((entry) => `  conflict ${entry.kind} ${entry.key}: two decision labels, nothing applied`),
   ...report.gitea.errors.map((entry) => `  error ${entry.kind} ${entry.key}: ${entry.error}`),
   ...(report.notify.skipped ? [`notifications: skipped (${report.notify.skipped})`] : [
@@ -247,6 +251,7 @@ const project = async (store, json) => {
       closed: projection.closed,
       superseded: projection.superseded,
       reopened: projection.reopened,
+      cleared: projection.cleared,
       conflicts: projection.conflicts,
       errors: projection.errors,
     },
