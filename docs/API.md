@@ -38,6 +38,38 @@ IPv4 or IPv6 loopback address. A non-loopback peer is rejected before a control
 body is parsed. The broker enforces exact mode `0600` on the socket; that
 same-UID boundary is checked again before issuing a probe-launch nonce.
 
+## Reconciliation apply CLI
+
+`opencode-broker-reconcile` exposes the dormant Package 3 controls below. They
+are disabled by default. When `reconcile.apply.enabled` is not strictly `true`,
+each command exits 1 and prints
+`{ "ok": false, "code": "reconcile-apply-disabled", "mutated": false }`
+before constructing a store, collecting sources, reading generation paths, or
+calling the broker. Invalid command syntax exits 2 before that disabled gate.
+
+| Command | Purpose |
+|---|---|
+| `apply <transitionID> [--json] [--dry-run]` | Reserve and run one authorized transition through overlay, generation, staged policy, probes, and probation. |
+| `rollback <transitionID> --reason TEXT [--json] [--dry-run]` | Compare-and-swap the broker back to the recorded rollback model (including explicit `null`) and then acknowledge the observed broker result in the ledger. |
+| `refresh [--json] [--dry-run]` | Collect certified sources and apply every eligible or incomplete transition in stable transition order. |
+| `recover [transitionID] [--json] [--dry-run]` | Resume the first missing durable phase for one transition, or every incomplete transition when no ID is supplied. |
+
+`--dry-run` may perform the isolated source refresh but does not write the
+ledger, overlay, generation registry/bundles/current link, or broker policy; it
+does not run the generation renderer, open a probe child, or call any publisher.
+Its isolated source collection may run `opencode models --pure` against scratch
+cache state, exactly like the existing observational `dry-run`. The enabled
+production adapter takes the base resolver config from
+`OPENCODE_RECONCILE_BASE_CONFIG` when set, otherwise from
+`$XDG_CONFIG_HOME/opencode/opencode.json` (or `~/.config/opencode/opencode.json`),
+and uses the loopback gateway endpoint from `OPENCODE_RECONCILE_GATEWAY_URL` or
+`http://127.0.0.1:8790/v1/chat/completions`.
+
+The applier calls broker policy CAS for staging, probe rollback, probation, and
+operator rollback. Each operation has a deterministic transition/revision and
+is recovered through `GET /model-policy/status` before any replay. No separate
+reconciler writer or direct `broker.json` mutation exists.
+
 ## Fresh-process probe transport
 
 `createProbeClientFactory()` resolves and validates the registry-owned immutable

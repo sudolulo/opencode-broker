@@ -58,9 +58,61 @@ observation, written by `dry-run`:
 | `supersededIssue` | `opencode-broker-reconcile project`, `approve`, `reject` | An issue pointer moved off a proposal that is no longer the one being asked about, carrying `supersededAt` and (for a local decision) `reason`. The next `project` run comments and closes it, then clears the pointer |
 | `notified` | `opencode-broker-reconcile project` | One entry per announced event, keyed `event\|transitionID\|timestamp`, holding `{ at, attempts, lastError, firstAttemptAt }`. `at` stays null until the notifier exits 0 |
 | `supersededAt` | `opencode-broker-reconcile dry-run` | When this proposal was retired. Stamped on the record because a role record drops back to `evidence-pending` afterwards, so current state alone cannot tell |
+| `applyIntent` | `opencode-broker-reconcile apply/refresh` | Deterministic saga identity: canonical transition revision, reserved generation, one persisted overlay timestamp, authentication revision, previous overlay hash/revision, and the safe catalog metadata needed to reconstruct identical overlay bytes |
+| `overlayAck`, `generationAck` | reconciliation applier | Exact canonical overlay hash/revision and immutable generation/manifest/effective hashes observed after publication |
+| `policyPending`, `brokerAck` | reconciliation applier | Exact non-routable `staged-probing` CAS request and broker acknowledgement. The pending request is durable before the broker call |
+| `probeResults` | reconciliation applier | One immutable terminal result for each canonical kind (`normal`, `tool`, `reasoning`). Matching replay is accepted; conflicting bytes block |
+| `probeAck` | reconciliation applier | Aggregate hash acknowledging that all three durable results passed |
+| `probationPending`, `probationAck` | reconciliation applier | Exact routable-probation CAS request and broker acknowledgement. Success is not reported until the acknowledgement is durable |
+| `probeRollbackAck` | reconciliation applier | Broker-first failed-probe or operator rollback acknowledgement. Failed probes never enter probation |
 
 Nothing here is routing state. No field in this file makes a model eligible, and
 the broker never reads it.
+
+The runtime fields above are saga acknowledgements and presentation only.
+Broker-owned counters, launch nonces, resolver tokens, probe assignments, and
+lease state never enter the ledger. Both reconciler binaries continue to mutate
+this file only through `createReconciliationStore().update()`; no applier helper
+writes ledger bytes independently.
+
+## Apply saga and recovery
+
+The exact forward order is: ledger intent; append-only overlay CAS; immutable
+generation build and publication; ledger generation acknowledgement; durable
+staged-policy intent; broker CAS to non-routable `staged-probing`; broker
+acknowledgement; fresh launch/open/run for only missing probe kinds; awaited
+per-kind result CAS; aggregate probe acknowledgement; durable probation intent;
+broker CAS to routable `probation`; probation acknowledgement. Every ledger lock
+is released before overlay/generation work, broker requests, resolver execution,
+probe child work, or close.
+
+Recovery starts from durable acknowledgements, verifies immutable generation and
+broker status, and resumes the first missing phase. Overlay timestamp and reserved
+generation are sampled once in `applyIntent`; recovery never renumbers or
+resamples the timestamp. A generation or broker commit that landed before its
+ledger acknowledgement is verified and acknowledged without repeating the
+mutation. A complete durable probe-result set performs no launch, open, run, or
+close. Every incomplete probe attempt requests a fresh launch nonce and opens a
+fresh child; neither value is persisted.
+
+The fresh helper/gateway path owns assignment release and completes release
+before returning a semantic result to the applier. The applier then awaits the
+per-kind ledger CAS. If that write reports an error, it reads the ledger: matching
+bytes prove commit-before-ack, absence leaves recovery to execute that external
+probe at least once again with a fresh child, and conflicting bytes block. Thus
+external execution is at-least-once across the uncertainty window while each
+durable probe kind is exactly-once. An opened child is always closed in `finally`;
+simultaneous primary and close failures are retained in order in an
+`AggregateError`.
+
+A failed semantic probe first CASes broker policy to `rolled-back`, restoring the
+recorded incumbent or explicit `null`, and only then writes its terminal result
+and rollback acknowledgement. The deterministic rollback transition includes the
+probe kind, so recovery after broker commit but before result persistence can
+validate status and reconstruct the exact terminal result from the broker
+acknowledgement. Any transition, revision, incumbent, generation, manifest,
+result, or acknowledgement mismatch moves the presentation record to the matching
+`blocked-*` state with its bounded reason and permits no later saga mutation.
 
 ## Inside `resolver-overlay.json`
 

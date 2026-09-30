@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // opencode-broker-reconcile: the operator surface of the model reconciler.
 //
-// Seven commands, and none of them touches routing:
+// Eleven commands. The original observation and decision surfaces do not touch routing:
 //   dry-run          refresh isolated catalog/resolver views, record candidate observations in the
 //                    reconciliation ledger, and report what the broker WOULD be handed;
 //   status           print the bounded projection of that ledger;
@@ -10,6 +10,9 @@
 //                    push one ntfy event per transition. Both projections ship OFF;
 //   approve/reject   record a decision on a stored proposal from this terminal;
 //   amend            replace the role and tiers a proposal offers, and await a fresh decision.
+//   apply/rollback/refresh/recover
+//                    dormant Package 3 transition controls; disabled unless the complete apply
+//                    path configuration is explicitly enabled.
 //
 // CRITICAL: THIS FILE IS DELIBERATELY THIN, AND THAT IS THE SAFETY PROPERTY. Every rule worth
 // trusting -- the scratch XDG_CACHE_HOME the refresh runs under, the 48h/72h stale gates, the
@@ -20,19 +23,27 @@
 // unit-tested without a subprocess. Catalog, state, decision or routing logic added here would be
 // logic no such test covers, and the CLI is the one caller a human runs by hand against live state.
 //
-// CRITICAL: NO INVENTORY IS PUBLISHED AND NO MODEL IS ACTIVATED. There is no flag that makes this
-// apply anything to routing: it posts no inventory to the broker, alters no target's eligibility,
-// runs no probe. An approval records that a human said yes, in the ledger, and stops there --
-// probing, probation and the deployment cutover are Packages 3 and 4, and each of them is part of
-// what makes publication safe. opencode-broker-watch remains the live publisher.
+// CRITICAL: APPLY SHIPS DORMANT. Approval still records a ledger decision only. The four runtime
+// commands return before constructing any dependency unless the complete apply configuration is
+// explicitly enabled; Package 4 owns that cutover. Even when enabled, this binary publishes no
+// inventory directly: the applier moves only the overlay/generation/policy saga described in STATE.
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { CONFIG, CONFIG_ERROR } from "../lib/config.js";
 import {
+  collectApplyReconciliationSources,
   formatDryRunReport,
   formatReconciliationStatus,
   readReconciliationStatus,
   runDryReconciliation,
 } from "../lib/model-reconcile.js";
+import { createReconciliationApplier } from "../lib/reconcile-apply.js";
 import { evidenceQueueStatus } from "../lib/reconcile-evidence.js";
+import { createResolverOverlayStore } from "../lib/reconcile-overlay.js";
+import { createResolverGenerationManager } from "../lib/resolver-generations.js";
+import { createProbeClientFactory } from "../lib/model-probe.js";
+import { brokerRequest, brokerSocketPath } from "../lib/client.js";
 import {
   amendProposal,
   applyLocalDecision,
@@ -54,6 +65,13 @@ const USAGE = [
   "  reject <transitionID> [--note TEXT]   record a local rejection of the stored proposal",
   "  amend <transitionID> --tiers a,b [--role provider:roleID]",
   "                                        replace the proposed mapping; a fresh decision is needed",
+  "  apply <transitionID> [--json] [--dry-run]",
+  "                                        apply one authorized transition",
+  "  rollback <transitionID> --reason TEXT [--json] [--dry-run]",
+  "                                        restore the recorded incumbent",
+  "  refresh [--json] [--dry-run]          collect fresh sources and apply eligible transitions",
+  "  recover [transitionID] [--json] [--dry-run]",
+  "                                        resume one or every incomplete transition",
 ].join("\n");
 
 // 0 completed (a report full of blocked candidates, and a projection that is switched off, are
@@ -80,6 +98,10 @@ const FLAG_ONLY = Object.freeze({
   status: ["--json"],
   "evidence-status": ["--json"],
   project: ["--json", "--dry-run"],
+  refresh: ["--json", "--dry-run"],
+  apply: ["--json", "--dry-run"],
+  rollback: ["--json", "--dry-run"],
+  recover: ["--json", "--dry-run"],
 });
 const DECISIONS = Object.freeze({ approve: "approved", reject: "rejected" });
 
@@ -143,9 +165,51 @@ const parseAmend = (argv) => {
   return { command: "amend", transitionID: parsed.transitionID, tiers, roleKey };
 };
 
+const parseApply = (argv) => {
+  const [id, ...flags] = argv;
+  const parsed = parseTransitionID(id);
+  if (parsed.error) return parsed;
+  const options = parseFlags("apply", flags);
+  return options.error ? options : { ...options, transitionID: parsed.transitionID };
+};
+
+const parseRecover = (argv) => {
+  const positional = argv.filter((value) => !value.startsWith("-"));
+  const flags = argv.filter((value) => value.startsWith("-"));
+  if (positional.length > 1) return { error: "recover accepts at most one transition id" };
+  const parsed = positional.length ? parseTransitionID(positional[0]) : { transitionID: undefined };
+  if (parsed.error) return parsed;
+  const options = parseFlags("recover", flags);
+  return options.error ? options : { ...options, transitionID: parsed.transitionID };
+};
+
+const parseRollback = (argv) => {
+  const [id, ...rest] = argv;
+  const parsed = parseTransitionID(id);
+  if (parsed.error) return parsed;
+  let reason;
+  const flags = [];
+  for (let index = 0; index < rest.length; index += 1) {
+    const value = rest[index];
+    if (value === "--reason") {
+      reason = rest[index + 1];
+      if (reason === undefined || reason.startsWith("--")) return { error: "--reason needs the text to record" };
+      index += 1;
+      continue;
+    }
+    flags.push(value);
+  }
+  if (reason === undefined) return { error: "rollback needs --reason with the reason to record" };
+  const options = parseFlags("rollback", flags);
+  return options.error ? options : { ...options, transitionID: parsed.transitionID, reason };
+};
+
 const parseArgs = (argv) => {
   const [command, ...rest] = argv;
   if (command === undefined) return { error: "no command given" };
+  if (command === "apply") return parseApply(rest);
+  if (command === "rollback") return parseRollback(rest);
+  if (command === "recover") return parseRecover(rest);
   if (Object.hasOwn(FLAG_ONLY, command)) return parseFlags(command, rest);
   if (Object.hasOwn(DECISIONS, command)) return parseDecision(command, rest);
   if (command === "amend") return parseAmend(rest);
@@ -289,11 +353,67 @@ const amend = (store, { transitionID, tiers, roleKey }) => {
   return EXIT_OK;
 };
 
+const APPLY_COMMANDS = new Set(["apply", "rollback", "refresh", "recover"]);
+
+const createApplyRuntime = (store) => {
+  const applyConfig = CONFIG.reconcile.apply;
+  const overlayStore = createResolverOverlayStore({ path: applyConfig.overlayPath });
+  const generationManager = createResolverGenerationManager({
+    root: applyConfig.generationsRoot,
+    currentLinkPath: applyConfig.currentLinkPath,
+  });
+  const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  const baseConfigPath = process.env.OPENCODE_RECONCILE_BASE_CONFIG
+    || join(configHome, "opencode/opencode.json");
+  const collectSources = () => collectApplyReconciliationSources({ baseConfigPath });
+  const probeClientFactory = createProbeClientFactory({
+    generationManager,
+    brokerSocketPath: brokerSocketPath(),
+    gatewayURL: process.env.OPENCODE_RECONCILE_GATEWAY_URL
+      || "http://127.0.0.1:8790/v1/chat/completions",
+    gatewayHeaders: {},
+  });
+  return createReconciliationApplier({
+    store,
+    overlayStore,
+    generationManager,
+    brokerRequest,
+    probeClientFactory,
+    collectSources,
+  });
+};
+
+const runApplyCommand = async (store, options) => {
+  const applier = createApplyRuntime(store);
+  const result = options.command === "apply"
+    ? await applier.apply({ transitionID: options.transitionID, dryRun: options.dryRun })
+    : options.command === "rollback"
+      ? await applier.rollback({
+        transitionID: options.transitionID,
+        reason: options.reason,
+        dryRun: options.dryRun,
+      })
+      : options.command === "refresh"
+        ? await applier.refresh({ dryRun: options.dryRun })
+        : await applier.recover({ transitionID: options.transitionID, dryRun: options.dryRun });
+  write(options.json ? JSON.stringify(result, null, 2) :
+    `${options.command}: ${result.ok ? "ok" : "failed"}${result.dryRun ? " (dry-run)" : ""}`);
+  return result.ok ? EXIT_OK : EXIT_ERROR;
+};
+
 const run = async (argv) => {
   const options = parseArgs(argv);
   if (options.error) {
     complain(`${options.error}\n${USAGE}`);
     return EXIT_USAGE;
+  }
+
+  // The dormant gate is deliberately before store construction, source refresh, broker status,
+  // generation-path access, or publisher setup. A fresh install therefore gets a structured refusal
+  // without even touching mtimes on the paths an eventual enabled run would own.
+  if (APPLY_COMMANDS.has(options.command) && !CONFIG.reconcile.apply.enabled) {
+    write(JSON.stringify({ ok: false, code: "reconcile-apply-disabled", mutated: false }, null, 2));
+    return EXIT_ERROR;
   }
 
   // A config that failed to parse leaves routing with NO targets and the role registry derived from
@@ -326,6 +446,7 @@ const run = async (argv) => {
     if (options.command === "project") {
       return options.dryRun ? projectDryRun(store, options.json) : await project(store, options.json);
     }
+    if (APPLY_COMMANDS.has(options.command)) return await runApplyCommand(store, options);
     if (options.command === "amend") return amend(store, options);
     return decide(store, options);
   } catch (error) {

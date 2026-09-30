@@ -416,15 +416,49 @@ test("an unparseable config exits 1 instead of reconciling against no targets", 
   }, { config: "{ targets: oops\n" });
 });
 
-test("an unknown command exits 2 with usage and writes nothing", () => {
+test("apply commands are present but disabled before source collection and write nothing", () => {
+  withFixture("apply-disabled", (fixture) => {
+    const before = new Map([
+      [fixture.liveCachePath, { bytes: readFileSync(fixture.liveCachePath), mtime: statSync(fixture.liveCachePath).mtimeMs }],
+      [fixture.liveResolverPath, { bytes: readFileSync(fixture.liveResolverPath), mtime: statSync(fixture.liveResolverPath).mtimeMs }],
+    ]);
+    for (const argv of [
+      ["apply", TRANSITION_ID, "--json"],
+      ["rollback", TRANSITION_ID, "--reason", "operator-request", "--json"],
+      ["refresh", "--json"],
+      ["recover", TRANSITION_ID, "--json"],
+    ]) {
+      const result = runCLI(fixture, argv);
+      assert.equal(result.status, 1, `${argv.join(" ")}: ${result.stderr}`);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        ok: false,
+        code: "reconcile-apply-disabled",
+        mutated: false,
+      });
+      assert.equal(result.stderr, "");
+    }
+    assert.equal(existsSync(fixture.statePath), false);
+    for (const [path, snapshot] of before) {
+      assert.deepEqual(readFileSync(path), snapshot.bytes);
+      assert.equal(statSync(path).mtimeMs, snapshot.mtime);
+    }
+  });
+});
+
+test("malformed apply commands exit 2 before the disabled gate", () => {
   withFixture("bad-command", (fixture) => {
     const result = runCLI(fixture, ["apply"]);
     assert.equal(result.status, 2);
     assert.equal(result.stdout, "");
-    assert.match(result.stderr, /unknown command "apply"/);
+    assert.match(result.stderr, /a transition id is required/);
     assert.match(result.stderr, /dry-run \[--json\]/);
     assert.match(result.stderr, /status \[--json\]/);
     assert.equal(existsSync(fixture.statePath), false);
+
+    assert.equal(runCLI(fixture, ["rollback", TRANSITION_ID]).status, 2);
+    assert.equal(runCLI(fixture, ["rollback", TRANSITION_ID, "--reason"]).status, 2);
+    assert.equal(runCLI(fixture, ["refresh", TRANSITION_ID]).status, 2);
+    assert.equal(runCLI(fixture, ["recover", TRANSITION_ID, "extra"]).status, 2);
 
     const missing = runCLI(fixture, []);
     assert.equal(missing.status, 2);
