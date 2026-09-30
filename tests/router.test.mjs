@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
@@ -17,6 +18,7 @@ const {
   extractSessionID,
   idleCleanupPath,
   routeTierForSession,
+  createResolverProcessBrokerRequest,
 } = await import("../lib/router-core.js");
 
 const withTempHome = async (fn) => {
@@ -67,6 +69,87 @@ test("plugin entry exports nothing but the factory", async () => {
   // the return value as a hooks object; a stray helper export breaks every boot.
   const entry = await import("../plugin/router.js");
   assert.deepEqual(Object.keys(entry).sort(), ["ModelRouter"]);
+});
+
+test("enabled resolver binding reads one exact generation and wraps every broker request with its process token", async () => {
+  const generationDirectory = "/test/generations/generation-7";
+  const configBytes = Buffer.from('{"provider":{"openai":{"models":{"gpt-6-sol":{}}}}}\n');
+  const manifestBytes = Buffer.from(JSON.stringify({
+    version: 1,
+    generation: 7,
+    baseHash: "a".repeat(64),
+    overlayHash: "b".repeat(64),
+    effectiveHash: "c".repeat(64),
+    modelKeys: ["openai/gpt-5.6-sol", "openai/gpt-6-sol"],
+    createdAt: 1,
+    authorizingRevisions: ["revision-7"],
+  }) + "\n");
+  const calls = [];
+  const reads = [];
+  let realpathCalls = 0;
+  const bound = await createResolverProcessBrokerRequest({
+    apply: { enabled: true, currentLinkPath: "/test/generations/current" },
+    realpath: (path) => {
+      realpathCalls += 1;
+      assert.equal(path, "/test/generations/current");
+      return generationDirectory;
+    },
+    readFile: (path) => {
+      reads.push(path);
+      if (path === join(generationDirectory, "opencode.json")) return configBytes;
+      if (path === join(generationDirectory, "manifest.json")) return manifestBytes;
+      throw new Error(`unexpected read ${path}`);
+    },
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/resolver-process/register"
+        ? { resolverToken: "process-token", scope: "ordinary" }
+        : { ok: true };
+    },
+  });
+
+  await bound("/lease", { sessionID: "session-1" });
+  await bound("/touch", { sessionID: "session-1" });
+
+  assert.equal(realpathCalls, 1);
+  assert.deepEqual(reads, [
+    join(generationDirectory, "opencode.json"),
+    join(generationDirectory, "manifest.json"),
+  ]);
+  assert.deepEqual(calls, [
+    {
+      path: "/resolver-process/register",
+      body: {
+        generation: 7,
+        manifestHash: createHash("sha256").update(manifestBytes).digest("hex"),
+        modelKeys: ["openai/gpt-5.6-sol", "openai/gpt-6-sol"],
+      },
+    },
+    { path: "/lease", body: { sessionID: "session-1", resolverToken: "process-token" } },
+    { path: "/touch", body: { sessionID: "session-1", resolverToken: "process-token" } },
+  ]);
+});
+
+test("disabled resolver binding performs no filesystem or registration work and preserves request bytes", async () => {
+  const calls = [];
+  const requestBody = { sessionID: "session-1", nested: { exact: true }, ordered: [3, 2, 1] };
+  const before = JSON.stringify(requestBody);
+  const bound = await createResolverProcessBrokerRequest({
+    apply: { enabled: false, currentLinkPath: null },
+    realpath: () => { throw new Error("disabled binding must not resolve"); },
+    readFile: () => { throw new Error("disabled binding must not read"); },
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body, bytes: JSON.stringify(body) });
+      return { ok: true };
+    },
+  });
+
+  await bound("/lease", requestBody);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, "/lease");
+  assert.equal(calls[0].body, requestBody);
+  assert.equal(calls[0].bytes, before);
+  assert.equal(JSON.stringify(requestBody), before);
 });
 
 test("extractSessionID prefers explicit fields and only uses lifecycle ids when appropriate", () => {

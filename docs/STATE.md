@@ -127,6 +127,26 @@ are reported rather than recreated. A render that would remove an active, probat
 or rollback model reference fails unless the same exact role/kind/model reference is
 present in the authorized retirement set.
 
+## Resolver process registry
+
+Resolver process registrations are broker-memory state only; no token or registration
+record is written to disk. The plugin resolves `current` once at factory construction,
+reads `opencode.json` and `manifest.json` from that one real directory, hashes the exact
+manifest bytes, and registers its generation, manifest hash, and exact sorted model-key
+set. The broker independently loads and validates the immutable generation registry and
+manifest and never trusts caller-supplied membership.
+
+The broker mints a 256-bit URL-safe token and stores only its SHA-256 hash with generation,
+manifest hash, immutable model-key set, and registration/touch/expiry times. Valid use
+extends a 10-minute active window. Restart clears the registry naturally. Status exposes
+counts and non-secret registration metadata, never token values or hashes.
+
+Missing, invalid, expired, pre-restart, future, unknown, cleaned, manifest-mismatched, and
+raw-base registrations authorize as logical generation 0 with `scope: "base-only"`,
+`manifestHash: null`, and model keys derived from normalized static targets. This is an
+eligibility view, not an immutable generation bundle. Lease decisions may persist that
+non-secret authorization result for diagnosis; plaintext tokens are never persisted.
+
 ## Inside `broker.json` model policy
 
 Broker state schema version `5` adds `modelPolicy`; the broker remains its only

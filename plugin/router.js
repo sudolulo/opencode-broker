@@ -5,7 +5,7 @@
 // export of a plugin module as a factory, so helpers live in lib/router-core.js.
 import {
   CONFIG,
-  brokerRequest,
+  brokerRequest as defaultBrokerRequest,
   consumePendingProfile,
   isClassifierAgent,
   modelIsLocalTarget,
@@ -34,6 +34,7 @@ import {
   applyMessageModel,
   applyOutputModel,
   cleanupDeletedSession,
+  createResolverProcessBrokerRequest,
   extractSessionID,
   routeTierForSession,
 } from "../lib/router-core.js";
@@ -114,6 +115,12 @@ const contextTokensOf = (message) => {
 const SMALL_MODEL_AGENTS = new Set(["title"]);
 
 export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
+  const brokerRequest = await createResolverProcessBrokerRequest({
+    apply: options.apply ?? CONFIG.reconcile.apply,
+    brokerRequest: options.brokerRequest ?? defaultBrokerRequest,
+    realpath: options.realpath,
+    readFile: options.readFile,
+  });
   const routes = new Map();
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
   const sessions = new Map();

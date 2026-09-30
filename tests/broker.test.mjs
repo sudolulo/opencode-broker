@@ -16,6 +16,7 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const brokerScript = join(repoRoot, "bin/opencode-broker");
 const { CONFIG_FINGERPRINT } = await import(new URL("../lib/config.js", import.meta.url).href);
 const { MODEL_POLICY_VERSION } = await import(new URL("../lib/model-policy.js", import.meta.url).href);
+const { createResolverGenerationManager } = await import(new URL("../lib/resolver-generations.js", import.meta.url).href);
 
 const withTempHome = async (fn) => {
   const originalHome = process.env.HOME;
@@ -1469,6 +1470,113 @@ test("disabled model-policy CAS returns 409 and writes no broker state", async (
   assert.equal(response.status, 409);
   assert.equal(response.body.code, "reconcile-apply-disabled");
   assert.deepEqual(readFileSync(statePath), before);
+}));
+
+test("disabled resolver-process registration returns 409 and writes no broker state", async () => withBroker(async ({ home, socketPath }) => {
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  const before = readFileSync(statePath);
+  const response = await rawRequest(socketPath, "/resolver-process/register", {
+    body: { generation: 999, manifestHash: "forged", modelKeys: ["openai/gpt-6-sol"] },
+  });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.code, "reconcile-apply-disabled");
+  assert.deepEqual(readFileSync(statePath), before);
+}));
+
+test("enabled resolver registration validates the immutable manifest and broker restart invalidates its token", async () => withTempHome(async (home) => {
+  writeAuth(home);
+  const configPath = applyConfigPath(home);
+  const generationsRoot = join(home, "state/generations");
+  const currentLinkPath = join(generationsRoot, "current");
+  const baseDirectory = join(home, "state/base");
+  mkdirSync(baseDirectory, { recursive: true, mode: 0o700 });
+  const baseConfigPath = join(baseDirectory, "opencode.json");
+  writeFileSync(baseConfigPath, JSON.stringify({
+    provider: { openai: { models: { "gpt-5.6-sol": { id: "gpt-5.6-sol" } } } },
+  }) + "\n", { mode: 0o600 });
+  const manager = createResolverGenerationManager({
+    root: generationsRoot,
+    currentLinkPath,
+    runResolver: async () => "openai/gpt-5.6-sol\n",
+    now: () => 1_800_000_000_000,
+    pid: 77,
+  });
+  const generation0 = await manager.build({
+    reservedGeneration: 0,
+    bootstrapGeneration0: true,
+    baseConfigPath,
+    overlay: { version: 1, revision: 0, updatedAt: 1_800_000_000_000, entries: {} },
+    authorizingRevisions: [],
+    protectedReferences: [],
+    authorizedRetirements: [],
+  });
+  await manager.publish(generation0);
+
+  const modelsServer = await startModelsServer(["qwen3.5-9b-coder"]);
+  try {
+    const brokerEnv = {
+      OPENCODE_BROKER_CONFIG: configPath,
+      OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url,
+    };
+    const first = await startBroker(home, brokerEnv);
+    let resolverToken;
+    try {
+      const registration = await rawRequest(first.socketPath, "/resolver-process/register", {
+        body: {
+          generation: generation0.generation,
+          manifestHash: generation0.manifestHash,
+          modelKeys: generation0.manifest.modelKeys,
+        },
+      });
+      assert.equal(registration.status, 200);
+      assert.equal(registration.body.scope, "ordinary");
+      assert.equal(registration.body.generation, 0);
+      resolverToken = registration.body.resolverToken;
+      assert.match(resolverToken, /^[A-Za-z0-9_-]{43}$/);
+      const processStatus = await rawRequest(first.socketPath, "/status", { body: {} });
+      assert.equal(processStatus.body.resolverProcesses.active, 1);
+      assert.deepEqual(processStatus.body.resolverProcesses.generations, { 0: 1 });
+      assert.equal(processStatus.body.resolverProcesses.registrations[0].generation, 0);
+      assert.equal(processStatus.body.resolverProcesses.registrations[0].manifestHash, generation0.manifestHash);
+      assert.deepEqual(processStatus.body.resolverProcesses.registrations[0].modelKeys, generation0.manifest.modelKeys);
+      assert.equal(JSON.stringify(processStatus.body.resolverProcesses).includes(resolverToken), false);
+
+      const lease = await rawRequest(first.socketPath, "/lease", {
+        body: { sessionID: "resolver-first", profile: "local", tier: "worker", replace: true, contextTokens: 0, resolverToken },
+      });
+      assert.equal(lease.status, 200, JSON.stringify(lease.body));
+      assert.deepEqual(lease.body.decision.registration, {
+        generation: 0,
+        manifestHash: generation0.manifestHash,
+        modelKeys: generation0.manifest.modelKeys,
+        compatible: true,
+        reason: null,
+      });
+      assert.equal(readFileSync(join(home, ".local/share/opencode/model-routing/broker.json"), "utf8").includes(resolverToken), false);
+      const released = await rawRequest(first.socketPath, "/release", {
+        body: { sessionID: "resolver-first", resolverToken },
+      });
+      assert.equal(released.status, 200);
+    } finally {
+      await stopBroker(first.child);
+    }
+
+    const restarted = await startBroker(home, brokerEnv);
+    try {
+      const lease = await rawRequest(restarted.socketPath, "/lease", {
+        body: { sessionID: "resolver-restarted", profile: "local", tier: "worker", replace: true, contextTokens: 0, resolverToken },
+      });
+      assert.equal(lease.status, 200, JSON.stringify(lease.body));
+      assert.equal(lease.body.decision.registration.generation, 0);
+      assert.equal(lease.body.decision.registration.manifestHash, null);
+      assert.equal(lease.body.decision.registration.reason, "invalid-token");
+      assert.equal(lease.body.decision.registration.modelKeys.includes("openai/gpt-5.6-sol"), true);
+    } finally {
+      await stopBroker(restarted.child);
+    }
+  } finally {
+    await modelsServer.stop();
+  }
 }));
 
 test("v4 state migrates to v5 preserving existing fields and model-policy status is readable", async () => withTempHome(async (home) => {

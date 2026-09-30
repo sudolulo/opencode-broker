@@ -56,6 +56,8 @@ import {
   isLoopbackControlAddress,
   normalizeModelPolicy,
 } from "../lib/model-policy.js";
+import { createResolverGenerationManager } from "../lib/resolver-generations.js";
+import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
 import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
@@ -149,9 +151,13 @@ const waitIsFresh = (decision) => {
 // The caller of the /lease being handled (handlers run one at a time), so every decision
 // made for that session records who asked for it. Set and cleared around acquire().
 let leaseCaller = null; // { sessionID, caller }
+let leaseRegistration = null;
 const recordDecision = (state, decision) => {
   if (leaseCaller && decision?.sessionID === leaseCaller.sessionID && !decision.caller) {
     decision = { ...decision, caller: leaseCaller.caller };
+  }
+  if (leaseRegistration && decision?.sessionID === leaseRegistration.sessionID && !decision.registration) {
+    decision = { ...decision, registration: leaseRegistration.registration };
   }
   state.lastDecision = decision;
   if (waitIsFresh(decision)) return;
@@ -315,8 +321,9 @@ const publicTarget = (target, tier, modelVariants) => target && {
   kind: target.kind,
 };
 
-const publicState = (state) => ({
+const publicState = (state, resolverProcesses = null) => ({
   ...state,
+  ...(resolverProcesses ? { resolverProcesses: resolverProcesses.status() } : {}),
   circuits: Object.fromEntries(Object.entries(state.circuits).map(([key, circuit]) => [key, {
     ...circuit,
     renewsAt: circuit?.until === null || !Number.isFinite(Number(circuit?.until))
@@ -1169,6 +1176,28 @@ const serve = async () => {
   let state = readState();
   sweep(state);
   writeState(state);
+  const resolverProcesses = createResolverProcessRegistry({
+    loadRegistry: () => {
+      const manager = createResolverGenerationManager({
+        root: CONFIG.reconcile.apply.generationsRoot,
+        currentLinkPath: CONFIG.reconcile.apply.currentLinkPath,
+      });
+      const registry = manager.readRegistry();
+      return {
+        version: registry.version,
+        highWater: registry.highWater,
+        generations: Object.fromEntries(Object.keys(registry.generations).map((generation) => {
+          const bundle = manager.generation(Number(generation));
+          return [generation, {
+            manifestHash: bundle.manifestHash,
+            modelKeys: bundle.manifest.modelKeys,
+          }];
+        })),
+      };
+    },
+    loadBaseModelKeys: () => [...new Set(Object.values(TARGETS)
+      .map((target) => `${target.providerID}/${target.modelID}`))].sort(),
+  });
   const handle = async (request, response) => {
     try {
       if (request.url === "/model-policy/status") {
@@ -1197,8 +1226,20 @@ const serve = async () => {
         }
         return reply(response, 200, { ok: true, ack: result.ack, changed: result.changed });
       }
+      if (request.url === "/resolver-process/register") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        const body = await parseBody(request);
+        return reply(response, 200, resolverProcesses.register(body));
+      }
       if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
       const body = await parseBody(request);
+      const registration = resolverProcesses.authorize({ resolverToken: body.resolverToken });
       sweep(state);
       const planRefresh = refreshPlanUsage(state);
       // Plan velocity: every reading the refresh leaves behind, however it resolves.
@@ -1221,20 +1262,22 @@ const serve = async () => {
         }
         const caller = sanitizeCaller(body.caller);
         leaseCaller = caller && typeof body.sessionID === "string" ? { sessionID: body.sessionID, caller } : null;
+        leaseRegistration = typeof body.sessionID === "string" ? { sessionID: body.sessionID, registration } : null;
         let lease;
         try {
           lease = await acquire(state, body, { isAbandoned: () => abandoned(request, response) });
         } finally {
           leaseCaller = null;
+          leaseRegistration = null;
         }
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
-        const { policy = null, reasons = [] } = state.lastDecision ?? {};
+        const { policy = null, reasons = [], registration: decisionRegistration = registration } = state.lastDecision ?? {};
         return reply(response, 200, {
           target: publicTarget(lease.target, body.tier, state.inventory?.modelVariants),
           existing: lease.existing,
-          decision: { policy, reasons },
+          decision: { policy, reasons, registration: decisionRegistration },
         });
       }
       if (request.url === "/release") {
@@ -1512,7 +1555,7 @@ const serve = async () => {
       }
       if (request.url === "/status") {
         writeState(state);
-        return reply(response, 200, { ...publicState(state), queue: { ...queueStats } });
+        return reply(response, 200, { ...publicState(state, resolverProcesses), queue: { ...queueStats } });
       }
       if (request.url === "/preview") {
         // Side-effect-free selection: what WOULD each tier get right now. No
@@ -1582,7 +1625,7 @@ const serve = async () => {
       }
       if (request.url === "/selection") {
         writeState(state);
-        return reply(response, 200, { lastDecision: publicState(state).lastDecision });
+        return reply(response, 200, { lastDecision: publicState(state, resolverProcesses).lastDecision });
       }
       if (request.url === "/inventory") {
         if (body.configFingerprint !== CONFIG_FINGERPRINT) {

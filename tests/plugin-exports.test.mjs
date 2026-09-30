@@ -15,5 +15,6 @@ for (const name of readdirSync(fileURLToPath(dir)).filter((n) => n.endsWith(".js
     const exports = Object.entries(mod);
     assert.equal(exports.length, 1, `exports: ${exports.map(([k]) => k).join(", ")}`);
     assert.equal(typeof exports[0][1], "function");
+    if (name === "router.js") assert.deepEqual(exports.map(([key]) => key), ["ModelRouter"]);
   });
 }
