@@ -70,6 +70,50 @@ const withTempHome = async (fn) => {
 
 const freshRouting = async () => import(`${new URL("../lib/routing.js", import.meta.url).href}?v=${Date.now()}-${Math.random()}`);
 
+const publishTrustedApiInventoryInChild = (home, publisher) => {
+  const configPath = join(home, "config.json");
+  const cachePath = join(home, "models.json");
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(configPath, JSON.stringify({ trustedSubscriptionProviders: ["anthropic"] }) + "\n");
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ anthropic: { type: "api" } }) + "\n");
+  writeFileSync(cachePath, JSON.stringify({
+    anthropic: { id: "anthropic", models: {
+      "claude-opus-5-5": {
+        id: "claude-opus-5-5", family: "claude-opus", release_date: "2026-09-18",
+        status: "active", tool_call: true,
+      },
+    } },
+  }) + "\n");
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    const routing = await import(${JSON.stringify(routingUrl)});
+    const catalog = JSON.parse(${JSON.stringify(readFileSync(cachePath, "utf8"))});
+    const inventory = { connected: ["anthropic"], all: [catalog.anthropic] };
+    let published;
+    const request = async (_path, body) => { published = body; return { changed: true }; };
+    if (${JSON.stringify(publisher)} === "provider-list") {
+      await routing.publishSubscriptionInventory({
+        directory: process.env.HOME,
+        listProviders: async () => inventory,
+        request,
+      });
+    } else {
+      await routing.publishCachedSubscriptionInventory({
+        cachePath: ${JSON.stringify(cachePath)},
+        listResolvableModels: () => new Set(["anthropic/claude-opus-5-5"]),
+        request,
+      });
+    }
+    process.stdout.write(JSON.stringify(published));
+  `], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  assert.equal(child.status, 0, child.stderr);
+  return JSON.parse(child.stdout);
+};
+
 test("tier mapping centralizes agent roles", () => {
   assert.equal(R.tierForAgent("build"), "build");
   assert.equal(R.tierForAgent("fast-build"), "fast-build");
@@ -598,6 +642,11 @@ test("inventory publication sends the current auth revision before a cloud lease
   assert.equal(calls[0].body.providers.openai.authType, "oauth");
 }));
 
+test("live provider-list publication keeps configured trusted API targets dormant by default", async () => withTempHome(async (home) => {
+  const published = publishTrustedApiInventoryInChild(home, "provider-list");
+  assert.deepEqual(published.targets, {});
+}));
+
 test("auth inventory admits static OAuth targets without provider catalog access", async () => withTempHome(async (home) => {
   const routing = await freshRouting();
   const authDir = join(home, ".local/share/opencode");
@@ -733,6 +782,11 @@ test("cached inventory publishes only authenticated catalog providers", async ()
   assert.equal(calls[0].body.configFingerprint, CONFIG_FINGERPRINT);
   assert.deepEqual(Object.keys(calls[0].body.providers), ["anthropic"]);
   assert.equal(Object.values(calls[0].body.targets)[0].modelID, "claude-fable-5");
+}));
+
+test("live cached publication keeps configured trusted API targets dormant by default", async () => withTempHome(async (home) => {
+  const published = publishTrustedApiInventoryInChild(home, "cached");
+  assert.deepEqual(published.targets, {});
 }));
 
 test("cached inventory errors are actionable", async () => withTempHome(async (home) => {
