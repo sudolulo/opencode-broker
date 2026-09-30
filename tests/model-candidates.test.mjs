@@ -15,12 +15,12 @@ import {
 const CONFLICTING_ROLES = normalizeModelRoles({
   "example:alpha": {
     families: ["example-alpha"], idPatterns: [{ prefix: "example-", suffix: "-alpha" }],
-    tiers: ["smart"], rank: 2, requiredCapabilities: { toolCall: true },
+    tiers: ["smart"], rank: 2, effortCeiling: "high", requiredCapabilities: { toolCall: true },
     evidenceDomains: ["example.com"],
   },
   "example:beta": {
     families: ["example-beta"], idPatterns: [{ prefix: "example-", suffix: "-beta" }],
-    tiers: ["worker"], rank: 1, requiredCapabilities: { toolCall: true },
+    tiers: ["worker"], rank: 1, effortCeiling: "medium", requiredCapabilities: { toolCall: true },
     evidenceDomains: ["example.com"],
   },
 }, { warn: () => {} });

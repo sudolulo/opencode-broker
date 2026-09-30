@@ -40,12 +40,12 @@ test("model reconciliation imports no inventory publication primitive", () => {
 const TEST_ROLES = normalizeModelRoles({
   "example:alpha": {
     families: ["example-alpha"], idPatterns: [{ prefix: "alpha-", suffix: "" }],
-    tiers: ["smart"], rank: 2, requiredCapabilities: { toolCall: true },
+    tiers: ["smart"], rank: 2, effortCeiling: "high", requiredCapabilities: { toolCall: true },
     evidenceDomains: ["example.com"],
   },
   "example:beta": {
     families: ["example-beta"], idPatterns: [{ prefix: "", suffix: "conflict" }],
-    tiers: ["worker"], rank: 1, requiredCapabilities: { toolCall: true },
+    tiers: ["worker"], rank: 1, effortCeiling: "medium", requiredCapabilities: { toolCall: true },
     evidenceDomains: ["example.com"],
   },
 }, { warn: () => {} });
@@ -182,6 +182,8 @@ test("records known successors, unknown roles, conflicts, and unresolved models 
       ["anthropic:claude-opus", "openai:gpt-luna", "openai:gpt-sol"]);
     assert.equal(Object.keys(ledger.unknown).length, 2);
     assert.equal(Object.keys(ledger.evidenceRequests).length, 3);
+    assert.equal(ledger.roles["openai:gpt-sol"].proposedEffortCeiling, "high");
+    assert.equal(ledger.roles["openai:gpt-sol"].requiredReasoningMode, null);
     assert.deepEqual(report.evidenceRequests, { pending: 3, claimed: 0, failed: 0 });
   });
 });
@@ -245,7 +247,7 @@ test("auth is snapshotted on both sides of collection, and the lock is not held 
 
 // ---- admission: what may never become a proposed target -------------------------------------
 
-test("api-key, unknown-auth, inactive, non-tool, malformed-id and fast models are never candidates", () => {
+test("inactive, non-tool, malformed-id, fast, and disconnected models are never candidates", () => {
   withStore("admission", ({ store }) => {
     const catalog = {
       ...CATALOG,
@@ -278,20 +280,61 @@ test("api-key, unknown-auth, inactive, non-tool, malformed-id and fast models ar
     // The role still goes to the only admissible successor.
     assert.equal(report.byModel["openai/gpt-6-sol"].state, "evidence-pending");
     for (const key of ["openai/gpt-7-sol", "openai/gpt-8-sol", "openai/gpt 9/sol",
-      "openai/gpt-6-sol-fast", "metered/metered-1", "mystery/mystery-1"]) {
+      "openai/gpt-6-sol-fast", "mystery/mystery-1"]) {
       assert.equal(key in report.byModel, false, `${key} became a candidate`);
     }
+    assert.equal(report.byModel["metered/metered-1"].state, "blocked-quarantined");
     assert.equal(skipReason(report, "openai", "gpt-7-sol"), "inactive");
     assert.equal(skipReason(report, "openai", "gpt-8-sol"), "tool-call-unsupported");
     assert.equal(skipReason(report, "openai", "gpt 9/sol"), "invalid-model-id");
     assert.equal(skipReason(report, "openai", "gpt-6-sol-fast"), "speed-variant");
-    // A quarantined provider produces no candidate AND no skip: it was never observed at all.
+    // A connected untrusted API provider is observed honestly but never proposed; a catalog-only
+    // provider with no auth entry is disconnected and therefore remains unobserved.
     assert.equal(skipReason(report, "metered", "metered-1"), null);
     assert.equal(skipReason(report, "mystery", "mystery-1"), null);
     const proposed = Object.values(report.proposedTargets).map((target) => target.modelID);
     for (const modelID of ["gpt-7-sol", "gpt-8-sol", "gpt 9/sol", "gpt-6-sol-fast", "metered-1", "mystery-1"]) {
       assert.equal(proposed.includes(modelID), false, `${modelID} reached the proposed inventory`);
     }
+  });
+});
+
+test("trusted api subscriptions enumerate active models while untrusted api stays blocked-quarantined", () => {
+  withStore("quarantined-api", ({ store }) => {
+    const apiAuth = Object.freeze({ revision: "same", types: Object.freeze({ anthropic: "api" }) });
+    const report = dryRun({
+      store,
+      trustedProviderIDs: [],
+      authSnapshot: sequence(apiAuth, apiAuth),
+      collectSources: () => sources({
+        data: { anthropic: CATALOG.anthropic },
+        resolverKeys: ["anthropic/claude-opus-5", "anthropic/claude-opus-5-5"],
+      }),
+    });
+    assert.equal(report.byModel["anthropic/claude-opus-5-5"].state, "blocked-quarantined");
+    assert.equal(report.byModel["anthropic/claude-opus-5-5"].reason,
+      "provider authentication is not operator-attested subscription access");
+    assert.deepEqual(report.evidenceRequests, { pending: 0, claimed: 0, failed: 0 });
+    assert.deepEqual(store.read().evidenceRequests, {});
+  });
+});
+
+test("connected unknown-auth inventory stays blocked-quarantined", () => {
+  withStore("quarantined-unknown", ({ store }) => {
+    const unknownAuth = Object.freeze({ revision: "same", types: Object.freeze({ anthropic: "unknown" }) });
+    const report = dryRun({
+      store,
+      trustedProviderIDs: ["anthropic"],
+      authSnapshot: sequence(unknownAuth, unknownAuth),
+      collectSources: () => sources({
+        data: { anthropic: CATALOG.anthropic },
+        resolverKeys: ["anthropic/claude-opus-5", "anthropic/claude-opus-5-5"],
+      }),
+    });
+    assert.equal(report.byModel["anthropic/claude-opus-5-5"].state, "blocked-quarantined");
+    assert.equal(report.byModel["anthropic/claude-opus-5-5"].reason,
+      "provider authentication is not operator-attested subscription access");
+    assert.deepEqual(report.evidenceRequests, { pending: 0, claimed: 0, failed: 0 });
   });
 });
 

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DEFAULT_MODEL_ROLES,
+  REASONING_MODES,
   familyTiersFromRoles,
   matchModelRole,
   normalizeModelRoles,
@@ -18,6 +19,39 @@ const EXPECTED_FAMILIES = {
   "openai:gpt-terra": { tiers: ["build"], fit: {} },
   "openai:gpt-luna": { tiers: ["worker"], fit: {} },
 };
+
+test("roles carry an effort ceiling and an optional required reasoning mode", () => {
+  assert.deepEqual(REASONING_MODES, ["none", "low", "medium", "high", "xhigh"]);
+  const roles = normalizeModelRoles({
+    "openai:gpt-sol": { effortCeiling: "medium", requiredReasoningMode: "low" },
+  });
+  assert.equal(roles["openai:gpt-sol"].effortCeiling, "medium");
+  assert.equal(roles["openai:gpt-sol"].requiredReasoningMode, "low");
+  assert.equal(Object.isFrozen(roles["openai:gpt-sol"]), true);
+
+  assert.deepEqual(Object.fromEntries(Object.entries(DEFAULT_MODEL_ROLES)
+    .map(([key, role]) => [key, role.effortCeiling])), {
+    "anthropic:claude-opus": "high",
+    "anthropic:claude-sonnet": "high",
+    "anthropic:claude-fable": "xhigh",
+    "anthropic:claude-haiku": "medium",
+    "openai:gpt-astra": "xhigh",
+    "openai:gpt-sol": "high",
+    "openai:gpt-terra": "high",
+    "openai:gpt-luna": "medium",
+  });
+  assert.equal(Object.values(DEFAULT_MODEL_ROLES)
+    .every((role) => role.requiredReasoningMode === null), true);
+});
+
+test("invalid effort ceiling policy is rejected without deleting the product role", () => {
+  const warnings = [];
+  const roles = normalizeModelRoles({
+    "openai:gpt-sol": { effortCeiling: "turbo", requiredReasoningMode: "magic" },
+  }, { warn: (message) => warnings.push(message) });
+  assert.equal(roles["openai:gpt-sol"].effortCeiling, "high");
+  assert.equal(warnings.length, 1);
+});
 
 test("default roles derive the existing family-tier policy exactly", () => {
   assert.deepEqual(familyTiersFromRoles(DEFAULT_MODEL_ROLES), EXPECTED_FAMILIES);
@@ -43,6 +77,7 @@ test("a valid subscription-provider role can be added without replacing defaults
       tiers: ["smart"],
       fit: { smart: 1.2 },
       rank: 3,
+      effortCeiling: "high",
       requiredCapabilities: { toolCall: true },
       evidenceDomains: ["models.example.com"],
     },
@@ -60,7 +95,7 @@ test("a colliding override is ignored and the default family owner wins", () => 
   const roles = normalizeModelRoles({
     "anthropic:premium": {
       families: ["claude-opus"], idPatterns: [{ prefix: "premium-", suffix: "" }],
-      tiers: ["deep"], rank: 9, requiredCapabilities: { toolCall: true },
+      tiers: ["deep"], rank: 9, effortCeiling: "xhigh", requiredCapabilities: { toolCall: true },
       evidenceDomains: ["anthropic.com"],
     },
   }, { warn: (line) => warnings.push(line) });
@@ -86,12 +121,12 @@ test("family and id-pattern disagreement is an explicit conflict", () => {
   const roles = normalizeModelRoles({
     "example:alpha": {
       families: ["example-alpha"], idPatterns: [{ prefix: "example-", suffix: "-alpha" }],
-      tiers: ["smart"], rank: 2, requiredCapabilities: { toolCall: true },
+      tiers: ["smart"], rank: 2, effortCeiling: "high", requiredCapabilities: { toolCall: true },
       evidenceDomains: ["example.com"],
     },
     "example:beta": {
       families: ["example-beta"], idPatterns: [{ prefix: "example-", suffix: "-beta" }],
-      tiers: ["worker"], rank: 1, requiredCapabilities: { toolCall: true },
+      tiers: ["worker"], rank: 1, effortCeiling: "medium", requiredCapabilities: { toolCall: true },
       evidenceDomains: ["example.com"],
     },
   });
@@ -142,7 +177,7 @@ test("a malformed role key is ignored and leaves every default standing", () => 
   const roles = normalizeModelRoles({
     "anthropic": {
       families: ["claude-nimbus"], idPatterns: [{ prefix: "claude-nimbus-", suffix: "" }],
-      tiers: ["smart"], rank: 1, requiredCapabilities: { toolCall: true },
+      tiers: ["smart"], rank: 1, effortCeiling: "high", requiredCapabilities: { toolCall: true },
       evidenceDomains: ["anthropic.com"],
     },
     "Anthropic:Claude-Opus": { tiers: ["worker"] },

@@ -1025,30 +1025,45 @@ test("the pure inventory builder produces exactly the body the publisher posts",
   assert.equal(Object.hasOwn(calls[0].body, "skipped"), false);
 }));
 
-// CRITICAL: the reconciler asks what a candidate registry and a candidate trusted-provider set
-// WOULD discover, without editing the deployment to find out -- so both are injected. The rule
-// neither injection may loosen: trust admits a PROVIDER, it never discovers a model. Only OAuth
-// models are ever dynamically discovered, so a trusted API-key provider earns a summary and
-// exactly zero targets.
-test("an injected trusted-provider set moves admission but discovers no API-key model", () => {
-  const inputs = {
-    catalog: {
-      metered: { id: "metered", models: {
-        "gpt-6-sol": { id: "gpt-6-sol", family: "gpt-sol", release_date: "2026-09-22", tool_call: true },
-      } },
-    },
-    authTypes: { metered: "api" },
-    staticTargets: {},
-    resolvableModels: ["metered/gpt-6-sol"],
+// Explicit trust means the provider's `api` label represents subscription access. It admits the
+// same active catalog models as OAuth without weakening the untrusted API quarantine.
+test("trusted api subscriptions enumerate active models while untrusted api stays blocked-quarantined", () => {
+  const inventory = {
+    connected: ["anthropic"],
+    all: [{ id: "anthropic", models: {
+      "claude-opus-5-5": {
+        id: "claude-opus-5-5", family: "claude-opus", release_date: "2026-09-18",
+        status: "active", tool_call: true,
+      },
+    } }],
   };
-  const untrusted = R.buildCachedSubscriptionInventory(inputs);
-  assert.deepEqual(untrusted.providers, {});
-  assert.deepEqual(untrusted.targets, {});
-  const trusted = R.buildCachedSubscriptionInventory({ ...inputs, trustedProviderIDs: ["metered"] });
-  assert.deepEqual(trusted.providers, {
-    metered: { authType: "api", connected: true, admission: "admitted", models: 0 },
+  const options = { resolvableModels: new Set(["anthropic/claude-opus-5-5"]) };
+  const trusted = R.discoverSubscriptionTargets(inventory, { anthropic: "api" }, {}, {
+    ...options, trustedProviderIDs: new Set(["anthropic"]),
   });
-  assert.deepEqual(trusted.targets, {});
+  assert.equal(trusted.providers.anthropic.admission, "admitted");
+  assert.equal(trusted.providers.anthropic.models, 1);
+  const trustedTarget = Object.values(trusted.targets)[0];
+  assert.equal(trustedTarget.source, "subscription-trusted");
+  assert.equal(R.targetIDsFor("auto", "smart", trusted.targets).includes(trustedTarget.id), true);
+  assert.equal(R.cloudTargetAdmitted(trustedTarget, trusted.providers), true);
+  assert.equal(R.cloudTargetAdmitted(trustedTarget, {
+    anthropic: { authType: "api", connected: true, admission: "quarantined-auth", models: 0 },
+  }), false);
+  const cached = R.buildCachedSubscriptionInventory({
+    catalog: { anthropic: inventory.all[0] },
+    authTypes: { anthropic: "api" },
+    staticTargets: {},
+    resolvableModels: options.resolvableModels,
+    trustedProviderIDs: new Set(["anthropic"]),
+  });
+  assert.equal(Object.values(cached.targets)[0].source, "subscription-trusted");
+
+  const untrusted = R.discoverSubscriptionTargets(inventory, { anthropic: "api" }, {}, {
+    ...options, trustedProviderIDs: new Set(),
+  });
+  assert.equal(untrusted.providers.anthropic.admission, "quarantined-auth");
+  assert.deepEqual(untrusted.targets, {});
 });
 
 test("provider admission reads the injected trusted-provider set, not the module's own", () => {

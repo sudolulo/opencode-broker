@@ -28,5 +28,12 @@
       "windows": [{ "id": "5h", "periodMs": 18000000, "meter": "requests", "capacity": 200 }]
     }
   },
+  // Keep this only when `anthropic` is subscription-backed even though OpenCode labels it `api`.
+  // An ordinary metered API key must not be trusted here.
+  "trustedSubscriptionProviders": ["anthropic"],
+  "modelRoles": {
+    "anthropic:claude-sonnet": { "effortCeiling": "high", "requiredReasoningMode": null },
+    "anthropic:claude-haiku": { "effortCeiling": "medium", "requiredReasoningMode": null }
+  },
   "localModelsUrl": "http://localhost:8080/v1/models"
 }

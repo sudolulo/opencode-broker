@@ -390,9 +390,23 @@
     }
   },
   "localModelsUrl": "http://localhost:8080/v1/models",
+  // Explicit operator attestation for subscription-backed providers that OpenCode labels `api`.
+  // Never put an ordinary metered API-key provider here.
   "trustedSubscriptionProviders": [
     "alibaba-token-plan"
   ],
+  // Product role defaults already carry these fields. Declare an override only when this
+  // deployment deliberately needs a different ceiling or requires an exact reasoning mode.
+  "modelRoles": {
+    "anthropic:claude-opus": {
+      "effortCeiling": "high",
+      "requiredReasoningMode": null
+    },
+    "openai:gpt-sol": {
+      "effortCeiling": "high",
+      "requiredReasoningMode": null
+    }
+  },
   "workerLocalShareDenominator": 4,
   "profileTools": {
     "localOnlineExtra": [

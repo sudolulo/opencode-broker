@@ -76,6 +76,18 @@ test("both knobs fall back to their defaults rather than NaN", async () => {
   assert.equal(CONFIG.sessionRebalance.cooldownMs, 1800000);
 });
 
+test("trusted subscription and role effort policy survive config normalization", async () => {
+  const { CONFIG } = await loadConfig(`{
+    "trustedSubscriptionProviders": ["anthropic"],
+    "modelRoles": {
+      "openai:gpt-sol": { "effortCeiling": "medium", "requiredReasoningMode": "low" }
+    }
+  }`);
+  assert.deepEqual(CONFIG.trustedSubscriptionProviders, ["anthropic"]);
+  assert.equal(CONFIG.modelRoles["openai:gpt-sol"].effortCeiling, "medium");
+  assert.equal(CONFIG.modelRoles["openai:gpt-sol"].requiredReasoningMode, "low");
+});
+
 test("per-target contextHeadroom is kept for local targets and rejected otherwise", async () => {
   const { CONFIG } = await loadConfig(`{
     "targets": {
