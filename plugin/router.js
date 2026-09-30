@@ -265,10 +265,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       try {
         for (const record of listPendingForgetRecords()) {
           try {
-            await brokerRequest("/forget", { sessionID: record.sessionID, ...(record.completed ? { completed: true } : {}) });
+            await brokerRequest("/forget", {
+              sessionID: record.sessionID,
+              ...(record.leaseID ? { leaseID: record.leaseID } : {}),
+              ...(record.completed ? { completed: true } : {}),
+            });
             removePendingForgetRecord(record.sessionID);
           } catch {
-            try { writePendingForgetRecord(record.sessionID, { completed: record.completed }); } catch {}
+            try { writePendingForgetRecord(record.sessionID, {
+              leaseID: record.leaseID,
+              completed: record.completed,
+            }); } catch {}
           }
         }
       } catch {}
@@ -324,6 +331,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       try {
         failure = await brokerRequest("/failure", {
           sessionID,
+          ...(route?.leaseID ? { leaseID: route.leaseID } : {}),
           ...(targetID ? { targetID } : {}),
           error: {
             code: LOCAL_CHILD_INACTIVITY_TIMEOUT,
@@ -333,7 +341,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       } catch (error) {
         report("error", `failed to report local child inactivity watchdog failure for ${sessionID}`, error);
         try {
-          await brokerRequest("/release", { sessionID });
+          await brokerRequest("/release", {
+            sessionID,
+            ...(route?.leaseID ? { leaseID: route.leaseID } : {}),
+          });
         } catch (releaseError) {
           report("error", `failed to release local child ${sessionID} after inactivity watchdog failure`, releaseError);
         }
@@ -548,6 +559,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         } catch {}
       }
       const routed = {
+        leaseID: lease.leaseID,
         profile: resolved.profile,
         tier,
         target,
@@ -941,7 +953,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           const singleTooLong = Number.isFinite(waitMs) && waitMs > RETRY_WAIT_FAILOVER_MS;
           const parkedTooLong = parkedMs > RETRY_WAIT_CUMULATIVE_MS;
           if (singleTooLong || parkedTooLong) {
-            const targetID = routes.get(sessionID).target.id;
+            const failedRoute = routes.get(sessionID);
+            const targetID = failedRoute.target.id;
+            const leaseID = failedRoute.leaseID;
             const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
             retryWaits.delete(sessionID);
             if (!singleTooLong) {
@@ -956,6 +970,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             try {
               failure = await brokerRequest("/failure", {
                 sessionID,
+                ...(leaseID ? { leaseID } : {}),
                 targetID,
                 error: { message: String(status.message ?? (singleTooLong
                   ? "provider retry wait exceeded failover threshold"
@@ -1018,6 +1033,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         const failedTarget = routes.get(sessionID)?.target;
+        const failedLeaseID = routes.get(sessionID)?.leaseID;
         const targetID = failedTarget?.id;
         const failedOnLocal = failedTarget?.kind === "local" || modelIsLocalTarget(failedTarget?.model);
         const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
@@ -1026,6 +1042,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         let failure = null;
         try { failure = await brokerRequest("/failure", {
           sessionID,
+          ...(failedLeaseID ? { leaseID: failedLeaseID } : {}),
           ...(targetID ? { targetID } : {}),
           error,
         }); } catch {}
@@ -1081,6 +1098,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             trimTracker(reportedSteps);
             brokerRequest("/usage", {
               sessionID,
+              ...(routes.get(sessionID)?.leaseID ? { leaseID: routes.get(sessionID).leaseID } : {}),
               providerID: model.providerID,
               modelID: model.modelID,
               observedAt: Date.now(),
@@ -1129,12 +1147,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         return;
       }
       if (event?.type === "session.idle") {
+        const leaseID = routes.get(sessionID)?.leaseID;
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         const completed = successCandidates.get(sessionID) === true;
-        try { await brokerRequest("/forget", { sessionID, ...(completed ? { completed: true } : {}) }); } catch {
-          try { writePendingForgetRecord(sessionID, { completed }); } catch {}
+        try { await brokerRequest("/forget", {
+          sessionID,
+          ...(leaseID ? { leaseID } : {}),
+          ...(completed ? { completed: true } : {}),
+        }); } catch {
+          try { writePendingForgetRecord(sessionID, { leaseID, completed }); } catch {}
         } finally {
           routes.delete(sessionID);
           successCandidates.delete(sessionID);

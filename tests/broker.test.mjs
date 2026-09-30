@@ -383,16 +383,18 @@ test("modelCapacity counts every target on the same local model, and keeps a slo
       const lease = (sessionID, profile, tier) =>
         request(socketPath, "/lease", { sessionID, profile, tier, contextTokens: 100, replace: true });
       assert.equal((await lease("ses-coder-1", "local", "worker")).target.id, "local-coder");
-      assert.equal((await lease("ses-classify-1", "auto", "classifier")).target.id, "local-classifier");
+      const classifierOne = await lease("ses-classify-1", "auto", "classifier");
+      assert.equal(classifierOne.target.id, "local-classifier");
       // local-coder holds ONE of its own four, but the model carries two leases -- its
       // modelCapacity -- so the classifier's lease counts against it and the coder waits.
       await assert.rejects(lease("ses-coder-2", "local", "worker"),
         /is busy \(every slot in use\); waiting for a free slot/);
       // The classifier lane may fill the model further: the reserved slot is its to take.
-      assert.equal((await lease("ses-classify-2", "auto", "classifier")).target.id, "local-classifier");
+      const classifierTwo = await lease("ses-classify-2", "auto", "classifier");
+      assert.equal(classifierTwo.target.id, "local-classifier");
       // Releasing the classifier's leases frees the model-wide count, not just its own.
-      await request(socketPath, "/forget", { sessionID: "ses-classify-1" });
-      await request(socketPath, "/forget", { sessionID: "ses-classify-2" });
+      await request(socketPath, "/forget", { sessionID: "ses-classify-1", leaseID: classifierOne.leaseID });
+      await request(socketPath, "/forget", { sessionID: "ses-classify-2", leaseID: classifierTwo.leaseID });
       assert.equal((await lease("ses-coder-2", "local", "worker")).target.id, "local-coder");
     } finally {
       await stopBroker(child);
@@ -513,8 +515,8 @@ test("a session's repeated waits are logged once, not once per poll", async () =
 test("a gateway caller is recorded on the session's decisions and usage lines", async () => withBroker(async ({ home, socketPath }) => {
   const caller = { address: "192.168.50.1", model: "background" };
   await request(socketPath, "/inventory", inventory({ openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 } }));
-  await request(socketPath, "/lease", { sessionID: "gw-caller", profile: "auto", tier: "worker", preferredModel: { providerID: "openai", id: "gpt-5.6-luna" }, replace: true, caller });
-  await request(socketPath, "/usage", { sessionID: "gw-caller", providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1, tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 }, caller });
+  const lease = await request(socketPath, "/lease", { sessionID: "gw-caller", profile: "auto", tier: "worker", preferredModel: { providerID: "openai", id: "gpt-5.6-luna" }, replace: true, caller });
+  await request(socketPath, "/usage", { sessionID: "gw-caller", leaseID: lease.leaseID, providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1, tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 }, caller });
   await request(socketPath, "/lease", { sessionID: "gw-junk", profile: "auto", tier: "worker", replace: true, caller: { address: "not an ip!", model: "x".repeat(500) } });
   const dir = join(home, ".local/share/opencode/model-routing");
   const decisions = readFileSync(join(dir, "decisions.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -791,6 +793,77 @@ test("estimated budget exhaustion remains advisory until the provider reports qu
   assert.equal(renewed.target.model.id, "qwen3.8-flash");
 }));
 
+test("ordinary leased settlements require the exact broker-minted lease id", async () => withBroker(async ({ home, socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-exact-ordinary",
+    profile: "auto",
+    tier: "worker",
+    replace: true,
+  });
+
+  const missing = await rawRequest(socketPath, "/release", {
+    body: { sessionID: "ses-exact-ordinary" },
+  });
+  assert.equal(missing.status, 400, JSON.stringify(missing.body));
+
+  const mismatchedTarget = await rawRequest(socketPath, "/failure", {
+    body: {
+      sessionID: "ses-exact-ordinary",
+      leaseID: lease.leaseID,
+      targetID: "qwen-flash",
+      error: { message: "wrong target" },
+    },
+  });
+  assert.equal(mismatchedTarget.status, 400, JSON.stringify(mismatchedTarget.body));
+
+  const budgetBeforeRejectedUsage = (await request(socketPath, "/status")).budgets.openai;
+  const staleUsage = await rawRequest(socketPath, "/usage", {
+    body: {
+      sessionID: "ses-exact-ordinary",
+      leaseID: "00000000-0000-4000-8000-000000000000",
+      providerID: "openai",
+      modelID: lease.target.model.id,
+      observedAt: Date.now(),
+      requests: 1,
+      tokens: { input: 100, output: 50 },
+    },
+  });
+  assert.equal(staleUsage.status, 400, JSON.stringify(staleUsage.body));
+  const budgetAfterRejectedUsage = (await request(socketPath, "/status")).budgets.openai;
+  assert.equal(budgetAfterRejectedUsage.utilization, budgetBeforeRejectedUsage.utilization,
+    "a rejected usage report must not change utilization");
+  assert.deepEqual(
+    budgetAfterRejectedUsage.windows.map((window) => [window.id, window.spent]),
+    budgetBeforeRejectedUsage.windows.map((window) => [window.id, window.spent]),
+    "a rejected usage report must not add spend",
+  );
+
+  const validFailureBody = {
+    sessionID: "ses-exact-ordinary",
+    leaseID: lease.leaseID,
+    targetID: lease.target.id,
+    error: { statusCode: 529, message: "overloaded" },
+  };
+  const validFailure = await rawRequest(socketPath, "/failure", { body: validFailureBody });
+  assert.equal(validFailure.status, 200, JSON.stringify(validFailure.body));
+  const failedState = JSON.parse(readFileSync(join(home, ".local/share/opencode/model-routing/broker.json"), "utf8"));
+  assert.deepEqual(
+    failedState.assignments["ses-exact-ordinary"].settledFailure?.reply,
+    validFailure.body,
+    "the exact assignment retains the first failure result for idempotent replay",
+  );
+  const replayedFailure = await rawRequest(socketPath, "/failure", { body: validFailureBody });
+  assert.deepEqual(replayedFailure, validFailure);
+
+  const exact = await rawRequest(socketPath, "/release", {
+    body: { sessionID: "ses-exact-ordinary", leaseID: lease.leaseID },
+  });
+  assert.equal(exact.status, 200, JSON.stringify(exact.body));
+}));
+
 test("a confirmed Alibaba allocation quota blocks every Alibaba model until its reported reset", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
@@ -806,6 +879,7 @@ test("a confirmed Alibaba allocation quota blocks every Alibaba model until its 
   const resetAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
   await request(socketPath, "/failure", {
     sessionID: "ses-quota-reset",
+    leaseID: lease.leaseID,
     targetID: "qwen-flash",
     error: { code: "Throttling.AllocationQuota", message: `Allocated quota exceeded; reset at ${resetAt}` },
   });
@@ -844,6 +918,7 @@ test("successful usage clears current probation and restores provider concurrenc
 
   const usage = {
     sessionID: "ses-openai-probe",
+    leaseID: probe.leaseID,
     providerID: "openai",
     modelID: probe.target.model.id,
     requests: 1,
@@ -889,6 +964,7 @@ test("Anthropic account quota reroutes the current session and blocks fresh sess
   assert.equal(first.target.model.providerID, "anthropic");
   const failure = await request(socketPath, "/failure", {
     sessionID: "ses-anthropic-quota",
+    leaseID: first.leaseID,
     targetID: first.target.id,
     error: { message: "This request would exceed your account's rate limit. Please try again later." },
   });
@@ -904,6 +980,7 @@ test("Anthropic account quota reroutes the current session and blocks fresh sess
   // quota circuit.
   await request(socketPath, "/usage", {
     sessionID: "ses-anthropic-quota",
+    leaseID: continued.leaseID,
     providerID: continued.target.model.providerID,
     modelID: continued.target.model.id,
     requests: 1,
@@ -930,7 +1007,7 @@ test("a provider overload fences the target BRIEFLY (overload circuit), never cr
   // Before OVERLOAD_MS was defined, this threw a ReferenceError in the handler and
   // the target was NEVER fenced (the plugin swallowed the 400). Now it fences.
   const failure = await request(socketPath, "/failure", {
-    sessionID: "ses-overload", targetID,
+    sessionID: "ses-overload", leaseID: lease.leaseID, targetID,
     error: { statusCode: 529, message: "Overloaded" },
   });
   assert.equal(failure.kind, "overload");
@@ -946,11 +1023,14 @@ test("a quota response without a reset re-probes on a bounded cadence", async ()
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
     "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
   }));
-  await request(socketPath, "/lease", {
+  const lease = await request(socketPath, "/lease", {
     sessionID: "ses-quota-indefinite", profile: "auto", tier: "worker", replace: true,
+    preferredModel: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" },
   });
+  assert.equal(lease.target.id, "qwen-flash");
   const failure = await request(socketPath, "/failure", {
     sessionID: "ses-quota-indefinite",
+    leaseID: lease.leaseID,
     targetID: "qwen-flash",
     error: { code: "insufficient_quota", message: "Token Plan quota exhausted" },
   });
@@ -1018,6 +1098,7 @@ test("model-not-found circuits only that version, falls back, and is pruned with
   assert.equal(lease.target.model.id, "claude-fable-5");
   const failure = await request(socketPath, "/failure", {
     sessionID: "ses-model-newest",
+    leaseID: lease.leaseID,
     targetID: newest.id,
     error: { statusCode: 404, code: "model_not_found", message: "model: claude-fable-5 not found" },
   });
@@ -1056,7 +1137,7 @@ test("a session keeps its pinned model across releases; only a NEW session is ba
     requests: 100,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   });
-  await request(socketPath, "/forget", { sessionID: "ses-replace" });
+  await request(socketPath, "/forget", { sessionID: "ses-replace", leaseID: first.leaseID });
 
   // The next turn returns to the same model: a different model mid-task re-reads a history it
   // did not write, and that is what derailed long sessions.
@@ -1099,6 +1180,7 @@ test("a preferred session model stays sticky until it becomes ineligible", async
 
   await request(socketPath, "/failure", {
     sessionID: "ses-sticky",
+    leaseID: sticky.leaseID,
     targetID: "gpt-luna",
     error: "rate limit",
   });
@@ -1127,10 +1209,13 @@ test("a preferred Smart Opus session reroutes to GPT when Opus becomes ineligibl
     replace: true,
     preferredModel: { providerID: "anthropic", id: "claude-opus-5" },
   };
-  assert.equal((await request(socketPath, "/lease", body)).target.id, "claude-opus-5");
-  assert.equal((await request(socketPath, "/lease", body)).decision.policy, "session-stickiness");
+  const first = await request(socketPath, "/lease", body);
+  assert.equal(first.target.id, "claude-opus-5");
+  const held = await request(socketPath, "/lease", body);
+  assert.equal(held.decision.policy, "session-stickiness");
   await request(socketPath, "/failure", {
     sessionID: "ses-smart-opus",
+    leaseID: held.leaseID,
     targetID: "claude-opus-5",
     error: "rate limit",
   });
@@ -1248,7 +1333,7 @@ test("budget, auth, and circuit gates reject fresh leasing", async () => withBro
   });
   assert.equal(gptLease.target.model.id, "gpt-5.6-luna");
   await request(socketPath, "/failure", {
-    sessionID: "ses-circuit-gpt", targetID: "gpt-luna", error: "rate limit",
+    sessionID: "ses-circuit-gpt", leaseID: gptLease.leaseID, targetID: "gpt-luna", error: "rate limit",
   });
 
   await request(socketPath, "/inventory", inventory({
@@ -1277,7 +1362,7 @@ test("budget, auth, and circuit gates reject fresh leasing", async () => withBro
   });
   assert.equal(qwenLease.target.model.id, "qwen3.8-flash");
   await request(socketPath, "/failure", {
-    sessionID: "ses-circuit-qwen", targetID: "qwen-flash", error: "rate limit",
+    sessionID: "ses-circuit-qwen", leaseID: qwenLease.leaseID, targetID: "qwen-flash", error: "rate limit",
   });
 
   await assert.rejects(request(socketPath, "/lease", {
@@ -1606,7 +1691,12 @@ const startLiveProbationCandidate = async (home, { offerEvery = 1 } = {}) => {
     });
     assert.equal(first.status, 200, JSON.stringify(first.body));
     assert.equal(first.body.target.model.id, "gpt-6-sol", JSON.stringify(first.body));
-    return { ...broker, candidateID, resolverToken: registration.body.resolverToken };
+    return {
+      ...broker,
+      candidateID,
+      resolverToken: registration.body.resolverToken,
+      firstLeaseID: first.body.leaseID,
+    };
   } catch (error) {
     await stopBroker(broker.child);
     throw error;
@@ -1657,7 +1747,9 @@ const assertOpportunityPauses = async ({
   assert.equal(paused.probation.opportunityCursorAt, null,
     "an unselectable candidate must close the opportunity window");
   const pausedMs = paused.probation.opportunityMs;
-  const releasedFallback = await rawRequest(socketPath, "/release", { body: { sessionID: firstSessionID } });
+  const releasedFallback = await rawRequest(socketPath, "/release", {
+    body: { sessionID: firstSessionID, leaseID: firstBlocked.body.leaseID },
+  });
   assert.equal(releasedFallback.status, 200, JSON.stringify(releasedFallback.body));
 
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1991,7 +2083,7 @@ test("enabled resolver registration validates the immutable manifest and broker 
       });
       assert.equal(readFileSync(join(home, ".local/share/opencode/model-routing/broker.json"), "utf8").includes(resolverToken), false);
       const released = await rawRequest(first.socketPath, "/release", {
-        body: { sessionID: "resolver-first", resolverToken },
+        body: { sessionID: "resolver-first", leaseID: lease.body.leaseID, resolverToken },
       });
       assert.equal(released.status, 200);
     } finally {
@@ -2215,39 +2307,217 @@ test("policy probation gives one compatible process the candidate while legacy a
   }
 }));
 
-test("off-offer probation requests route the incumbent without accruing or opening an opportunity window", async () => withTempHome(async (home) => {
+test("probation advances every compatible opportunity and recurs at slots 0 5 and 10 without off-offer accrual", async () => withTempHome(async (home) => {
   const broker = await startLiveProbationCandidate(home, { offerEvery: 5 });
   try {
+    assert.match(broker.firstLeaseID, /^[0-9a-f-]{36}$/);
     const releasedCandidate = await rawRequest(broker.socketPath, "/release", {
-      body: { sessionID: "probation-live-candidate" },
+      body: { sessionID: "probation-live-candidate", leaseID: broker.firstLeaseID },
     });
     assert.equal(releasedCandidate.status, 200, JSON.stringify(releasedCandidate.body));
+    const initial = await probationRole(broker.socketPath);
+    assert.equal(initial.probation.opportunityCursor, 1, "slot 0 consumed the first opportunity");
+    const initialOpportunityMs = initial.probation.opportunityMs;
+    const offeredSlots = [0];
 
-    const legacy = await leaseCompatibleSmartSession(
+    for (let slot = 1; slot <= 10; slot += 1) {
+      const sessionID = `probation-recurring-${slot}`;
+      const leased = await leaseCompatibleSmartSession(
+        broker.socketPath,
+        broker.resolverToken,
+        sessionID,
+      );
+      assert.equal(leased.status, 200, JSON.stringify(leased.body));
+      const candidate = leased.body.target.model.id === "gpt-6-sol";
+      if (candidate) offeredSlots.push(slot);
+      assert.equal(candidate, slot === 5 || slot === 10, `slot ${slot}`);
+
+      const role = await probationRole(broker.socketPath);
+      assert.equal(role.probation.opportunityCursor, slot + 1, `slot ${slot} advances the cursor`);
+      if (!candidate) {
+        assert.equal(role.probation.opportunityMs, initialOpportunityMs,
+          `off-offer slot ${slot} must not accrue opportunity time`);
+        assert.equal(role.probation.opportunityCursorAt, null,
+          `off-offer slot ${slot} must not open an opportunity window`);
+      }
+      const released = await rawRequest(broker.socketPath, "/release", {
+        body: { sessionID, leaseID: leased.body.leaseID },
+      });
+      assert.equal(released.status, 200, JSON.stringify(released.body));
+    }
+    assert.deepEqual(offeredSlots, [0, 5, 10]);
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a delayed L1 failure after forget and L2 cannot settle or indict L2", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    assert.match(broker.firstLeaseID, /^[0-9a-f-]{36}$/);
+    const forgotten = await rawRequest(broker.socketPath, "/forget", {
+      body: {
+        sessionID: "probation-live-candidate",
+        leaseID: broker.firstLeaseID,
+        completed: false,
+      },
+    });
+    assert.equal(forgotten.status, 200, JSON.stringify(forgotten.body));
+
+    const second = await leaseCompatibleSmartSession(
       broker.socketPath,
-      undefined,
-      "probation-off-offer-legacy",
+      broker.resolverToken,
+      "probation-live-candidate",
     );
-    assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
-    assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
-    const before = await probationRole(broker.socketPath);
-    assert.equal(before.probation.opportunityCursor, 1);
-    assert.equal(before.probation.opportunityCursorAt, null);
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    assert.equal(second.body.target.model.id, "gpt-6-sol");
+    assert.notEqual(second.body.leaseID, broker.firstLeaseID);
+
+    const delayed = await rawRequest(broker.socketPath, "/failure", {
+      body: {
+        sessionID: "probation-live-candidate",
+        leaseID: broker.firstLeaseID,
+        targetID: broker.candidateID,
+        failureClass: "model-not-found",
+        error: { statusCode: 404, code: "model_not_found", message: "delayed L1 failure" },
+      },
+    });
+    assert.equal(delayed.status, 200, JSON.stringify(delayed.body));
+
+    const state = JSON.parse(readFileSync(join(home, ".local/share/opencode/model-routing/broker.json"), "utf8"));
+    assert.equal(state.leases["probation-live-candidate"].leaseID, second.body.leaseID,
+      "the delayed report must not consume L2");
+    assert.equal(state.circuits[broker.candidateID], undefined,
+      "an already-abandoned L1 must not indict the candidate after L2 exists");
+    const role = state.modelPolicy.roles["openai:gpt-sol"];
+    assert.equal(role.probation.leases[broker.firstLeaseID].settlement.outcome, "abandoned");
+    assert.equal(role.probation.leases[second.body.leaseID].settlement, null);
+
+    const valid = await rawRequest(broker.socketPath, "/failure", {
+      body: {
+        sessionID: "probation-live-candidate",
+        leaseID: second.body.leaseID,
+        targetID: broker.candidateID,
+        failureClass: "model-not-found",
+        error: { statusCode: 404, code: "model_not_found", message: "current L2 failure" },
+      },
+    });
+    assert.equal(valid.status, 200, JSON.stringify(valid.body));
+    const after = await probationRole(broker.socketPath);
+    assert.equal(after.probation.leases[second.body.leaseID].settlement.outcome, "failure");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a delayed candidate failure without a lease id is rejected after the session moves to the incumbent", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home, { offerEvery: 5 });
+  try {
+    const released = await rawRequest(broker.socketPath, "/release", {
+      body: { sessionID: "probation-live-candidate", leaseID: broker.firstLeaseID },
+    });
+    assert.equal(released.status, 200, JSON.stringify(released.body));
 
     const incumbent = await leaseCompatibleSmartSession(
       broker.socketPath,
       broker.resolverToken,
-      "probation-off-offer-current",
+      "probation-live-candidate",
     );
     assert.equal(incumbent.status, 200, JSON.stringify(incumbent.body));
     assert.equal(incumbent.body.target.model.id, "gpt-5.6-sol");
-    const after = await probationRole(broker.socketPath);
-    assert.equal(after.probation.opportunityCursor, 1,
-      "an off-offer incumbent request must not advance the opportunity cursor");
-    assert.equal(after.probation.opportunityCursorAt, null,
-      "an off-offer incumbent request must not open an opportunity window");
-    assert.equal(after.probation.opportunityMs, before.probation.opportunityMs,
-      "an off-offer incumbent request must not accrue opportunity time");
+
+    const delayed = await rawRequest(broker.socketPath, "/failure", {
+      body: {
+        sessionID: "probation-live-candidate",
+        targetID: broker.candidateID,
+        failureClass: "model-not-found",
+        error: { statusCode: 404, code: "model_not_found", message: "delayed candidate failure" },
+      },
+    });
+    assert.equal(delayed.status, 400, JSON.stringify(delayed.body));
+
+    const state = JSON.parse(readFileSync(join(home, ".local/share/opencode/model-routing/broker.json"), "utf8"));
+    assert.equal(state.leases["probation-live-candidate"].leaseID, incumbent.body.leaseID,
+      "the unbound delayed report must not consume the incumbent lease");
+    assert.equal(state.circuits[broker.candidateID], undefined,
+      "the unbound delayed report must not indict the candidate");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a delayed L1 usage after release cannot settle L2 while exact valid usage and completion remain idempotent", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const released = await rawRequest(broker.socketPath, "/release", {
+      body: { sessionID: "probation-live-candidate", leaseID: broker.firstLeaseID },
+    });
+    assert.equal(released.status, 200, JSON.stringify(released.body));
+    const second = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      broker.resolverToken,
+      "probation-live-candidate",
+    );
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+
+    for (const [path, body] of [
+      ["/complete", { sessionID: "probation-live-candidate" }],
+      ["/failure", {
+        sessionID: "probation-live-candidate",
+        leaseID: "00000000-0000-4000-8000-000000000000",
+        error: { message: "forged" },
+      }],
+      ["/usage", {
+        sessionID: "probation-other-session",
+        leaseID: second.body.leaseID,
+        providerID: "openai",
+        modelID: "gpt-6-sol",
+        observedAt: Date.now(),
+        requests: 1,
+        tokens: { input: 1, output: 1 },
+      }],
+    ]) {
+      const rejected = await rawRequest(broker.socketPath, path, { body });
+      assert.equal(rejected.status, 400, `${path}: ${JSON.stringify(rejected.body)}`);
+    }
+
+    const delayedUsage = await rawRequest(broker.socketPath, "/usage", {
+      body: {
+        sessionID: "probation-live-candidate",
+        leaseID: broker.firstLeaseID,
+        providerID: "openai",
+        modelID: "gpt-6-sol",
+        observedAt: Date.now(),
+        requests: 1,
+        tokens: { input: 10, output: 5 },
+      },
+    });
+    assert.equal(delayedUsage.status, 200, JSON.stringify(delayedUsage.body));
+    let role = await probationRole(broker.socketPath);
+    assert.equal(role.probation.leases[broker.firstLeaseID].settlement.outcome, "abandoned");
+    assert.equal(role.probation.leases[second.body.leaseID].settlement, null,
+      "delayed L1 usage must not count as L2 success");
+
+    const validUsage = await rawRequest(broker.socketPath, "/usage", {
+      body: {
+        sessionID: "probation-live-candidate",
+        leaseID: second.body.leaseID,
+        providerID: "openai",
+        modelID: "gpt-6-sol",
+        observedAt: Date.now(),
+        requests: 1,
+        tokens: { input: 10, output: 5 },
+      },
+    });
+    assert.equal(validUsage.status, 200, JSON.stringify(validUsage.body));
+    const completed = await rawRequest(broker.socketPath, "/complete", {
+      body: { sessionID: "probation-live-candidate", leaseID: second.body.leaseID },
+    });
+    assert.equal(completed.status, 200, JSON.stringify(completed.body));
+    role = await probationRole(broker.socketPath);
+    assert.deepEqual(role.probation.successes, [second.body.leaseID]);
+    assert.equal(role.probation.leases[second.body.leaseID].settlement.source, "usage",
+      "completion after usage remains an idempotent replay");
   } finally {
     await stopBroker(broker.child);
   }
@@ -2292,6 +2562,7 @@ test("probation opportunity pauses while the candidate circuit is open", async (
     const failure = await rawRequest(broker.socketPath, "/failure", {
       body: {
         sessionID: "probation-live-candidate",
+        leaseID: broker.firstLeaseID,
         targetID: broker.candidateID,
         error: { statusCode: 404, code: "model_not_found", message: "model: gpt-6-sol not found" },
       },
@@ -2351,6 +2622,7 @@ test("release settles candidate leases so more than 512 lease cycles remain avai
       sessionIDs.push(`probation-release-${String(index).padStart(3, "0")}`);
     }
     for (const [index, sessionID] of sessionIDs.entries()) {
+      let leaseID = broker.firstLeaseID;
       if (index > 0) {
         const lease = await leaseCompatibleSmartSession(
           broker.socketPath,
@@ -2359,8 +2631,9 @@ test("release settles candidate leases so more than 512 lease cycles remain avai
         );
         assert.equal(lease.status, 200, `cycle ${index + 1}: ${JSON.stringify(lease.body)}`);
         assert.equal(lease.body.target.model.id, "gpt-6-sol", `cycle ${index + 1}`);
+        leaseID = lease.body.leaseID;
       }
-      const released = await rawRequest(broker.socketPath, "/release", { body: { sessionID } });
+      const released = await rawRequest(broker.socketPath, "/release", { body: { sessionID, leaseID } });
       assert.equal(released.status, 200, `cycle ${index + 1}: ${JSON.stringify(released.body)}`);
     }
 
@@ -2375,7 +2648,11 @@ test("release settles candidate leases so more than 512 lease cycles remain avai
     const firstSettlement = structuredClone(latest.settlement);
 
     const replay = await rawRequest(broker.socketPath, "/release", {
-      body: { sessionID: sessionIDs.at(-1) },
+      body: {
+        sessionID: sessionIDs.at(-1),
+        leaseID: Object.entries(role.probation.leases)
+          .find(([, record]) => record.sessionID === sessionIDs.at(-1))[0],
+      },
     });
     assert.equal(replay.status, 200, JSON.stringify(replay.body));
     role = await probationRole(broker.socketPath);
@@ -2430,7 +2707,11 @@ test("broker lease settlements survive restart, promote once, and persist post-a
       },
     });
     assert.equal(forgotten.body.target.model.id, "gpt-6-sol");
-    await request(broker.socketPath, "/forget", { sessionID: "probation-forgotten", completed: false });
+    await request(broker.socketPath, "/forget", {
+      sessionID: "probation-forgotten",
+      leaseID: forgotten.body.leaseID,
+      completed: false,
+    });
     let status = await rawRequest(broker.socketPath, "/model-policy/status", { method: "GET" });
     let records = Object.values(status.body.modelPolicy.roles["openai:gpt-sol"].probation.leases);
     assert.equal(records.find((record) => record.sessionID === "probation-forgotten").settlement.outcome, "abandoned");
@@ -2485,6 +2766,7 @@ test("broker lease settlements survive restart, promote once, and persist post-a
       if (index === 0) {
         await request(broker.socketPath, "/usage", {
           sessionID,
+          leaseID: candidate.body.leaseID,
           providerID: "openai",
           modelID: "gpt-6-sol",
           observedAt: Date.now(),
@@ -2492,7 +2774,7 @@ test("broker lease settlements survive restart, promote once, and persist post-a
           tokens: {},
         });
       }
-      await request(broker.socketPath, "/complete", { sessionID });
+      await request(broker.socketPath, "/complete", { sessionID, leaseID: candidate.body.leaseID });
     }
     status = await rawRequest(broker.socketPath, "/model-policy/status", { method: "GET" });
     role = status.body.modelPolicy.roles["openai:gpt-sol"];
@@ -2500,6 +2782,7 @@ test("broker lease settlements survive restart, promote once, and persist post-a
     assert.equal(role.probation.phase, "active");
     assert.equal(role.probation.successes.length, 5, "usage plus complete settles one success");
 
+    const postActiveLeases = new Map();
     for (const sessionID of ["post-active-bad-1", "post-active-bad-2"]) {
       const candidate = await rawRequest(broker.socketPath, "/lease", {
         body: {
@@ -2512,9 +2795,11 @@ test("broker lease settlements survive restart, promote once, and persist post-a
         },
       });
       assert.equal(candidate.body.target.model.id, "gpt-6-sol");
+      postActiveLeases.set(sessionID, candidate.body.leaseID);
     }
     await request(broker.socketPath, "/failure", {
       sessionID: "post-active-bad-1",
+      leaseID: postActiveLeases.get("post-active-bad-1"),
       failureClass: "model-not-found",
       error: { message: "client closed request" },
     });
@@ -2523,6 +2808,7 @@ test("broker lease settlements survive restart, promote once, and persist post-a
       "the response follows the state write");
     await request(broker.socketPath, "/failure", {
       sessionID: "post-active-bad-2",
+      leaseID: postActiveLeases.get("post-active-bad-2"),
       failureClass: "unsupported-model-parameter",
       error: { message: "client closed request" },
     });
@@ -2823,11 +3109,11 @@ const oneShotEndOfLease = (endpoint) =>
     const oneShotID = `gw-end-${endpoint.slice(1)}`;
     const sessionPinID = `ses_end_${endpoint.slice(1)}`;
     for (const [sessionID, oneShot] of [[oneShotID, true], [sessionPinID, false]]) {
-      await request(socketPath, "/lease", {
+      const lease = await request(socketPath, "/lease", {
         sessionID, profile: "auto", tier: "worker", contextTokens: 100, replace: true,
         ...(oneShot ? { oneShot: true } : {}),
       });
-      await request(socketPath, endpoint, { sessionID });
+      await request(socketPath, endpoint, { sessionID, leaseID: lease.leaseID });
     }
     const status = await request(socketPath, "/status");
     assert.equal(status.assignments[oneShotID], undefined,

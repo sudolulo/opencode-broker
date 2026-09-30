@@ -283,7 +283,7 @@ test("target-busy: a resident local model with every slot taken is a wait, not a
     assert.equal(selection.body.lastDecision?.policy, "waiting", "a wait is not filed as a refusal");
 
     // The slot frees: the waiter gets it on the retry.
-    await post(socketPath, "/forget", { sessionID: "ses-holder" });
+    await post(socketPath, "/forget", { sessionID: "ses-holder", leaseID: held.body.leaseID });
     const granted = await post(socketPath, "/lease", { sessionID: "ses-waiter", profile: "local", tier: "worker", replace: true, contextTokens: 100 });
     assert.equal(granted.statusCode, 200);
     assert.equal(granted.body.target.id, "lan-solo");

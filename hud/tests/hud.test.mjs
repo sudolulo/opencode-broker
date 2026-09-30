@@ -167,6 +167,7 @@ const withFakeBroker = async (handler) => {
   };
 };
 const LEASED_TARGET = {
+  leaseID: "lease-hud-allocation",
   target: { id: "qwen-unc", kind: "local", model: { providerID: "llamacpp", id: "qwen3.8-27b-uncensored" } },
   existing: false,
 };
@@ -517,6 +518,30 @@ test("staying on a native tier-switch question does not switch the agent", async
 });
 
 // ---- the broker owns the swap in; the HUD waits for it -------------------------------------
+
+test("HUD allocation releases the exact broker-minted lease", async () => {
+  const calls = [];
+  routerHooks.resolveProfile = () => ({ profile: "local" });
+  routerHooks.brokerRequest = async (path, body) => {
+    calls.push({ path, body });
+    return path === "/lease" ? LEASED_TARGET : { ok: true };
+  };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: "hud-exact-lease", agent: "build" } });
+    await waitFor(() => calls.some((call) => call.path === "/release"));
+    assert.deepEqual(calls.find((call) => call.path === "/release")?.body, {
+      sessionID: "hud-exact-lease",
+      leaseID: LEASED_TARGET.leaseID,
+    });
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+    resetSwapBackCalls();
+  }
+});
 
 test("deleting a session this HUD did not swap does not launch an awaited restore", async () => {
   const h = await withTuiHarness();

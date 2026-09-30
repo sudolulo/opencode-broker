@@ -7,12 +7,12 @@ if a file is not here, the router does not own it.
 | Path | Writer | Readers | Content |
 |---|---|---|---|
 | `broker.sock` | broker | plugins, gateway, opencode-guard, CLIs | The API socket ([API.md](API.md)) |
-| `broker.json` | broker | broker | Version-5 leases, assignments, circuits, cursors, inventory, health, budget ledger, and broker-owned runtime `modelPolicy` |
+| `broker.json` | broker | broker | Version-5 leases and assignments carrying exact `leaseID`/`sessionID` bindings, plus circuits, cursors, inventory, health, budget ledger, and broker-owned runtime `modelPolicy` |
 | `pending-profile.json` | hud | router plugin | A profile armed for the NEXT root session `{ profile, updatedAt }`; consumed when that session is created, ignored after 30 min. (A `profile.json` left by an older build is deleted, never read.) |
 | `profiles/<sessionID>.json` | router plugin, hud | plugins, opencode-guard | Per-session profile `{ profile, explicit, updatedAt }`; pruned after 14 days |
 | `context-estimates/<sessionID>.json` | router plugin | router plugin | Last known context tokens `{ tokens, updatedAt }`; seeds resumed sessions without a full history fetch; 14-day prune |
 | `managed-switches/<sessionID>.json` | router plugin, hud | hud | Short-lived marker (5 min) distinguishing router-driven model switches from the user's own |
-| `pending-forgets/<sessionID>.json` | router plugin | router plugin | Queued `/forget` calls to retry when the broker was unreachable; 14-day prune |
+| `pending-forgets/<sessionID>.json` | router plugin | router plugin | Queued exact `/forget` calls `{ leaseID?, completed, updatedAt }` to retry when the broker was unreachable; 14-day prune |
 | `decisions.jsonl` | broker | operator, tooling | Every routing decision — grants, revalidations, refusals, failures, and burn-watch stops (`policy: "burn-stop"`), with the gateway's `caller` on a gateway session's lines (bounded 4MB, truncating) |
 | `usage.jsonl` (+ `usage.jsonl.1`) | broker | `opencode-broker usage`, operator | One line per provider request: session, model, the lease's target/profile/tier, `prompt` (input + cache read + cache write), that total split into `input`, `cacheRead` and `cacheWrite` (always present, zeroes included, so a burn-watch stop can be audited afterwards), `output` tokens, and for gateway requests the `caller` (client address and requested model). For tuning local windows, because opencode deletes child sessions and their token history. Rotated at 8MB, one previous generation kept |
 | `fallbacks/<sessionID>.json` | router plugin | hud, router plugin | Fallback/displacement marker; `policy: "provider-displaced"` carries `restoreAt` -- stickiness is released once it passes, and a healthy lease clears every other kind |
@@ -169,11 +169,15 @@ counters, invalid identities, or inconsistent acknowledgements are refused.
 The probation record persists `phase`, offer cursor, cumulative `opportunityMs`,
 `opportunityCursorAt`, the bounded `opportunityEligibleUntil`, distinct success
 lease IDs, rolling qualifying failures, and exact lease/session bindings. Each
-binding stores its lease time, synthetic marker, and at most one terminal
-settlement. Bindings remain until the ordinary assignment retention boundary;
+binding stores its target ID, lease time, synthetic marker, and at most one terminal
+settlement. Replacing a session assignment does not delete its prior candidate
+binding; settled bindings remain under the bounded candidate-binding retention;
 there is no independent settlement-age cutoff. Restart therefore preserves an
 open opportunity window and accrues no more than its remaining 10 minutes.
-Old/incompatible traffic closes the window. Five production successes change the
+Every compatible candidate-capable production opportunity advances the offer cursor,
+while only an actually selectable candidate slot accrues time. Off-offer,
+old/incompatible, and dynamically blocked traffic closes the window without accrual.
+Five production successes change the
 phase to `active` while retaining the rollback model and post-active failure watch;
 two qualifying failures within 15 minutes or seven cumulative eligible days change
 it to `rolled-back`, restore the rollback model (including explicit `null`), and

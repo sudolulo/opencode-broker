@@ -434,6 +434,65 @@ const settlePolicyLease = (state, lease, { outcome, failureClass, source, now = 
   return result.event;
 };
 
+const policyLeaseBinding = (state, leaseID, sessionID) => {
+  for (const role of Object.values(state.modelPolicy?.roles ?? {})) {
+    const record = role?.probation?.leases?.[leaseID];
+    if (!record) continue;
+    if (record.sessionID !== sessionID) throw new Error("lease id does not match session id");
+    return {
+      leaseID,
+      sessionID,
+      targetID: record.targetID ?? null,
+      modelPolicyRoleKey: role.roleKey,
+      historical: true,
+    };
+  }
+  return null;
+};
+
+const hasPolicyLeaseBindingForSession = (state, sessionID) => Object.values(state.modelPolicy?.roles ?? {})
+  .some((role) => Object.values(role?.probation?.leases ?? {})
+    .some((record) => record?.sessionID === sessionID));
+
+const settlementBinding = (state, body, { usage = false } = {}) => {
+  const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+  if (!sessionID) {
+    if (usage && body.leaseID === undefined) return null;
+    throw new Error("invalid session id");
+  }
+  const currentLease = state.leases[sessionID];
+  const assignment = state.assignments[sessionID];
+  const brokerMintedBinding = Boolean(currentLease?.leaseID || assignment?.leaseID ||
+    hasPolicyLeaseBindingForSession(state, sessionID));
+  if (body.leaseID === undefined) {
+    if (brokerMintedBinding) throw new Error("lease id is required for settlement");
+    return currentLease ?? assignment ?? null;
+  }
+  if (!validSessionID(body.leaseID)) throw new Error("invalid lease id");
+  if (currentLease?.leaseID === body.leaseID) return currentLease;
+  if (assignment?.leaseID === body.leaseID) return assignment;
+  const historical = policyLeaseBinding(state, body.leaseID, sessionID);
+  if (historical) return historical;
+  throw new Error("unknown or stale lease id for session");
+};
+
+const bindingTargetID = (binding, body) => {
+  if (binding?.targetID) {
+    if (body.targetID !== undefined && body.targetID !== binding.targetID) {
+      throw new Error("target id does not match lease id");
+    }
+    return binding.targetID;
+  }
+  return body.targetID || null;
+};
+
+const dropExactLease = (state, sessionID, leaseID) => {
+  if (state.leases[sessionID]?.leaseID === leaseID ||
+    (leaseID === undefined && state.leases[sessionID]?.leaseID === undefined)) {
+    delete state.leases[sessionID];
+  }
+};
+
 const removePolicyLeaseBinding = (state, lease) => {
   const leases = lease?.modelPolicyRoleKey
     ? state.modelPolicy?.roles?.[lease.modelPolicyRoleKey]?.probation?.leases
@@ -445,9 +504,9 @@ const removePolicyLeaseBinding = (state, lease) => {
 // the next turn reads it back, which is what stickiness is. A one-shot's has no next turn and
 // no reader, so keeping it only spends cap space and file size until the cap overflows onto
 // real pins. Dropping it here is what keeps the tiered eviction a rarely-used backstop.
-const dropOneShotAssignment = (state, sessionID) => {
-  if (isOneShotAssignment(state.assignments[sessionID], sessionID)) {
-    removePolicyLeaseBinding(state, state.assignments[sessionID]);
+const dropOneShotAssignment = (state, sessionID, leaseID) => {
+  if (isOneShotAssignment(state.assignments[sessionID], sessionID) &&
+    (leaseID === undefined || state.assignments[sessionID]?.leaseID === leaseID)) {
     delete state.assignments[sessionID];
   }
 };
@@ -907,19 +966,21 @@ const acquire = async (state, request, {
     : false;
   if (opportunityRole && hadProductionCandidateLease) {
     const candidateKey = `${opportunityRole.providerID}/${opportunityRole.probationModelID}`;
-    const eligibleCandidateRequest = expandedPolicyIDs.some((targetID) => {
-      const target = admittedTargets[targetID];
-      return policyLane.policyTargetID === targetID && policyLane.targetIDs.includes(targetID) &&
-        target?.providerID === opportunityRole.providerID &&
-        target?.modelID === opportunityRole.probationModelID &&
-        targetEligibleFor(target, request, state, undefined, admittedTargets, sessionID);
-    });
+    const opportunityTargetID = policyLane.candidateOpportunityTargetID;
+    const opportunityTarget = opportunityTargetID ? policyLane.targets[opportunityTargetID] : null;
+    const candidateCapableProductionOpportunity = Boolean(opportunityTarget &&
+      opportunityTarget.providerID === opportunityRole.providerID &&
+      opportunityTarget.modelID === opportunityRole.probationModelID &&
+      targetEligibleFor(opportunityTarget, request, state, undefined, policyLane.targets, sessionID));
+    const eligibleCandidateRequest = candidateCapableProductionOpportunity &&
+      policyLane.policyTargetID === opportunityTargetID && policyLane.targetIDs.includes(opportunityTargetID);
     const opportunity = accrueOpportunityTime(state.modelPolicy, {
       roleKey: opportunityRole.roleKey,
       now: Date.now(),
       compatibleActiveRegistration: registration?.compatible === true &&
         Array.isArray(registration.modelKeys) && registration.modelKeys.includes(candidateKey),
       eligibleCandidateRequest,
+      candidateCapableProductionOpportunity,
     });
     state.modelPolicy = opportunity.policy;
     if (opportunity.timedOut) {
@@ -968,7 +1029,7 @@ const acquire = async (state, request, {
           balancedTargetIDs: [target.id],
           providerUtilization: { [target.providerID]: effectiveUtilization(state.budgets, target.providerID) },
         });
-        return { target, existing: true };
+        return { target, existing: true, leaseID: existing.leaseID };
       }
     }
     ensureActive();
@@ -1255,8 +1316,6 @@ const acquire = async (state, request, {
     state.cursors[choice.cursorKey] = choice.nextCursor;
   }
   ensureActive();
-  const previousAssignment = state.assignments[sessionID];
-  if (previousAssignment) removePolicyLeaseBinding(state, previousAssignment);
   const leasedAt = Date.now();
   const leaseID = randomUUID();
   const candidateRole = modelPolicyRoleForTarget(state, choice.target);
@@ -1266,23 +1325,27 @@ const acquire = async (state, request, {
       roleKey: candidateRole.roleKey,
       leaseID,
       sessionID,
+      targetID: choice.target.id,
       now: leasedAt,
       synthetic: Boolean(probeAssignment) || sessionID.startsWith("gw-probe-"),
     });
     state.modelPolicy = recorded.policy;
-    policyLease = { leaseID, sessionID, modelPolicyRoleKey: candidateRole.roleKey };
+    policyLease = { modelPolicyRoleKey: candidateRole.roleKey };
     if (opportunityRole?.roleKey === candidateRole.roleKey && !hadProductionCandidateLease && !recorded.event.synthetic) {
       const opportunity = accrueOpportunityTime(state.modelPolicy, {
         roleKey: candidateRole.roleKey,
         now: leasedAt,
         compatibleActiveRegistration: true,
         eligibleCandidateRequest: true,
+        candidateCapableProductionOpportunity: true,
       });
       state.modelPolicy = opportunity.policy;
     }
   }
   state.leases[sessionID] = {
     targetID: choice.target.id,
+    leaseID,
+    sessionID,
     touchedAt: leasedAt,
     profile,
     tier,
@@ -1291,6 +1354,8 @@ const acquire = async (state, request, {
   ensureActive();
   state.assignments[sessionID] = {
     targetID: choice.target.id,
+    leaseID,
+    sessionID,
     profile,
     tier,
     updatedAt: leasedAt,
@@ -1311,7 +1376,7 @@ const acquire = async (state, request, {
     contextTokens,
     ...choice.decision,
   });
-  return { target: choice.target, existing: false };
+  return { target: choice.target, existing: false, leaseID };
 };
 
 // ☠️ `close` IS NOT OPTIONAL. A request whose client hung up before this ran never emits `end`
@@ -1603,6 +1668,7 @@ const serve = async () => {
           registration: decisionRegistration = registration,
         } = state.lastDecision ?? {};
         return reply(response, 200, {
+          leaseID: lease.leaseID,
           target: publicTarget(lease.target, body.tier, state.inventory?.modelVariants),
           existing: lease.existing,
           decision: {
@@ -1614,13 +1680,13 @@ const serve = async () => {
         });
       }
       if (request.url === "/release") {
-        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
-        settlePolicyLease(state, state.leases[body.sessionID] ?? state.assignments[body.sessionID], {
+        const binding = settlementBinding(state, body);
+        settlePolicyLease(state, binding, {
           outcome: "abandoned",
           source: "lease",
         });
-        delete state.leases[body.sessionID];
-        dropOneShotAssignment(state, body.sessionID);
+        dropExactLease(state, body.sessionID, binding?.leaseID);
+        dropOneShotAssignment(state, body.sessionID, binding?.leaseID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }
@@ -1632,7 +1698,7 @@ const serve = async () => {
         return reply(response, 200, { ok: true, present });
       }
       if (request.url === "/failure") {
-        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const binding = settlementBinding(state, body);
         const lease = state.leases[body.sessionID];
         const assignment = state.assignments[body.sessionID];
         // The router sees provider events while the guard sees the failed prompt result,
@@ -1640,7 +1706,7 @@ const serve = async () => {
         // consumes the lease; preserve its reply on the sticky assignment so every later
         // report for that settled turn is a no-op. A fresh lease replaces the assignment
         // wholesale, which re-arms failure handling for the next turn.
-        if (!lease && assignment?.settledFailure &&
+        if (!lease && binding === assignment && assignment?.settledFailure &&
           (!body.targetID || body.targetID === assignment.settledFailure.targetID)) {
           settlePolicyLease(state, assignment, {
             outcome: "failure",
@@ -1649,20 +1715,26 @@ const serve = async () => {
           });
           return reply(response, 200, assignment.settledFailure.reply);
         }
-        const targetID = body.targetID || lease?.targetID || assignment?.targetID;
+        const targetID = bindingTargetID(binding, body);
         const error = normalizeProviderError(body.error);
         const kind = classifyRoutingFailure(error);
         const target = targetForID(targetID, allTargets(state));
+        const policyEvent = settlePolicyLease(state, binding, {
+          outcome: "failure",
+          failureClass: body.failureClass,
+          source: "failure",
+        });
+        if (policyEvent?.replayed && binding?.historical) {
+          writeState(state);
+          return reply(response, 200, { ok: true, kind: "replayed" });
+        }
         const settleFailure = (replyBody) => {
-          settlePolicyLease(state, lease ?? assignment, {
-            outcome: "failure",
-            failureClass: body.failureClass,
-            source: "failure",
-          });
-          if (assignment && targetID && assignment.targetID === targetID) {
+          const exactAssignment = binding === assignment || (binding === lease &&
+            binding?.leaseID === assignment?.leaseID);
+          if (exactAssignment && assignment && targetID && assignment.targetID === targetID) {
             assignment.settledFailure = { targetID, reply: replyBody };
           }
-          delete state.leases[body.sessionID];
+          dropExactLease(state, body.sessionID, binding?.leaseID);
           writeState(state);
           return reply(response, 200, replyBody);
         };
@@ -1790,15 +1862,13 @@ const serve = async () => {
         return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
       }
       if (request.url === "/complete") {
-        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
-        const lease = state.leases[body.sessionID];
-        const assignment = state.assignments[body.sessionID];
-        const targetID = lease?.targetID || assignment?.targetID;
+        const binding = settlementBinding(state, body);
+        const targetID = bindingTargetID(binding, body);
         const target = targetForID(targetID, allTargets(state));
         if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
-        settlePolicyLease(state, lease ?? assignment, { outcome: "success", source: "complete" });
-        delete state.leases[body.sessionID];
-        dropOneShotAssignment(state, body.sessionID);
+        settlePolicyLease(state, binding, { outcome: "success", source: "complete" });
+        dropExactLease(state, body.sessionID, binding?.leaseID);
+        dropOneShotAssignment(state, body.sessionID, binding?.leaseID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }
@@ -1819,16 +1889,14 @@ const serve = async () => {
         return reply(response, 200, { ok: true });
       }
       if (request.url === "/forget") {
-        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const binding = settlementBinding(state, body);
         const completed = body.completed === true;
         if (completed) {
-          const lease = state.leases[body.sessionID];
-          const assignment = state.assignments[body.sessionID];
-          const targetID = lease?.targetID || assignment?.targetID;
+          const targetID = bindingTargetID(binding, body);
           const target = targetForID(targetID, allTargets(state));
           if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
         }
-        settlePolicyLease(state, state.leases[body.sessionID] ?? state.assignments[body.sessionID], {
+        settlePolicyLease(state, binding, {
           outcome: completed ? "success" : "abandoned",
           source: "forget",
         });
@@ -1838,8 +1906,8 @@ const serve = async () => {
         // ONE-SHOT SESSIONS ARE THE EXCEPTION: their id is minted per request and never
         // recurs, so there is no next turn to return and nothing that can read the pin back.
         // The assignment goes with the lease rather than waiting out the TTL in the cap.
-        delete state.leases[body.sessionID];
-        dropOneShotAssignment(state, body.sessionID);
+        dropExactLease(state, body.sessionID, binding?.leaseID);
+        dropOneShotAssignment(state, body.sessionID, binding?.leaseID);
         writeState(state);
         return reply(response, 200, { ok: true });
       }
@@ -1853,6 +1921,10 @@ const serve = async () => {
         const requests = Math.min(Math.max(0, Number(body.requests) || 0), 100);
         const raw = body.tokens && typeof body.tokens === "object" ? body.tokens : {};
         const clampTokens = (value) => Math.min(Math.max(0, Number(value) || 0), 50_000_000);
+        // A leased usage report is accepted only for its exact broker-minted binding.
+        // Validate before mutating the ledger so a stale report has no side effects.
+        const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+        const assignment = settlementBinding(state, body, { usage: true });
         state.budgets = recordBudgetUsage(state.budgets, providerID, {
           requests,
           modelID: typeof body.modelID === "string" ? body.modelID : undefined,
@@ -1864,11 +1936,8 @@ const serve = async () => {
           },
         });
         // A step-finish usage report is stronger success evidence than waiting for
-        // session.idle, but only when it matches this session's current assignment.
-        // Missing, invalid, stale, and future observations retain probation while their
-        // budget reading remains useful. Keep the observation time so a delayed report
-        // cannot clear newer probation.
-        const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+        // session.idle, but only when it matches the exact retained binding. Keep the
+        // observation time so a delayed report cannot clear newer probation.
         // Burn watch: after the ledger, before the reply, so a stop rides back to the
         // client that reported the step -- the one process that can abort that session.
         let burn = null;
@@ -1888,7 +1957,6 @@ const serve = async () => {
             });
           }
         }
-        const assignment = sessionID ? (state.leases[sessionID] ?? state.assignments[sessionID]) : null;
         logUsage(usageRecord({
           at: Date.now(), sessionID, providerID,
           modelID: typeof body.modelID === "string" ? body.modelID : null,

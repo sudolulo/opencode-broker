@@ -771,7 +771,12 @@ export const createGatewayHandler = ({
       if (typeof lease?.code === "string") refusal.code = lease.code;
       throw refusal;
     }
-    return { sessionID, providerID: model.providerID, modelID: model.id };
+    return {
+      sessionID,
+      leaseID: lease?.leaseID,
+      providerID: model.providerID,
+      modelID: model.id,
+    };
   };
 
   const prepareWaitMs = Number(config.prepareWaitMs) > 0 ? Number(config.prepareWaitMs) : PREPARE_WAIT_MS;
@@ -893,11 +898,17 @@ export const createGatewayHandler = ({
     }
   };
 
-  const settle = async (sessionID, path, body = {}) => {
-    try { await brokerRequest(path, { sessionID, ...body }); } catch { /* broker hiccup must not fail the request */ }
+  const settle = async (leased, path, body = {}) => {
+    try {
+      await brokerRequest(path, {
+        sessionID: leased.sessionID,
+        ...(leased.leaseID ? { leaseID: leased.leaseID } : {}),
+        ...body,
+      });
+    } catch { /* broker hiccup must not fail the request */ }
   };
 
-  const reportUsage = async (leased, tokens) => settle(leased.sessionID, "/usage", {
+  const reportUsage = async (leased, tokens) => settle(leased, "/usage", {
     ...(callerOf(leased.sessionID) ? { caller: callerOf(leased.sessionID) } : {}),
     providerID: leased.providerID,
     modelID: leased.modelID,
@@ -987,6 +998,7 @@ export const createGatewayHandler = ({
       lastError = error;
     };
     let acquiredLease = false;
+    let lastLeased = null;
     const excluded = [];
     // ☠️ A PROFILE-MAPPED REQUEST MUST NOT EXCLUDE ITS OWN LANE. The exclusion
     // (0.2.2) exists because the gateway picks among the providers IT can
@@ -1027,9 +1039,10 @@ export const createGatewayHandler = ({
         break;
       }
       acquiredLease = true;
+      lastLeased = leased;
       const providerConfig = config.providers[leased.providerID];
       if (!providerConfig?.baseUrl) {
-        await settle(leased.sessionID, "/release");
+        await settle(leased, "/release");
         lastError = new Error(`no forward config for ${leased.providerID}`);
         continue;
       }
@@ -1038,7 +1051,7 @@ export const createGatewayHandler = ({
       // did. Release, skip the lane for this request, move on.
       let key;
       try { key = await providerKey(providerConfig, authPath); } catch (error) {
-        await settle(leased.sessionID, "/release");
+        await settle(leased, "/release");
         excludeLane(leased.providerID);
         // ☠️ SAY SO. This path spends a real lease and produces nothing: no usage is reported and
         // no `/failure` is filed (deliberately -- a stale LOCAL credential must not indict a
@@ -1217,10 +1230,10 @@ export const createGatewayHandler = ({
         // exclude the lane for THIS request's retry, and move on; genuinely
         // broken providers still get indicted by real HTTP errors below.
         if (isAbort(error)) {
-          await settle(leased.sessionID, "/release");
+          await settle(leased, "/release");
           if (clientAbort?.aborted) { lastError = new Error("client disconnected"); break; }
         } else {
-          await settle(leased.sessionID, "/failure", { error: { message: String(error?.message ?? error) } });
+          await settle(leased, "/failure", { error: { message: String(error?.message ?? error) } });
         }
         excludeLane(leased.providerID);
         rememberForwardError(error);
@@ -1234,7 +1247,7 @@ export const createGatewayHandler = ({
             ? `OpenAI Responses upstream HTTP ${response.status}`
             : text || `upstream HTTP ${response.status}`;
         clearTimeout(stallTimer);
-        await settle(leased.sessionID, "/failure", {
+        await settle(leased, "/failure", {
           error: { statusCode: response.status, message: safeMessage },
         });
         const error = new Error(api === MESSAGES
@@ -1286,10 +1299,10 @@ export const createGatewayHandler = ({
           // attempt it threw away.
           const error = outcome.error ?? new Error(`upstream ${leased.providerID} produced an empty stream`);
           if (isAbort(error) || clientAbort?.aborted) {
-            await settle(leased.sessionID, "/release");
+            await settle(leased, "/release");
             if (clientAbort?.aborted) { lastError = new Error("client disconnected"); break; }
           } else {
-            await settle(leased.sessionID, "/failure", { error: { message: String(error?.message ?? error).slice(0, 400) } });
+            await settle(leased, "/failure", { error: { message: String(error?.message ?? error).slice(0, 400) } });
           }
           excludeLane(leased.providerID);
           rememberForwardError(error);
@@ -1308,7 +1321,7 @@ export const createGatewayHandler = ({
           if (clientAbort?.aborted) {
             // The client walked away mid-stream. Its own doing: release the
             // lease, indict nobody, and write nothing to a socket that is gone.
-            await settle(leased.sessionID, "/release");
+            await settle(leased, "/release");
           } else {
             // ☆ The client gets a truncated answer AND an explanation it can
             // parse; the broker gets the failure, because circuits only open on
@@ -1321,7 +1334,7 @@ export const createGatewayHandler = ({
               error: { type: "api_error", message: "gateway: Anthropic upstream stream failed" },
             })}\n\n`);
             else { await sink.write(errorFrame(why)); await sink.write(DONE_FRAME); }
-            await settle(leased.sessionID, "/failure", {
+            await settle(leased, "/failure", {
               error: { message: api === MESSAGES
                 ? `Anthropic stream failed after ${outcome.outputChars} chars`
                 : `stream failed after ${outcome.outputChars} chars: ${String(outcome.error?.message ?? outcome.error)}`.slice(0, 400) },
@@ -1332,7 +1345,7 @@ export const createGatewayHandler = ({
           // fault -- but the client must never be left waiting for a terminator
           // that is not coming.
           if (api === CHAT && !outcome.sawDone) await sink.write(DONE_FRAME);
-          await settle(leased.sessionID, "/complete");
+          await settle(leased, "/complete");
         }
         return { status: 200, streamed: true, providerID: leased.providerID, modelID: leased.modelID };
       }
@@ -1343,13 +1356,13 @@ export const createGatewayHandler = ({
           rawBody = await response.text();
           payload = JSON.parse(rawBody);
         } catch {
-          await settle(leased.sessionID, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
+          await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
           rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
           excludeLane(leased.providerID);
           continue;
         }
         if (payload?.usage) await reportUsage(leased, readMessagesUsage(payload.usage));
-        await settle(leased.sessionID, "/complete");
+        await settle(leased, "/complete");
         return {
           status: response.status,
           rawBody,
@@ -1362,7 +1375,7 @@ export const createGatewayHandler = ({
       // throw here would escape completions() as an unhandledRejection.
       let payload;
       try { payload = await response.json(); } catch {
-        await settle(leased.sessionID, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
+        await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
         rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
         excludeLane(leased.providerID);
         continue;
@@ -1384,7 +1397,7 @@ export const createGatewayHandler = ({
         }
       }
       if (payload?.usage) await reportUsage(leased, readUsage(payload.usage));
-      await settle(leased.sessionID, "/complete");
+      await settle(leased, "/complete");
       return { status: 200, payload, providerID: leased.providerID, modelID: leased.modelID };
     }
     // ☠️ ABANDONING THE REQUEST MUST NOT STRAND THE LEASE. Every failure path
@@ -1393,7 +1406,7 @@ export const createGatewayHandler = ({
     // target for the full 2h TTL -- the debris 0.2.3's startup sweep exists to
     // clear after a CRASH, which a live process must not be manufacturing.
     // Releasing an already-released session is a no-op delete.
-    if (acquiredLease) await settle(sessionID, "/release");
+    if (acquiredLease && lastLeased) await settle(lastLeased, "/release");
     return {
       status: 502,
       payload: { error: { message: `gateway: no provider could serve the request: ${String(lastError?.message ?? lastError)}`, type: "upstream_error" } },

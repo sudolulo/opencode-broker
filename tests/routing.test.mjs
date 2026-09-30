@@ -1538,15 +1538,24 @@ test("session context estimates persist to disk and reload cleanly", async () =>
   assert.equal(typeof stored.updatedAt, "number");
 }));
 
-test("pending forget records persist, reload, and delete cleanly", async () => withTempHome(async (home) => {
+test("pending forget records persist their exact lease, reload, and delete cleanly", async () => withTempHome(async (home) => {
   const routing = await freshRouting();
   routing.ensureRoutingStateDir();
-  assert.equal(routing.writePendingForgetRecord("ses_forget", { completed: true }), true);
+  assert.equal(routing.writePendingForgetRecord("ses_forget", {
+    leaseID: "lease-pending-forget",
+    completed: true,
+  }), true);
   const record = routing.readPendingForgetRecord("ses_forget");
   assert.ok(record);
   assert.equal(record.completed, true);
+  assert.equal(record.leaseID, "lease-pending-forget");
   assert.equal(typeof record.updatedAt, "number");
-  assert.deepEqual(routing.listPendingForgetRecords(), [{ sessionID: "ses_forget", completed: true, updatedAt: record.updatedAt }]);
+  assert.deepEqual(routing.listPendingForgetRecords(), [{
+    sessionID: "ses_forget",
+    leaseID: "lease-pending-forget",
+    completed: true,
+    updatedAt: record.updatedAt,
+  }]);
   routing.removePendingForgetRecord("ses_forget");
   assert.equal(routing.readPendingForgetRecord("ses_forget"), null);
   assert.deepEqual(routing.listPendingForgetRecords(), []);

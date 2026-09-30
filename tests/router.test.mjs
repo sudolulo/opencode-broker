@@ -277,9 +277,9 @@ test("applyOutputModel ignores invalid inputs", async () => {
   assert.equal(noRoute.model, undefined);
 });
 
-test("deleted sessions with a success candidate forget once with completion", async () => {
+test("deleted sessions with a success candidate forget the exact lease once with completion", async () => {
   const calls = [];
-  const routes = new Map([["session-a", { target: { id: "target-a" } }]]);
+  const routes = new Map([["session-a", { leaseID: "lease-session-a", target: { id: "target-a" } }]]);
   const sessions = new Map([["session-a", { id: "session-a" }]]);
   const blocked = new Map([["session-a", "blocked"]]);
   const successCandidates = new Map([["session-a", true]]);
@@ -303,7 +303,11 @@ test("deleted sessions with a success candidate forget once with completion", as
     },
   });
 
-  assert.deepEqual(calls, [["/forget", { sessionID: "session-a", completed: true }]]);
+  assert.deepEqual(calls, [["/forget", {
+    sessionID: "session-a",
+    leaseID: "lease-session-a",
+    completed: true,
+  }]]);
   assert.equal(routes.has("session-a"), false);
   assert.equal(sessions.has("session-a"), false);
   assert.equal(blocked.has("session-a"), false);
@@ -1014,13 +1018,14 @@ test("classifier failures report without arming the local watchdog, aborting, or
     http.request = (options, callback) => {
       const request = new EventEmitter();
       request.end = (payload = "") => {
-        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const body = payload ? JSON.parse(payload) : {};
+        requests.push({ path: options.path, body });
         const response = new EventEmitter();
         response.statusCode = 200;
         response.setEncoding = () => {};
         callback(response);
         const reply = options.path === "/lease"
-          ? { target: { id: "local-classifier", kind: "local", model: { providerID: "llamacpp", id: "qwen3.5-4b" } } }
+          ? { leaseID: "lease-" + body.sessionID, target: { id: "local-classifier", kind: "local", model: { providerID: "llamacpp", id: "qwen3.5-4b" } } }
           : options.path === "/failure" ? { kind: "overload" }
             : options.path === "/usage" ? { burn: { stop: true, reason: "test burn stop" } }
               : {};
@@ -1090,6 +1095,9 @@ test("classifier failures report without arming the local watchdog, aborting, or
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.requests.filter((request) => request.path === "/lease").length, 3);
   assert.equal(result.requests.filter((request) => request.path === "/failure").length, 2);
+  for (const request of result.requests.filter((entry) => entry.path === "/failure" || entry.path === "/usage")) {
+    assert.equal(request.body.leaseID, `lease-${request.body.sessionID}`, `${request.path} carries its exact lease`);
+  }
   assert.equal(result.timersBeforeFailure, 0, "classifier children do not arm the local inactivity watchdog");
   assert.equal(result.intervals.length, 3, "classifier leases retain ordinary heartbeat coverage");
   assert.deepEqual(result.timers, [], "classifier failures never schedule generic re-engagement");

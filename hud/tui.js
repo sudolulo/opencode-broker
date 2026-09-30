@@ -1356,7 +1356,7 @@ export default {
         await setRoutedModel(id, lease?.target);
         return lease;
       } finally {
-        await releaseLease(id);
+        await releaseLease(id, lease);
       }
     };
     const pendingAllocations = new Map();
@@ -1391,11 +1391,14 @@ export default {
       for (const timer of pendingAllocations.values()) clearTimeout(timer);
       pendingAllocations.clear();
     });
-    const releaseLease = async (id, forget = false) => {
+    const releaseLease = async (id, lease, forget = false) => {
       try {
-        await brokerRequest(forget ? "/forget" : "/release", { sessionID: id });
+        await brokerRequest(forget ? "/forget" : "/release", {
+          sessionID: id,
+          ...(lease?.leaseID ? { leaseID: lease.leaseID } : {}),
+        });
       } catch {
-        writePendingForgetRecord(id);
+        writePendingForgetRecord(id, { leaseID: lease?.leaseID });
       }
     };
     const validateHomeProfile = async (profile) => {
@@ -1409,10 +1412,11 @@ export default {
       // ☆ Nothing is claimed for the swap-back: the probe id is thrown away, and whichever session
       // later adopts this default takes ownership through its own lease.
       const probe = `profile-${process.pid}-${Date.now()}`;
+      let lease = null;
       try {
-        await requestLease(probe, profile, "build");
+        lease = await requestLease(probe, profile, "build");
       } finally {
-        await releaseLease(probe, true);
+        await releaseLease(probe, lease, true);
       }
     };
     // Leaving the LAST session on a swapping profile runs the swap-back. Deliberately not
@@ -1485,14 +1489,14 @@ export default {
         // /models reports it `loaded`, so by the time it is pinned it can serve.
         await setRoutedModel(id, lease.target);
         const pinned = lease.target.model.id;
-        await releaseLease(id);
+        await releaseLease(id, lease);
         lease = null;
         writeSessionProfile(id, profile, { explicit: true });
         restoreDefaultModel(id, previous, profile);
         refresh();
         api.ui?.toast?.({ title: "routing profile", message: `${profileTitle(profile)}: ${pinned} selected.` });
       } catch (error) {
-        if (lease) await releaseLease(id);
+        if (lease) await releaseLease(id, lease);
         api.ui?.toast?.({ variant: "error", title: "routing profile", message: String(error?.message ?? error) });
       }
     };
@@ -1531,14 +1535,14 @@ export default {
         // session.created, but it resolves the profile 25 ms in -- before writeSessionProfile
         // below has recorded it -- so it would read the wrong profile and pin the wrong model.
         await setRoutedModel(createdID, lease.target);
-        await releaseLease(createdID);
+        await releaseLease(createdID, lease);
         lease = null;
         writeSessionProfile(createdID, profile, { explicit: true });
         refresh();
         api.route.navigate("session", { sessionID: createdID });
       } catch (error) {
         if (createdID) {
-          await releaseLease(createdID, true);
+          await releaseLease(createdID, lease, true);
           try { await api.client.session.delete({ sessionID: createdID, directory: api.state.path.directory }); } catch {}
         }
         api.ui?.toast?.({ variant: "error", title: "routing profile", message: String(error?.message ?? error) });

@@ -105,7 +105,10 @@ test("routes a request through a lease, rewrites the model, reports usage", asyn
     authPath: authFile(),
     brokerRequest: async (path, body) => {
       brokerCalls.push({ path, body });
-      if (path === "/lease") return { target: { model: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" } } };
+      if (path === "/lease") return {
+        leaseID: "lease-gateway-success",
+        target: { model: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" } },
+      };
       return { ok: true };
     },
     fetchImpl: async (url, options) => {
@@ -130,14 +133,16 @@ test("routes a request through a lease, rewrites the model, reports usage", asyn
   assert.equal(upstream[0].auth, "Bearer sk-sp-test", "credential from the auth store");
   const lease = brokerCalls.find((call) => call.path === "/lease");
   assert.deepEqual(lease.body.providers, ["llamacpp", "alibaba-token-plan"]);
-  assert.ok(brokerCalls.some((call) => call.path === "/usage" && call.body.tokens.input === 10));
-  assert.ok(brokerCalls.some((call) => call.path === "/complete"));
+  assert.ok(brokerCalls.some((call) => call.path === "/usage" &&
+    call.body.tokens.input === 10 && call.body.leaseID === "lease-gateway-success"));
+  assert.ok(brokerCalls.some((call) => call.path === "/complete" &&
+    call.body.leaseID === "lease-gateway-success"));
 });
 
 test("a failing provider is reported and the retry lands elsewhere", async () => {
   const leases = [
-    { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b-coder" } } },
-    { target: { model: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" } } },
+    { leaseID: "lease-gateway-failed", target: { model: { providerID: "llamacpp", id: "qwen3.5-9b-coder" } } },
+    { leaseID: "lease-gateway-retry", target: { model: { providerID: "alibaba-token-plan", id: "qwen3.8-flash" } } },
   ];
   const brokerCalls = [];
   const handler = createGatewayHandler({
@@ -164,6 +169,7 @@ test("a failing provider is reported and the retry lands elsewhere", async () =>
   });
   const failure = brokerCalls.find((call) => call.path === "/failure");
   assert.match(failure.body.error.message, /local model exploded/);
+  assert.equal(failure.body.leaseID, "lease-gateway-failed");
 });
 
 test("bad gateway keys and unroutable requests fail closed", async () => {
