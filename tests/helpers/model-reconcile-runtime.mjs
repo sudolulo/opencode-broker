@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   lstatSync,
@@ -102,12 +103,6 @@ const listen = (server, ...args) => new Promise((resolve, reject) => {
 });
 
 const closeServer = (server) => new Promise((resolve) => server.close(resolve));
-
-const readBody = async (request) => {
-  let text = "";
-  for await (const chunk of request) text += chunk;
-  return text ? JSON.parse(text) : {};
-};
 
 const unixRequest = (socketPath, path, body = {}, { method = "POST", headers = {} } = {}) =>
   new Promise((resolve, reject) => {
@@ -237,38 +232,9 @@ const stopChild = async (child) => {
   await new Promise((resolve) => child.once("exit", resolve));
 };
 
-const startTraceProxy = async ({ socketPath, upstreamSocketPath, trace, observed }) => {
-  const server = createServer(async (request, response) => {
-    try {
-      const body = await readBody(request);
-      const childPID = request.headers["x-opencode-probe-pid"];
-      if (request.url === "/model-policy/probe-launch") trace.push("probe-launch");
-      if (request.url === "/resolver-process/register" && childPID) {
-        trace.push("child-register");
-        observed.probeGeneration = body.generation;
-      }
-      if (request.url === "/model-policy/probe" && childPID) trace.push("child-model-policy-probe");
-      if (request.url === "/probe/release" && !request.headers["x-opencode-resolver-token"]) trace.push("release");
-      const upstream = await unixRequest(upstreamSocketPath, request.url, body, {
-        method: request.method,
-        headers: request.headers,
-      });
-      response.writeHead(upstream.status, { "content-type": "application/json" });
-      response.end(`${JSON.stringify(upstream.body)}\n`);
-    } catch (error) {
-      response.writeHead(500, { "content-type": "application/json" });
-      response.end(`${JSON.stringify({ error: error.message })}\n`);
-    }
-  });
-  await listen(server, socketPath);
-  chmodSync(socketPath, 0o600);
-  assertSocketMode(socketPath);
-  return server;
-};
-
-const startGateway = async ({ brokerSocketPath, trace, observed }) => {
-  const brokerRequest = async (path, body) => {
-    const result = await unixRequest(brokerSocketPath, path, body);
+const startGateway = async ({ brokerRequest, recordTrace, effects }) => {
+  const checkedBrokerRequest = async (path, body) => {
+    const result = await brokerRequest(path, body);
     if (result.status < 200 || result.status >= 300) {
       const error = new Error(result.body.error ?? `broker HTTP ${result.status}`);
       error.code = result.body.code;
@@ -286,8 +252,9 @@ const startGateway = async ({ brokerSocketPath, trace, observed }) => {
       providers: { openai: { baseUrl: "http://provider.invalid/v1" } },
     },
     gatewayKey: GATEWAY_KEY,
-    brokerRequest,
+    brokerRequest: checkedBrokerRequest,
     fetchImpl: async (_url, options) => {
+      effects.externalCalls += 1;
       const body = JSON.parse(options.body);
       const payload = body.tools
         ? { choices: [{ message: { tool_calls: [{ function: { name: "probe_echo", arguments: "{\"ok\":true}" } }] } }], usage: {} }
@@ -300,8 +267,11 @@ const startGateway = async ({ brokerSocketPath, trace, observed }) => {
   });
   const server = createServer((request, response) => {
     if (request.headers["x-opencode-probe-session"]) {
-      trace.push("ordinary-gateway");
-      if (!request.headers["x-opencode-probe-pid"]) observed.parentProbeNetworkCalls += 1;
+      recordTrace({
+        source: "gateway",
+        event: "ordinary-gateway",
+        childOwned: Boolean(request.headers["x-opencode-probe-pid"]),
+      });
     }
     void handler(request, response);
   });
@@ -327,26 +297,16 @@ export const createModelReconcileRuntime = async ({
   const generationsRoot = join(stateRoot, "generations");
   const currentLinkPath = join(generationsRoot, "current");
   const actualSocketPath = join(stateRoot, "broker.sock");
-  const traceSocketPath = join(root, "traced-broker.sock");
+  const tracePath = join(root, "probe-trace.jsonl");
+  const childTraceModulePath = join(root, "child-trace.mjs");
   const baseConfigPath = join(root, "base/opencode.json");
-  const trace = [];
-  const observed = {
-    probeGeneration: null,
-    parentProbeNetworkCalls: 0,
-    probeChildReaped: false,
-  };
   const effects = {
-    launchNonces: 0,
-    assignments: 0,
-    leases: 0,
-    safeRegistrations: 0,
     resolverRuns: 0,
-    brokerMutations: 0,
     externalCalls: 0,
   };
+  let probeChildReaped = false;
   let closed = false;
   let broker = null;
-  let proxy = null;
   let gateway = null;
   let probeChild = null;
   const pendingFailures = new Map();
@@ -354,6 +314,53 @@ export const createModelReconcileRuntime = async ({
 
   mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
   chmodSync(stateRoot, 0o700);
+  writeFileSync(tracePath, "", { mode: 0o600 });
+  writeFileSync(childTraceModulePath, `
+import { appendFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const require = createRequire(import.meta.url);
+const http = require("node:http");
+const originalRequest = http.request;
+const tracePath = process.env.OPENCODE_BROKER_TEST_TRACE;
+
+http.request = function tracedRequest(...args) {
+  const options = args[0] instanceof URL ? {} : args[0] ?? {};
+  const requestPath = options.path;
+  let requestBody = "";
+  const callbackIndex = args.findIndex((value, index) => index > 0 && typeof value === "function");
+  if (callbackIndex !== -1) {
+    const callback = args[callbackIndex];
+    args[callbackIndex] = function tracedResponse(response) {
+      let generation = null;
+      if (requestPath === "/resolver-process/register" && requestBody) {
+        try {
+          generation = JSON.parse(requestBody).generation ?? null;
+        } catch (error) {
+          generation = { parseError: String(error?.message ?? error) };
+        }
+      }
+      appendFileSync(tracePath, JSON.stringify({
+        source: "child",
+        kind: "broker-response",
+        path: requestPath,
+        status: response.statusCode ?? 500,
+        socketPath: options.socketPath ?? null,
+        generation,
+      }) + "\\n");
+      return callback(response);
+    };
+  }
+  const request = originalRequest.apply(this, args);
+  const originalEnd = request.end;
+  request.end = function tracedEnd(chunk, ...rest) {
+    if (chunk !== undefined && chunk !== null) requestBody += Buffer.from(chunk).toString("utf8");
+    return originalEnd.call(this, chunk, ...rest);
+  };
+  return request;
+};
+syncBuiltinESMExports();
+`, { mode: 0o600 });
   writeJSON(authPath, {
     openai: { type: "oauth", access: "runtime-openai-fixture-access" },
     anthropic: { type: "api", key: "runtime-anthropic-fixture-key" },
@@ -426,17 +433,36 @@ export const createModelReconcileRuntime = async ({
   }
 
   broker = await startBroker({ home, configPath, actualSocketPath });
-  proxy = await startTraceProxy({
-    socketPath: traceSocketPath,
-    upstreamSocketPath: actualSocketPath,
-    trace,
-    observed,
-  });
-  gateway = await startGateway({ brokerSocketPath: traceSocketPath, trace, observed });
+
+  const recordTrace = (record) => {
+    appendFileSync(tracePath, `${JSON.stringify(record)}\n`);
+  };
+  const traceRecords = () => readFileSync(tracePath, "utf8").split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const policyIdentity = () => {
+    const brokerStatePath = join(stateRoot, "broker.json");
+    if (!existsSync(brokerStatePath)) return null;
+    return JSON.stringify(JSON.parse(readFileSync(brokerStatePath, "utf8")).modelPolicy ?? null);
+  };
+  const requestBroker = async (path, body = {}, options = {}) => {
+    const beforePolicy = policyIdentity();
+    const result = await unixRequest(actualSocketPath, path, body, options);
+    recordTrace({
+      source: "parent",
+      kind: "broker-response",
+      path,
+      status: result.status,
+      policyChanged: policyIdentity() !== beforePolicy,
+    });
+    return result;
+  };
+
+  gateway = await startGateway({ brokerRequest: requestBroker, recordTrace, effects });
 
   const rawBrokerRequest = async (path, body = {}, options = {}) => {
     const requestOptions = path === "/model-policy/status" ? { ...options, method: "GET" } : options;
-    const result = await unixRequest(traceSocketPath, path, body, requestOptions);
+    const result = await requestBroker(path, body, requestOptions);
     if (result.status < 200 || result.status >= 300) {
       const error = new Error(result.body.error ?? `broker HTTP ${result.status}`);
       error.code = result.body.code;
@@ -467,15 +493,22 @@ export const createModelReconcileRuntime = async ({
   const probeClientFactory = createProbeClientFactory({
     spawnProbeProcess: (request) => {
       if (!realProbeHelper) throw new Error("runtime requires the real probe helper");
-      probeChild = spawn(request.command, request.args, request.options);
+      probeChild = spawn(request.command, request.args, {
+        ...request.options,
+        env: {
+          ...process.env,
+          OPENCODE_BROKER_TEST_TRACE: tracePath,
+          NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${childTraceModulePath}`].filter(Boolean).join(" "),
+        },
+      });
       probeChild.once("exit", () => {
-        observed.probeChildReaped = true;
-        trace.push("reap");
+        probeChildReaped = true;
+        recordTrace({ source: "parent", event: "reap" });
       });
       return probeChild;
     },
     generationManager,
-    brokerSocketPath: traceSocketPath,
+    brokerSocketPath: actualSocketPath,
     gatewayURL: gateway.url,
     gatewayHeaders: { Authorization: `Bearer ${GATEWAY_KEY}` },
   });
@@ -521,7 +554,6 @@ export const createModelReconcileRuntime = async ({
       manifestHash: bundle.manifestHash,
       modelKeys: bundle.manifest.modelKeys,
     });
-    effects.safeRegistrations += 1;
     return registration;
   };
 
@@ -534,7 +566,6 @@ export const createModelReconcileRuntime = async ({
       resolverToken: client?.resolverToken,
       replace: true,
     });
-    effects.leases += 1;
     return {
       sessionID,
       leaseID: response.leaseID,
@@ -611,7 +642,6 @@ export const createModelReconcileRuntime = async ({
     closed = true;
     await Promise.allSettled([
       gateway ? closeServer(gateway.server) : Promise.resolve(),
-      proxy ? closeServer(proxy) : Promise.resolve(),
     ]);
     if (probeChild && probeChild.exitCode === null && probeChild.signalCode === null) probeChild.kill("SIGKILL");
     await stopChild(broker?.child);
@@ -629,17 +659,39 @@ export const createModelReconcileRuntime = async ({
     overlay: () => overlayStore.read(),
     currentManifest: () => generationManager.current().manifest,
     currentGeneration: () => generationManager.current().generation,
-    probeGeneration: () => observed.probeGeneration,
-    probeTrace: () => [...trace],
-    parentProbeNetworkCalls: () => observed.parentProbeNetworkCalls,
-    probeChildReaped: () => observed.probeChildReaped,
+    probeGeneration: () => traceRecords().find((record) =>
+      record.source === "child" && record.path === "/resolver-process/register" && record.status === 200)?.generation ?? null,
+    probeTrace: () => traceRecords().flatMap((record) => {
+      if (record.source === "parent" && record.path === "/model-policy/probe-launch" && record.status === 200) {
+        return ["probe-launch"];
+      }
+      if (record.source === "child" && record.path === "/resolver-process/register" && record.status === 200) {
+        return ["child-register"];
+      }
+      if (record.source === "child" && record.path === "/model-policy/probe" && record.status === 200) {
+        return ["child-model-policy-probe"];
+      }
+      if (record.event === "ordinary-gateway") return ["ordinary-gateway"];
+      if (record.source === "parent" && record.path === "/probe/release" && record.status === 200) {
+        return ["release"];
+      }
+      if (record.event === "reap") return ["reap"];
+      return [];
+    }),
+    parentProbeNetworkCalls: () => traceRecords().filter((record) =>
+      record.event === "ordinary-gateway" && !record.childOwned).length,
+    probeChildReaped: () => probeChildReaped,
+    actualBrokerSocketPath: () => actualSocketPath,
+    actualBrokerSocketMode: () => lstatSync(actualSocketPath).mode & 0o777,
+    probeBrokerSocketPath: () => traceRecords().find((record) =>
+      record.source === "child" && record.path === "/resolver-process/register")?.socketPath ?? null,
     registerGeneration,
     registerCurrentGeneration,
     lease,
     successfulCandidateLease,
     failCandidate,
     policy: (roleKey) => JSON.parse(readFileSync(join(stateRoot, "broker.json"), "utf8")).modelPolicy.roles[roleKey],
-    postProbeWithToken: async (resolverToken, request) => unixRequest(traceSocketPath, "/model-policy/probe", {
+    postProbeWithToken: async (resolverToken, request) => requestBroker("/model-policy/probe", {
       ...request,
       candidateIntroduction: request.candidateIntroduction ?? {
         generation: generationManager.current().generation,
@@ -653,21 +705,27 @@ export const createModelReconcileRuntime = async ({
           ...process.env,
           HOME: home,
           OPENCODE_BROKER_CONFIG: configPath,
-          OPENCODE_MODEL_BROKER_SOCKET: traceSocketPath,
+          OPENCODE_MODEL_BROKER_SOCKET: actualSocketPath,
         },
         encoding: "utf8",
       });
       if (result.error) throw result.error;
-      return JSON.parse(result.stdout || "{}");
+      return { status: result.status, body: JSON.parse(result.stdout || "{}") };
     },
-    postControl: async (path, body) => {
-      // Package 3's rollback operation is a broker CAS driven by the reconciler; there is no
-      // separate production rollback endpoint in the API table. Keep the matrix's logical rollback
-      // row on that same mutation boundary instead of inventing an eighth production route here.
-      const controlPath = path === "/model-policy/rollback" ? "/model-policy/cas" : path;
-      return (await unixRequest(traceSocketPath, controlPath, body)).body;
-    },
+    postControl: (path, body) => requestBroker(path, body),
     snapshotBytesAndMtimes: () => Object.fromEntries(prohibitedPaths.map((path) => [path, snapshotPath(path)])),
-    effectCounts: () => ({ ...effects }),
+    effectCounts: () => {
+      const successful = traceRecords().filter((record) =>
+        record.kind === "broker-response" && record.status >= 200 && record.status < 300);
+      return {
+        launchNonces: successful.filter((record) => record.path === "/model-policy/probe-launch").length,
+        assignments: successful.filter((record) => record.path === "/model-policy/probe").length,
+        leases: successful.filter((record) => record.path === "/lease").length,
+        safeRegistrations: successful.filter((record) => record.path === "/resolver-process/register").length,
+        resolverRuns: effects.resolverRuns,
+        brokerMutations: successful.filter((record) => record.policyChanged === true).length,
+        externalCalls: effects.externalCalls,
+      };
+    },
   };
 };

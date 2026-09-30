@@ -20,6 +20,8 @@ test("GPT6 overlay promotes after five successes and rolls back after two post-a
 
   await runtime.discover(TRUSTED_OPENAI_GPT6);
   await runtime.applier.apply({ transitionID: runtime.transitionID(ROLE) });
+  assert.equal(runtime.probeBrokerSocketPath(), runtime.actualBrokerSocketPath());
+  assert.equal(runtime.actualBrokerSocketMode(), 0o600);
   assert.equal(runtime.overlay().entries["openai/gpt-6-sol"].model.cost.input, 0);
   assert.equal(runtime.currentManifest().modelKeys.includes("openai/gpt-6-sol"), true);
   assert.deepEqual(runtime.probeTrace(), [
@@ -33,6 +35,17 @@ test("GPT6 overlay promotes after five successes and rolls back after two post-a
   assert.equal(runtime.probeGeneration(), runtime.currentGeneration());
   assert.equal(runtime.parentProbeNetworkCalls(), 0);
   assert.equal(runtime.probeChildReaped(), true);
+  const activeEffects = runtime.effectCounts();
+  assert.equal(activeEffects.brokerMutations > 0, true);
+  assert.deepEqual({ ...activeEffects, brokerMutations: "observed" }, {
+    launchNonces: 1,
+    assignments: 3,
+    leases: 3,
+    safeRegistrations: 1,
+    resolverRuns: 2,
+    brokerMutations: "observed",
+    externalCalls: 3,
+  });
 
   const oldClient = await runtime.registerGeneration(0);
   const newClient = await runtime.registerCurrentGeneration();
@@ -59,25 +72,7 @@ test("trusted Anthropic api is admitted while default-off runtime mutates nothin
 
   const dormant = await createModelReconcileRuntime({ applyEnabled: false });
   context.after(() => dormant.close());
-  for (const [name, operation] of [
-    ["CLI apply", () => dormant.runCLI(["apply", TRANSITION_ID, "--json"])],
-    ["CLI rollback", () => dormant.runCLI(["rollback", TRANSITION_ID, "--reason", "operator-request", "--json"])],
-    ["CLI refresh", () => dormant.runCLI(["refresh", "--json"])],
-    ["CLI recover", () => dormant.runCLI(["recover", TRANSITION_ID, "--json"])],
-    ["CAS", () => dormant.postControl("/model-policy/cas", {})],
-    ["rollback", () => dormant.postControl("/model-policy/rollback", {})],
-    ["probe launch", () => dormant.postControl("/model-policy/probe-launch", {})],
-    ["probe", () => dormant.postControl("/model-policy/probe", {})],
-    ["probe consume", () => dormant.postControl("/probe/consume", {})],
-    ["probe release", () => dormant.postControl("/probe/release", {})],
-    ["resolver registration", () => dormant.postControl("/resolver-process/register", {})],
-  ]) {
-    const before = dormant.snapshotBytesAndMtimes();
-    const result = await operation();
-    assert.equal(result.code, "reconcile-apply-disabled", name);
-    assert.deepEqual(dormant.snapshotBytesAndMtimes(), before, name);
-  }
-  assert.deepEqual(dormant.effectCounts(), {
+  const noEffects = {
     launchNonces: 0,
     assignments: 0,
     leases: 0,
@@ -85,5 +80,55 @@ test("trusted Anthropic api is admitted while default-off runtime mutates nothin
     resolverRuns: 0,
     brokerMutations: 0,
     externalCalls: 0,
-  });
+  };
+  const rollbackCAS = {
+    transitionID: `${TRANSITION_ID}:rollback`,
+    revision: "disabled-logical-rollback",
+    roleKey: ROLE,
+    expectedIncumbentModelID: "gpt-6-sol",
+    generation: 1,
+    manifestHash: "a".repeat(64),
+    desired: {
+      activeModelID: "gpt-5.6-sol",
+      probationModelID: null,
+      rollbackModelID: "gpt-5.6-sol",
+      routingIntent: {
+        tiers: ["smart"],
+        fit: { smart: 1.4 },
+        effortCeiling: "high",
+        requiredReasoningMode: null,
+      },
+      probation: {
+        phase: "rolled-back",
+        offerEvery: 5,
+        opportunityCursor: 0,
+        opportunityMs: 0,
+        opportunityCursorAt: null,
+        opportunityEligibleUntil: null,
+        successes: [],
+        failures: [],
+        leases: {},
+      },
+    },
+  };
+  for (const [name, expectedStatus, operation] of [
+    ["CLI apply", 1, () => dormant.runCLI(["apply", TRANSITION_ID, "--json"])],
+    ["CLI rollback", 1, () => dormant.runCLI(["rollback", TRANSITION_ID, "--reason", "operator-request", "--json"])],
+    ["CLI refresh", 1, () => dormant.runCLI(["refresh", "--json"])],
+    ["CLI recover", 1, () => dormant.runCLI(["recover", TRANSITION_ID, "--json"])],
+    ["CAS", 409, () => dormant.postControl("/model-policy/cas", {})],
+    ["logical rollback CAS", 409, () => dormant.postControl("/model-policy/cas", rollbackCAS)],
+    ["probe launch", 409, () => dormant.postControl("/model-policy/probe-launch", {})],
+    ["probe", 409, () => dormant.postControl("/model-policy/probe", {})],
+    ["probe consume", 409, () => dormant.postControl("/probe/consume", {})],
+    ["probe release", 409, () => dormant.postControl("/probe/release", {})],
+    ["resolver registration", 409, () => dormant.postControl("/resolver-process/register", {})],
+  ]) {
+    const before = dormant.snapshotBytesAndMtimes();
+    const result = await operation();
+    assert.equal(result.status, expectedStatus, name);
+    assert.equal(result.body.code, "reconcile-apply-disabled", name);
+    assert.deepEqual(dormant.snapshotBytesAndMtimes(), before, name);
+    assert.deepEqual(dormant.effectCounts(), noEffects, name);
+  }
 });
