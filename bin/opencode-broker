@@ -907,12 +907,18 @@ const acquire = async (state, request, {
     : false;
   if (opportunityRole && hadProductionCandidateLease) {
     const candidateKey = `${opportunityRole.providerID}/${opportunityRole.probationModelID}`;
+    const eligibleCandidateRequest = expandedPolicyIDs.some((targetID) => {
+      const target = admittedTargets[targetID];
+      return target?.providerID === opportunityRole.providerID &&
+        target?.modelID === opportunityRole.probationModelID &&
+        targetEligibleFor(target, request, state, undefined, admittedTargets, sessionID);
+    });
     const opportunity = accrueOpportunityTime(state.modelPolicy, {
       roleKey: opportunityRole.roleKey,
       now: Date.now(),
       compatibleActiveRegistration: registration?.compatible === true &&
         Array.isArray(registration.modelKeys) && registration.modelKeys.includes(candidateKey),
-      eligibleCandidateRequest: true,
+      eligibleCandidateRequest,
     });
     state.modelPolicy = opportunity.policy;
     if (opportunity.timedOut) {
@@ -1608,6 +1614,10 @@ const serve = async () => {
       }
       if (request.url === "/release") {
         if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        settlePolicyLease(state, state.leases[body.sessionID] ?? state.assignments[body.sessionID], {
+          outcome: "abandoned",
+          source: "lease",
+        });
         delete state.leases[body.sessionID];
         dropOneShotAssignment(state, body.sessionID);
         writeState(state);

@@ -1563,6 +1563,118 @@ const publishProbationCandidate = async (socketPath, configPath) => {
   return candidateID;
 };
 
+const startLiveProbationCandidate = async (home) => {
+  writeAuth(home);
+  const generation = await createProbeGeneration(home);
+  const configPath = applyConfigPath(home);
+  const broker = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath },
+    [...DEFAULT_RESOLVABLE_MODELS, "openai/gpt-6-sol"]);
+  try {
+    const registration = await rawRequest(broker.socketPath, "/resolver-process/register", {
+      body: {
+        generation: generation.generation,
+        manifestHash: generation.manifestHash,
+        modelKeys: generation.manifest.modelKeys,
+      },
+    });
+    assert.equal(registration.status, 200, JSON.stringify(registration.body));
+    const policy = brokerPolicyRequest({
+      generation: generation.generation,
+      manifestHash: generation.manifestHash,
+      desired: {
+        ...brokerPolicyRequest().desired,
+        probation: {
+          ...brokerPolicyRequest().desired.probation,
+          phase: "probation",
+          offerEvery: 1,
+        },
+      },
+    });
+    const applied = await rawRequest(broker.socketPath, "/model-policy/cas", { body: policy });
+    assert.equal(applied.status, 200, JSON.stringify(applied.body));
+    const candidateID = await publishProbationCandidate(broker.socketPath, configPath);
+    const first = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "probation-live-candidate",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+        contextTokens: 0,
+        resolverToken: registration.body.resolverToken,
+      },
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.target.model.id, "gpt-6-sol", JSON.stringify(first.body));
+    return { ...broker, candidateID, resolverToken: registration.body.resolverToken };
+  } catch (error) {
+    await stopBroker(broker.child);
+    throw error;
+  }
+};
+
+const probationRole = async (socketPath) => {
+  const status = await rawRequest(socketPath, "/model-policy/status", { method: "GET" });
+  assert.equal(status.status, 200, JSON.stringify(status.body));
+  return status.body.modelPolicy.roles["openai:gpt-sol"];
+};
+
+const leaseCompatibleSmartSession = (socketPath, resolverToken, sessionID, overrides = {}) => rawRequest(
+  socketPath,
+  "/lease",
+  {
+    body: {
+      sessionID,
+      profile: "auto",
+      tier: "smart",
+      providers: ["openai"],
+      replace: true,
+      resolverToken,
+      ...overrides,
+    },
+  },
+);
+
+const assertOpportunityPauses = async ({
+  socketPath,
+  resolverToken,
+  sessionPrefix,
+  leaseOverrides = {},
+}) => {
+  const open = await probationRole(socketPath);
+  assert.notEqual(open.probation.opportunityCursorAt, null, "the production candidate lease opens an opportunity window");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const firstSessionID = `${sessionPrefix}-first`;
+  const firstBlocked = await leaseCompatibleSmartSession(
+    socketPath,
+    resolverToken,
+    firstSessionID,
+    leaseOverrides,
+  );
+  assert.equal(firstBlocked.status, 200, JSON.stringify(firstBlocked.body));
+  assert.equal(firstBlocked.body.target.model.id, "gpt-5.6-sol");
+  const paused = await probationRole(socketPath);
+  assert.equal(paused.probation.opportunityCursorAt, null,
+    "an unselectable candidate must close the opportunity window");
+  const pausedMs = paused.probation.opportunityMs;
+  const releasedFallback = await rawRequest(socketPath, "/release", { body: { sessionID: firstSessionID } });
+  assert.equal(releasedFallback.status, 200, JSON.stringify(releasedFallback.body));
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const stillBlocked = await leaseCompatibleSmartSession(
+    socketPath,
+    resolverToken,
+    `${sessionPrefix}-second`,
+    leaseOverrides,
+  );
+  assert.equal(stillBlocked.status, 200, JSON.stringify(stillBlocked.body));
+  assert.equal(stillBlocked.body.target.model.id, "gpt-5.6-sol");
+  const stillPaused = await probationRole(socketPath);
+  assert.equal(stillPaused.probation.opportunityCursorAt, null);
+  assert.equal(stillPaused.probation.opportunityMs, pausedMs,
+    "blocked requests must not accrue more opportunity time");
+};
+
 const probeLaunchRequest = (generation, overrides = {}) => ({
   transitionID: "transition-openai-sol-gpt6",
   operationID: "transition-openai-sol-gpt6:staged-probing",
@@ -2098,6 +2210,108 @@ test("policy probation gives one compatible process the candidate while legacy a
     assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
     assert.equal(legacy.body.decision.blockedGeneration, true);
     assert.equal(legacy.body.decision.reasons.includes("blocked-generation"), true);
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("probation opportunity pauses while the candidate circuit is open", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const failure = await rawRequest(broker.socketPath, "/failure", {
+      body: {
+        sessionID: "probation-live-candidate",
+        targetID: broker.candidateID,
+        error: { statusCode: 404, code: "model_not_found", message: "model: gpt-6-sol not found" },
+      },
+    });
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.kind, "model");
+    await assertOpportunityPauses({
+      socketPath: broker.socketPath,
+      resolverToken: broker.resolverToken,
+      sessionPrefix: "probation-circuit-blocked",
+    });
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("probation opportunity pauses while the candidate is at full capacity", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const quarantined = await rawRequest(broker.socketPath, "/quarantine", {
+      body: { scope: "provider", kind: "compatibility", providerID: "openai", reasonCode: "operator" },
+    });
+    assert.equal(quarantined.status, 200, JSON.stringify(quarantined.body));
+    const probation = await rawRequest(broker.socketPath, "/rearm", {
+      body: { targetID: "provider:openai", reasonCode: "operator" },
+    });
+    assert.equal(probation.status, 200, JSON.stringify(probation.body));
+    await assertOpportunityPauses({
+      socketPath: broker.socketPath,
+      resolverToken: broker.resolverToken,
+      sessionPrefix: "probation-capacity-blocked",
+    });
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("probation opportunity pauses while the request exceeds the candidate context", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    await assertOpportunityPauses({
+      socketPath: broker.socketPath,
+      resolverToken: broker.resolverToken,
+      sessionPrefix: "probation-context-blocked",
+      leaseOverrides: { contextTokens: 350_000 },
+    });
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("release settles candidate leases so more than 512 lease cycles remain available", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const sessionIDs = ["probation-live-candidate"];
+    for (let index = 1; index < 513; index += 1) {
+      sessionIDs.push(`probation-release-${String(index).padStart(3, "0")}`);
+    }
+    for (const [index, sessionID] of sessionIDs.entries()) {
+      if (index > 0) {
+        const lease = await leaseCompatibleSmartSession(
+          broker.socketPath,
+          broker.resolverToken,
+          sessionID,
+        );
+        assert.equal(lease.status, 200, `cycle ${index + 1}: ${JSON.stringify(lease.body)}`);
+        assert.equal(lease.body.target.model.id, "gpt-6-sol", `cycle ${index + 1}`);
+      }
+      const released = await rawRequest(broker.socketPath, "/release", { body: { sessionID } });
+      assert.equal(released.status, 200, `cycle ${index + 1}: ${JSON.stringify(released.body)}`);
+    }
+
+    let role = await probationRole(broker.socketPath);
+    const records = Object.values(role.probation.leases);
+    assert.equal(records.length, 512, "settled bindings are retained only up to the idempotency cap");
+    assert.equal(records.some((record) => record.sessionID === sessionIDs[0]), false,
+      "the oldest settled binding is trimmed");
+    const latest = records.find((record) => record.sessionID === sessionIDs.at(-1));
+    assert.equal(latest.settlement.outcome, "abandoned");
+    assert.equal(latest.settlement.qualifying, false);
+    const firstSettlement = structuredClone(latest.settlement);
+
+    const replay = await rawRequest(broker.socketPath, "/release", {
+      body: { sessionID: sessionIDs.at(-1) },
+    });
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+    role = await probationRole(broker.socketPath);
+    const replayed = Object.values(role.probation.leases)
+      .find((record) => record.sessionID === sessionIDs.at(-1));
+    assert.deepEqual(replayed.settlement, firstSettlement,
+      "an idempotent release replay retains the original neutral settlement");
   } finally {
     await stopBroker(broker.child);
   }
