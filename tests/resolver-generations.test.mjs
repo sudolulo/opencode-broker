@@ -100,7 +100,7 @@ const emptyOverlay = () => ({ version: 1, revision: 0, updatedAt: NOW - 1, entri
 const writeBase = (directory, config = baseConfig(), spacing = 2) => {
   mkdirSync(directory, { recursive: true });
   const path = join(directory, "base.json");
-  writeFileSync(path, `${JSON.stringify(config, null, spacing)}\n`);
+  writeFileSync(path, `${JSON.stringify(config, null, spacing)}\n`, { mode: 0o600 });
   return path;
 };
 
@@ -418,6 +418,42 @@ test("generation lookup returns only a canonical independently verified bundle",
   }
 });
 
+test("generation lookup rejects an effective config widened to mode 0644", async () => {
+  const fixture = setup("lookup-config-mode");
+  const candidate = await fixture.manager.build(buildArgs(fixture));
+  await fixture.manager.publish(candidate);
+  chmodSync(join(candidate.directory, "opencode.json"), 0o644);
+
+  assert.throws(
+    () => fixture.manager.generation(1),
+    /effective config.*mode 0644.*0600/i,
+  );
+});
+
+test("generation lookup rejects a manifest widened to mode 0644", async () => {
+  const fixture = setup("lookup-manifest-mode");
+  const candidate = await fixture.manager.build(buildArgs(fixture));
+  await fixture.manager.publish(candidate);
+  chmodSync(join(candidate.directory, "manifest.json"), 0o644);
+
+  assert.throws(
+    () => fixture.manager.generation(1),
+    /manifest.*mode 0644.*0600/i,
+  );
+});
+
+test("registry read rejects a registry widened to mode 0644", async () => {
+  const fixture = setup("registry-mode");
+  const candidate = await fixture.manager.build(buildArgs(fixture));
+  await fixture.manager.publish(candidate);
+  chmodSync(fixture.manager.paths().registry, 0o644);
+
+  assert.throws(
+    () => fixture.manager.readRegistry(),
+    /registry.*mode 0644.*0600/i,
+  );
+});
+
 test("registry loss or high-water regression fails loudly", async () => {
   const fixture = setup("high-water");
   const candidate = await fixture.manager.build(buildArgs(fixture));
@@ -429,7 +465,7 @@ test("registry loss or high-water regression fails loudly", async () => {
     version: 1,
     highWater: 0,
     generations: { 4: { manifestHash: "a".repeat(64), effectiveHash: "b".repeat(64), createdAt: NOW } },
-  }));
+  }), { mode: 0o600 });
   assert.throws(() => fixture.manager.readRegistry(), /high-water.*regressed/i);
 });
 
