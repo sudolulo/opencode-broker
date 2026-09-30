@@ -476,6 +476,8 @@ const responsesErrorFrame = (message) => `event: error\ndata: ${JSON.stringify({
 const CHAT = { name: "chat", path: "/chat/completions" };
 const RESPONSES = { name: "responses", path: "/responses" };
 const MESSAGES = { name: "messages", path: "/messages" };
+// This is control flow, unlike the human-facing sentence on the Error.
+const LOCAL_FORWARDABLE_EXHAUSTION = "gateway-local-forwardable-exhaustion";
 
 const providerServes = (provider, api) => api === CHAT
   ? provider.chatApi !== false
@@ -702,16 +704,21 @@ export const createGatewayHandler = ({
     // (declared context x localContextHeadroom) underneath either number.
     const override = Number(route?.maxContextTokens);
     const routeCap = Number.isFinite(override) && override > 0 ? override : null;
-    const providers = allowedProviders.filter((id) => {
-      if (excludeProviders.includes(id)) return false;
+    const forwardableProviders = allowedProviders.filter((id) => {
       if (!providerServes(config.providers[id] ?? {}, api)) return false;
       const cap = routeCap ?? Number(config.providers[id]?.maxContextTokens);
       return !(Number.isFinite(cap) && cap > 0 && contextTokens > cap);
     });
+    const providers = forwardableProviders.filter((id) => !excludeProviders.includes(id));
     if (!providers.length) {
-      throw new Error(!allowedProviders.some((id) => providerServes(config.providers[id] ?? {}, api))
+      const apiUnsupported = !allowedProviders.some((id) => providerServes(config.providers[id] ?? {}, api));
+      const error = new Error(apiUnsupported
         ? `no configured lane serves /v1${api.path} (set ${api.name}Api: true on one that does)`
         : "every forwardable provider was excluded this attempt");
+      if (forwardableProviders.length && forwardableProviders.every((id) => excludeProviders.includes(id))) {
+        error.code = LOCAL_FORWARDABLE_EXHAUSTION;
+      }
+      throw error;
     }
     const lease = await brokerRequest("/lease", {
       sessionID,
@@ -905,6 +912,11 @@ export const createGatewayHandler = ({
   };
   const completionsFor = async (sessionID, requestBody, clientAbort, sink, api, route, streaming, wantedJson, keepUsageFrames, requestHeaders) => {
     let lastError = null;
+    let lastForwardError = null;
+    const rememberForwardError = (error) => {
+      lastForwardError = error;
+      lastError = error;
+    };
     let acquiredLease = false;
     const excluded = [];
     // ☠️ A PROFILE-MAPPED REQUEST MUST NOT EXCLUDE ITS OWN LANE. The exclusion
@@ -926,7 +938,14 @@ export const createGatewayHandler = ({
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       let leased;
       try { leased = await leaseWithPrepare(sessionID, requestBody, excluded, route, clientAbort, deadline, api); }
-      catch (error) { lastError = error; break; }
+      catch (error) {
+        // A local retry dead-end adds no new diagnosis. Broker and pre-forward
+        // errors still replace the old failure because they carry new facts.
+        lastError = error?.code === LOCAL_FORWARDABLE_EXHAUSTION && lastForwardError
+          ? lastForwardError
+          : error;
+        break;
+      }
       acquiredLease = true;
       const providerConfig = config.providers[leased.providerID];
       if (!providerConfig?.baseUrl) {
@@ -1124,21 +1143,26 @@ export const createGatewayHandler = ({
           await settle(leased.sessionID, "/failure", { error: { message: String(error?.message ?? error) } });
         }
         excludeLane(leased.providerID);
-        lastError = error;
+        rememberForwardError(error);
         continue;
       }
       if (!response.ok) {
         const text = (await response.text().catch(() => "")).slice(0, 400);
         const safeMessage = api === MESSAGES
           ? `Anthropic upstream HTTP ${response.status}`
-          : text || `upstream HTTP ${response.status}`;
+          : api === RESPONSES
+            ? `OpenAI Responses upstream HTTP ${response.status}`
+            : text || `upstream HTTP ${response.status}`;
         clearTimeout(stallTimer);
         await settle(leased.sessionID, "/failure", {
           error: { statusCode: response.status, message: safeMessage },
         });
-        lastError = new Error(api === MESSAGES
+        const error = new Error(api === MESSAGES
           ? safeMessage
-          : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
+          : api === RESPONSES
+            ? `upstream ${leased.providerID} HTTP ${response.status}`
+            : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
+        rememberForwardError(error);
         excludeLane(leased.providerID);
         continue;
       }
@@ -1188,7 +1212,7 @@ export const createGatewayHandler = ({
             await settle(leased.sessionID, "/failure", { error: { message: String(error?.message ?? error).slice(0, 400) } });
           }
           excludeLane(leased.providerID);
-          lastError = error;
+          rememberForwardError(error);
           continue;
         }
         // Committed. Account first: tokens were generated and somebody is
@@ -1240,7 +1264,7 @@ export const createGatewayHandler = ({
           payload = JSON.parse(rawBody);
         } catch {
           await settle(leased.sessionID, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
-          lastError = new Error(`upstream ${leased.providerID} returned unparseable JSON`);
+          rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
           excludeLane(leased.providerID);
           continue;
         }
@@ -1259,7 +1283,7 @@ export const createGatewayHandler = ({
       let payload;
       try { payload = await response.json(); } catch {
         await settle(leased.sessionID, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
-        lastError = new Error(`upstream ${leased.providerID} returned unparseable JSON`);
+        rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
         excludeLane(leased.providerID);
         continue;
       }

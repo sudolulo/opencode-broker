@@ -2223,6 +2223,46 @@ const RESP_DELTA = 'event: response.output_text.delta\ndata: {"type":"response.o
 const RESP_DONE = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","status":"completed","usage":{"input_tokens":13,"output_tokens":5,"total_tokens":18}}}\n\n';
 const RESP_ERROR = 'event: error\ndata: {"type":"error","code":"server_error","message":"slot died"}\n\n';
 
+test("a sole Responses provider failure keeps its safe attribution after local retry exhaustion", async () => {
+  const privateDetail = "upstream-private-sentinel";
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      openai: { baseUrl: "http://openai.example/v1", chatApi: false, responsesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "openai", id: "gpt-5.4" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(privateDetail, { status: 500 }),
+  });
+
+  await withServer(handler, async (base) => {
+    const response = await askResponses(base);
+    assert.equal(response.status, 502);
+    const message = (await response.json()).error.message;
+    assert.deepEqual({
+      namesProvider: message.includes("openai"),
+      namesStatus: message.includes("500"),
+      leaksPrivateDetail: message.includes(privateDetail),
+      reportsLocalExhaustion: message.includes("every forwardable provider was excluded"),
+    }, {
+      namesProvider: true,
+      namesStatus: true,
+      leaksPrivateDetail: false,
+      reportsLocalExhaustion: false,
+    });
+  });
+  assert.deepEqual(brokerCalls.map((call) => call.route), ["/lease", "/failure", "/release"]);
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.equal(failure.body.error.statusCode, 500);
+  assert.equal(failure.body.error.message, "OpenAI Responses upstream HTTP 500");
+  assert.equal(JSON.stringify(failure.body).includes(privateDetail), false);
+});
+
 test("a /v1/responses request goes to the lane's /responses with its extras, and is accounted", async () => {
   const seen = [];
   const brokerCalls = [];

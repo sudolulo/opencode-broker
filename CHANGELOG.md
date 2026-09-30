@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.1] — 2026-09-30
+
+### Fixed
+
+- **Gateway retry errors preserve safe provider attribution.** When a failed provider is the only
+  forwardable Responses lane, local retry exhaustion now retains the provider ID and HTTP status
+  while redacting the upstream response body from both client and broker failure payloads.
+
 ## [1.23.0] — 2026-09-29
 
 ### Added
