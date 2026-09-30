@@ -1531,6 +1531,38 @@ const createProbeGeneration = async (home) => {
   return generation1;
 };
 
+const publishProbationCandidate = async (socketPath, configPath) => {
+  const candidateID = "subscription-openai-gpt-6-sol-standard";
+  const published = inventory({
+    openai: { authType: "oauth", connected: true, admission: "admitted", models: 1 },
+  });
+  published.targets = {
+    [candidateID]: {
+      id: candidateID,
+      providerID: "openai",
+      modelID: "gpt-6-sol",
+      kind: "cloud",
+      capacity: null,
+      source: "subscription-oauth",
+      tiers: ["smart"],
+      fit: { smart: 9 },
+      family: "gpt-sol",
+      releaseDate: "2026-09-22",
+      speed: "standard",
+      capabilities: { toolCall: true },
+      context: 400_000,
+      output: 96_000,
+      variants: ["low", "medium"],
+    },
+  };
+  published.modelContexts = { "openai/gpt-6-sol": 400_000 };
+  published.modelOutputs = { "openai/gpt-6-sol": 96_000 };
+  published.modelVariants = { "openai/gpt-6-sol": ["low", "medium"] };
+  published.configFingerprint = createHash("sha256").update(readFileSync(configPath)).digest("hex");
+  await request(socketPath, "/inventory", published);
+  return candidateID;
+};
+
 const probeLaunchRequest = (generation, overrides = {}) => ({
   transitionID: "transition-openai-sol-gpt6",
   operationID: "transition-openai-sol-gpt6:staged-probing",
@@ -2066,6 +2098,154 @@ test("policy probation gives one compatible process the candidate while legacy a
     assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
     assert.equal(legacy.body.decision.blockedGeneration, true);
     assert.equal(legacy.body.decision.reasons.includes("blocked-generation"), true);
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("broker lease settlements survive restart, promote once, and persist post-active rollback before replying", async () => withTempHome(async (home) => {
+  writeAuth(home);
+  const generation = await createProbeGeneration(home);
+  const configPath = applyConfigPath(home);
+  const env = { OPENCODE_BROKER_CONFIG: configPath };
+  const resolvable = [...DEFAULT_RESOLVABLE_MODELS, "openai/gpt-6-sol"];
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  let broker = await startBroker(home, env, resolvable);
+  try {
+    const registration = await rawRequest(broker.socketPath, "/resolver-process/register", {
+      body: {
+        generation: generation.generation,
+        manifestHash: generation.manifestHash,
+        modelKeys: generation.manifest.modelKeys,
+      },
+    });
+    const policy = brokerPolicyRequest({
+      generation: generation.generation,
+      manifestHash: generation.manifestHash,
+      desired: {
+        ...brokerPolicyRequest().desired,
+        probation: {
+          ...brokerPolicyRequest().desired.probation,
+          phase: "probation",
+          offerEvery: 1,
+        },
+      },
+    });
+    assert.equal((await rawRequest(broker.socketPath, "/model-policy/cas", { body: policy })).status, 200);
+    await publishProbationCandidate(broker.socketPath, configPath);
+
+    const forgotten = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "probation-forgotten",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+        resolverToken: registration.body.resolverToken,
+      },
+    });
+    assert.equal(forgotten.body.target.model.id, "gpt-6-sol");
+    await request(broker.socketPath, "/forget", { sessionID: "probation-forgotten", completed: false });
+    let status = await rawRequest(broker.socketPath, "/model-policy/status", { method: "GET" });
+    let records = Object.values(status.body.modelPolicy.roles["openai:gpt-sol"].probation.leases);
+    assert.equal(records.find((record) => record.sessionID === "probation-forgotten").settlement.outcome, "abandoned");
+    assert.deepEqual(status.body.modelPolicy.roles["openai:gpt-sol"].probation.successes, []);
+
+    const expiring = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "probation-expiring",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+        resolverToken: registration.body.resolverToken,
+      },
+    });
+    assert.equal(expiring.body.target.model.id, "gpt-6-sol");
+  } finally {
+    await stopBroker(broker.child);
+  }
+
+  const staleState = JSON.parse(readFileSync(statePath, "utf8"));
+  staleState.leases["probation-expiring"].touchedAt = Date.now() - 3 * 60 * 60_000;
+  writeFileSync(statePath, JSON.stringify(staleState) + "\n", { mode: 0o600 });
+  broker = await startBroker(home, env, resolvable);
+  try {
+    let status = await rawRequest(broker.socketPath, "/model-policy/status", { method: "GET" });
+    let role = status.body.modelPolicy.roles["openai:gpt-sol"];
+    let records = Object.values(role.probation.leases);
+    assert.equal(records.find((record) => record.sessionID === "probation-expiring").settlement.source, "expiry");
+    assert.deepEqual(role.probation.successes, []);
+
+    const registration = await rawRequest(broker.socketPath, "/resolver-process/register", {
+      body: {
+        generation: generation.generation,
+        manifestHash: generation.manifestHash,
+        modelKeys: generation.manifest.modelKeys,
+      },
+    });
+    for (let index = 0; index < 5; index += 1) {
+      const sessionID = `probation-success-${index}`;
+      const candidate = await rawRequest(broker.socketPath, "/lease", {
+        body: {
+          sessionID,
+          profile: "auto",
+          tier: "smart",
+          providers: ["openai"],
+          replace: true,
+          resolverToken: registration.body.resolverToken,
+        },
+      });
+      assert.equal(candidate.body.target.model.id, "gpt-6-sol");
+      if (index === 0) {
+        await request(broker.socketPath, "/usage", {
+          sessionID,
+          providerID: "openai",
+          modelID: "gpt-6-sol",
+          observedAt: Date.now(),
+          requests: 1,
+          tokens: {},
+        });
+      }
+      await request(broker.socketPath, "/complete", { sessionID });
+    }
+    status = await rawRequest(broker.socketPath, "/model-policy/status", { method: "GET" });
+    role = status.body.modelPolicy.roles["openai:gpt-sol"];
+    assert.equal(role.activeModelID, "gpt-6-sol");
+    assert.equal(role.probation.phase, "active");
+    assert.equal(role.probation.successes.length, 5, "usage plus complete settles one success");
+
+    for (const sessionID of ["post-active-bad-1", "post-active-bad-2"]) {
+      const candidate = await rawRequest(broker.socketPath, "/lease", {
+        body: {
+          sessionID,
+          profile: "auto",
+          tier: "smart",
+          providers: ["openai"],
+          replace: true,
+          resolverToken: registration.body.resolverToken,
+        },
+      });
+      assert.equal(candidate.body.target.model.id, "gpt-6-sol");
+    }
+    await request(broker.socketPath, "/failure", {
+      sessionID: "post-active-bad-1",
+      failureClass: "model-not-found",
+      error: { message: "client closed request" },
+    });
+    let persisted = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(persisted.modelPolicy.roles["openai:gpt-sol"].probation.failures.length, 1,
+      "the response follows the state write");
+    await request(broker.socketPath, "/failure", {
+      sessionID: "post-active-bad-2",
+      failureClass: "unsupported-model-parameter",
+      error: { message: "client closed request" },
+    });
+    persisted = JSON.parse(readFileSync(statePath, "utf8"));
+    role = persisted.modelPolicy.roles["openai:gpt-sol"];
+    assert.equal(role.activeModelID, "gpt-5.6-sol");
+    assert.equal(role.probation.phase, "rolled-back");
+    assert.equal(role.rollbackReason, "model-failure-threshold");
   } finally {
     await stopBroker(broker.child);
   }

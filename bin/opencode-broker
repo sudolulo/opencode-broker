@@ -2,6 +2,7 @@
 // The broker coordinates independent OpenCode servers without handling prompts,
 // credentials, or provider traffic. It only assigns model leases and health state.
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { homedir } from "node:os";
@@ -60,6 +61,11 @@ import { createResolverGenerationManager } from "../lib/resolver-generations.js"
 import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
 import { resolvePolicyLane } from "../lib/policy-targets.js";
 import { createProbeBrokerState } from "../lib/model-probe.js";
+import {
+  accrueOpportunityTime,
+  recordCandidateLease,
+  settleCandidateOutcome,
+} from "../lib/model-probation.js";
 import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
@@ -406,17 +412,50 @@ const applyCheckResult = (state, providerID, result) => {
 const isOneShotAssignment = (assignment, sessionID) => assignment?.oneShot === true ||
   (assignment?.oneShot === undefined && ONE_SHOT_SESSION_PREFIX.test(sessionID));
 
+const modelPolicyRoleForTarget = (state, target) => Object.values(state.modelPolicy?.roles ?? {})
+  .find((role) => role?.providerID === target?.providerID && (
+    (role.probation?.phase === "probation" && role.probationModelID === target?.modelID) ||
+    (role.probation?.phase === "active" && role.activeModelID === target?.modelID &&
+      role.activeModelID !== role.rollbackModelID)
+  )) ?? null;
+
+const settlePolicyLease = (state, lease, { outcome, failureClass, source, now = Date.now() }) => {
+  if (!lease?.modelPolicyRoleKey || !lease?.leaseID || !lease?.sessionID) return null;
+  const result = settleCandidateOutcome(state.modelPolicy, {
+    roleKey: lease.modelPolicyRoleKey,
+    leaseID: lease.leaseID,
+    sessionID: lease.sessionID,
+    outcome,
+    failureClass,
+    source,
+    now,
+  });
+  state.modelPolicy = result.policy;
+  return result.event;
+};
+
+const removePolicyLeaseBinding = (state, lease) => {
+  const leases = lease?.modelPolicyRoleKey
+    ? state.modelPolicy?.roles?.[lease.modelPolicyRoleKey]?.probation?.leases
+    : null;
+  if (leases && lease?.leaseID) delete leases[lease.leaseID];
+};
+
 // Called wherever a lease ENDS. An ordinary assignment stays -- it is the session's pin, and
 // the next turn reads it back, which is what stickiness is. A one-shot's has no next turn and
 // no reader, so keeping it only spends cap space and file size until the cap overflows onto
 // real pins. Dropping it here is what keeps the tiered eviction a rarely-used backstop.
 const dropOneShotAssignment = (state, sessionID) => {
-  if (isOneShotAssignment(state.assignments[sessionID], sessionID)) delete state.assignments[sessionID];
+  if (isOneShotAssignment(state.assignments[sessionID], sessionID)) {
+    removePolicyLeaseBinding(state, state.assignments[sessionID]);
+    delete state.assignments[sessionID];
+  }
 };
 
 const sweep = (state, now = Date.now()) => {
   for (const [sessionID, lease] of Object.entries(state.leases)) {
     if (!lease?.touchedAt || now - lease.touchedAt > LEASE_TTL_MS || !isProfile(lease?.profile) || !["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(lease?.tier)) {
+      settlePolicyLease(state, lease, { outcome: "abandoned", source: "expiry", now });
       delete state.leases[sessionID];
     }
   }
@@ -428,6 +467,7 @@ const sweep = (state, now = Date.now()) => {
   // the expired leases, so what remains in state.leases is alive right now.
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
     if (!state.leases[sessionID] && (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS)) {
+      removePolicyLeaseBinding(state, assignment);
       delete state.assignments[sessionID];
     }
   }
@@ -463,7 +503,10 @@ const sweep = (state, now = Date.now()) => {
     const evicted = order.slice(0, assignmentIDs.length - MAX_ASSIGNMENTS);
     // Counted before the deletes, while the entries are still readable.
     const evictedPins = Math.max(0, evicted.length - spent.length);
-    for (const sessionID of evicted) delete state.assignments[sessionID];
+    for (const sessionID of evicted) {
+      removePolicyLeaseBinding(state, state.assignments[sessionID]);
+      delete state.assignments[sessionID];
+    }
     if (evictedPins > 0) {
       // Never silent: losing a pin costs a live session its model mid-task. Reaching here
       // means every settled one-shot was already spent and MAX_ASSIGNMENTS is still below
@@ -833,23 +876,49 @@ const acquire = async (state, request, {
     admittedTargets = exact;
   }
   const expandedPolicyIDs = targetEligibleIDsFor(profile, tier, admittedTargets);
-  const policyLane = probeAssignment ? {
-    targetIDs: Object.keys(admittedTargets),
-    targets: admittedTargets,
-    policyTargetID: Object.keys(admittedTargets)[0],
-    reason: "probe-exact-target",
-    blockedGeneration: false,
-  } : resolvePolicyLane({
+  const policyLaneArgs = {
     targetIDs: expandedPolicyIDs,
     targets: admittedTargets,
-    modelPolicy: state.modelPolicy,
     registration,
     activeLeases: Object.entries(state.leases)
       .filter(([activeSessionID]) => activeSessionID !== sessionID)
       .map(([activeSessionID, lease]) => ({ sessionID: activeSessionID, ...lease })),
     tier,
     enabled: CONFIG.reconcile.apply.enabled,
+  };
+  let policyLane = probeAssignment ? {
+    targetIDs: Object.keys(admittedTargets),
+    targets: admittedTargets,
+    policyTargetID: Object.keys(admittedTargets)[0],
+    reason: "probe-exact-target",
+    blockedGeneration: false,
+  } : resolvePolicyLane({
+    modelPolicy: state.modelPolicy,
+    ...policyLaneArgs,
   });
+  const opportunityRole = !probeAssignment ? Object.values(state.modelPolicy?.roles ?? {}).find((role) =>
+    role?.probation?.phase === "probation" && role.routingIntent?.tiers?.includes(tier) &&
+    expandedPolicyIDs.some((targetID) => {
+      const target = admittedTargets[targetID];
+      return target?.providerID === role.providerID && target?.modelID === role.probationModelID;
+    })) : null;
+  const hadProductionCandidateLease = opportunityRole
+    ? Object.values(opportunityRole.probation.leases ?? {}).some((lease) => lease?.synthetic === false)
+    : false;
+  if (opportunityRole && hadProductionCandidateLease) {
+    const candidateKey = `${opportunityRole.providerID}/${opportunityRole.probationModelID}`;
+    const opportunity = accrueOpportunityTime(state.modelPolicy, {
+      roleKey: opportunityRole.roleKey,
+      now: Date.now(),
+      compatibleActiveRegistration: registration?.compatible === true &&
+        Array.isArray(registration.modelKeys) && registration.modelKeys.includes(candidateKey),
+      eligibleCandidateRequest: true,
+    });
+    state.modelPolicy = opportunity.policy;
+    if (opportunity.timedOut) {
+      policyLane = resolvePolicyLane({ modelPolicy: state.modelPolicy, ...policyLaneArgs });
+    }
+  }
   if (policyLane.reason) {
     const allowed = new Set(policyLane.targetIDs);
     const expanded = new Set(expandedPolicyIDs);
@@ -896,10 +965,12 @@ const acquire = async (state, request, {
       }
     }
     ensureActive();
+    settlePolicyLease(state, existing, { outcome: "abandoned", source: "lease" });
     delete state.leases[sessionID];
   }
   if (existing && replace) {
     ensureActive();
+    settlePolicyLease(state, existing, { outcome: "abandoned", source: "lease" });
     delete state.leases[sessionID];
   }
   const selection = {
@@ -1177,13 +1248,46 @@ const acquire = async (state, request, {
     state.cursors[choice.cursorKey] = choice.nextCursor;
   }
   ensureActive();
-  state.leases[sessionID] = { targetID: choice.target.id, touchedAt: Date.now(), profile, tier };
+  const previousAssignment = state.assignments[sessionID];
+  if (previousAssignment) removePolicyLeaseBinding(state, previousAssignment);
+  const leasedAt = Date.now();
+  const leaseID = randomUUID();
+  const candidateRole = modelPolicyRoleForTarget(state, choice.target);
+  let policyLease = {};
+  if (candidateRole) {
+    const recorded = recordCandidateLease(state.modelPolicy, {
+      roleKey: candidateRole.roleKey,
+      leaseID,
+      sessionID,
+      now: leasedAt,
+      synthetic: Boolean(probeAssignment) || sessionID.startsWith("gw-probe-"),
+    });
+    state.modelPolicy = recorded.policy;
+    policyLease = { leaseID, sessionID, modelPolicyRoleKey: candidateRole.roleKey };
+    if (opportunityRole?.roleKey === candidateRole.roleKey && !hadProductionCandidateLease && !recorded.event.synthetic) {
+      const opportunity = accrueOpportunityTime(state.modelPolicy, {
+        roleKey: candidateRole.roleKey,
+        now: leasedAt,
+        compatibleActiveRegistration: true,
+        eligibleCandidateRequest: true,
+      });
+      state.modelPolicy = opportunity.policy;
+    }
+  }
+  state.leases[sessionID] = {
+    targetID: choice.target.id,
+    touchedAt: leasedAt,
+    profile,
+    tier,
+    ...policyLease,
+  };
   ensureActive();
   state.assignments[sessionID] = {
     targetID: choice.target.id,
     profile,
     tier,
-    updatedAt: Date.now(),
+    updatedAt: leasedAt,
+    ...policyLease,
     // A fallback rung is a degraded route, never a home: it must yield to the lane's
     // primary the moment one is eligible (fallback-stickiness above owns that), so it
     // is recorded but never pinned.
@@ -1527,6 +1631,11 @@ const serve = async () => {
         // wholesale, which re-arms failure handling for the next turn.
         if (!lease && assignment?.settledFailure &&
           (!body.targetID || body.targetID === assignment.settledFailure.targetID)) {
+          settlePolicyLease(state, assignment, {
+            outcome: "failure",
+            failureClass: body.failureClass,
+            source: "failure",
+          });
           return reply(response, 200, assignment.settledFailure.reply);
         }
         const targetID = body.targetID || lease?.targetID || assignment?.targetID;
@@ -1534,6 +1643,11 @@ const serve = async () => {
         const kind = classifyRoutingFailure(error);
         const target = targetForID(targetID, allTargets(state));
         const settleFailure = (replyBody) => {
+          settlePolicyLease(state, lease ?? assignment, {
+            outcome: "failure",
+            failureClass: body.failureClass,
+            source: "failure",
+          });
           if (assignment && targetID && assignment.targetID === targetID) {
             assignment.settledFailure = { targetID, reply: replyBody };
           }
@@ -1671,6 +1785,7 @@ const serve = async () => {
         const targetID = lease?.targetID || assignment?.targetID;
         const target = targetForID(targetID, allTargets(state));
         if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
+        settlePolicyLease(state, lease ?? assignment, { outcome: "success", source: "complete" });
         delete state.leases[body.sessionID];
         dropOneShotAssignment(state, body.sessionID);
         writeState(state);
@@ -1702,6 +1817,10 @@ const serve = async () => {
           const target = targetForID(targetID, allTargets(state));
           if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
         }
+        settlePolicyLease(state, state.leases[body.sessionID] ?? state.assignments[body.sessionID], {
+          outcome: completed ? "success" : "abandoned",
+          source: "forget",
+        });
         // The lease goes (its slot is free again); the assignment stays. It is the session's
         // pin, so the next turn after an idle returns to the same model instead of being
         // re-rolled. It ages out on ASSIGNMENT_TTL_MS like any other.
@@ -1771,6 +1890,7 @@ const serve = async () => {
         if (Number.isFinite(rawObservedAt) && rawObservedAt <= Date.now() &&
           target && target.providerID === providerID && target.modelID === body.modelID) {
           state.health = markProbationSuccessHealthy(state.health, providerID, { at: rawObservedAt });
+          settlePolicyLease(state, assignment, { outcome: "success", source: "usage" });
         }
         writeState(state);
         return reply(response, 200, { ok: true, utilization: effectiveUtilization(state.budgets, providerID), ...(burn ? { burn } : {}) });

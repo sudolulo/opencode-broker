@@ -14,10 +14,10 @@ tooling) is a supported client.
 | `/lease` | `{ sessionID, profile, tier, replace?, preferredModel?, contextTokens?, providers?, localOnly?, releasePin?, oneShot?, waitedMs?, resolverToken? }` | Acquire (or revalidate) a model lease. Returns `{ target: { id, model: { providerID, id, variant? }, kind }, existing, decision: { registration } }`. `registration` is the token's validated generation eligibility and never contains the token. Fails with a clear error when no eligible target fits (context, circuits, health, admission) — see **Refusals** below. `providers` and `localOnly` NARROW admission and can never widen it: `providers` to callers a client can actually speak to, `localOnly: true` to targets on the LAN, for content that may not leave it. A session keeps the model it was last assigned while that model can serve it; `releasePin: true` asks for a fresh decision. `oneShot: true` declares that this `sessionID` is minted per request and will never be reused (the gateway does this): it does not affect selection, it only marks the assignment as safe to discard ahead of real sessions' pins. It is **refused** unless the `sessionID` starts with `gw-`, the per-request naming contract — a real session must not be able to ask for its own pin to be spent first. `waitedMs` is the optional non-negative finite count of milliseconds this caller has **already** spent waiting for its primary in the current lease loop; it defaults to 0 and gates rungs carrying `profileFallbackAfterMs` (see **Selection semantics**). Callers reset it for a new upstream-forward attempt, so a retry after a failed forward does not inherit the first attempt's elapsed time. An invalid value is refused rather than coerced: read as 0 it would hold a delayed rung shut forever, and read as huge it would surrender a scarce shared slot immediately. |
 | `/release` | `{ sessionID }` | Drop the session's lease. A one-shot session's assignment is dropped with it (nothing can read it back); an ordinary session's pin stays. |
 | `/touch` | `{ sessionID }` | Heartbeat; leases expire after 2h untouched. |
-| `/failure` | `{ sessionID, targetID?, error }` | Report a provider failure. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). |
-| `/complete` | `{ sessionID }` | Successful end: clears probation for the target's provider, drops the lease, and drops a one-shot session's assignment with it. |
-| `/forget` | `{ sessionID, completed? }` | Drop the lease at the end of a turn. The assignment (the session's pinned model) stays and ages out after 14 days — unless the session is one-shot, which has no next turn to read it, so its assignment goes with the lease; `completed: true` also clears probation. Assignments are also capped at 512: eviction is oldest-first, but it spends every settled one-shot entry before any session pin. **An assignment whose session still holds a live lease is never evicted**, by the cap or by the 14-day age rule — a session that only revalidates a held lease never moves `updatedAt`, so age is not evidence that it is idle. An entry counts as one-shot if it carries the `oneShot` flag, or carries no flag at all and its id starts with `gw-` (entries written before the flag existed). |
-| `/usage` | `{ sessionID?, providerID, modelID?, requests, tokens: { input, output, cacheRead, cacheWrite }, caller? }` | Feed the budget ledger and the burn watch (one report per provider request). Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
+| `/failure` | `{ sessionID, targetID?, error, failureClass? }` | Report a provider failure. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). For a governed candidate lease, `failureClass` is also classified by the closed model-policy taxonomy below; an absent or unknown class is neutral. |
+| `/complete` | `{ sessionID }` | Successful end: clears probation for the target's provider, settles an exactly bound candidate lease once, drops the lease, and drops a one-shot session's assignment with it. |
+| `/forget` | `{ sessionID, completed? }` | Drop the lease at the end of a turn. For a governed candidate, `completed: true` settles success and every other value settles neutral abandonment. The assignment (the session's pinned model) stays and ages out after 14 days — unless the session is one-shot, which has no next turn to read it, so its assignment goes with the lease; `completed: true` also clears provider probation. Assignments are also capped at 512: eviction is oldest-first, but it spends every settled one-shot entry before any session pin. **An assignment whose session still holds a live lease is never evicted**, by the cap or by the 14-day age rule — a session that only revalidates a held lease never moves `updatedAt`, so age is not evidence that it is idle. An entry counts as one-shot if it carries the `oneShot` flag, or carries no flag at all and its id starts with `gw-` (entries written before the flag existed). |
+| `/usage` | `{ sessionID?, providerID, modelID?, observedAt?, requests, tokens: { input, output, cacheRead, cacheWrite }, caller? }` | Feed the budget ledger and the burn watch (one report per provider request). A non-future observation whose provider/model exactly matches the retained lease or assignment also settles candidate success; a later `/complete` is an idempotent replay. Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
 | `/inventory` | `{ targets, providers, modelContexts, modelVariants, authRevision, authOnly? }` | Publish discovered provider/model inventory. Refused unless `authRevision` matches the broker's own hash of opencode's `auth.json` — an OAuth-to-API-key change can never publish stale admission. |
 | `/status` | `{ resolverToken? }` | Full public state: leases, circuits (with `renewsAt`), health, budget report, last decision, non-secret active resolver-process registrations by generation, and `deprecations` when the broker is still reading a renamed setting. |
 | `/selection` | `{}` | Just `lastDecision` — why the last lease chose its target. |
@@ -72,6 +72,36 @@ future-generation, unknown-generation, cleaned-generation, manifest-mismatched, 
 clients receive logical generation-0 `base-only` eligibility derived from normalized static
 targets, with `manifestHash: null`. This fallback does not require or claim an immutable
 generation-0 bundle and does not roll back global policy.
+
+## Model probation and automatic rollback
+
+Candidate outcomes are keyed by the broker-minted lease ID and exact session ID. A
+validated `/usage` or `/complete` counts one production success, never one each; a
+duplicate or contradictory report is a non-counting replay. Synthetic `gw-probe-*`
+traffic, abandonment from expiry or `/forget`, and every unclassified or excluded
+failure are neutral. The qualifying model failures are exactly
+`model-not-found`, `unsupported-model-parameter`,
+`invalid-model-tool-call-response`, and `model-entitlement-failure`. The excluded
+classes are exactly `network-failure`, `rate-limit`, `provider-overload`,
+`user-cancellation`, `client-disconnect`, and `tool-execution-failure`; every other
+value normalizes to recorded, non-qualifying `unknown`.
+
+Five distinct production lease successes promote the candidate. Two qualifying
+failures that settle within one rolling 15-minute window roll it back during
+probation or after promotion. The broker restores the recorded rollback model, or
+explicit `activeModelID: null` for a new role, and writes `broker.json` before the
+settlement response. Fifteen minutes is only the failure aggregation window: exact
+lease/session settlement remains idempotent for normal lease/assignment retention
+and has no separate settlement deadline.
+
+The seven-day timeout counts cumulative eligible opportunity time, not wall time.
+After the first compatible candidate production lease, each compatible role request
+opens or extends a window no more than 10 minutes into the future. The next request
+accrues only the uncounted overlap with that persisted window. Silence can therefore
+add at most its remainder; an incompatible/old-generation request closes it. At
+exactly seven cumulative days without five successes the broker restores the same
+rollback target with `rollbackReason: "probation-timeout"`. No compatible traffic
+never starts this clock.
 
 Each `/inventory` provider has `admission`, one of `admitted`, `disconnected`,
 `quarantined-auth`, or `quarantined-model`. It describes access only; whether the

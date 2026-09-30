@@ -166,6 +166,20 @@ its acknowledged history. Model identities must match the configured role; an
 incumbent must also match a normalized static target. Unknown fields, malformed
 counters, invalid identities, or inconsistent acknowledgements are refused.
 
+The probation record persists `phase`, offer cursor, cumulative `opportunityMs`,
+`opportunityCursorAt`, the bounded `opportunityEligibleUntil`, distinct success
+lease IDs, rolling qualifying failures, and exact lease/session bindings. Each
+binding stores its lease time, synthetic marker, and at most one terminal
+settlement. Bindings remain until the ordinary assignment retention boundary;
+there is no independent settlement-age cutoff. Restart therefore preserves an
+open opportunity window and accrues no more than its remaining 10 minutes.
+Old/incompatible traffic closes the window. Five production successes change the
+phase to `active` while retaining the rollback model and post-active failure watch;
+two qualifying failures within 15 minutes or seven cumulative eligible days change
+it to `rolled-back`, restore the rollback model (including explicit `null`), and
+persist `rollbackReason` before the triggering response. Synthetic, abandoned,
+transient, and unknown outcomes remain recorded but do not change counters.
+
 Policy CAS is pure before the broker commits it. The acknowledgement binds the
 transition, revision, role, generation, manifest hash, canonical desired-policy
 hash, and original application time. An exact replay returns that same
