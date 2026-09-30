@@ -306,6 +306,60 @@ test("an enabled Gitea projection must name its own baseURL, owner and repo", as
   }
 });
 
+test("reconcile apply defaults off with null paths and requires all absolute paths", async () => {
+  const defaults = (await loadConfig(`{}`)).CONFIG.reconcile.apply;
+  assert.deepEqual({ ...defaults }, {
+    enabled: false,
+    overlayPath: null,
+    generationsRoot: null,
+    currentLinkPath: null,
+    configError: null,
+  });
+
+  const enabled = (await loadConfig(`{
+    "reconcile": { "apply": {
+      "enabled": true,
+      "overlayPath": "/var/lib/opencode-broker/resolver-overlay.json",
+      "generationsRoot": "/var/lib/opencode-broker/generations",
+      "currentLinkPath": "/var/lib/opencode-broker/current"
+    } }
+  }`)).CONFIG.reconcile.apply;
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.configError, null);
+
+  const invalid = (await loadConfig(`{
+    "reconcile": { "apply": {
+      "enabled": true,
+      "overlayPath": "relative/overlay.json",
+      "generationsRoot": "/var/lib/opencode-broker/generations"
+    } }
+  }`)).CONFIG.reconcile.apply;
+  assert.deepEqual({
+    enabled: invalid.enabled,
+    overlayPath: invalid.overlayPath,
+    generationsRoot: invalid.generationsRoot,
+    currentLinkPath: invalid.currentLinkPath,
+  }, { enabled: false, overlayPath: null, generationsRoot: null, currentLinkPath: null });
+  assert.match(invalid.configError, /overlayPath.*absolute/);
+  assert.match(invalid.configError, /currentLinkPath.*missing/);
+
+  const truthy = (await loadConfig(`{
+    "reconcile": { "apply": {
+      "enabled": "true",
+      "overlayPath": "/tmp/overlay",
+      "generationsRoot": "/tmp/generations",
+      "currentLinkPath": "/tmp/current"
+    } }
+  }`)).CONFIG.reconcile.apply;
+  assert.deepEqual({ ...truthy }, {
+    enabled: false,
+    overlayPath: null,
+    generationsRoot: null,
+    currentLinkPath: null,
+    configError: null,
+  });
+});
+
 // The shipped examples are documentation; a typo in one would teach every new install a
 // config that silently routes nothing.
 test("the shipped example configs parse and declare targets", async () => {

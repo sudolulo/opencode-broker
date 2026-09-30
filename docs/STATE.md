@@ -7,7 +7,7 @@ if a file is not here, the router does not own it.
 | Path | Writer | Readers | Content |
 |---|---|---|---|
 | `broker.sock` | broker | plugins, gateway, opencode-guard, CLIs | The API socket ([API.md](API.md)) |
-| `broker.json` | broker | broker | Leases, assignments, circuits, cursors, inventory, health, budget ledger |
+| `broker.json` | broker | broker | Version-5 leases, assignments, circuits, cursors, inventory, health, budget ledger, and broker-owned runtime `modelPolicy` |
 | `pending-profile.json` | hud | router plugin | A profile armed for the NEXT root session `{ profile, updatedAt }`; consumed when that session is created, ignored after 30 min. (A `profile.json` left by an older build is deleted, never read.) |
 | `profiles/<sessionID>.json` | router plugin, hud | plugins, opencode-guard | Per-session profile `{ profile, explicit, updatedAt }`; pruned after 14 days |
 | `context-estimates/<sessionID>.json` | router plugin | router plugin | Last known context tokens `{ tokens, updatedAt }`; seeds resumed sessions without a full history fetch; 14-day prune |
@@ -126,6 +126,35 @@ escape, and rechecks exact manifest/effective hashes. Unknown or cleaned generat
 are reported rather than recreated. A render that would remove an active, probation,
 or rollback model reference fails unless the same exact role/kind/model reference is
 present in the authorized retirement set.
+
+## Inside `broker.json` model policy
+
+Broker state schema version `5` adds `modelPolicy`; the broker remains its only
+writer. A version-4 file is migrated by preserving every existing normalized
+broker field and adding `{ "version": 1, "roles": {}, "history": [] }`. The
+broker accepts only explicit version 4 migration or current version 5. Corrupt
+JSON, an unknown broker or policy version, and malformed policy fail startup
+loudly while preserving the original bytes for diagnosis; they are never reset
+to empty state.
+
+`modelPolicy` schema version `1` has exactly `version`, `roles`, and `history`.
+Each `roles[providerID:roleID]` record explicitly stores `roleKey`, `providerID`,
+incumbent/active/probation/rollback model IDs (including an explicit `null` when
+the role is unrouted), inherited `routingIntent`, introduction generation and
+manifest hash, bounded probation counters, transition/revision identity, and
+its acknowledged history. Model identities must match the configured role; an
+incumbent must also match a normalized static target. Unknown fields, malformed
+counters, invalid identities, or inconsistent acknowledgements are refused.
+
+Policy CAS is pure before the broker commits it. The acknowledgement binds the
+transition, revision, role, generation, manifest hash, canonical desired-policy
+hash, and original application time. An exact replay returns that same
+acknowledgement without rewriting bytes. Stale revision/incumbent, changed
+desired hash, changed generation, or changed manifest fails before mutation.
+Package 3 keeps this machinery dormant by default: `reconcile.apply` normalizes
+to `enabled: false` with `overlayPath`, `generationsRoot`, and `currentLinkPath`
+all `null`. Enabling it requires all three to be non-empty absolute paths;
+otherwise it stays off and publishes `configError`.
 
 ## The reconciliation ledger lock
 

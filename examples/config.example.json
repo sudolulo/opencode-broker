@@ -407,6 +407,15 @@
       "requiredReasoningMode": null
     }
   },
+  // Reconciliation mutation is default-OFF. Package 4 cutover supplies absolute deployment paths.
+  "reconcile": {
+    "apply": {
+      "enabled": false,
+      "overlayPath": null,
+      "generationsRoot": null,
+      "currentLinkPath": null
+    }
+  },
   "workerLocalShareDenominator": 4,
   "profileTools": {
     "localOnlineExtra": [

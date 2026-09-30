@@ -35,5 +35,9 @@
     "anthropic:claude-sonnet": { "effortCeiling": "high", "requiredReasoningMode": null },
     "anthropic:claude-haiku": { "effortCeiling": "medium", "requiredReasoningMode": null }
   },
+  // Package 3 ships reconciliation apply dormant. Package 4 supplies deployment paths and enables it.
+  "reconcile": {
+    "apply": { "enabled": false, "overlayPath": null, "generationsRoot": null, "currentLinkPath": null }
+  },
   "localModelsUrl": "http://localhost:8080/v1/models"
 }

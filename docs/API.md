@@ -1,8 +1,9 @@
 # Broker socket API
 
 The broker listens as JSON-over-HTTP on a unix socket:
-`~/.local/share/opencode/model-routing/broker.sock`. Every request is a `POST`
-with a JSON body; every response is JSON. Non-2xx responses carry
+`~/.local/share/opencode/model-routing/broker.sock`. Requests are `POST` with a
+JSON body except for the read-only `GET /model-policy/status`; every response is
+JSON. Non-2xx responses carry
 `{ "error": "<message>" }`. This socket — together with the state files in
 [STATE.md](STATE.md) — is the broker's public contract: anything that speaks it
 (the bundled plugins and gateway, opencode-guard's classifier route, your own
@@ -23,6 +24,14 @@ tooling) is a supported client.
 | `/preview` | `{ profile?, tiers?, contextTokens? }` | Side-effect-free selection: what each tier WOULD get right now. No lease, no cursor advance. Returns `{ preview: { <tier>: target \| null }, delayedProfileFallbacks: [{ targetIDs, afterMs }] }`. Preview answers for the present moment, so it selects as `waitedMs: 0` and a rung that is merely *not yet* open reads as `null`. `delayedProfileFallbacks` is what keeps that honest: it names the profile's delayed rungs and their thresholds, so a reader can tell "this profile has no fallback" from "its fallback has not opened yet". |
 | `/rearm` | `{ targetID? , reasonCode? }` | Clear a circuit. `provider:<id>` rearms a quarantined provider into probation; a target id clears that target; empty clears all circuits. |
 | `/quarantine` | `{ scope: "provider", kind: "compatibility", providerID, reasonCode? }` | Operator quarantine of a provider. |
+| `POST /model-policy/cas` | `{ transitionID, revision, roleKey, expectedIncumbentModelID, generation, manifestHash, desired }` | Loopback control call that compare-and-swaps one normalized provider-role policy. It returns `{ ok, ack, changed }`. The same transition/revision, desired-policy hash, generation, and manifest is a non-writing replay; stale revision, incumbent, desired hash, generation, or manifest mismatches fail before mutation. Package 3 returns `409` with `code: "reconcile-apply-disabled"` unless `reconcile.apply.enabled` is strictly `true` with all three absolute paths configured. |
+| `GET /model-policy/status` | no body | Read-only normalized broker policy plus the effective `reconcile.apply` status. It never rewrites `broker.json`. |
+
+The two `/model-policy/*` endpoints are control operations. The Unix socket has
+no remote address and is local by construction; any future TCP peer must have an
+IPv4 or IPv6 loopback address. A non-loopback peer is rejected before a control
+body is parsed. The socket permissions remain part of the same-UID control
+boundary.
 
 Each `/inventory` provider has `admission`, one of `admitted`, `disconnected`,
 `quarantined-auth`, or `quarantined-model`. It describes access only; whether the

@@ -51,6 +51,12 @@ import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js
 import { notifyArgv } from "../lib/notify.js";
 import { CONFIG_FINGERPRINT, DEPRECATIONS, envSetting } from "../lib/config.js";
 import {
+  compareAndSwapModelPolicy,
+  emptyModelPolicy,
+  isLoopbackControlAddress,
+  normalizeModelPolicy,
+} from "../lib/model-policy.js";
+import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
   fetchPlanUsage,
@@ -215,10 +221,28 @@ const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }, source = "/i
     console.error(`[opencode-broker] ${source} dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
   }
 };
-const emptyState = () => ({ version: 4, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {} });
+const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy() });
 const readState = () => {
+  let source;
   try {
-    const value = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+    source = readFileSync(STATE_PATH, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return emptyState();
+    throw error;
+  }
+  let value;
+  try {
+    value = JSON.parse(source);
+  } catch (error) {
+    throw new Error(`broker state is corrupt: ${error.message}`);
+  }
+  if (value?.version !== 4 && value?.version !== 5) {
+    throw new Error(`broker state version ${JSON.stringify(value?.version)} is unsupported`);
+  }
+  const modelPolicy = value.version === 4
+    ? emptyModelPolicy()
+    : normalizeModelPolicy(value.modelPolicy, { modelRoles: CONFIG.modelRoles, staticTargets: TARGETS });
+  {
     // CRITICAL: THE DAEMON DOES NOT TRUST ITS OWN STATE FILE. /inventory is only one of the
     // two ways discovered inventory enters this process; the other is this reload. A daemon
     // poisoned before the ingest filter existed -- or by any pane still publishing pre-fix --
@@ -241,7 +265,7 @@ const readState = () => {
     // an unreadable quota is once again the leanest-looking lane.
     seedPlanUsageCache(value?.planUsage);
     return {
-      version: 4,
+      version: 5,
       leases: value?.leases && typeof value.leases === "object" ? value.leases : {},
       assignments: value?.assignments && typeof value.assignments === "object" ? value.assignments : {},
       circuits: value?.circuits && typeof value.circuits === "object" ? value.circuits : {},
@@ -259,16 +283,18 @@ const readState = () => {
       // cooldown off and lets every restart move a session to a new provider.
       rebalances: value?.rebalances && typeof value.rebalances === "object" ? value.rebalances : {},
       lastDecision: value?.lastDecision && typeof value.lastDecision === "object" ? value.lastDecision : null,
+      modelPolicy,
     };
-  } catch { return emptyState(); }
+  }
 };
 
 const allTargets = (state) => ({ ...TARGETS, ...(state.inventory?.targets ?? {}) });
 
 const writeState = (state) => {
   ensureRoutingStateDir();
-  state.version = 4;
+  state.version = 5;
   state.health = normalizeHealth(state.health);
+  state.modelPolicy = normalizeModelPolicy(state.modelPolicy, { modelRoles: CONFIG.modelRoles, staticTargets: TARGETS });
   // Carry the plan readings across restarts; see seedPlanUsageCache. Written
   // from the live cache rather than held on `state`, so it cannot go stale
   // relative to what the process actually knows.
@@ -1144,8 +1170,34 @@ const serve = async () => {
   sweep(state);
   writeState(state);
   const handle = async (request, response) => {
-    if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
     try {
+      if (request.url === "/model-policy/status") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "GET") return reply(response, 405, { error: "GET required" });
+        return reply(response, 200, { modelPolicy: state.modelPolicy, apply: CONFIG.reconcile.apply });
+      }
+      if (request.url === "/model-policy/cas") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        const body = await parseBody(request);
+        const result = compareAndSwapModelPolicy(state.modelPolicy, body);
+        if (result.changed) {
+          state.modelPolicy = normalizeModelPolicy(result.policy, {
+            modelRoles: CONFIG.modelRoles,
+            staticTargets: TARGETS,
+          });
+          writeState(state);
+        }
+        return reply(response, 200, { ok: true, ack: result.ack, changed: result.changed });
+      }
+      if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
       const body = await parseBody(request);
       sweep(state);
       const planRefresh = refreshPlanUsage(state);

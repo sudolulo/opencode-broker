@@ -15,6 +15,7 @@ process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.me
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const brokerScript = join(repoRoot, "bin/opencode-broker");
 const { CONFIG_FINGERPRINT } = await import(new URL("../lib/config.js", import.meta.url).href);
+const { MODEL_POLICY_VERSION } = await import(new URL("../lib/model-policy.js", import.meta.url).href);
 
 const withTempHome = async (fn) => {
   const originalHome = process.env.HOME;
@@ -55,6 +56,30 @@ const request = (socketPath, path, body = {}) => new Promise((resolve, reject) =
   });
   req.on("error", reject);
   req.end(payload);
+});
+
+const rawRequest = (socketPath, path, { method = "POST", body } = {}) => new Promise((resolve, reject) => {
+  const payload = body === undefined ? null : JSON.stringify(body);
+  const req = http.request({
+    socketPath,
+    path,
+    method,
+    headers: payload === null ? {} : {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(payload),
+    },
+  }, (res) => {
+    let text = "";
+    res.setEncoding("utf8");
+    res.on("data", (chunk) => { text += chunk; });
+    res.on("end", () => {
+      let parsed = {};
+      try { parsed = text ? JSON.parse(text) : {}; } catch {}
+      resolve({ status: res.statusCode, body: parsed });
+    });
+  });
+  req.on("error", reject);
+  req.end(payload ?? undefined);
 });
 
 // The daemon's own resolver view (lib/routing.js `resolvableModelsPath`), i.e. what
@@ -121,6 +146,33 @@ const stopBroker = async (child) => {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
+};
+
+const startBrokerFailure = async (home, stateBytes) => {
+  const routing = join(home, ".local/share/opencode/model-routing");
+  mkdirSync(routing, { recursive: true });
+  writeFileSync(join(routing, "broker.json"), stateBytes);
+  writeResolvableModels(home, DEFAULT_RESOLVABLE_MODELS);
+  const child = spawn(process.execPath, [brokerScript, "serve"], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      HOME: home,
+      OPENCODE_BROKER_LOCAL_MODELS_URL: "http://127.0.0.1:9/v1/models",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const result = await Promise.race([
+    new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal }))),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("broker did not fail startup")), 2000)),
+  ]).finally(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return { ...result, stdout, stderr };
 };
 
 const startModelsServer = async (models) => {
@@ -1370,6 +1422,144 @@ const seedState = (home, state) => {
   }));
   return statePath;
 };
+
+const brokerPolicyRequest = (overrides = {}) => ({
+  transitionID: "transition-openai-sol-gpt6",
+  revision: "revision-2",
+  roleKey: "openai:gpt-sol",
+  expectedIncumbentModelID: "gpt-5.6-sol",
+  generation: 4,
+  manifestHash: "a".repeat(64),
+  desired: {
+    activeModelID: "gpt-5.6-sol",
+    probationModelID: "gpt-6-sol",
+    rollbackModelID: "gpt-5.6-sol",
+    routingIntent: {
+      tiers: ["smart"], fit: { smart: 1.25 }, effortCeiling: "high", requiredReasoningMode: null,
+    },
+    probation: {
+      phase: "staged-probing", offerEvery: 5, opportunityCursor: 0, opportunityMs: 0,
+      opportunityCursorAt: null, opportunityEligibleUntil: null,
+      successes: [], failures: [], leases: {},
+    },
+  },
+  ...overrides,
+});
+
+const applyConfigPath = (home) => {
+  const fixture = JSON.parse(readFileSync(process.env.OPENCODE_BROKER_CONFIG, "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  fixture.reconcile = {
+    apply: {
+      enabled: true,
+      overlayPath: join(home, "state/resolver-overlay.json"),
+      generationsRoot: join(home, "state/generations"),
+      currentLinkPath: join(home, "state/generations/current"),
+    },
+  };
+  const path = join(home, "apply-config.json");
+  writeFileSync(path, JSON.stringify(fixture));
+  return path;
+};
+
+test("disabled model-policy CAS returns 409 and writes no broker state", async () => withBroker(async ({ home, socketPath }) => {
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  const before = readFileSync(statePath);
+  const response = await rawRequest(socketPath, "/model-policy/cas", { body: brokerPolicyRequest() });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.code, "reconcile-apply-disabled");
+  assert.deepEqual(readFileSync(statePath), before);
+}));
+
+test("v4 state migrates to v5 preserving existing fields and model-policy status is readable", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const statePath = seedState(home, {
+    leases: { ses_migrate: { targetID: "gpt-flagship", profile: "auto", tier: "smart", touchedAt: now } },
+    assignments: { ses_migrate: { targetID: "gpt-flagship", profile: "auto", tier: "smart", updatedAt: now } },
+    circuits: { sentinel: { kind: "model", until: now + 60_000, updatedAt: now } },
+    cursors: { smart: 3 },
+    inventory: { targets: {}, providers: {}, modelContexts: {}, modelOutputs: {}, modelVariants: {}, authRevision: null, updatedAt: 17 },
+    budgets: { openai: { marker: 1 } },
+    lastDecision: { policy: "sentinel" },
+    rebalances: { ses_migrate: now },
+  });
+  const { child, socketPath } = await startBroker(home);
+  try {
+    const migrated = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(migrated.version, 5);
+    assert.deepEqual(migrated.leases.ses_migrate, {
+      targetID: "gpt-flagship", profile: "auto", tier: "smart", touchedAt: now,
+    });
+    assert.deepEqual(migrated.assignments.ses_migrate, {
+      targetID: "gpt-flagship", profile: "auto", tier: "smart", updatedAt: now,
+    });
+    assert.deepEqual(migrated.circuits.sentinel, { kind: "model", until: now + 60_000, updatedAt: now });
+    assert.deepEqual(migrated.cursors, { smart: 3 });
+    assert.deepEqual(migrated.budgets, { openai: { marker: 1 } });
+    assert.deepEqual(migrated.lastDecision, { policy: "sentinel" });
+    assert.deepEqual(migrated.rebalances, { ses_migrate: now });
+    const status = await rawRequest(socketPath, "/model-policy/status", { method: "GET" });
+    assert.equal(status.status, 200);
+    assert.equal(status.body.modelPolicy.version, MODEL_POLICY_VERSION);
+    assert.deepEqual(status.body.modelPolicy.roles, {});
+    assert.equal(status.body.apply.enabled, false);
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+test("model-policy status is read-only and an enabled CAS writes only on change", async () => withTempHome(async (home) => {
+  writeAuth(home);
+  const configPath = applyConfigPath(home);
+  const { child, socketPath } = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath });
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  try {
+    const beforeStatus = readFileSync(statePath);
+    const initial = await rawRequest(socketPath, "/model-policy/status", { method: "GET" });
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.apply.enabled, true);
+    assert.deepEqual(readFileSync(statePath), beforeStatus, "GET status must not write");
+
+    const first = await rawRequest(socketPath, "/model-policy/cas", { body: brokerPolicyRequest() });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.ok, true);
+    assert.equal(first.body.changed, true);
+    const afterFirst = readFileSync(statePath);
+
+    const replay = await rawRequest(socketPath, "/model-policy/cas", { body: brokerPolicyRequest() });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.changed, false);
+    assert.deepEqual(replay.body.ack, first.body.ack);
+    assert.deepEqual(readFileSync(statePath), afterFirst, "idempotent CAS must not rewrite state");
+
+    const status = await rawRequest(socketPath, "/model-policy/status", { method: "GET" });
+    assert.equal(status.body.modelPolicy.roles["openai:gpt-sol"].probationModelID, "gpt-6-sol");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+test("corrupt malformed and unknown model-policy state fail broker startup loudly without replacement", async () => withTempHome(async (home) => {
+  const base = {
+    version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: {}, health: {},
+    budgets: {}, lastDecision: null, planUsage: {}, rebalances: {},
+  };
+  const cases = [
+    ["corrupt", Buffer.from("{broken\n"), /broker state.*corrupt|unexpected token|json/i],
+    ["malformed", Buffer.from(JSON.stringify({ ...base, modelPolicy: { version: 1, roles: [], history: [] } })), /model policy.*roles/i],
+    ["unknown", Buffer.from(JSON.stringify({ ...base, modelPolicy: { version: 99, roles: {}, history: [] } })), /model policy version/i],
+  ];
+  for (const [name, bytes, expected] of cases) {
+    const caseHome = join(home, name);
+    mkdirSync(caseHome);
+    const result = await startBrokerFailure(caseHome, bytes);
+    assert.notEqual(result.code, 0, `${name}: ${result.stdout}\n${result.stderr}`);
+    assert.doesNotMatch(result.stdout, /listening on/, name);
+    assert.match(result.stderr, expected, name);
+    assert.deepEqual(readFileSync(join(caseHome, ".local/share/opencode/model-routing/broker.json")), bytes,
+      `${name} state must be preserved for diagnosis`);
+  }
+}));
 
 test("the assignment cap evicts settled one-shot gateway entries before session pins", async () => withTempHome(async (home) => {
   const now = Date.now();
