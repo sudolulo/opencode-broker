@@ -614,6 +614,17 @@ test("recovery observes a committed failed-probe rollback before reconstructing 
   assert.equal(fixture.openCalls.length, 1, "recovery must not open a child after durable rollback");
 });
 
+test("recovery keeps an acknowledged failed-probe rollback distinct from a manual rollback", async () => {
+  const fixture = makeFixture({ probeFailure: "tool" });
+  await assert.rejects(fixture.applier().apply({ transitionID: TRANSITION_ID }), /probe.*tool/i);
+
+  await assert.rejects(fixture.applier().recover({ transitionID: TRANSITION_ID }), /probe.*tool/i);
+  const record = fixture.state().roles[ROLE];
+  assert.equal(record.state, "rolled-back");
+  assert.match(record.probeRollbackAck.transitionID, /:probe-rollback:tool$/);
+  assert.equal(fixture.counts.brokerChanges, 2);
+});
+
 test("recovery acknowledges a committed probation CAS before rejecting stale sources", async () => {
   const fixture = makeFixture({ crashAfter: "broker:probation-cas" });
   await assert.rejects(fixture.applier().apply({ transitionID: TRANSITION_ID }), /injected crash/);
@@ -777,6 +788,68 @@ test("recovery treats an acknowledged manual rollback as terminal", async () => 
   assert.equal(result.mutated, false);
   assert.equal(fixture.counts.brokerChanges, brokerChanges);
   assert.equal(fixture.events.length, ledgerEvents);
+});
+
+test("recovery acknowledges a manual rollback CAS committed before its ledger acknowledgement", async () => {
+  const fixture = makeFixture({ crashAfter: "broker:probe-rollback" });
+  await fixture.applier().apply({ transitionID: TRANSITION_ID });
+  await assert.rejects(fixture.applier().rollback({
+    transitionID: TRANSITION_ID,
+    reason: "operator-request",
+  }), /injected crash/);
+  assert.equal(fixture.state().roles[ROLE].state, "probation");
+  assert.equal(fixture.state().roles[ROLE].probeRollbackAck, undefined);
+  const brokerChanges = fixture.counts.brokerChanges;
+
+  const result = await fixture.applier().recover({ transitionID: TRANSITION_ID });
+  const record = fixture.state().roles[ROLE];
+  assert.equal(result.ok, true);
+  assert.equal(result.state, "rolled-back");
+  assert.equal(result.mutated, true);
+  assert.equal(record.state, "rolled-back");
+  assert.equal(record.reason, "operator-request");
+  assert.deepEqual(record.probeRollbackAck, result.rollbackAck);
+  assert.equal(record.stateChangedAt, result.rollbackAck.appliedAt);
+  assert.equal(fixture.counts.brokerChanges, brokerChanges, "recovery must not replay the committed CAS");
+});
+
+test("recover-all includes a pending manual rollback after probation", async () => {
+  const fixture = makeFixture({ crashAfter: "broker:probe-rollback" });
+  await fixture.applier().apply({ transitionID: TRANSITION_ID });
+  await assert.rejects(fixture.applier().rollback({
+    transitionID: TRANSITION_ID,
+    reason: "operator-request",
+  }), /injected crash/);
+
+  const result = await fixture.applier().recover();
+  assert.equal(result.ok, true);
+  assert.equal(result.mutated, true);
+  assert.equal(result.results.length, 1);
+  assert.equal(result.results[0].state, "rolled-back");
+  assert.equal(fixture.state().roles[ROLE].state, "rolled-back");
+});
+
+test("recovery fails closed when a committed manual rollback does not exactly match its intent", async () => {
+  const fixture = makeFixture({ crashAfter: "broker:probe-rollback" });
+  await fixture.applier().apply({ transitionID: TRANSITION_ID });
+  await assert.rejects(fixture.applier().rollback({
+    transitionID: TRANSITION_ID,
+    reason: "operator-request",
+  }), /injected crash/);
+  fixture.tamperPolicy((policy) => {
+    policy.roles[ROLE].probation.opportunityCursor += 1;
+    return policy;
+  });
+  const brokerChanges = fixture.counts.brokerChanges;
+
+  await assert.rejects(
+    fixture.applier().recover({ transitionID: TRANSITION_ID }),
+    /manual rollback broker status mismatch/,
+  );
+  const record = fixture.state().roles[ROLE];
+  assert.equal(record.state, "blocked-conflict");
+  assert.equal(record.probeRollbackAck, undefined);
+  assert.equal(fixture.counts.brokerChanges, brokerChanges);
 });
 
 test("manual rollback records a broker generation mismatch as blocked", async () => {
