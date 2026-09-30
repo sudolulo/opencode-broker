@@ -22,6 +22,10 @@ if a file is not here, the router does not own it.
 | `.model-reconciliation.lock.<pid>.<uuid>/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | same | A lock directory being built, before publication. Exists only between its mkdir and the rename that publishes it; a writer killed in that window leaves one behind, and the next writer to hold the public lock sweeps it — only on proof the identity inside is dead |
 | `resolver-overlay.json` | reconciliation applier | generation renderer, reconciliation status tooling | Versioned append-only materialized view of ledger-authorized resolver models; see the schema and ownership contract below |
 | `.resolver-overlay.lock/` | reconciliation applier | reconciliation applier | Ephemeral inter-process lock covering overlay disk read, hash/revision CAS, replay detection, atomic replacement, and parent-directory fsync. The directory is 0700 and its complete `owner` and `instance.<pid>.<uuid>` records are 0600 before publication |
+| `<generationsRoot>/resolver-generations.json` | generation renderer | broker, plugin registration, reconciliation tooling | Versioned registry of immutable generation manifest/effective hashes and the monotonic generation high-water mark |
+| `<generationsRoot>/generation-N/` | generation renderer | OpenCode resolver processes, broker, reconciliation tooling | Immutable mode-0700 generation bundle containing mode-0600 `opencode.json` and `manifest.json` |
+| `<generationsRoot>/current` | generation renderer | OpenCode startup, router plugin | Relative symlink atomically replaced only after the complete bundle and registry entry validate |
+| `<generationsRoot>/.resolver-generations.lock/` | generation renderer | generation renderer | Ephemeral private inter-process lock serializing generation reservation, rendering, registry publication, current-link replacement, and cleanup |
 
 ## Inside `model-reconciliation.json`
 
@@ -85,6 +89,43 @@ transition, proposal revision, provider/model/role identity, and evidence-or-dec
 authorization hash against the reconciliation ledger and role registry. Unknown
 versions or fields, corrupt JSON, orphaned entries, changed history, nonzero cost,
 and stale hash/revision CAS fail loudly without replacing the existing bytes.
+
+## Inside resolver generations
+
+`resolver-generations.json` has schema version `1` and exactly `version`, `highWater`,
+and `generations`. Each generation record contains `manifestHash`, `effectiveHash`,
+and `createdAt`. The high-water mark never decreases, including when cleanup removes
+an old registry entry. A missing or corrupt registry, an unknown version, or a
+generation above its high-water mark fails loudly; state is not reconstructed from
+directory names.
+
+Each `generation-N` directory is published only after its mode-0600
+`opencode.json` and `manifest.json` have been fsynced together in a sibling mode-0700
+temporary directory. The manifest records version, generation, exact base-byte hash,
+canonical resolver-overlay hash, canonical effective-config hash, exact sorted model
+keys returned by a fresh `opencode models --pure` run in an isolated scratch
+`XDG_CONFIG_HOME`, creation time, and sorted authorizing ledger revisions. Overlay
+models may only be added beneath an existing provider, may not collide with base
+models, and retain Task 2's zero-cost and no-credential/`baseURL` constraints.
+
+Publication independently re-verifies the canonical directory, both regular files,
+the exact manifest-byte hash, and the canonical effective-config hash before first
+atomically replacing the private registry and then atomically replacing `current`
+with a relative sibling symlink. A crash before registry publication leaves the old
+link current and permits only an exact-intent orphan recovery; a crash after registry
+publication is completed by replaying the link replacement. Generation 0 is a
+base-only bootstrap accepted only with an empty registry, no current link, and an
+empty overlay. It can later be republished for rollback and is never cleaned.
+
+Cleanup always retains generation 0, `current`, and generations named by active
+process registrations. It removes unreferenced generation directories only after 30
+days by default, removes their registry entries without lowering `highWater`, and
+sweeps renderer temp directories. Generation lookup accepts only a number, derives
+the registry-owned `generation-N` path, rejects directory or file symlinks and path
+escape, and rechecks exact manifest/effective hashes. Unknown or cleaned generations
+are reported rather than recreated. A render that would remove an active, probation,
+or rollback model reference fails unless the same exact role/kind/model reference is
+present in the authorized retirement set.
 
 ## The reconciliation ledger lock
 
