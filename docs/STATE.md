@@ -20,6 +20,8 @@ if a file is not here, the router does not own it.
 | `model-reconciliation.json` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence`, operator tooling | Versioned provider-role candidate observations, the evidence request queue, and proposal presentation state. Those two commands are its ONLY writers; see the field inventory below |
 | `.model-reconciliation.lock/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence` | The ephemeral lock serializing every reconciliation-ledger mutation. Holds an `owner` identity record and an `instance.<pid>.<uuid>` file; see the protocol below. Removed when the writer exits |
 | `.model-reconciliation.lock.<pid>.<uuid>/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | same | A lock directory being built, before publication. Exists only between its mkdir and the rename that publishes it; a writer killed in that window leaves one behind, and the next writer to hold the public lock sweeps it — only on proof the identity inside is dead |
+| `resolver-overlay.json` | reconciliation applier | generation renderer, reconciliation status tooling | Versioned append-only materialized view of ledger-authorized resolver models; see the schema and ownership contract below |
+| `.resolver-overlay.lock/` | reconciliation applier | reconciliation applier | Ephemeral inter-process lock covering overlay disk read, hash/revision CAS, replay detection, atomic replacement, and parent-directory fsync. The directory is 0700 and its complete `owner` and `instance.<pid>.<uuid>` records are 0600 before publication |
 
 ## Inside `model-reconciliation.json`
 
@@ -55,6 +57,34 @@ observation, written by `dry-run`:
 
 Nothing here is routing state. No field in this file makes a model eligible, and
 the broker never reads it.
+
+## Inside `resolver-overlay.json`
+
+Schema version `1`. The top-level fields are exactly `version`, `revision`,
+`updatedAt`, and `entries`. The reconciliation applier is the sole writer. It writes
+the file synchronously as a mode-0600 sibling temp with one trailing newline, fsyncs
+the temp, renames it over the overlay, and fsyncs the mode-0700 parent directory.
+The lock remains held from the disk read through canonical-hash and revision CAS,
+same-intent replay detection, replacement, and fsync, so two processes starting from
+one revision cannot overwrite each other.
+
+Entries are keyed by exact `providerID/modelID` and contain `transitionID`, canonical
+proposal `revision`, `authorizationKind` (`auto-eligible` or `approved`),
+`providerID`, `modelID`, `roleKey`, `authorizationHash`, the first positive
+`introductionGeneration`, and allowlisted resolver `model` metadata. The only cost
+object permitted is numeric zero for `input`, `output`, `cache_read`, and
+`cache_write`. Entries are append-only: a later generation may add a model but may
+not remove or alter any historical entry, including its first introduction
+generation. `updatedAt` comes from the durable apply intent rather than the wall
+clock used during recovery, making a commit-before-ack replay byte-identical and
+non-writing.
+
+The overlay contains no credentials, API keys, bearer values, token paths,
+environment values, or `baseURL`. Validation cross-checks each entry's exact
+transition, proposal revision, provider/model/role identity, and evidence-or-decision
+authorization hash against the reconciliation ledger and role registry. Unknown
+versions or fields, corrupt JSON, orphaned entries, changed history, nonzero cost,
+and stale hash/revision CAS fail loudly without replacing the existing bytes.
 
 ## The reconciliation ledger lock
 
