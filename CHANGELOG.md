@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.0] — 2026-09-30
+
+### Added
+
+- **Dormant model-promotion runtime.** Trusted subscription models can be represented in authorized
+  zero-cost resolver overlays and immutable resolver generations, while the broker can bind clients
+  to exact generation manifests, stage compare-and-swap model policy, probe candidates through the
+  loopback gateway, require production probation, and roll back qualifying failures. All apply,
+  publication, mutation, and scheduling controls remain default-OFF; Package 4 alone activates them
+  after deployment cutover gates.
+
 ## [1.23.1] — 2026-09-30
 
 ### Fixed

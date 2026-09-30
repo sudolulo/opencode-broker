@@ -27,6 +27,25 @@ if a file is not here, the router does not own it.
 | `<generationsRoot>/current` | generation renderer | OpenCode startup, router plugin | Relative symlink atomically replaced only after the complete bundle and registry entry validate |
 | `<generationsRoot>/.resolver-generations.lock/` | generation renderer | generation renderer | Ephemeral private inter-process lock serializing generation reservation, rendering, registry publication, current-link replacement, and cleanup |
 
+## Runtime ownership and durability
+
+| State | Authority / only writer | Version, mode, and atomic boundary | Retention and corruption behavior |
+|---|---|---|---|
+| `model-reconciliation.json` | Reconciliation ledger; both reconciler binaries write only through `createReconciliationStore().update()` | Schema 1, mode 0600 under a mode-0700 root; exclusive identity lock, private temp, fsync, rename, parent fsync | Durable audit/saga state. Unknown version/field or corrupt JSON fails loudly and the original bytes remain |
+| `resolver-overlay.json` | Reconciliation applier materialized view; not policy authority | Schema 1, mode 0600; hash+revision CAS under its private lock, private temp, fsync, rename, parent fsync | Entries are append-only. Corruption, historical mutation, deletion, secret-shaped fields, and stale CAS preserve the prior bytes and fail loudly |
+| `resolver-generations.json` | Generation renderer | Schema 1, mode 0600; registry lock and atomic private-file replacement with fsync | Monotonic high-water never regresses. Corruption, unknown version, missing hashes, or inconsistent generation records fail loudly |
+| `generation-N/{opencode.json,manifest.json}` | Generation renderer | Mode-0700 immutable directory with mode-0600 files; both files and directory are fsynced before one directory rename | Generation 0, current, and active-process references are retained; other generations age out after 30 days. Symlinks, path escape, or hash mismatch are refused, never repaired |
+| `current` generation symlink | Generation renderer | Relative sibling symlink atomically renamed over `current`, followed by parent fsync | Points only to a verified registered bundle; a failed publication leaves the prior generation current |
+| `broker.json.modelPolicy` | Broker daemon runtime authority | Broker schema 5 / policy schema 1 in mode-0600 `broker.json`; pure CAS result enters the broker's existing atomic write | Lease bindings are bounded with broker state; policy/history and rollback target survive restart. Malformed current policy fails startup without replacing bytes |
+| Resolver process registrations | Broker daemon, memory only | No file/version; 256-bit token digests bind exact registry-verified manifest membership | Valid use extends a 10-minute window; restart drops all registrations. Unsafe identity falls back to logical generation 0 rather than changing global policy |
+| Probe-launch authorizations | Broker daemon, memory only | Protocol 1; digest-only `pln_` records issued atomically from staged policy | Single use, 60-second expiry, restart-volatile; malformed, expired, replayed, or mismatched launch fails closed |
+| Probe assignments | Broker daemon, memory only | Protocol 1; random `gw-probe-*` session plus digest-bound `pbn_`, with atomic `issued` to `consumed-gateway-owned` to `released` transitions | Hard 60-second expiry/reaper. Only the current owner may release; replay and binding mismatch fail closed |
+
+All Package 3 mutation machinery is dormant by default. `reconcile.apply.enabled`
+normalizes to `false`, live paths normalize to `null`, and no live publication or
+schedule uses these writers. Package 4 alone configures paths, performs cutover,
+enables publication/policy mutation, and changes scheduling.
+
 ## Inside `model-reconciliation.json`
 
 Schema version `1`. The top-level keys are exactly `version`, `updatedAt`, `roles`,

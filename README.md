@@ -108,7 +108,9 @@ so nothing is ever spent on a provider you did not list.
 | `budgets` | Per provider, the subscription's `windows` (`id`, `periodMs`, `meter`: `requests` or `tokens`, `capacity`, optional `anchor`) and optionally `planUsage.type` (`anthropic-oauth`, `openai-oauth`, `bailian-cli`, or the generic `http`) to read exact usage from the provider. |
 | `deals` | Time-limited discounts (`providerID`, `multiplier`, optional `modelPrefix`, `daily`, `window`) the balancer leans into. |
 | `tierProviderWeights` | Per tier, a provider preference weight (>1 leans toward, <1 saves for other tiers). |
-| `trustedSubscriptionProviders` | Providers admitted without proving OAuth (flat-rate plans that use API keys). |
+| `trustedSubscriptionProviders` | Explicit operator attestation that an `api`-labelled provider is subscription-backed. Trusted providers may enumerate active catalog models, but trust does not bypass role, evidence, resolver, capability, probe, probation, rejection, or rollback gates. Unlisted `api` and unknown-auth providers stay quarantined. |
+| `modelRoles` | Provider-qualified role-policy overrides. Product roles cannot be removed; overrides may adjust validated matchers, tiers, fit, evidence domains, `effortCeiling`, and an optional `requiredReasoningMode`. |
+| `reconcile.apply` | Dormant runtime controls: `enabled` defaults to `false`. Enabling requires absolute `overlayPath`, `generationsRoot`, and `currentLinkPath`; incomplete configuration stays off with a visible error. Package 4 owns live activation. |
 | `localModelsUrl` | The local server's model list (llama.cpp router mode `/v1/models`), polled to see what is loaded. |
 | `localContextHeadroom` | Fraction of a local window the router will lease into (default 0.6) when a target declares no `outputReserve`. |
 | `workerLocalShareDenominator` | One in N `auto` worker assignments goes to a local target (default 4; 1 disables). |
@@ -312,7 +314,8 @@ refreshes both inputs -- opencode's models.dev cache and the resolver view
 (`resolvable-models.json`) -- republishes the broker's inventory, and notifies about anything a
 human still has to judge. **It remains the live publisher.**
 
-`opencode-broker-reconcile` is the review side of the same question, and it publishes nothing:
+`opencode-broker-reconcile` is the review and dormant apply surface. Its ordinary observation and
+projection commands do not alter routing, and every runtime command remains disabled by default:
 
 ```sh
 opencode-broker-reconcile dry-run [--json]         # refresh isolated inputs, record observations
@@ -323,16 +326,22 @@ opencode-broker-reconcile project [--json] [--dry-run]   # present proposals, re
 opencode-broker-reconcile approve <transitionID> [--note TEXT]
 opencode-broker-reconcile reject  <transitionID> [--note TEXT]
 opencode-broker-reconcile amend   <transitionID> --tiers a,b [--role provider:roleID]
+opencode-broker-reconcile apply   <transitionID> [--json] [--dry-run]
+opencode-broker-reconcile rollback <transitionID> --reason TEXT [--json] [--dry-run]
+opencode-broker-reconcile refresh [--json] [--dry-run]
+opencode-broker-reconcile recover [transitionID] [--json] [--dry-run]
 ```
 
 - **The ledger is the only thing it writes.** `dry-run` records candidate observations in
   `model-reconciliation.json` in the routing state directory (see
-  [docs/STATE.md](docs/STATE.md)), under an exclusive mkdir lock, and mutates nothing else.
-- **It does not publish inventory or alter routing.** It computes the inventory the broker
+  [docs/STATE.md](docs/STATE.md)), under an exclusive atomically published private lock, and
+  mutates nothing else.
+- **The default path does not publish inventory or alter routing.** It computes the inventory the broker
   *would* be handed, through the same pure builder live publication uses, and returns it for
   review. It posts nothing to the broker, changes no target's eligibility and runs no probe. An
-  approval records that a human said yes, in the ledger, and stops there -- probing, probation
-  and the deployment cutover are later packages, so nothing here can activate a model.
+  approval records that a human said yes in the ledger and stops there. Runtime commands return
+  `reconcile-apply-disabled` before source collection, broker calls, renderer execution, or
+  publication unless `reconcile.apply.enabled` is explicitly configured.
 - **Its refreshes are isolated.** `opencode models` is run against a scratch `XDG_CACHE_HOME`
   that is deleted afterwards, and `opencode models --pure` is parsed in memory, so neither the
   live models.dev cache nor `resolvable-models.json` is touched -- not their bytes, not their
@@ -346,6 +355,32 @@ opencode-broker-reconcile amend   <transitionID> --tiers a,b [--role provider:ro
 - **`reviewed-models.json` is left intact.** The dry run reads the watch job's ledger and
   reports which of its keys a future import would cover; the import and the deletion of that
   file happen in a later package.
+
+### Dormant model-promotion runtime
+
+Package 3 includes the runtime needed for a controlled model transition, but does not activate it.
+`reconcile.apply.enabled` is `false` by default, all live paths normalize to `null`, the existing
+watch remains the live inventory publisher, and no schedule invokes apply. Package 4 alone performs
+the generated-config cutover, enables live inventory and policy mutation, configures trusted
+providers, changes schedules, and retires the old publisher.
+
+When explicitly enabled against operator-supplied paths, an authorized transition is materialized
+as an append-only zero-cost resolver overlay and an immutable private generation. The plugin
+registers the exact generation manifest once at process startup; a missing, stale, forged, cleaned,
+or pre-restart token receives generation-0/base-only eligibility, so an old client remains on the
+incumbent instead of receiving a model its resolver never loaded. Policy holds preserve unrelated
+lanes, provider weighting, quota balancing, health circuits, context limits, profiles, and privacy
+boundaries while allowing only the governed role's active or eligible probation model.
+
+Compatibility probes use a fresh `bin/opencode-broker-probe-client` process. The broker authorizes
+one exact staged transition, the child redeems that launch while independently verifying the
+immutable generation, and all three probes use the ordinary authenticated loopback gateway model.
+The gateway consumes a one-shot nonce before leasing the exact target and releases it on every
+terminal path; no provider is called directly and no probe-only model name is advertised. After the
+normal, strict-tool, and reasoning probes pass, five distinct successful production leases promote
+the candidate. Two qualifying model failures within 15 minutes roll it back during probation or
+after promotion; old-generation traffic, abandoned leases, transient provider failures, and
+synthetic probes do not count.
 
 Exit codes: `0` the command completed (a report full of blocked candidates, and a projection that
 is switched off, are still completed runs), `1` corrupt state, unusable config, no readable source,
