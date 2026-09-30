@@ -54,7 +54,7 @@ const approvedRecord = (overrides = {}) => ({
   ...overrides,
 });
 
-const recordIntentRevision = (record) => hash({
+const recordIntentRevision = (record, ordinaryModel = "smart") => hash({
   transitionID: record.transitionID,
   roleKey: record.roleKey,
   providerID: record.providerID,
@@ -69,6 +69,7 @@ const recordIntentRevision = (record) => hash({
   evidenceRevision: record.evidenceRevision ?? null,
   evidence: record.evidence ?? [],
   approval: record.approval ?? null,
+  ordinaryModel,
 });
 
 const probationState = (phase) => ({
@@ -402,7 +403,7 @@ const makeFixture = ({
     },
   };
 
-  const source = {
+  let source = {
     authRevision: "auth-revision-1",
     authRevisionAfter: "auth-revision-1",
     catalog: { stale: false, empty: false, error: null },
@@ -454,6 +455,7 @@ const makeFixture = ({
     state: () => clone(state),
     policy: () => clone(policy.roles[ROLE]),
     tamperPolicy: (mutator) => { policy = mutator(clone(policy)); },
+    tamperSources: (mutator) => { source = mutator(clone(source)); },
     closeCalls: () => closeCalls,
     lockHeld: () => lockHeld,
   };
@@ -561,6 +563,7 @@ test("complete persisted probe results skip launch and child creation while fini
       reservedGeneration: 1,
       overlayUpdatedAt: NOW,
       authRevision: "auth-revision-1",
+      ordinaryModel: "smart",
       previousOverlayHash: hash({ version: 1, revision: 0, updatedAt: NOW - 10, entries: {} }),
       previousOverlayRevision: 0,
       catalogModels: {
@@ -609,6 +612,55 @@ test("recovery observes a committed failed-probe rollback before reconstructing 
   assert.equal(record.state, "rolled-back");
   assert.equal(fixture.counts.probeLaunches, 1, "recovery must not launch after durable rollback");
   assert.equal(fixture.openCalls.length, 1, "recovery must not open a child after durable rollback");
+});
+
+test("recovery acknowledges a committed probation CAS before rejecting stale sources", async () => {
+  const fixture = makeFixture({ crashAfter: "broker:probation-cas" });
+  await assert.rejects(fixture.applier().apply({ transitionID: TRANSITION_ID }), /injected crash/);
+  assert.equal(fixture.state().roles[ROLE].probationAck, undefined);
+  fixture.tamperSources((sources) => ({
+    ...sources,
+    catalog: { ...sources.catalog, stale: true },
+  }));
+
+  const result = await fixture.applier().recover({ transitionID: TRANSITION_ID });
+  assert.equal(result.ok, true);
+  assert.equal(result.state, "probation");
+  assert.equal(result.mutated, true);
+  assert.equal(fixture.state().roles[ROLE].state, "probation");
+  assert.deepEqual(fixture.state().roles[ROLE].probationAck, result.probationAck);
+  assert.equal(fixture.counts.probationChanges, 1, "recovery must not replay the committed CAS");
+});
+
+test("recovery records a committed probe rollback from persisted intent before rejecting stale sources", async () => {
+  const fixture = makeFixture({ probeFailure: "tool", crashAfter: "broker:probe-rollback" });
+  await assert.rejects(fixture.applier().apply({ transitionID: TRANSITION_ID }), /injected crash/);
+  assert.equal(fixture.state().roles[ROLE].probeResults?.tool, undefined);
+  fixture.tamperSources((sources) => ({
+    ...sources,
+    ordinaryModel: "changed-after-commit",
+    resolver: { ...sources.resolver, stale: true },
+  }));
+
+  await assert.rejects(fixture.applier().recover({ transitionID: TRANSITION_ID }), /probe.*tool/i);
+  const record = fixture.state().roles[ROLE];
+  assert.equal(record.state, "rolled-back");
+  assert.equal(record.reason, "invalid-model-tool-call-response");
+  assert.equal(record.probeResults.tool.requestID, "mpr_0cb35402c527602dcefee6184b662f70");
+  assert.equal(record.probeResults.tool.observedAt, record.probeRollbackAck.appliedAt);
+  assert.equal(fixture.counts.probeLaunches, 1, "recovery must not launch after durable rollback");
+  assert.equal(fixture.openCalls.length, 1, "recovery must not open a child after durable rollback");
+});
+
+test("recovery rejects a changed probe model before launching missing probes", async () => {
+  const fixture = makeFixture({ crashAfter: "broker:cas" });
+  await assert.rejects(fixture.applier().apply({ transitionID: TRANSITION_ID }), /injected crash/);
+  fixture.tamperSources((sources) => ({ ...sources, ordinaryModel: "changed-after-intent" }));
+
+  await assert.rejects(fixture.applier().recover({ transitionID: TRANSITION_ID }), /ordinary probe model changed since apply intent/);
+  assert.equal(fixture.state().roles[ROLE].state, "blocked-conflict");
+  assert.equal(fixture.counts.probeLaunches, 0);
+  assert.equal(fixture.openCalls.length, 0);
 });
 
 test("probe lifecycle closes opened children and aggregates primary plus close failures", async () => {
