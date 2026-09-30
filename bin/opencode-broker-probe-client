@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { isAbsolute, join, resolve, sep } from "node:path";
+
+import { PROBE_PROTOCOL_VERSION, createProbeProtocolParser } from "../lib/model-probe.js";
+
+const MAX_FRAME_BYTES = 64 * 1024;
+const MAX_RESPONSE_BYTES = 64 * 1024;
+const SHA256 = /^[a-f0-9]{64}$/;
+
+const isPlainObject = (value) => value !== null
+  && typeof value === "object"
+  && !Array.isArray(value)
+  && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+
+const canonicalize = (value) => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+};
+
+const canonicalHash = (value) => createHash("sha256")
+  .update(JSON.stringify(canonicalize(value)))
+  .digest("hex");
+const bytesHash = (value) => createHash("sha256").update(value).digest("hex");
+
+const exactFields = (value, fields, label) => {
+  if (!isPlainObject(value)) throw new Error(`${label} must be an object`);
+  const actual = Object.keys(value);
+  if (actual.some((field) => !fields.includes(field)) || fields.some((field) => !Object.hasOwn(value, field))) {
+    throw new Error(`${label} has an invalid shape`);
+  }
+  return value;
+};
+
+const regularPrivateFile = (path, label) => {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} is not a canonical regular file`);
+  if ((stat.mode & 0o777) !== 0o600) throw new Error(`${label} must have exact mode 0600`);
+  return readFileSync(path);
+};
+
+const parseJSON = (bytes, label) => {
+  try { return JSON.parse(bytes.toString("utf8")); }
+  catch (error) { throw new Error(`${label} is invalid JSON`, { cause: error }); }
+};
+
+const loopbackGateway = (value) => {
+  let url;
+  try { url = new URL(value); } catch { return false; }
+  return url.protocol === "http:" && ["127.0.0.1", "::1", "localhost"].includes(url.hostname);
+};
+
+const validateBootstrap = (frame) => {
+  exactFields(frame, [
+    "version", "type", "brokerSocketPath", "gatewayURL", "gatewayHeaders", "generationRoot",
+    "transitionID", "roleKey", "candidateIdentity", "candidateIntroduction", "generationAck",
+    "ordinaryModel", "probeLaunchNonce",
+  ], "probe bootstrap");
+  if (frame.version !== PROBE_PROTOCOL_VERSION || frame.type !== "bootstrap") {
+    throw new Error("probe bootstrap version or type is invalid");
+  }
+  if (typeof frame.brokerSocketPath !== "string" || !isAbsolute(frame.brokerSocketPath)
+    || typeof frame.generationRoot !== "string" || !isAbsolute(frame.generationRoot)
+    || !loopbackGateway(frame.gatewayURL)
+    || !isPlainObject(frame.gatewayHeaders)
+    || typeof frame.transitionID !== "string" || !frame.transitionID
+    || typeof frame.roleKey !== "string" || !frame.roleKey
+    || typeof frame.ordinaryModel !== "string" || !frame.ordinaryModel
+    || typeof frame.probeLaunchNonce !== "string" || !/^pln_[A-Za-z0-9_-]{43}$/.test(frame.probeLaunchNonce)) {
+    throw new Error("probe bootstrap identity is invalid");
+  }
+  exactFields(frame.candidateIdentity, ["providerID", "modelID"], "probe candidate identity");
+  exactFields(frame.candidateIntroduction, ["generation", "manifestHash"], "probe candidate introduction");
+  exactFields(frame.generationAck, ["generation", "manifestHash", "effectiveHash"], "probe generation ack");
+  if (!Number.isInteger(frame.generationAck.generation) || frame.generationAck.generation < 1
+    || !SHA256.test(frame.generationAck.manifestHash)
+    || !SHA256.test(frame.generationAck.effectiveHash)
+    || frame.candidateIntroduction.generation !== frame.generationAck.generation
+    || frame.candidateIntroduction.manifestHash !== frame.generationAck.manifestHash) {
+    throw new Error("probe generation acknowledgement is invalid");
+  }
+  for (const value of Object.values(frame.gatewayHeaders)) {
+    if (typeof value !== "string" || /[\r\n]/.test(value)) throw new Error("probe gateway headers are invalid");
+  }
+  return frame;
+};
+
+const verifyGeneration = (bootstrap) => {
+  const rootStat = lstatSync(bootstrap.generationRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || (rootStat.mode & 0o777) !== 0o700) {
+    throw new Error("probe generation root is not a canonical mode-0700 directory");
+  }
+  const canonicalRoot = realpathSync(bootstrap.generationRoot);
+  if (canonicalRoot !== resolve(bootstrap.generationRoot)) throw new Error("probe generation root escapes its path");
+  const directory = join(canonicalRoot, `generation-${bootstrap.generationAck.generation}`);
+  const directoryStat = lstatSync(directory);
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory() || (directoryStat.mode & 0o777) !== 0o700) {
+    throw new Error("probe generation directory is not canonical and private");
+  }
+  const canonicalDirectory = realpathSync(directory);
+  if (canonicalDirectory !== resolve(directory) || !canonicalDirectory.startsWith(`${canonicalRoot}${sep}`)) {
+    throw new Error("probe generation directory escapes its registry root");
+  }
+  const registryBytes = regularPrivateFile(join(canonicalRoot, "resolver-generations.json"),
+    "probe generation registry");
+  const registry = parseJSON(registryBytes, "probe generation registry");
+  const registryRecord = registry?.version === 1
+    ? registry.generations?.[String(bootstrap.generationAck.generation)]
+    : null;
+  if (!registryRecord
+    || registryRecord.manifestHash !== bootstrap.generationAck.manifestHash
+    || registryRecord.effectiveHash !== bootstrap.generationAck.effectiveHash) {
+    throw new Error("probe generation registry acknowledgement mismatch");
+  }
+  const manifestBytes = regularPrivateFile(join(canonicalDirectory, "manifest.json"), "probe generation manifest");
+  const configBytes = regularPrivateFile(join(canonicalDirectory, "opencode.json"), "probe effective config");
+  const manifest = parseJSON(manifestBytes, "probe generation manifest");
+  const config = parseJSON(configBytes, "probe effective config");
+  const candidateKey = `${bootstrap.candidateIdentity.providerID}/${bootstrap.candidateIdentity.modelID}`;
+  if (bytesHash(manifestBytes) !== bootstrap.generationAck.manifestHash
+    || manifest?.generation !== bootstrap.generationAck.generation
+    || manifest?.effectiveHash !== bootstrap.generationAck.effectiveHash
+    || canonicalHash(config) !== bootstrap.generationAck.effectiveHash
+    || !Array.isArray(manifest?.modelKeys) || !manifest.modelKeys.includes(candidateKey)) {
+    throw new Error("probe immutable generation content or candidate membership mismatch");
+  }
+  return { modelKeys: [...manifest.modelKeys] };
+};
+
+const writeFrame = (frame) => new Promise((resolveWrite, rejectWrite) => {
+  const bytes = Buffer.from(`${JSON.stringify(frame)}\n`);
+  if (bytes.length - 1 > MAX_FRAME_BYTES) return rejectWrite(new Error("probe output frame exceeds 64 KiB"));
+  process.stdout.write(bytes, (error) => error ? rejectWrite(error) : resolveWrite());
+});
+
+const brokerRequest = (bootstrap, path, body, { resolverToken } = {}) => new Promise((resolveRequest, rejectRequest) => {
+  const payload = Buffer.from(JSON.stringify(body));
+  const request = httpRequest({
+    socketPath: bootstrap.brokerSocketPath,
+    path,
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": payload.length,
+      "x-opencode-probe-pid": String(process.pid),
+      ...(resolverToken ? { "x-opencode-resolver-token": resolverToken } : {}),
+    },
+    timeout: 10_000,
+  }, (response) => {
+    const chunks = [];
+    let length = 0;
+    response.on("data", (chunk) => {
+      length += chunk.length;
+      if (length > MAX_RESPONSE_BYTES) {
+        request.destroy(new Error("broker probe response exceeds 64 KiB"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    response.on("end", () => {
+      let parsed;
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
+      catch { return rejectRequest(new Error("broker probe response is invalid JSON")); }
+      if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
+        return rejectRequest(new Error(`broker probe request ${path} was rejected`));
+      }
+      resolveRequest(parsed);
+    });
+  });
+  request.once("timeout", () => request.destroy(new Error("broker probe request timed out")));
+  request.once("error", rejectRequest);
+  request.end(payload);
+});
+
+const boundedGatewayBody = async (response) => {
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > MAX_RESPONSE_BYTES) throw new Error("gateway probe response exceeds 64 KiB");
+  try { return JSON.parse(bytes.toString("utf8") || "{}"); }
+  catch { throw new Error("gateway probe response is invalid JSON"); }
+};
+
+const normalizeGatewayResponse = (kind, status, body) => {
+  if (kind === "tool") {
+    const calls = Array.isArray(body?.choices?.[0]?.message?.tool_calls)
+      ? body.choices[0].message.tool_calls.slice(0, 2).map((call) => ({
+          function: {
+            name: String(call?.function?.name ?? "").slice(0, 100),
+            arguments: String(call?.function?.arguments ?? "").slice(0, 4096),
+          },
+        }))
+      : [];
+    return { status, body: { choices: [{ message: { tool_calls: calls } }] } };
+  }
+  const content = String(body?.choices?.[0]?.message?.content ?? "").slice(0, 4096);
+  return { status, body: { choices: [{ message: { content } }] } };
+};
+
+let bootstrap = null;
+let resolverToken = null;
+let closing = false;
+const outstanding = new Map();
+
+const releaseOutstanding = async () => {
+  if (!bootstrap || !resolverToken) return;
+  const releases = [...outstanding.values()].map((assignment) => brokerRequest(
+    bootstrap,
+    "/probe/release",
+    { sessionID: assignment.sessionID, probeNonce: assignment.probeNonce },
+    { resolverToken },
+  ).catch(() => null));
+  await Promise.all(releases);
+  outstanding.clear();
+};
+
+const handleBootstrap = async (frame) => {
+  if (bootstrap !== null) throw new Error("probe bootstrap was repeated");
+  bootstrap = validateBootstrap(frame);
+  verifyGeneration(bootstrap);
+  const registration = await brokerRequest(bootstrap, "/resolver-process/register", {
+    generation: bootstrap.generationAck.generation,
+    manifestHash: bootstrap.generationAck.manifestHash,
+    probeLaunchNonce: bootstrap.probeLaunchNonce,
+  });
+  if (registration?.scope !== "probeFresh"
+    || typeof registration.resolverToken !== "string"
+    || registration.generation !== bootstrap.generationAck.generation
+    || registration.manifestHash !== bootstrap.generationAck.manifestHash) {
+    throw new Error("broker returned an invalid fresh probe registration");
+  }
+  resolverToken = registration.resolverToken;
+  await writeFrame({ version: PROBE_PROTOCOL_VERSION, type: "ready" });
+};
+
+const handleProbe = async (frame) => {
+  if (!bootstrap || !resolverToken || closing) throw new Error("probe helper is not ready");
+  exactFields(frame, ["version", "type", "requestID", "request"], "probe request frame");
+  if (typeof frame.requestID !== "string" || frame.requestID !== frame.request?.requestID) {
+    throw new Error("probe request correlation mismatch");
+  }
+  exactFields(frame.request, [
+    "kind", "requestID", "ordinaryModel", "candidateIntroduction", "gatewayRequest",
+  ], "probe semantic request");
+  if (!["normal", "tool", "reasoning"].includes(frame.request.kind)
+    || frame.request.ordinaryModel !== bootstrap.ordinaryModel
+    || JSON.stringify(frame.request.candidateIntroduction) !== JSON.stringify(bootstrap.candidateIntroduction)
+    || !isPlainObject(frame.request.gatewayRequest)
+    || frame.request.gatewayRequest.model !== bootstrap.ordinaryModel) {
+    throw new Error("probe semantic request binding mismatch");
+  }
+  const assignment = await brokerRequest(bootstrap, "/model-policy/probe", {
+    transitionID: bootstrap.transitionID,
+    roleKey: bootstrap.roleKey,
+    candidateIdentity: bootstrap.candidateIdentity,
+    candidateIntroduction: bootstrap.candidateIntroduction,
+    probeKind: frame.request.kind,
+    requestID: frame.requestID,
+  }, { resolverToken });
+  if (typeof assignment?.sessionID !== "string" || !/^gw-probe-[A-Za-z0-9_-]{43}$/.test(assignment.sessionID)
+    || typeof assignment?.probeNonce !== "string" || !/^pbn_[A-Za-z0-9_-]{43}$/.test(assignment.probeNonce)) {
+    throw new Error("broker returned an invalid probe assignment");
+  }
+  outstanding.set(frame.requestID, assignment);
+  let response;
+  try {
+    const gatewayResponse = await fetch(bootstrap.gatewayURL, {
+      method: "POST",
+      headers: {
+        ...bootstrap.gatewayHeaders,
+        "content-type": "application/json",
+        "x-opencode-probe-session": assignment.sessionID,
+        "x-opencode-probe-nonce": assignment.probeNonce,
+        "x-opencode-probe-pid": String(process.pid),
+      },
+      body: JSON.stringify(frame.request.gatewayRequest),
+      signal: AbortSignal.timeout(25_000),
+    });
+    const body = await boundedGatewayBody(gatewayResponse);
+    response = normalizeGatewayResponse(frame.request.kind, gatewayResponse.status, body);
+  } catch {
+    await brokerRequest(bootstrap, "/probe/release", {
+      sessionID: assignment.sessionID,
+      probeNonce: assignment.probeNonce,
+    }, { resolverToken }).catch(() => null);
+    response = { status: 599, body: { choices: [] } };
+  } finally {
+    outstanding.delete(frame.requestID);
+  }
+  await writeFrame({
+    version: PROBE_PROTOCOL_VERSION,
+    type: "result",
+    requestID: frame.requestID,
+    response,
+  });
+};
+
+const shutdown = async (code = 0) => {
+  if (closing) return;
+  closing = true;
+  await releaseOutstanding();
+  if (code === 0) await writeFrame({ version: PROBE_PROTOCOL_VERSION, type: "closed" }).catch(() => {});
+  process.exitCode = code;
+  process.stdin.destroy();
+};
+
+let chain = Promise.resolve();
+const fatal = () => {
+  chain = chain.then(async () => {
+    await releaseOutstanding();
+    await writeFrame({
+      version: PROBE_PROTOCOL_VERSION,
+      type: "error",
+      requestID: "protocol",
+      error: "probe helper protocol failure",
+    }).catch(() => {});
+    process.exitCode = 1;
+    process.stdin.destroy();
+  }).catch(() => { process.exitCode = 1; process.stdin.destroy(); });
+};
+
+const parser = createProbeProtocolParser({
+  onFrame: (frame) => {
+    chain = chain.then(async () => {
+      if (frame.type === "bootstrap") return handleBootstrap(frame);
+      if (frame.type === "probe") return handleProbe(frame);
+      if (frame.type === "shutdown") return shutdown(0);
+      throw new Error("probe helper received an invalid frame type");
+    }).catch(async () => {
+      await writeFrame({
+        version: PROBE_PROTOCOL_VERSION,
+        type: "error",
+        requestID: typeof frame.requestID === "string" ? frame.requestID : "protocol",
+        error: "probe helper request failed",
+      }).catch(() => {});
+      await shutdown(1);
+    });
+  },
+});
+
+process.stdin.on("data", (chunk) => {
+  try { parser.push(chunk); } catch { fatal(); }
+});
+process.stdin.on("end", () => {
+  try { parser.end(); } catch { process.exitCode = 1; }
+  chain = chain.then(() => shutdown(closing ? (process.exitCode ?? 0) : 1));
+});
+process.stdin.on("error", fatal);

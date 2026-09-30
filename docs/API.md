@@ -24,15 +24,47 @@ tooling) is a supported client.
 | `/preview` | `{ profile?, tiers?, contextTokens? }` | Side-effect-free selection: what each tier WOULD get right now. No lease, no cursor advance. Returns `{ preview: { <tier>: target \| null }, delayedProfileFallbacks: [{ targetIDs, afterMs }] }`. Preview answers for the present moment, so it selects as `waitedMs: 0` and a rung that is merely *not yet* open reads as `null`. `delayedProfileFallbacks` is what keeps that honest: it names the profile's delayed rungs and their thresholds, so a reader can tell "this profile has no fallback" from "its fallback has not opened yet". |
 | `/rearm` | `{ targetID? , reasonCode? }` | Clear a circuit. `provider:<id>` rearms a quarantined provider into probation; a target id clears that target; empty clears all circuits. |
 | `/quarantine` | `{ scope: "provider", kind: "compatibility", providerID, reasonCode? }` | Operator quarantine of a provider. |
-| `POST /resolver-process/register` | `{ generation, manifestHash, modelKeys, rawBase? }` | Loopback process-start call. With apply enabled, the broker independently verifies the exact immutable registry entry and manifest membership and returns `{ resolverToken, scope, generation, manifestHash, modelKeys, expiresAt? }`. Tokens are opaque, memory-only, and active for 10 minutes after their latest valid use. Unsafe registrations return logical generation-0 `base-only` eligibility with `resolverToken: null` and normalized static-target model keys. With apply disabled this returns `409`/`reconcile-apply-disabled` before reading a body or generation path. |
+| `POST /resolver-process/register` | Ordinary: `{ generation, manifestHash, modelKeys, rawBase? }`; fresh probe helper: `{ generation, manifestHash, probeLaunchNonce }` | Loopback process-start call. With apply enabled, an ordinary registration independently verifies the exact immutable registry entry and manifest membership and returns `{ resolverToken, scope, generation, manifestHash, modelKeys, expiresAt? }`. Ordinary tokens are opaque, memory-only, and active for 10 minutes after their latest valid use. A fresh helper atomically redeems one exact-bound, 60-second `pln_` launch nonce; the broker loads model membership itself and returns a five-minute `{ resolverToken, scope: "probeFresh", generation, manifestHash, expiresAt }`. A new redemption for the same staged operation revokes its prior helper token. Only token and nonce SHA-256 digests remain in broker memory. Unsafe ordinary registrations return logical generation-0 `base-only` eligibility; an invalid probe redemption fails and never falls back or mints a token. With apply disabled this returns `409`/`reconcile-apply-disabled` before reading a body or generation path. |
 | `POST /model-policy/cas` | `{ transitionID, revision, roleKey, expectedIncumbentModelID, generation, manifestHash, desired }` | Loopback control call that compare-and-swaps one normalized provider-role policy. It returns `{ ok, ack, changed }`. The same transition/revision, desired-policy hash, generation, and manifest is a non-writing replay; stale revision, incumbent, desired hash, generation, or manifest mismatches fail before mutation. Package 3 returns `409` with `code: "reconcile-apply-disabled"` unless `reconcile.apply.enabled` is strictly `true` with all three absolute paths configured. |
+| `POST /model-policy/probe-launch` | `{ transitionID, operationID, expectedPolicyRevision, roleKey, candidateIdentity, candidateIntroduction }` | Reconciler control call. Requires `operationID === transitionID + ":staged-probing"`, the acknowledged current revision, and the exact non-routable staged candidate identity/introduction. Returns one random 256-bit `pln_` nonce valid for exactly 60 seconds. Issue, expiry, and redemption are memory-only; broker restart invalidates every nonce. |
+| `POST /model-policy/probe` | Exact body `{ transitionID, roleKey, candidateIdentity, candidateIntroduction, probeKind, requestID }` plus `x-opencode-resolver-token` | Fresh helper only. An ordinary, expired, prior-process, or wrong-bound token returns `403`/`probe-process-required` or a binding refusal before assignment. Success returns one random `gw-probe-*` session and purpose-separated `pbn_` nonce for the exact staged target. Duplicate request IDs are refused. |
+| `POST /probe/consume` | `{ sessionID, probeNonce }` | Loopback gateway call. Atomically changes the exact assignment from `issued` to `consumed-gateway-owned` before `/lease`, and returns the broker-verified preferred model. Replay, expiry, session mismatch, and nonce mismatch fail closed. |
+| `POST /probe/release` | `{ sessionID, probeNonce }` | Idempotent terminal release. A helper carrying its resolver-token header may release only an `issued` assignment; after consumption only the gateway path (without that header, carrying the exact nonce) or the hard-expiry reaper can release it. |
 | `GET /model-policy/status` | no body | Read-only normalized broker policy plus the effective `reconcile.apply` status. It never rewrites `broker.json`. |
 
-`/resolver-process/register` and the two `/model-policy/*` endpoints are control operations. The Unix socket has
+`/resolver-process/register`, `/model-policy/*`, and `/probe/*` are control operations. The Unix socket has
 no remote address and is local by construction; any future TCP peer must have an
 IPv4 or IPv6 loopback address. A non-loopback peer is rejected before a control
-body is parsed. The socket permissions remain part of the same-UID control
-boundary.
+body is parsed. The broker enforces exact mode `0600` on the socket; that
+same-UID boundary is checked again before issuing a probe-launch nonce.
+
+## Fresh-process probe transport
+
+`createProbeClientFactory()` resolves and validates the registry-owned immutable
+generation through `generationManager.generation()` before spawning
+`bin/opencode-broker-probe-client`. The child independently derives the canonical
+`generation-<n>` directory under the mode-`0700` root and verifies the private
+registry, exact manifest bytes, canonical effective-config hash, acknowledgement,
+and candidate membership before registration. Neither side accepts a caller path.
+
+The parent and helper use version-1 NDJSON over stdin/stdout. Every frame is at
+most 64 KiB and carries a correlated `requestID`; malformed JSON, partial EOF,
+unknown version/type, or an oversized frame is fatal. The one bootstrap frame is
+sent on stdin, never argv, and contains the broker socket, loopback gateway URL
+and headers, exact policy/generation binding, ordinary gateway model, and launch
+nonce. The helper retains its resolver token and emits protocol frames only;
+stderr diagnostics are bounded to 16 KiB and redacted by the parent. Shutdown is
+bounded and reaped: request shutdown, wait two seconds, `SIGTERM`, wait two
+seconds, then `SIGKILL` and await exit. `close()` is asynchronous and idempotent.
+
+The helper requests one assignment per semantic probe, then calls the ordinary
+authenticated gateway endpoint with the ordinary model plus
+`x-opencode-probe-session` and `x-opencode-probe-nonce`. The gateway accepts these
+markers only with valid gateway authentication from loopback, verifies and
+consumes the supplied session before leasing, and passes the exact preferred model
+to the broker. It awaits `/probe/release` on success, lease refusal, downstream
+failure, and timeout. Headerless requests retain the ordinary path, and
+`GET /v1/models` never advertises a candidate or probe-only model name.
 
 Every ordinary POST body may carry the opaque `resolverToken` returned at process
 registration. A valid use extends its active window. Missing, invalid, expired, pre-restart,

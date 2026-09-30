@@ -189,6 +189,160 @@ test("bad gateway keys and unroutable requests fail closed", async () => {
   });
 });
 
+for (const scenario of ["success", "lease-failure", "downstream-failure", "timeout"]) {
+  test(`gateway owns and releases a consumed probe after ${scenario}`, async () => {
+    const calls = [];
+    const sessionID = `gw-probe-${"s".repeat(43)}`;
+    const probeNonce = `pbn_${"n".repeat(43)}`;
+    const preferredModel = { providerID: "openai", modelID: "gpt-6-sol" };
+    const handler = createGatewayHandler({
+      config: {
+        tier: "worker",
+        profile: "auto",
+        modelProfiles: { smart: { profile: "auto", tier: "smart" } },
+        providers: { openai: { baseUrl: "http://openai.example/v1" } },
+      },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (path, body) => {
+        calls.push({ path, body });
+        if (path === "/probe/consume") {
+          assert.deepEqual(body, { sessionID, probeNonce });
+          return { sessionID, preferredModel, expiresAt: Date.now() + 60_000 };
+        }
+        if (path === "/lease") {
+          if (scenario === "lease-failure") throw new Error("lease failed");
+          return { target: { model: { providerID: "openai", id: "gpt-6-sol" } } };
+        }
+        return { ok: true };
+      },
+      fetchImpl: async () => {
+        if (scenario === "downstream-failure") {
+          return { ok: false, status: 500, text: async () => "failed" };
+        }
+        if (scenario === "timeout") throw new DOMException("timed out", "TimeoutError");
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ choices: [{ message: { content: "PROBE_OK" } }], usage: {} }),
+        };
+      },
+    });
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer gw-secret",
+          "Content-Type": "application/json",
+          "x-opencode-probe-session": sessionID,
+          "x-opencode-probe-nonce": probeNonce,
+        },
+        body: JSON.stringify({ model: "smart", messages: [{ role: "user", content: "Compatibility probe" }] }),
+      });
+      assert.equal([200, 502].includes(response.status), true);
+      await response.arrayBuffer();
+    });
+    assert.deepEqual(calls.slice(0, 2).map((call) => call.path), ["/probe/consume", "/lease"]);
+    const lease = calls.find((call) => call.path === "/lease");
+    assert.equal(lease.body.sessionID, sessionID);
+    assert.deepEqual(lease.body.preferredModel, { providerID: "openai", id: "gpt-6-sol" });
+    const releases = calls.filter((call) => call.path === "/probe/release");
+    assert.equal(releases.length, 1);
+    assert.deepEqual(releases[0].body, { sessionID, probeNonce });
+  });
+}
+
+test("gateway probe marker requires gateway auth loopback session and successful consume", async () => {
+  const calls = [];
+  const sessionID = `gw-probe-${"s".repeat(43)}`;
+  const probeNonce = `pbn_${"n".repeat(43)}`;
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker",
+      profile: "auto",
+      modelProfiles: { smart: { profile: "auto", tier: "smart" } },
+      providers: { openai: { baseUrl: "http://openai.example/v1" } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/probe/consume") throw new Error("session mismatch");
+      throw new Error("must not lease");
+    },
+    fetchImpl: async () => { throw new Error("must not forward"); },
+  });
+  await withServer(handler, async (base) => {
+    const missingAuth = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-opencode-probe-session": sessionID,
+        "x-opencode-probe-nonce": probeNonce,
+      },
+      body: JSON.stringify({ model: "smart", messages: [] }),
+    });
+    assert.equal(missingAuth.status, 401);
+    const missingSession = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer gw-secret",
+        "Content-Type": "application/json",
+        "x-opencode-probe-nonce": probeNonce,
+      },
+      body: JSON.stringify({ model: "smart", messages: [] }),
+    });
+    assert.equal(missingSession.status, 400);
+    const mismatch = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer gw-secret",
+        "Content-Type": "application/json",
+        "x-opencode-probe-session": sessionID,
+        "x-opencode-probe-nonce": probeNonce,
+      },
+      body: JSON.stringify({ model: "smart", messages: [] }),
+    });
+    assert.equal(mismatch.status, 403);
+  });
+  assert.deepEqual(calls.map((call) => call.path), ["/probe/consume"]);
+});
+
+test("probe candidate is never advertised and ordinary requests never call probe endpoints", async () => {
+  const calls = [];
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker",
+      profile: "auto",
+      routedModelId: "routed",
+      modelProfiles: { smart: { profile: "auto", tier: "smart" } },
+      providers: { openai: { baseUrl: "http://openai.example/v1" } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { target: { model: { providerID: "openai", id: "gpt-5.6-sol" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }),
+    }),
+  });
+  await withServer(handler, async (base) => {
+    const models = await fetch(`${base}/v1/models`, { headers: { Authorization: "Bearer gw-secret" } });
+    assert.deepEqual((await models.json()).data.map((entry) => entry.id), ["routed", "smart"]);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "smart", messages: [] }),
+    });
+    assert.equal(response.status, 200);
+  });
+  assert.equal(calls.some((call) => call.path.startsWith("/probe/")), false);
+  assert.equal(calls.find((call) => call.path === "/lease").body.sessionID.startsWith("gw-probe-"), false);
+});
+
 test("instruct jsonMode strips response_format and appends the raw-JSON instruction", async () => {
   const upstream = [];
   const handler = createGatewayHandler({

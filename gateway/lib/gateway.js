@@ -35,6 +35,11 @@ const sameSecret = (presented, expected) => timingSafeEqual(
   createHash("sha256").update(String(expected)).digest(),
 );
 
+const loopbackAddress = (value) => {
+  const address = String(value ?? "").replace(/^::ffff:/, "");
+  return address === "::1" || /^127(?:\.\d{1,3}){3}$/.test(address);
+};
+
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
 // A GPU model swap measures ~2m40s. The wait is bounded, config-overridable,
@@ -688,7 +693,15 @@ export const createGatewayHandler = ({
   // document extractor and a chat UI all read as anonymous gateway traffic.
   const callers = new Map();
   const callerOf = (sessionID) => callers.get(sessionID);
-  const leaseOnce = async (sessionID, requestBody, excludeProviders = [], route = null, api = CHAT, waitedMs = 0) => {
+  const leaseOnce = async (
+    sessionID,
+    requestBody,
+    excludeProviders = [],
+    route = null,
+    api = CHAT,
+    waitedMs = 0,
+    probeAssignment = null,
+  ) => {
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. chars/4 is the usual
     // serviceable estimate for OpenAI-shaped payloads.
@@ -742,6 +755,12 @@ export const createGatewayHandler = ({
       // merely bursty cannot seize a scarce shared target the moment its own lane is busy.
       waitedMs,
       providers,
+      ...(probeAssignment ? {
+        preferredModel: {
+          providerID: probeAssignment.preferredModel.providerID,
+          id: probeAssignment.preferredModel.modelID,
+        },
+      } : {}),
       ...(callerOf(sessionID) ? { caller: callerOf(sessionID) } : {}),
     });
     const model = lease?.target?.model;
@@ -793,7 +812,16 @@ export const createGatewayHandler = ({
   // once, so several slots freeing together drain without a retry interval between them.
   const waiting = new Map(); // profile -> entries in arrival order
 
-  const leaseWithPrepare = async (sessionID, requestBody, excluded, route, clientAbort, deadline, api = CHAT) => {
+  const leaseWithPrepare = async (
+    sessionID,
+    requestBody,
+    excluded,
+    route,
+    clientAbort,
+    deadline,
+    api = CHAT,
+    probeAssignment = null,
+  ) => {
     const line = route?.profile ?? config.profile;
     const budget = waitFor(route);
     let entry = null;
@@ -822,7 +850,9 @@ export const createGatewayHandler = ({
           // Time spent waiting, not time spent being answered: a slow first refusal is latency,
           // and counting it would let a request that never queued walk onto a delayed rung.
           const waitedMs = waitStarted === null ? 0 : Math.max(0, now() - waitStarted);
-          try { return await leaseOnce(sessionID, requestBody, excluded, route, api, waitedMs); } catch (refusal) {
+          try {
+            return await leaseOnce(sessionID, requestBody, excluded, route, api, waitedMs, probeAssignment);
+          } catch (refusal) {
             // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
             // out for everyone. The deadline is the request's own either way.
             const absentLocal = route?.waitForLocal === true &&
@@ -883,7 +913,15 @@ export const createGatewayHandler = ({
 
   // `sink` present == the client asked for SSE and gets frames instead of a
   // payload; absent == the buffered path, unchanged since 0.1.0.
-  const completions = async (requestBody, clientAbort = null, sink = null, api = CHAT, caller = null, requestHeaders = {}) => {
+  const completions = async (
+    requestBody,
+    clientAbort = null,
+    sink = null,
+    api = CHAT,
+    caller = null,
+    requestHeaders = {},
+    probeAssignment = null,
+  ) => {
     const streaming = Boolean(sink);
     const wantedJson = Boolean(requestBody?.response_format?.type?.startsWith?.("json"));
     // Did the CLIENT ask for the usage tail, or only we? (See the strip in
@@ -902,15 +940,46 @@ export const createGatewayHandler = ({
     // which exists for exactly "same session, give me a different target" and
     // deletes the held lease before selecting. ☆ It also collapses the
     // decisions.jsonl trail for one curl from 19 unrelated ids down to one.
-    const sessionID = `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionID = probeAssignment?.sessionID
+      ?? `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     if (caller) callers.set(sessionID, caller);
     try {
-      return await completionsFor(sessionID, requestBody, clientAbort, sink, api, route, streaming, wantedJson, keepUsageFrames, requestHeaders);
+      return await completionsFor(
+        sessionID,
+        requestBody,
+        clientAbort,
+        sink,
+        api,
+        route,
+        streaming,
+        wantedJson,
+        keepUsageFrames,
+        requestHeaders,
+        probeAssignment,
+      );
     } finally {
       callers.delete(sessionID);
+      if (probeAssignment) {
+        await brokerRequest("/probe/release", {
+          sessionID: probeAssignment.sessionID,
+          probeNonce: probeAssignment.probeNonce,
+        });
+      }
     }
   };
-  const completionsFor = async (sessionID, requestBody, clientAbort, sink, api, route, streaming, wantedJson, keepUsageFrames, requestHeaders) => {
+  const completionsFor = async (
+    sessionID,
+    requestBody,
+    clientAbort,
+    sink,
+    api,
+    route,
+    streaming,
+    wantedJson,
+    keepUsageFrames,
+    requestHeaders,
+    probeAssignment = null,
+  ) => {
     let lastError = null;
     let lastForwardError = null;
     const rememberForwardError = (error) => {
@@ -937,7 +1006,18 @@ export const createGatewayHandler = ({
     const deadline = now() + waitFor(route);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       let leased;
-      try { leased = await leaseWithPrepare(sessionID, requestBody, excluded, route, clientAbort, deadline, api); }
+      try {
+        leased = await leaseWithPrepare(
+          sessionID,
+          requestBody,
+          excluded,
+          route,
+          clientAbort,
+          deadline,
+          api,
+          probeAssignment,
+        );
+      }
       catch (error) {
         // A local retry dead-end adds no new diagnosis. Broker and pre-forward
         // errors still replace the old failure because they carry new facts.
@@ -1415,6 +1495,20 @@ export const createGatewayHandler = ({
       response.end(JSON.stringify({ error: { message: "missing or invalid gateway key" } }));
       return;
     }
+    const rawProbeNonce = request.headers["x-opencode-probe-nonce"];
+    const rawProbeSession = request.headers["x-opencode-probe-session"];
+    const probeNonce = Array.isArray(rawProbeNonce) ? rawProbeNonce[0] : rawProbeNonce;
+    const probeSessionID = Array.isArray(rawProbeSession) ? rawProbeSession[0] : rawProbeSession;
+    const hasProbeMarker = probeNonce !== undefined || probeSessionID !== undefined;
+    if (hasProbeMarker) {
+      if (!loopbackAddress(request.socket?.remoteAddress)) {
+        return respondJson(response, 403, { error: { message: "probe requests require loopback" } });
+      }
+      if (typeof probeNonce !== "string" || !/^pbn_[A-Za-z0-9_-]{43}$/.test(probeNonce)
+        || typeof probeSessionID !== "string" || !/^gw-probe-[A-Za-z0-9_-]{43}$/.test(probeSessionID)) {
+        return respondJson(response, 400, { error: { message: "probe session and nonce are required" } });
+      }
+    }
     if (request.method === "GET" && url === "/v1/models") {
       // ☆ An interactive client builds its model picker from here, so this list
       // is the gateway's answer to "what may I ask for". The routed id comes
@@ -1458,6 +1552,31 @@ export const createGatewayHandler = ({
         },
       }));
       return;
+    }
+    let probeAssignment = null;
+    if (hasProbeMarker) {
+      let consumed;
+      try {
+        consumed = await brokerRequest("/probe/consume", {
+          sessionID: probeSessionID,
+          probeNonce,
+        });
+      } catch {
+        return respondJson(response, 403, { error: { message: "probe assignment rejected" } });
+      }
+      if (consumed?.sessionID !== probeSessionID
+        || typeof consumed?.preferredModel?.providerID !== "string"
+        || typeof consumed?.preferredModel?.modelID !== "string") {
+        return respondJson(response, 403, { error: { message: "probe assignment binding mismatch" } });
+      }
+      probeAssignment = {
+        sessionID: probeSessionID,
+        probeNonce,
+        preferredModel: {
+          providerID: consumed.preferredModel.providerID,
+          modelID: consumed.preferredModel.modelID,
+        },
+      };
     }
     const streaming = parsed.stream === true;
     // Anything that is not an explicit `stream: true` keeps the buffered
@@ -1532,7 +1651,7 @@ export const createGatewayHandler = ({
           ? request.headers["anthropic-version"][0] : request.headers["anthropic-version"],
         anthropicBeta: Array.isArray(request.headers["anthropic-beta"])
           ? request.headers["anthropic-beta"][0] : request.headers["anthropic-beta"],
-      });
+      }, probeAssignment);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
     }

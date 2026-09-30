@@ -2,7 +2,7 @@
 // The broker coordinates independent OpenCode servers without handling prompts,
 // credentials, or provider traffic. It only assigns model leases and health state.
 import { spawn } from "node:child_process";
-import { appendFileSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +59,7 @@ import {
 import { createResolverGenerationManager } from "../lib/resolver-generations.js";
 import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
 import { resolvePolicyLane } from "../lib/policy-targets.js";
+import { createProbeBrokerState } from "../lib/model-probe.js";
 import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
@@ -711,7 +712,11 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   return true;
 };
 
-const acquire = async (state, request, { isAbandoned = () => false, registration = null } = {}) => {
+const acquire = async (state, request, {
+  isAbandoned = () => false,
+  registration = null,
+  probeAssignment = null,
+} = {}) => {
   const ensureActive = () => {
     if (!isAbandoned()) return;
     const error = new Error("request abandoned");
@@ -820,8 +825,21 @@ const acquire = async (state, request, { isAbandoned = () => false, registration
     .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers))
     .filter(([, target]) => !localOnlyRequest || target.kind === "local")
     .filter(([, target]) => !providerAllowlist || providerAllowlist.has(target.providerID)));
+  if (probeAssignment) {
+    const exact = Object.fromEntries(Object.entries(admittedTargets).filter(([, target]) =>
+      target.providerID === probeAssignment.preferredModel.providerID
+      && target.modelID === probeAssignment.preferredModel.modelID));
+    if (Object.keys(exact).length !== 1) throw new Error("probe exact target is unavailable or ambiguous");
+    admittedTargets = exact;
+  }
   const expandedPolicyIDs = targetEligibleIDsFor(profile, tier, admittedTargets);
-  const policyLane = resolvePolicyLane({
+  const policyLane = probeAssignment ? {
+    targetIDs: Object.keys(admittedTargets),
+    targets: admittedTargets,
+    policyTargetID: Object.keys(admittedTargets)[0],
+    reason: "probe-exact-target",
+    blockedGeneration: false,
+  } : resolvePolicyLane({
     targetIDs: expandedPolicyIDs,
     targets: admittedTargets,
     modelPolicy: state.modelPolicy,
@@ -1258,6 +1276,21 @@ const serve = async () => {
     loadBaseModelKeys: () => [...new Set(Object.values(TARGETS)
       .map((target) => `${target.providerID}/${target.modelID}`))].sort(),
   });
+  const probeState = createProbeBrokerState();
+  setInterval(() => probeState.reap(), 1_000).unref();
+  const probeReply = (response, error) => reply(response, error?.status ?? 409, {
+    error: String(error?.message ?? error),
+    code: typeof error?.code === "string" ? error.code : "invalid-probe-request",
+  });
+  const requireProbeFields = (body, expected, code, label) => {
+    const fields = body && typeof body === "object" && !Array.isArray(body)
+      ? Object.keys(body).sort()
+      : [];
+    if (fields.join("\0") === [...expected].sort().join("\0")) return;
+    const error = new Error(`${label} must contain exactly ${expected.join(", ")}`);
+    error.code = code;
+    throw error;
+  };
   const handle = async (request, response) => {
     try {
       if (request.url === "/model-policy/status") {
@@ -1286,6 +1319,24 @@ const serve = async () => {
         }
         return reply(response, 200, { ok: true, ack: result.ack, changed: result.changed });
       }
+      if (request.url === "/model-policy/probe-launch") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        if ((lstatSync(socketPath).mode & 0o777) !== 0o600) {
+          return reply(response, 409, { error: "probe control socket must have exact mode 0600", code: "probe-control-socket-insecure" });
+        }
+        const body = await parseBody(request);
+        try {
+          return reply(response, 200, probeState.issueLaunch(body, { modelPolicy: state.modelPolicy }));
+        } catch (error) {
+          return probeReply(response, error);
+        }
+      }
       if (request.url === "/resolver-process/register") {
         if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
           return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
@@ -1295,11 +1346,108 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = await parseBody(request);
+        if (Object.hasOwn(body, "probeLaunchNonce")) {
+          try {
+            const fields = Object.keys(body).sort();
+            if (fields.join("\0") !== ["generation", "manifestHash", "probeLaunchNonce"].sort().join("\0")) {
+              const error = new Error("fresh probe registration must contain exactly generation, manifestHash, and probeLaunchNonce");
+              error.code = "invalid-probe-registration";
+              throw error;
+            }
+            if (!Number.isInteger(body.generation) || typeof body.manifestHash !== "string") {
+              const error = new Error("probe generation identity is invalid");
+              error.code = "invalid-probe-generation";
+              throw error;
+            }
+            const manager = createResolverGenerationManager({
+              root: CONFIG.reconcile.apply.generationsRoot,
+              currentLinkPath: CONFIG.reconcile.apply.currentLinkPath,
+            });
+            const bundle = manager.generation(body.generation);
+            return reply(response, 200, probeState.redeemLaunch({
+              generation: body.generation,
+              manifestHash: body.manifestHash,
+              modelKeys: bundle.manifest.modelKeys,
+              probeLaunchNonce: body.probeLaunchNonce,
+            }));
+          } catch (error) {
+            return probeReply(response, error);
+          }
+        }
         return reply(response, 200, resolverProcesses.register(body));
+      }
+      if (request.url === "/model-policy/probe") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        const body = await parseBody(request);
+        const header = request.headers["x-opencode-resolver-token"];
+        const resolverToken = Array.isArray(header) ? header[0] : header;
+        try {
+          return reply(response, 200, probeState.issueAssignment({
+            resolverToken,
+            request: body,
+            modelPolicy: state.modelPolicy,
+          }));
+        } catch (error) {
+          return probeReply(response, error);
+        }
+      }
+      if (request.url === "/probe/consume") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        const body = await parseBody(request);
+        try {
+          requireProbeFields(body, ["sessionID", "probeNonce"], "invalid-probe-consume", "probe consume request");
+          return reply(response, 200, probeState.consumeAssignment(body));
+        } catch (error) {
+          return probeReply(response, error);
+        }
+      }
+      if (request.url === "/probe/release") {
+        if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+          return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+        }
+        if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+        if (!CONFIG.reconcile.apply.enabled) {
+          return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
+        }
+        const body = await parseBody(request);
+        const header = request.headers["x-opencode-resolver-token"];
+        const resolverToken = Array.isArray(header) ? header[0] : header;
+        try {
+          requireProbeFields(body, ["sessionID", "probeNonce"], "invalid-probe-release", "probe release request");
+          return reply(response, 200, probeState.releaseAssignment({
+            sessionID: body.sessionID,
+            probeNonce: body.probeNonce,
+            resolverToken,
+            owner: resolverToken ? "helper" : "gateway",
+          }));
+        } catch (error) {
+          return probeReply(response, error);
+        }
       }
       if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
       const body = await parseBody(request);
-      const registration = resolverProcesses.authorize({ resolverToken: body.resolverToken });
+      const probeAssignment = request.url === "/lease" && typeof body.sessionID === "string"
+        ? probeState.assignmentForLease(body.sessionID)
+        : null;
+      const registration = probeAssignment ? {
+        generation: probeAssignment.generation,
+        manifestHash: probeAssignment.manifestHash,
+        modelKeys: probeAssignment.modelKeys,
+        compatible: true,
+        reason: null,
+      } : resolverProcesses.authorize({ resolverToken: body.resolverToken });
       sweep(state);
       const planRefresh = refreshPlanUsage(state);
       // Plan velocity: every reading the refresh leaves behind, however it resolves.
@@ -1328,6 +1476,7 @@ const serve = async () => {
           lease = await acquire(state, body, {
             isAbandoned: () => abandoned(request, response),
             registration,
+            probeAssignment,
           });
         } finally {
           leaseCaller = null;
@@ -1859,7 +2008,10 @@ const serve = async () => {
   server.on("close", removeSocket);
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(socketPath, resolve);
+    server.listen(socketPath, () => {
+      chmodSync(socketPath, 0o600);
+      resolve();
+    });
     if (slotWatch) setInterval(() => { pollSlots().catch(() => {}); }, CONFIG.slotWatch.intervalMs).unref();
   });
   // Providers with no usage reading (lib/provider-check.js) are checked on a timer. The
