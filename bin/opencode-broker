@@ -58,6 +58,7 @@ import {
 } from "../lib/model-policy.js";
 import { createResolverGenerationManager } from "../lib/resolver-generations.js";
 import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
+import { resolvePolicyLane } from "../lib/policy-targets.js";
 import {
   applyPlanUsageCircuit,
   cachedPlanUsage,
@@ -294,7 +295,18 @@ const readState = () => {
   }
 };
 
-const allTargets = (state) => ({ ...TARGETS, ...(state.inventory?.targets ?? {}) });
+const allTargets = (state) => ({
+  ...TARGETS,
+  ...Object.fromEntries(Object.entries(state.inventory?.targets ?? {}).map(([id, target]) => {
+    const key = `${target.providerID}/${target.modelID}`;
+    return [id, {
+      ...target,
+      ...(state.inventory?.modelContexts?.[key] ? { context: state.inventory.modelContexts[key] } : {}),
+      ...(state.inventory?.modelOutputs?.[key] ? { output: state.inventory.modelOutputs[key] } : {}),
+      ...(state.inventory?.modelVariants?.[key] ? { variants: [...state.inventory.modelVariants[key]] } : {}),
+    }];
+  })),
+});
 
 const writeState = (state) => {
   ensureRoutingStateDir();
@@ -699,7 +711,7 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   return true;
 };
 
-const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
+const acquire = async (state, request, { isAbandoned = () => false, registration = null } = {}) => {
   const ensureActive = () => {
     if (!isAbandoned()) return;
     const error = new Error("request abandoned");
@@ -804,14 +816,34 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
   // inherits only this one property from the session it belongs to.
   // ☠️ "keep only local", never "drop cloud" -- same reason as everywhere else.
   const localOnlyRequest = request.localOnly === true;
-  const admittedTargets = Object.fromEntries(Object.entries(targets)
+  let admittedTargets = Object.fromEntries(Object.entries(targets)
     .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers))
     .filter(([, target]) => !localOnlyRequest || target.kind === "local")
     .filter(([, target]) => !providerAllowlist || providerAllowlist.has(target.providerID)));
+  const expandedPolicyIDs = targetEligibleIDsFor(profile, tier, admittedTargets);
+  const policyLane = resolvePolicyLane({
+    targetIDs: expandedPolicyIDs,
+    targets: admittedTargets,
+    modelPolicy: state.modelPolicy,
+    registration,
+    activeLeases: Object.entries(state.leases)
+      .filter(([activeSessionID]) => activeSessionID !== sessionID)
+      .map(([activeSessionID, lease]) => ({ sessionID: activeSessionID, ...lease })),
+    tier,
+    enabled: CONFIG.reconcile.apply.enabled,
+  });
+  if (policyLane.reason) {
+    const allowed = new Set(policyLane.targetIDs);
+    const expanded = new Set(expandedPolicyIDs);
+    admittedTargets = Object.fromEntries(Object.entries(policyLane.targets)
+      .filter(([id]) => !expanded.has(id) || allowed.has(id)));
+  } else {
+    admittedTargets = policyLane.targets;
+  }
 
   const existing = state.leases[sessionID];
   if (existing && !replace) {
-    const target = targetForID(existing.targetID, targets);
+    const target = targetForID(existing.targetID, admittedTargets);
     if (isProfile(existing.profile) && ["worker", "review", "build", "fast-build", "smart", "deep", "classifier"].includes(existing.tier) &&
       existing.profile === profile && existing.tier === tier) {
       let availableModels;
@@ -835,7 +867,9 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
           profile,
           tier,
           policy: "held-lease-revalidation",
-          reasons: ["revalidated-held-lease"],
+          reasons: ["revalidated-held-lease", ...(policyLane.reason ? [policyLane.reason] : []),
+            ...(policyLane.blockedGeneration ? ["blocked-generation"] : [])],
+          ...(policyLane.blockedGeneration ? { blockedGeneration: true } : {}),
           eligibleTargetIDs: [target.id],
           balancedTargetIDs: [target.id],
           providerUtilization: { [target.providerID]: effectiveUtilization(state.budgets, target.providerID) },
@@ -877,8 +911,8 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
   // undefined, where every local target is ineligible by definition. The rung would then be
   // unreachable no matter how long the caller waited, and the refusal would read as
   // "no eligible target" rather than naming the rung.
-  const includesLocal = localOnlyRequest || targetEligibleIDsFor(profile, tier, targets)
-    .map((targetID) => targetForID(targetID, targets))
+  const includesLocal = localOnlyRequest || targetEligibleIDsFor(profile, tier, admittedTargets)
+    .map((targetID) => targetForID(targetID, admittedTargets))
     .some((target) => target?.kind === "local");
   let availableModels;
   if (includesLocal) {
@@ -897,6 +931,23 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
   // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
   ensureActive();
   reclaimIdleLeases(state, admittedTargets, sessionID);
+  if (policyLane.policyTargetID) {
+    const candidateTargets = Object.fromEntries(Object.entries(admittedTargets)
+      .filter(([id]) => !expandedPolicyIDs.includes(id) || id === policyLane.policyTargetID));
+    const candidateChoice = chooseTarget({
+      ...selection,
+      targets: candidateTargets,
+      active: activeCounts(state, candidateTargets),
+      localModels: availableModels,
+    });
+    if (candidateChoice?.target?.id === policyLane.policyTargetID) {
+      admittedTargets = candidateTargets;
+    } else {
+      admittedTargets = Object.fromEntries(Object.entries(admittedTargets)
+        .filter(([id]) => id !== policyLane.policyTargetID));
+    }
+    selection.targets = admittedTargets;
+  }
   const ordinaryChoice = chooseTarget({
     ...selection,
     active: activeCounts(state, admittedTargets),
@@ -1026,8 +1077,17 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
       },
     };
   }
+  if (choice && policyLane.reason) {
+    choice.decision = {
+      ...choice.decision,
+      reasons: [...(choice.decision?.reasons ?? []), policyLane.reason,
+        ...(policyLane.blockedGeneration ? ["blocked-generation"] : [])],
+      ...(policyLane.blockedGeneration ? { blockedGeneration: true } : {}),
+    };
+  }
   if (!choice) {
-    const wanted = targetIDsFor(profile, tier, targets).map((id) => targetForID(id, targets)).filter(Boolean);
+    const wanted = targetIDsFor(profile, tier, admittedTargets)
+      .map((id) => targetForID(id, admittedTargets)).filter(Boolean);
     // A local-only REQUEST is refused for the local reason even when the lane it rode is
     // mixed: "no eligible local model ..." is the true sentence there, and it is one of
     // the two wordings that already exist rather than a third.
@@ -1048,7 +1108,7 @@ const acquire = async (state, request, { isAbandoned = () => false } = {}) => {
     // local model that is not loaded at all is not a wait: that is the refusal below.
     const nowMs = Date.now();
     const activeNow = activeCounts(state, admittedTargets, sessionID);
-    const busy = prepared || !(availableModels instanceof Set) ? [] : targetEligibleIDsFor(profile, tier, targets)
+    const busy = prepared || !(availableModels instanceof Set) ? [] : targetEligibleIDsFor(profile, tier, admittedTargets)
       .map((targetID) => admittedTargets[targetID])
       .filter((target) => target?.kind === "local" && availableModels.has(target.modelID) &&
         localContextEligible(targetContext(target, state.inventory?.modelContexts), contextTokens,
@@ -1265,7 +1325,10 @@ const serve = async () => {
         leaseRegistration = typeof body.sessionID === "string" ? { sessionID: body.sessionID, registration } : null;
         let lease;
         try {
-          lease = await acquire(state, body, { isAbandoned: () => abandoned(request, response) });
+          lease = await acquire(state, body, {
+            isAbandoned: () => abandoned(request, response),
+            registration,
+          });
         } finally {
           leaseCaller = null;
           leaseRegistration = null;
@@ -1273,11 +1336,21 @@ const serve = async () => {
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
-        const { policy = null, reasons = [], registration: decisionRegistration = registration } = state.lastDecision ?? {};
+        const {
+          policy = null,
+          reasons = [],
+          blockedGeneration = false,
+          registration: decisionRegistration = registration,
+        } = state.lastDecision ?? {};
         return reply(response, 200, {
           target: publicTarget(lease.target, body.tier, state.inventory?.modelVariants),
           existing: lease.existing,
-          decision: { policy, reasons, registration: decisionRegistration },
+          decision: {
+            policy,
+            reasons,
+            ...(blockedGeneration ? { blockedGeneration: true } : {}),
+            registration: decisionRegistration,
+          },
         });
       }
       if (request.url === "/release") {

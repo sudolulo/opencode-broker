@@ -1647,6 +1647,137 @@ test("model-policy status is read-only and an enabled CAS writes only on change"
   }
 }));
 
+test("policy probation gives one compatible process the candidate while legacy and concurrent clients get the incumbent", async () => withTempHome(async (home) => {
+  writeAuth(home);
+  const configPath = applyConfigPath(home);
+  const generationsRoot = join(home, "state/generations");
+  const currentLinkPath = join(generationsRoot, "current");
+  const baseDirectory = join(home, "state/base");
+  mkdirSync(baseDirectory, { recursive: true, mode: 0o700 });
+  const baseConfigPath = join(baseDirectory, "opencode.json");
+  writeFileSync(baseConfigPath, JSON.stringify({
+    provider: { openai: { models: {
+      "gpt-5.6-sol": { id: "gpt-5.6-sol" },
+      "gpt-6-sol": { id: "gpt-6-sol" },
+    } } },
+  }) + "\n", { mode: 0o600 });
+  const manager = createResolverGenerationManager({
+    root: generationsRoot,
+    currentLinkPath,
+    runResolver: async () => "openai/gpt-5.6-sol\nopenai/gpt-6-sol\n",
+    now: () => 1_800_000_000_000,
+    pid: 78,
+  });
+  const generation = await manager.build({
+    reservedGeneration: 0,
+    bootstrapGeneration0: true,
+    baseConfigPath,
+    overlay: { version: 1, revision: 0, updatedAt: 1_800_000_000_000, entries: {} },
+    authorizingRevisions: [],
+    protectedReferences: [],
+    authorizedRetirements: [],
+  });
+  await manager.publish(generation);
+
+  const broker = await startBroker(home, {
+    OPENCODE_BROKER_CONFIG: configPath,
+    OPENCODE_BROKER_LOCAL_MODELS_URL: "http://127.0.0.1:9/v1/models",
+  }, [...DEFAULT_RESOLVABLE_MODELS, "openai/gpt-6-sol"]);
+  try {
+    const registration = await rawRequest(broker.socketPath, "/resolver-process/register", {
+      body: {
+        generation: generation.generation,
+        manifestHash: generation.manifestHash,
+        modelKeys: generation.manifest.modelKeys,
+      },
+    });
+    assert.equal(registration.status, 200);
+
+    const policy = brokerPolicyRequest({
+      generation: 1,
+      desired: {
+        ...brokerPolicyRequest().desired,
+        probation: { ...brokerPolicyRequest().desired.probation, phase: "probation" },
+      },
+    });
+    assert.equal((await rawRequest(broker.socketPath, "/model-policy/cas", { body: policy })).status, 200);
+
+    const candidateID = "subscription-openai-gpt-6-sol-standard";
+    const published = inventory({
+      openai: { authType: "oauth", connected: true, admission: "admitted", models: 1 },
+    });
+    published.targets = {
+      [candidateID]: {
+        id: candidateID,
+        providerID: "openai",
+        modelID: "gpt-6-sol",
+        kind: "cloud",
+        capacity: null,
+        source: "subscription-oauth",
+        tiers: ["smart"],
+        fit: { smart: 9 },
+        family: "gpt-sol",
+        releaseDate: "2026-09-22",
+        speed: "standard",
+        capabilities: { toolCall: true },
+        context: 400_000,
+        output: 96_000,
+        variants: ["low", "medium"],
+      },
+    };
+    published.modelContexts = { "openai/gpt-6-sol": 400_000 };
+    published.modelOutputs = { "openai/gpt-6-sol": 96_000 };
+    published.modelVariants = { "openai/gpt-6-sol": ["low", "medium"] };
+    published.configFingerprint = createHash("sha256").update(readFileSync(configPath)).digest("hex");
+    await request(broker.socketPath, "/inventory", published);
+
+    const candidate = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "policy-candidate",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+        resolverToken: registration.body.resolverToken,
+      },
+    });
+    assert.equal(candidate.status, 200, JSON.stringify(candidate.body));
+    assert.equal(candidate.body.target.model.id, "gpt-6-sol");
+    assert.equal(candidate.body.target.model.variant, "medium");
+
+    const concurrent = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "policy-concurrent",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+        resolverToken: registration.body.resolverToken,
+      },
+    });
+    assert.equal(concurrent.status, 200, JSON.stringify(concurrent.body));
+    assert.equal(concurrent.body.target.model.id, "gpt-5.6-sol");
+    assert.equal(Object.hasOwn(concurrent.body.decision, "blockedGeneration"), false,
+      "generation holds are recorded only on the lease they exclude");
+
+    const legacy = await rawRequest(broker.socketPath, "/lease", {
+      body: {
+        sessionID: "policy-legacy",
+        profile: "auto",
+        tier: "smart",
+        providers: ["openai"],
+        replace: true,
+      },
+    });
+    assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
+    assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
+    assert.equal(legacy.body.decision.blockedGeneration, true);
+    assert.equal(legacy.body.decision.reasons.includes("blocked-generation"), true);
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
 test("corrupt malformed and unknown model-policy state fail broker startup loudly without replacement", async () => withTempHome(async (home) => {
   const base = {
     version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: {}, health: {},

@@ -853,6 +853,37 @@ test("catalog metadata for an unresolvable model stays out of the inventory", ()
   assert.deepEqual(Object.keys(discovery.modelVariants), ["openai/gpt-5.6-luna"]);
 });
 
+test("policy candidates retain fresh capabilities context output and variants through inventory normalization", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      models: {
+        "gpt-6-sol": {
+          id: "gpt-6-sol",
+          status: "active",
+          tool_call: true,
+          family: "gpt-sol",
+          release_date: "2026-09-22",
+          limit: { context: 400_000, output: 96_000 },
+          reasoning_options: [{ type: "effort", values: ["low", "medium"] }],
+        },
+      },
+    }],
+  }, { openai: "oauth" }, {}, { resolvableModels: ["openai/gpt-6-sol"] });
+  const target = Object.values(discovery.targets)[0];
+  assert.deepEqual(target.capabilities, { toolCall: true });
+  assert.equal(target.context, 400_000);
+  assert.equal(target.output, 96_000);
+  assert.deepEqual(target.variants, ["low", "medium"]);
+
+  const normalized = R.normalizeDiscoveredInventory(discovery);
+  assert.deepEqual(normalized.targets[target.id].capabilities, { toolCall: true });
+  assert.equal(normalized.targets[target.id].context, 400_000);
+  assert.equal(normalized.targets[target.id].output, 96_000);
+  assert.deepEqual(normalized.targets[target.id].variants, ["low", "medium"]);
+});
+
 test("resolvable synthesized static model IDs inherit base catalog variants", () => {
   const discovery = R.discoverSubscriptionTargets({
     connected: ["anthropic"],
