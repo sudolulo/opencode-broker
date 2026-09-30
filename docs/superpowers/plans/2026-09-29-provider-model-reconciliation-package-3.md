@@ -23,7 +23,7 @@
 - Preserve the plugin one-export rule: `plugin/router.js` continues to export exactly one factory function; all helper constants and functions live under `lib/`.
 - Policy replacement must preserve provider weighting, quota balancing, target health/circuits, context/output limits, profile and tier boundaries, local/private network constraints, and unrelated routing. It inherits routing intent only; candidate context, output, variants, and capabilities come from fresh candidate metadata.
 - Every test injects clocks, randomness, filesystem roots, resolver execution, broker calls, gateway calls, process identity, and network-facing functions. Tests must not use the live home directory, live Unix socket, live resolver cache, live gateway, provider network, or deployment config.
-- Release baseline is exactly `1.23.0`, and Task 10 may change only `package.json` to `1.24.0` dated `2026-09-30`. Before Task 1, run `node -e 'const p=require("./package.json"); if (p.version!=="1.23.0") process.exit(1)'`; a nonzero result stops all ten tasks and requires re-planning. This repository does not track `package-lock.json`; do not generate or stage one. Never downgrade or overwrite an intervening release.
+- Release baseline is exactly `1.23.1`, and Task 10 may change only `package.json` to `1.24.0` dated `2026-09-30`. Before Task 1, run `node -e 'const p=require("./package.json"); if (p.version!=="1.23.1") process.exit(1)'`; a nonzero result stops all ten tasks and requires re-planning. This repository does not track `package-lock.json`; do not generate or stage one. Never downgrade or overwrite an intervening release.
 - Begin execution from a clean worktree, never stage unrelated files, and use each task's exact `git add` list. If any listed path has concurrent edits, stop that task and integrate from clean HEAD rather than overwriting it; this is especially strict for gateway files in Task 7.
 - Commit each task independently. Do not push, deploy, restart a service, publish inventory, activate apply mode, or begin Package 4 in this plan.
 
@@ -1432,13 +1432,13 @@ git commit -m "feat: reconcile runtime model transitions"
 **Interfaces:**
 - Produces one temporary-root end-to-end fixture spanning ledger, overlay, generation registry, broker policy, process registration, the real probe helper child, local fake broker/gateway services, probation, promotion, post-active rollback, trusted Anthropic admission, and old-client incumbent behavior.
 - Documents that all Package 3 machinery is dormant/default-off and Package 4 alone enables live mutation/publication/scheduling.
-- Releases exactly `1.24.0` from exact baseline `1.23.0`; any other starting version blocks this task and requires plan revision. Do not create or stage `package-lock.json`.
+- Releases exactly `1.24.0` from exact baseline `1.23.1`; any other starting version blocks this task and requires plan revision. Do not create or stage `package-lock.json`.
 
 - [ ] **Step 1: Verify release baseline and clean execution preconditions**
 
 ```bash
 git --no-pager status --short
-node -e 'const p=require("./package.json"); if (p.version!=="1.23.0") { console.error({package:p.version}); process.exit(1) }'
+node -e 'const p=require("./package.json"); if (p.version!=="1.23.1") { console.error({package:p.version}); process.exit(1) }'
 test ! -e package-lock.json
 ```
 
@@ -1549,9 +1549,9 @@ rg -n '(api[_-]?key|authorization:|bearer |token\s*[:=]\s*["'"'][^"'"']+|console
 
 Expected: inspect every printed line. Credential-shaped text is allowed only as a redacted fixture/assertion proving rejection; remove debug statements and silent test exclusions. Re-run the focused test command after any correction.
 
-- [ ] **Step 9: Bump only 1.23.0 to 1.24.0 and write the dated dormant changelog**
+- [ ] **Step 9: Bump only 1.23.1 to 1.24.0 and write the dated dormant changelog**
 
-Set only the root version in `package.json` to `1.24.0`; do not create `package-lock.json`. Add this release heading and meaning above the preserved `1.23.0` entry:
+Set only the root version in `package.json` to `1.24.0`; do not create `package-lock.json`. Add this release heading and meaning above the preserved `1.23.1` entry:
 
 ```markdown
 ## [1.24.0] — 2026-09-30
@@ -1568,11 +1568,11 @@ Set only the root version in `package.json` to `1.24.0`; do not create `package-
 
 ```bash
 test ! -e package-lock.json
-node -e 'const fs=require("fs"); const p=require("./package.json"); const changelog=fs.readFileSync("./CHANGELOG.md","utf8"); const heading=/^## \[([^\]]+)\] — (\d{4}-\d{2}-\d{2})/m.exec(changelog); if (p.version!=="1.24.0"||!heading||heading[1]!=="1.24.0"||heading[2]!=="2026-09-30"||!changelog.includes("## [1.23.0]")) process.exit(1)'
+node -e 'const fs=require("fs"); const p=require("./package.json"); const changelog=fs.readFileSync("./CHANGELOG.md","utf8"); const heading=/^## \[([^\]]+)\] — (\d{4}-\d{2}-\d{2})/m.exec(changelog); if (p.version!=="1.24.0"||!heading||heading[1]!=="1.24.0"||heading[2]!=="2026-09-30"||!changelog.includes("## [1.23.1]")) process.exit(1)'
 npm test
 ```
 
-Expected: no lockfile exists, `package.json` and the first changelog heading agree exactly on `1.24.0` dated `2026-09-30`, the prior `1.23.0` entry remains, and the suite exits 0 with zero failures.
+Expected: no lockfile exists, `package.json` and the first changelog heading agree exactly on `1.24.0` dated `2026-09-30`, the prior `1.23.1` entry remains, and the suite exits 0 with zero failures.
 
 - [ ] **Step 10: Use the required verification and review skills**
 
@@ -1666,7 +1666,7 @@ Expected: changing the sole threshold seam from five to six makes the integratio
 - **Review Focus 3: PASS.** Task 5 names and implements missing/invalid/forged/cleaned/restart registration fallback.
 - **Review Focus 4: PASS.** Task 9 names and implements every saga crash boundary, stale CAS blocking, fresh child lifecycle, commit-before-ack probe recovery, and no-launch complete recovery.
 - **Review Focus 5: PASS.** Task 8 names and implements old-only pause, abandoned/non-model neutrality, and post-active rollback.
-- **Baseline precondition: PASS.** Planning-time verification established exact `1.23.0`; Task 10 permits only `1.23.0 -> 1.24.0` dated `2026-09-30` and forbids creating or staging `package-lock.json`.
+- **Baseline precondition: PASS.** Planning-time verification established exact `1.23.1`; Task 10 permits only `1.23.1 -> 1.24.0` dated `2026-09-30` and forbids creating or staging `package-lock.json`.
 
 ## Execution recommendation
 
