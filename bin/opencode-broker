@@ -909,7 +909,8 @@ const acquire = async (state, request, {
     const candidateKey = `${opportunityRole.providerID}/${opportunityRole.probationModelID}`;
     const eligibleCandidateRequest = expandedPolicyIDs.some((targetID) => {
       const target = admittedTargets[targetID];
-      return target?.providerID === opportunityRole.providerID &&
+      return policyLane.policyTargetID === targetID && policyLane.targetIDs.includes(targetID) &&
+        target?.providerID === opportunityRole.providerID &&
         target?.modelID === opportunityRole.probationModelID &&
         targetEligibleFor(target, request, state, undefined, admittedTargets, sessionID);
     });

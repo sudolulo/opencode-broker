@@ -1563,7 +1563,7 @@ const publishProbationCandidate = async (socketPath, configPath) => {
   return candidateID;
 };
 
-const startLiveProbationCandidate = async (home) => {
+const startLiveProbationCandidate = async (home, { offerEvery = 1 } = {}) => {
   writeAuth(home);
   const generation = await createProbeGeneration(home);
   const configPath = applyConfigPath(home);
@@ -1586,7 +1586,7 @@ const startLiveProbationCandidate = async (home) => {
         probation: {
           ...brokerPolicyRequest().desired.probation,
           phase: "probation",
-          offerEvery: 1,
+          offerEvery,
         },
       },
     });
@@ -2210,6 +2210,77 @@ test("policy probation gives one compatible process the candidate while legacy a
     assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
     assert.equal(legacy.body.decision.blockedGeneration, true);
     assert.equal(legacy.body.decision.reasons.includes("blocked-generation"), true);
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("off-offer probation requests route the incumbent without accruing or opening an opportunity window", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home, { offerEvery: 5 });
+  try {
+    const releasedCandidate = await rawRequest(broker.socketPath, "/release", {
+      body: { sessionID: "probation-live-candidate" },
+    });
+    assert.equal(releasedCandidate.status, 200, JSON.stringify(releasedCandidate.body));
+
+    const legacy = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      undefined,
+      "probation-off-offer-legacy",
+    );
+    assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
+    assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
+    const before = await probationRole(broker.socketPath);
+    assert.equal(before.probation.opportunityCursor, 1);
+    assert.equal(before.probation.opportunityCursorAt, null);
+
+    const incumbent = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      broker.resolverToken,
+      "probation-off-offer-current",
+    );
+    assert.equal(incumbent.status, 200, JSON.stringify(incumbent.body));
+    assert.equal(incumbent.body.target.model.id, "gpt-5.6-sol");
+    const after = await probationRole(broker.socketPath);
+    assert.equal(after.probation.opportunityCursor, 1,
+      "an off-offer incumbent request must not advance the opportunity cursor");
+    assert.equal(after.probation.opportunityCursorAt, null,
+      "an off-offer incumbent request must not open an opportunity window");
+    assert.equal(after.probation.opportunityMs, before.probation.opportunityMs,
+      "an off-offer incumbent request must not accrue opportunity time");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("an active candidate lease routes another request to the incumbent without accruing or opening an opportunity window", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const legacy = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      undefined,
+      "probation-active-candidate-legacy",
+    );
+    assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
+    assert.equal(legacy.body.target.model.id, "gpt-5.6-sol");
+    const before = await probationRole(broker.socketPath);
+    assert.equal(before.probation.opportunityCursor, 1);
+    assert.equal(before.probation.opportunityCursorAt, null);
+
+    const incumbent = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      broker.resolverToken,
+      "probation-active-candidate-current",
+    );
+    assert.equal(incumbent.status, 200, JSON.stringify(incumbent.body));
+    assert.equal(incumbent.body.target.model.id, "gpt-5.6-sol");
+    const after = await probationRole(broker.socketPath);
+    assert.equal(after.probation.opportunityCursor, 1,
+      "an incumbent request blocked by an active candidate lease must not advance the opportunity cursor");
+    assert.equal(after.probation.opportunityCursorAt, null,
+      "an incumbent request blocked by an active candidate lease must not open an opportunity window");
+    assert.equal(after.probation.opportunityMs, before.probation.opportunityMs,
+      "an incumbent request blocked by an active candidate lease must not accrue opportunity time");
   } finally {
     await stopBroker(broker.child);
   }
