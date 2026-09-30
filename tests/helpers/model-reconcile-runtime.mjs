@@ -30,6 +30,7 @@ import { discoverSubscriptionTargets } from "../../lib/routing.js";
 
 export const ROLE = "openai:gpt-sol";
 export const TRANSITION_ID = "a1b2c3d4e5f60718293a4b5c";
+export const RUNTIME_GATEWAY_KEY = "runtime-gateway-fixture-key";
 
 export const TRUSTED_OPENAI_GPT6 = Object.freeze({
   providerID: "openai",
@@ -55,7 +56,6 @@ const NOW = 1_800_000_000_000;
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const BROKER_SCRIPT = join(REPO_ROOT, "bin/opencode-broker");
 const RECONCILE_SCRIPT = join(REPO_ROOT, "bin/opencode-broker-reconcile");
-const GATEWAY_KEY = "runtime-gateway-fixture-key";
 const MODEL_ROLES = normalizeModelRoles();
 
 const CATALOG = Object.freeze({
@@ -251,7 +251,7 @@ const startGateway = async ({ brokerRequest, recordTrace, effects }) => {
       modelProfiles: { smart: { profile: "auto", tier: "smart" } },
       providers: { openai: { baseUrl: "http://provider.invalid/v1" } },
     },
-    gatewayKey: GATEWAY_KEY,
+    gatewayKey: RUNTIME_GATEWAY_KEY,
     brokerRequest: checkedBrokerRequest,
     fetchImpl: async (_url, options) => {
       effects.externalCalls += 1;
@@ -266,6 +266,7 @@ const startGateway = async ({ brokerRequest, recordTrace, effects }) => {
     },
   });
   const server = createServer((request, response) => {
+    effects.gatewayAuthorizations.push(request.headers.authorization ?? null);
     if (request.headers["x-opencode-probe-session"]) {
       recordTrace({
         source: "gateway",
@@ -303,11 +304,15 @@ export const createModelReconcileRuntime = async ({
   const boundaryTracePath = join(root, "boundary-trace.jsonl");
   const boundarySocketPath = join(root, "boundary-broker.sock");
   const markerBin = join(root, "marker-bin");
+  const runtimeCatalogPath = join(root, "runtime-catalog.json");
+  const runtimePurePath = join(root, "runtime-pure.txt");
+  const gatewayKeyPath = join(root, "runtime-gateway-key");
   const boundaryTrapScript = join(REPO_ROOT, "tests/helpers/runtime-boundary-trap.mjs");
   const baseConfigPath = join(root, "base/opencode.json");
   const effects = {
     resolverRuns: 0,
     externalCalls: 0,
+    gatewayAuthorizations: [],
   };
   let probeChildReaped = false;
   let closed = false;
@@ -325,8 +330,11 @@ export const createModelReconcileRuntime = async ({
   writeFileSync(tracePath, "", { mode: 0o600 });
   writeFileSync(boundaryTracePath, "", { mode: 0o600 });
   mkdirSync(markerBin, { recursive: true, mode: 0o700 });
+  writeFileSync(runtimeCatalogPath, `${JSON.stringify(CATALOG)}\n`, { mode: 0o600 });
+  writeFileSync(runtimePurePath, `${[...baseModels, "openai/gpt-6-sol"].join("\n")}\n`, { mode: 0o600 });
+  writeFileSync(gatewayKeyPath, `${RUNTIME_GATEWAY_KEY}\n`, { mode: 0o600 });
   const markerSource = `#!${process.execPath}
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 appendFileSync(process.env.OPENCODE_BOUNDARY_TRACE, JSON.stringify({
   kind: "invocation",
@@ -334,6 +342,15 @@ appendFileSync(process.env.OPENCODE_BOUNDARY_TRACE, JSON.stringify({
   argv: process.argv.slice(2),
   observerPID: process.pid,
 }) + "\\n");
+if (basename(process.argv[1]) === "opencode" && process.argv[2] === "models") {
+  if (process.argv[3] === "--pure") {
+    process.stdout.write(readFileSync(process.env.OPENCODE_RUNTIME_PURE_MODELS));
+  } else {
+    const directory = process.env.XDG_CACHE_HOME + "/opencode";
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(directory + "/models.json", readFileSync(process.env.OPENCODE_RUNTIME_CATALOG));
+  }
+}
 `;
   for (const name of ["opencode", "publisher-marker"]) {
     const path = join(markerBin, name);
@@ -516,7 +533,7 @@ appendFileSync(process.env.OPENCODE_BOUNDARY_TRACE, JSON.stringify({
     generationManager,
     brokerSocketPath: actualSocketPath,
     gatewayURL: gateway.url,
-    gatewayHeaders: { Authorization: `Bearer ${GATEWAY_KEY}` },
+    gatewayHeaders: { Authorization: `Bearer ${RUNTIME_GATEWAY_KEY}` },
     onTrace: (event) => recordTrace({ source: "child-protocol", kind: "trace", ...event }),
   });
   const realApplier = createReconciliationApplier({
@@ -733,6 +750,45 @@ appendFileSync(process.env.OPENCODE_BOUNDARY_TRACE, JSON.stringify({
       if (result.error) throw result.error;
       return { status: result.status, body: JSON.parse(result.stdout || "{}") };
     },
+    runProductionCLI: (argv) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [RECONCILE_SCRIPT, ...argv], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          HOME: home,
+          OPENCODE_BROKER_CONFIG: configPath,
+          OPENCODE_MODEL_BROKER_SOCKET: actualSocketPath,
+          OPENCODE_RECONCILE_GATEWAY_URL: gateway.url,
+          OPENCODE_BROKER_GATEWAY_KEY_FILE: gatewayKeyPath,
+          OPENCODE_BROKER_LOCAL_MODELS_URL: "http://127.0.0.1:9/v1/models",
+          OPENCODE_RECONCILE_BASE_CONFIG: baseConfigPath,
+          OPENCODE_BOUNDARY_TRACE: boundaryTracePath,
+          OPENCODE_RUNTIME_CATALOG: runtimeCatalogPath,
+          OPENCODE_RUNTIME_PURE_MODELS: runtimePurePath,
+          PATH: `${markerBin}:${process.env.PATH}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.once("error", reject);
+      child.once("close", (status, signal) => {
+        if (signal !== null) {
+          reject(new Error(`production reconciler exited on ${signal}: ${stderr}`));
+          return;
+        }
+        let body = {};
+        try { body = stdout ? JSON.parse(stdout) : {}; } catch {}
+        resolve({ status, body, stdout, stderr, gatewayKeyPath });
+      });
+    }),
+    serializedProbeEvidence: () => JSON.stringify({
+      trace: traceRecords(),
+      boundary: readFileSync(boundaryTracePath, "utf8"),
+    }),
+    gatewayAuthorizations: () => [...effects.gatewayAuthorizations],
     postControl: (path, body) => requestBroker(path, body),
     snapshotBytesAndMtimes: () => Object.fromEntries(prohibitedPaths.map((path) => [path, snapshotPath(path)])),
     effectCounts: () => {

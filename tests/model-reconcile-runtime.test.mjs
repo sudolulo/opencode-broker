@@ -3,12 +3,37 @@ import test from "node:test";
 
 import {
   ROLE,
+  RUNTIME_GATEWAY_KEY,
   TRANSITION_ID,
   TRUSTED_ANTHROPIC_55,
   TRUSTED_OPENAI_GPT6,
   VALID_PROBE_REQUEST,
   createModelReconcileRuntime,
 } from "./helpers/model-reconcile-runtime.mjs";
+
+test("production reconciliation adapter authenticates gateway probes without exposing its key", async (context) => {
+  const runtime = await createModelReconcileRuntime({
+    applyEnabled: true,
+    baseModels: ["openai/gpt-5.6-sol"],
+  });
+  context.after(() => runtime.close());
+
+  await runtime.discover(TRUSTED_OPENAI_GPT6);
+  const result = await runtime.runProductionCLI(["apply", TRANSITION_ID, "--json"]);
+
+  assert.deepEqual(runtime.gatewayAuthorizations(), [
+    `Bearer ${RUNTIME_GATEWAY_KEY}`,
+    `Bearer ${RUNTIME_GATEWAY_KEY}`,
+    `Bearer ${RUNTIME_GATEWAY_KEY}`,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.body.ok, true);
+  assert.equal(runtime.effectCounts().gatewayCalls, 3);
+  for (const visible of [result.stdout, result.stderr, runtime.serializedProbeEvidence()]) {
+    assert.equal(visible.includes(RUNTIME_GATEWAY_KEY), false, "gateway key reached output or trace");
+    assert.equal(visible.includes(`Bearer ${RUNTIME_GATEWAY_KEY}`), false, "authorization reached output or trace");
+  }
+});
 
 test("GPT6 overlay promotes after five successes and rolls back after two post-active failures", async (context) => {
   const runtime = await createModelReconcileRuntime({

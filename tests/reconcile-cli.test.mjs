@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -89,6 +89,7 @@ const build = (name, {
   broken = false,
   liveCache = LIVE_CATALOG,
   config = CONFIG_FIXTURE,
+  applyEnabled = false,
 } = {}) => {
   const base = mkdtempSync(join(tmpdir(), `reconcile-cli-${name}-`));
   const home = join(base, "home");
@@ -115,7 +116,19 @@ const build = (name, {
 
   const configPath = join(configRoot, "opencode-broker/config.json");
   mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, typeof config === "string" ? config : JSON.stringify(config));
+  const effectiveConfig = typeof config === "string" || !applyEnabled ? config : {
+    ...config,
+    reconcile: {
+      ...(config.reconcile ?? {}),
+      apply: {
+        enabled: true,
+        overlayPath: join(stateRoot, "resolver-overlay.json"),
+        generationsRoot: join(stateRoot, "generations"),
+        currentLinkPath: join(stateRoot, "generations/current"),
+      },
+    },
+  };
+  writeFileSync(configPath, typeof effectiveConfig === "string" ? effectiveConfig : JSON.stringify(effectiveConfig));
 
   const catalogPath = join(base, "fake-catalog.json");
   const purePath = join(base, "fake-pure.txt");
@@ -143,7 +156,7 @@ const withFixture = (name, run, options) => {
 // Inherited OPENCODE_* and XDG_* variables are stripped: this suite runs on a host that has a
 // real broker config, a real routing state root and a real models.dev cache, and any one of them
 // leaking in would make the test either pass for the wrong reason or write to live state.
-const runCLI = (fixture, args) => {
+const runCLI = (fixture, args, extraEnv = {}) => {
   const clean = Object.fromEntries(Object.entries(process.env)
     .filter(([name]) => !/^(OPENCODE_|XDG_)/.test(name)));
   return spawnSync(process.execPath, [CLI, ...args], {
@@ -156,6 +169,7 @@ const runCLI = (fixture, args) => {
       XDG_CACHE_HOME: fixture.liveCacheRoot,
       XDG_CONFIG_HOME: fixture.configRoot,
       OPENCODE_BROKER_CONFIG: fixture.configPath,
+      ...extraEnv,
     },
   });
 };
@@ -443,6 +457,47 @@ test("apply commands are present but disabled before source collection and write
       assert.equal(statSync(path).mtimeMs, snapshot.mtime);
     }
   });
+});
+
+test("enabled apply refuses missing, non-regular, loose and empty gateway key files without leaking contents", () => {
+  for (const keyCase of ["missing", "directory", "loose", "empty"]) {
+    withFixture(`gateway-key-${keyCase}`, (fixture) => {
+      const keyPath = join(fixture.base, `gateway-key-${keyCase}`);
+      const sentinel = "reconciler-gateway-secret-must-not-leak";
+      if (keyCase === "directory") mkdirSync(keyPath);
+      if (keyCase === "loose") {
+        writeFileSync(keyPath, `${sentinel}\n`, { mode: 0o644 });
+        chmodSync(keyPath, 0o644);
+      }
+      if (keyCase === "empty") writeFileSync(keyPath, " \n", { mode: 0o600 });
+
+      const result = runCLI(fixture, ["apply", TRANSITION_ID, "--json"], {
+        OPENCODE_BROKER_GATEWAY_KEY_FILE: keyPath,
+      });
+
+      assert.equal(result.status, 1, `${keyCase}: ${result.stderr}`);
+      assert.equal(result.stdout, "");
+      assert.equal(result.stderr.includes(sentinel), false);
+      assert.match(result.stderr, keyCase === "missing"
+        ? /does not exist/
+        : keyCase === "directory"
+          ? /not a regular file/
+          : keyCase === "loose"
+            ? /mode 0644/
+            : /is empty/);
+    }, { applyEnabled: true });
+  }
+});
+
+test("enabled apply uses the gateway key default under XDG_CONFIG_HOME", () => {
+  withFixture("gateway-key-default", (fixture) => {
+    const expectedPath = join(fixture.configRoot, "opencode-broker/gateway-key");
+    const result = runCLI(fixture, ["apply", TRANSITION_ID, "--json"]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, new RegExp(expectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(result.stderr, /does not exist/);
+  }, { applyEnabled: true });
 });
 
 test("malformed apply commands exit 2 before the disabled gate", () => {

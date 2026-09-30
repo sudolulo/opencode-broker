@@ -28,7 +28,7 @@
 // explicitly enabled; Package 4 owns that cutover. Even when enabled, this binary publishes no
 // inventory directly: the applier moves only the overlay/generation/policy saga described in STATE.
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { CONFIG, CONFIG_ERROR } from "../lib/config.js";
 import {
@@ -54,6 +54,7 @@ import {
 } from "../lib/reconcile-gitea.js";
 import { deliverNotifications, pendingNotifications } from "../lib/reconcile-notify.js";
 import { createReconciliationStore } from "../lib/reconcile-state.js";
+import { DEFAULT_GATEWAY_CONFIG, readGatewayKeyFile } from "../gateway/lib/gateway.js";
 
 const USAGE = [
   "usage: opencode-broker-reconcile <command>",
@@ -366,12 +367,18 @@ const createApplyRuntime = (store) => {
   const baseConfigPath = process.env.OPENCODE_RECONCILE_BASE_CONFIG
     || join(configHome, "opencode/opencode.json");
   const collectSources = () => collectApplyReconciliationSources({ baseConfigPath });
+  // Read only when an enabled apply command constructs its runtime. The value stays in this
+  // process until createProbeClientFactory writes its bootstrap frame to the probe child's stdin;
+  // that factory deliberately keeps bootstrap data out of argv, traces and error diagnostics.
+  const gatewayKeyPath = process.env.OPENCODE_BROKER_GATEWAY_KEY_FILE
+    || join(dirname(DEFAULT_GATEWAY_CONFIG), "gateway-key");
+  const gatewayKey = readGatewayKeyFile(gatewayKeyPath);
   const probeClientFactory = createProbeClientFactory({
     generationManager,
     brokerSocketPath: brokerSocketPath(),
     gatewayURL: process.env.OPENCODE_RECONCILE_GATEWAY_URL
       || "http://127.0.0.1:8790/v1/chat/completions",
-    gatewayHeaders: {},
+    gatewayHeaders: { Authorization: `Bearer ${gatewayKey}` },
   });
   return createReconciliationApplier({
     store,

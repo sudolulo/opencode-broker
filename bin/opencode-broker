@@ -3,7 +3,20 @@
 // credentials, or provider traffic. It only assigns model leases and health state.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -111,7 +124,8 @@ const queueStats = { depth: 0, abandoned: 0, slowWaits: 0, deadlineHits: 0, last
 const localProviderIDs = (targets) => new Set(Object.values(targets)
   .filter((target) => target?.kind === "local").map((target) => target.providerID));
 
-const STATE_PATH = join(routingStateDir(), "broker.json");
+const STATE_ROOT = routingStateDir();
+const STATE_PATH = join(STATE_ROOT, "broker.json");
 // Every routing decision -- grants, revalidations, stickiness, REFUSALS and
 // reported failures -- lands here as one JSON line, so "why did this session get
 // that model" is always answerable after the fact. Bounded by truncation: this
@@ -325,9 +339,67 @@ const writeState = (state) => {
   // relative to what the process actually knows.
   const planUsage = planUsageSnapshot();
   if (Object.keys(planUsage).length) state.planUsage = planUsage;
-  const temporary = `${STATE_PATH}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temporary, JSON.stringify(state) + "\n", { mode: 0o600 });
-  renameSync(temporary, STATE_PATH);
+  const temporary = `${STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor;
+  let committed = false;
+  try {
+    // Build the replacement privately. "wx" refuses a collision rather than truncating another
+    // writer's temp; fchmod enforces the exact mode despite the caller's umask.
+    descriptor = openSync(temporary, "wx", 0o600);
+    writeFileSync(descriptor, JSON.stringify(state) + "\n");
+    fchmodSync(descriptor, 0o600);
+    // The complete bytes must reach stable storage before their name can replace the live state.
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, STATE_PATH);
+    committed = true;
+  } catch (error) {
+    // Before rename, the old broker.json is still authoritative. Remove only this writer's temp
+    // and report the original write failure; cleanup trouble is an additional warning, never a
+    // reason to hide which durability step failed.
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); }
+      catch (closeError) {
+        try {
+          console.error(`[opencode-broker] unable to close failed broker state temp ${temporary}: ${closeError?.message ?? closeError}`);
+        } catch {}
+      }
+    }
+    try { unlinkSync(temporary); }
+    catch (cleanupError) {
+      if (cleanupError?.code !== "ENOENT") {
+        try {
+          console.error(`[opencode-broker] unable to remove failed broker state temp ${temporary}: ${cleanupError?.message ?? cleanupError}`);
+        } catch {}
+      }
+    }
+    throw error;
+  }
+
+  // Rename is the commit boundary. A parent-directory fsync failure means the new state is visible
+  // but may not survive a crash; warning is accurate, while throwing would falsely tell the caller
+  // that an already committed mutation failed and invite it to repeat the operation.
+  if (committed) {
+    let directoryDescriptor;
+    try {
+      directoryDescriptor = openSync(STATE_ROOT, "r");
+      fsyncSync(directoryDescriptor);
+    } catch (error) {
+      try {
+        console.error(`[opencode-broker] broker state ${STATE_PATH} was committed but its directory entry could not be made durable: ${error?.message ?? error}`);
+      } catch {}
+    } finally {
+      if (directoryDescriptor !== undefined) {
+        try { closeSync(directoryDescriptor); }
+        catch (error) {
+          try {
+            console.error(`[opencode-broker] broker state ${STATE_PATH} was committed but its directory descriptor could not be closed: ${error?.message ?? error}`);
+          } catch {}
+        }
+      }
+    }
+  }
 };
 
 const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(sessionID);

@@ -15,6 +15,23 @@ All notable changes to this project are documented here. The format is based on
   publication, mutation, and scheduling controls remain default-OFF; Package 4 alone activates them
   after deployment cutover gates.
 
+### Security
+
+- **Reconciliation probes authenticate to the gateway without publishing its key.** Enabled apply
+  commands read the same private `OPENCODE_BROKER_GATEWAY_KEY_FILE` contract as the gateway (default
+  `~/.config/opencode-broker/gateway-key`) and pass the in-memory bearer header only in the probe
+  child's stdin bootstrap, never argv, output, state, or protocol traces.
+
+### Fixed
+
+- **Broker state replacement is crash-durable.** Every `broker.json` update now fully writes and
+  fsyncs an exact-mode-0600 sibling temp before rename, then fsyncs the parent directory. A failure
+  before rename removes the temp and preserves the live file; a directory-sync failure after rename
+  reports the already committed state as a warning rather than inviting a duplicate mutation.
+- **The production reconciler uses GET for broker model-policy status.** The full production adapter
+  test exposed that the shared socket client hardcoded POST even for the broker's read-only status
+  endpoint, preventing an enabled apply from reaching its probes.
+
 ## [1.23.1] — 2026-09-30
 
 ### Fixed
