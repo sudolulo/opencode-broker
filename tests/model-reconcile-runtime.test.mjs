@@ -20,7 +20,32 @@ test("GPT6 overlay promotes after five successes and rolls back after two post-a
 
   await runtime.discover(TRUSTED_OPENAI_GPT6);
   await runtime.applier.apply({ transitionID: runtime.transitionID(ROLE) });
-  assert.equal(runtime.probeBrokerSocketPath(), runtime.actualBrokerSocketPath());
+  const childPID = runtime.probeChildPID();
+  const childTrace = runtime.probeProtocolTrace();
+  assert.equal(Number.isInteger(childPID) && childPID > 0, true);
+  assert.equal(childTrace.every((event) => event.pid === childPID), true);
+  assert.deepEqual(childTrace.filter((event) => event.event === "broker-registration")
+    .map(({ requestID, path }) => ({ requestID, path })), [
+    { requestID: "bootstrap", path: "/resolver-process/register" },
+  ]);
+  assert.equal(childTrace.find((event) => event.event === "broker-registration").generation,
+    runtime.currentGeneration());
+  const persistedRequestIDs = runtime.persistedProbeRequestIDs();
+  assert.deepEqual(childTrace.filter((event) => event.event === "broker-probe")
+    .map((event) => event.requestID).sort(), persistedRequestIDs);
+  for (const requestID of persistedRequestIDs) {
+    const requestTrace = childTrace.filter((event) => event.requestID === requestID);
+    assert.deepEqual(requestTrace.map((event) => event.event), [
+      "broker-probe", "gateway-request", "gateway-release-complete",
+    ]);
+    assert.equal(new Set(requestTrace.map((event) => event.assignmentHash)).size, 1);
+  }
+  assert.equal(childTrace.filter((event) => event.socketPath !== null)
+    .every((event) => event.socketPath === runtime.actualBrokerSocketPath()), true);
+  assert.equal(runtime.parentForwardingCalls(), 0);
+  assert.deepEqual(runtime.gatewayReleaseAssignmentHashes().sort(), childTrace
+    .filter((event) => event.event === "gateway-release-complete")
+    .map((event) => event.assignmentHash).sort());
   assert.equal(runtime.actualBrokerSocketMode(), 0o600);
   assert.equal(runtime.overlay().entries["openai/gpt-6-sol"].model.cost.input, 0);
   assert.equal(runtime.currentManifest().modelKeys.includes("openai/gpt-6-sol"), true);
@@ -33,18 +58,24 @@ test("GPT6 overlay promotes after five successes and rolls back after two post-a
     "reap",
   ]);
   assert.equal(runtime.probeGeneration(), runtime.currentGeneration());
-  assert.equal(runtime.parentProbeNetworkCalls(), 0);
   assert.equal(runtime.probeChildReaped(), true);
   const activeEffects = runtime.effectCounts();
   assert.equal(activeEffects.brokerMutations > 0, true);
-  assert.deepEqual({ ...activeEffects, brokerMutations: "observed" }, {
+  assert.equal(activeEffects.policyWrites > 0, true);
+  assert.deepEqual({ ...activeEffects, brokerMutations: "observed", policyWrites: "observed" }, {
     launchNonces: 1,
     assignments: 3,
     leases: 3,
     safeRegistrations: 1,
     resolverRuns: 2,
     brokerMutations: "observed",
+    policyWrites: "observed",
     externalCalls: 3,
+    gatewayCalls: 3,
+    sourceRuns: 0,
+    publisherCalls: 0,
+    boundaryRequests: 0,
+    boundaryConnections: 0,
   });
 
   const oldClient = await runtime.registerGeneration(0);
@@ -79,7 +110,13 @@ test("trusted Anthropic api is admitted while default-off runtime mutates nothin
     safeRegistrations: 0,
     resolverRuns: 0,
     brokerMutations: 0,
+    policyWrites: 0,
     externalCalls: 0,
+    gatewayCalls: 0,
+    sourceRuns: 0,
+    publisherCalls: 0,
+    boundaryRequests: 0,
+    boundaryConnections: 0,
   };
   const rollbackCAS = {
     transitionID: `${TRANSITION_ID}:rollback`,

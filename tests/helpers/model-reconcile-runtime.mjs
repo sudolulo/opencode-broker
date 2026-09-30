@@ -270,7 +270,9 @@ const startGateway = async ({ brokerRequest, recordTrace, effects }) => {
       recordTrace({
         source: "gateway",
         event: "ordinary-gateway",
-        childOwned: Boolean(request.headers["x-opencode-probe-pid"]),
+        assignmentHash: createHash("sha256")
+          .update(String(request.headers["x-opencode-probe-session"]))
+          .digest("hex"),
       });
     }
     void handler(request, response);
@@ -298,7 +300,10 @@ export const createModelReconcileRuntime = async ({
   const currentLinkPath = join(generationsRoot, "current");
   const actualSocketPath = join(stateRoot, "broker.sock");
   const tracePath = join(root, "probe-trace.jsonl");
-  const childTraceModulePath = join(root, "child-trace.mjs");
+  const boundaryTracePath = join(root, "boundary-trace.jsonl");
+  const boundarySocketPath = join(root, "boundary-broker.sock");
+  const markerBin = join(root, "marker-bin");
+  const boundaryTrapScript = join(REPO_ROOT, "tests/helpers/runtime-boundary-trap.mjs");
   const baseConfigPath = join(root, "base/opencode.json");
   const effects = {
     resolverRuns: 0,
@@ -309,58 +314,51 @@ export const createModelReconcileRuntime = async ({
   let broker = null;
   let gateway = null;
   let probeChild = null;
+  let probeChildPID = null;
+  let boundaryTrap = null;
+  let boundaryTrapPort = null;
   const pendingFailures = new Map();
   let leaseSequence = 0;
 
   mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
   chmodSync(stateRoot, 0o700);
   writeFileSync(tracePath, "", { mode: 0o600 });
-  writeFileSync(childTraceModulePath, `
+  writeFileSync(boundaryTracePath, "", { mode: 0o600 });
+  mkdirSync(markerBin, { recursive: true, mode: 0o700 });
+  const markerSource = `#!${process.execPath}
 import { appendFileSync } from "node:fs";
-import { createRequire, syncBuiltinESMExports } from "node:module";
-
-const require = createRequire(import.meta.url);
-const http = require("node:http");
-const originalRequest = http.request;
-const tracePath = process.env.OPENCODE_BROKER_TEST_TRACE;
-
-http.request = function tracedRequest(...args) {
-  const options = args[0] instanceof URL ? {} : args[0] ?? {};
-  const requestPath = options.path;
-  let requestBody = "";
-  const callbackIndex = args.findIndex((value, index) => index > 0 && typeof value === "function");
-  if (callbackIndex !== -1) {
-    const callback = args[callbackIndex];
-    args[callbackIndex] = function tracedResponse(response) {
-      let generation = null;
-      if (requestPath === "/resolver-process/register" && requestBody) {
-        try {
-          generation = JSON.parse(requestBody).generation ?? null;
-        } catch (error) {
-          generation = { parseError: String(error?.message ?? error) };
-        }
-      }
-      appendFileSync(tracePath, JSON.stringify({
-        source: "child",
-        kind: "broker-response",
-        path: requestPath,
-        status: response.statusCode ?? 500,
-        socketPath: options.socketPath ?? null,
-        generation,
-      }) + "\\n");
-      return callback(response);
-    };
+import { basename } from "node:path";
+appendFileSync(process.env.OPENCODE_BOUNDARY_TRACE, JSON.stringify({
+  kind: "invocation",
+  command: basename(process.argv[1]),
+  argv: process.argv.slice(2),
+  observerPID: process.pid,
+}) + "\\n");
+`;
+  for (const name of ["opencode", "publisher-marker"]) {
+    const path = join(markerBin, name);
+    writeFileSync(path, markerSource, { mode: 0o700 });
+    chmodSync(path, 0o700);
   }
-  const request = originalRequest.apply(this, args);
-  const originalEnd = request.end;
-  request.end = function tracedEnd(chunk, ...rest) {
-    if (chunk !== undefined && chunk !== null) requestBody += Buffer.from(chunk).toString("utf8");
-    return originalEnd.call(this, chunk, ...rest);
-  };
-  return request;
-};
-syncBuiltinESMExports();
-`, { mode: 0o600 });
+  boundaryTrap = spawn(process.execPath, [boundaryTrapScript, boundaryTracePath, boundarySocketPath], {
+    cwd: REPO_ROOT,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let trapStderr = "";
+  boundaryTrap.stderr.on("data", (chunk) => { trapStderr += String(chunk); });
+  boundaryTrapPort = await new Promise((resolve, reject) => {
+    let stdout = "";
+    boundaryTrap.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      const newline = stdout.indexOf("\n");
+      if (newline === -1) return;
+      resolve(JSON.parse(stdout.slice(0, newline)).port);
+    });
+    boundaryTrap.once("error", reject);
+    boundaryTrap.once("exit", (code, signal) => reject(new Error(
+      `runtime boundary trap exited before listen (${code ?? signal}): ${trapStderr}`,
+    )));
+  });
   writeJSON(authPath, {
     openai: { type: "oauth", access: "runtime-openai-fixture-access" },
     anthropic: { type: "api", key: "runtime-anthropic-fixture-key" },
@@ -380,6 +378,14 @@ syncBuiltinESMExports();
     burnWatch: { enabled: false },
     slotWatch: { enabled: false },
     reconcile: {
+      gitea: {
+        enabled: true,
+        baseURL: `http://127.0.0.1:${boundaryTrapPort}/gitea`,
+        owner: "runtime",
+        repo: "boundary-trap",
+        tokenPath: join(root, "publisher-token"),
+      },
+      notifyCommand: [join(markerBin, "publisher-marker")],
       apply: applyEnabled ? {
         enabled: true,
         overlayPath,
@@ -389,6 +395,7 @@ syncBuiltinESMExports();
     },
   };
   writeJSON(configPath, config);
+  writeFileSync(join(root, "publisher-token"), "fixture-only\n", { mode: 0o600 });
   writeJSON(join(stateRoot, "resolvable-models.json"), {
     updatedAt: Date.now(),
     models: ["openai/gpt-5.6-sol", "openai/gpt-6-sol", "anthropic/claude-opus-5-5"],
@@ -454,6 +461,9 @@ syncBuiltinESMExports();
       path,
       status: result.status,
       policyChanged: policyIdentity() !== beforePolicy,
+      assignmentHash: typeof body?.sessionID === "string"
+        ? createHash("sha256").update(body.sessionID).digest("hex")
+        : null,
     });
     return result;
   };
@@ -495,12 +505,8 @@ syncBuiltinESMExports();
       if (!realProbeHelper) throw new Error("runtime requires the real probe helper");
       probeChild = spawn(request.command, request.args, {
         ...request.options,
-        env: {
-          ...process.env,
-          OPENCODE_BROKER_TEST_TRACE: tracePath,
-          NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${childTraceModulePath}`].filter(Boolean).join(" "),
-        },
       });
+      probeChildPID = probeChild.pid;
       probeChild.once("exit", () => {
         probeChildReaped = true;
         recordTrace({ source: "parent", event: "reap" });
@@ -511,6 +517,7 @@ syncBuiltinESMExports();
     brokerSocketPath: actualSocketPath,
     gatewayURL: gateway.url,
     gatewayHeaders: { Authorization: `Bearer ${GATEWAY_KEY}` },
+    onTrace: (event) => recordTrace({ source: "child-protocol", kind: "trace", ...event }),
   });
   const realApplier = createReconciliationApplier({
     store,
@@ -645,6 +652,7 @@ syncBuiltinESMExports();
     ]);
     if (probeChild && probeChild.exitCode === null && probeChild.signalCode === null) probeChild.kill("SIGKILL");
     await stopChild(broker?.child);
+    await stopChild(boundaryTrap);
     rmSync(root, { recursive: true, force: true });
   };
 
@@ -660,31 +668,38 @@ syncBuiltinESMExports();
     currentManifest: () => generationManager.current().manifest,
     currentGeneration: () => generationManager.current().generation,
     probeGeneration: () => traceRecords().find((record) =>
-      record.source === "child" && record.path === "/resolver-process/register" && record.status === 200)?.generation ?? null,
+      record.source === "child-protocol" && record.event === "broker-registration")?.generation ?? null,
     probeTrace: () => traceRecords().flatMap((record) => {
       if (record.source === "parent" && record.path === "/model-policy/probe-launch" && record.status === 200) {
         return ["probe-launch"];
       }
-      if (record.source === "child" && record.path === "/resolver-process/register" && record.status === 200) {
+      if (record.source === "child-protocol" && record.event === "broker-registration") {
         return ["child-register"];
       }
-      if (record.source === "child" && record.path === "/model-policy/probe" && record.status === 200) {
+      if (record.source === "child-protocol" && record.event === "broker-probe") {
         return ["child-model-policy-probe"];
       }
       if (record.event === "ordinary-gateway") return ["ordinary-gateway"];
-      if (record.source === "parent" && record.path === "/probe/release" && record.status === 200) {
+      if (record.source === "child-protocol" && record.event === "gateway-release-complete") {
         return ["release"];
       }
       if (record.event === "reap") return ["reap"];
       return [];
     }),
-    parentProbeNetworkCalls: () => traceRecords().filter((record) =>
-      record.event === "ordinary-gateway" && !record.childOwned).length,
     probeChildReaped: () => probeChildReaped,
+    probeChildPID: () => probeChildPID,
+    probeProtocolTrace: () => traceRecords().filter((record) => record.source === "child-protocol")
+      .map(({ source: _source, kind: _kind, ...record }) => record),
+    parentForwardingCalls: () => traceRecords().filter((record) =>
+      record.source === "parent"
+      && ["/resolver-process/register", "/model-policy/probe"].includes(record.path)).length,
+    gatewayReleaseAssignmentHashes: () => traceRecords().filter((record) =>
+      record.source === "parent" && record.path === "/probe/release" && record.status === 200)
+      .map((record) => record.assignmentHash),
+    persistedProbeRequestIDs: () => Object.values(store.read().roles[ROLE]?.probeResults ?? {})
+      .map((result) => result.requestID).sort(),
     actualBrokerSocketPath: () => actualSocketPath,
     actualBrokerSocketMode: () => lstatSync(actualSocketPath).mode & 0o777,
-    probeBrokerSocketPath: () => traceRecords().find((record) =>
-      record.source === "child" && record.path === "/resolver-process/register")?.socketPath ?? null,
     registerGeneration,
     registerCurrentGeneration,
     lease,
@@ -705,7 +720,13 @@ syncBuiltinESMExports();
           ...process.env,
           HOME: home,
           OPENCODE_BROKER_CONFIG: configPath,
-          OPENCODE_MODEL_BROKER_SOCKET: actualSocketPath,
+          OPENCODE_MODEL_BROKER_SOCKET: boundarySocketPath,
+          OPENCODE_RECONCILE_GATEWAY_URL:
+            `http://127.0.0.1:${boundaryTrapPort}/gateway/v1/chat/completions`,
+          OPENCODE_BROKER_LOCAL_MODELS_URL: `http://127.0.0.1:${boundaryTrapPort}/source/v1/models`,
+          OPENCODE_RECONCILE_BASE_CONFIG: baseConfigPath,
+          OPENCODE_BOUNDARY_TRACE: boundaryTracePath,
+          PATH: `${markerBin}:${process.env.PATH}`,
         },
         encoding: "utf8",
       });
@@ -715,16 +736,49 @@ syncBuiltinESMExports();
     postControl: (path, body) => requestBroker(path, body),
     snapshotBytesAndMtimes: () => Object.fromEntries(prohibitedPaths.map((path) => [path, snapshotPath(path)])),
     effectCounts: () => {
+      const boundary = readFileSync(boundaryTracePath, "utf8").split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+      if (!applyEnabled) {
+        const requests = boundary.filter((record) => record.kind === "request");
+        const invocations = boundary.filter((record) => record.kind === "invocation");
+        return {
+          launchNonces: requests.filter((record) => record.path === "/model-policy/probe-launch").length,
+          assignments: requests.filter((record) => record.path === "/model-policy/probe").length,
+          leases: requests.filter((record) => record.path === "/lease").length,
+          safeRegistrations: requests.filter((record) => record.path === "/resolver-process/register").length,
+          resolverRuns: invocations.filter((record) =>
+            record.command === "opencode" && record.argv.join(" ") === "models --pure").length,
+          brokerMutations: requests.filter((record) => record.path === "/model-policy/cas").length,
+          policyWrites: requests.filter((record) => record.path === "/model-policy/cas").length,
+          externalCalls: requests.filter((record) => record.transport === "external").length,
+          gatewayCalls: requests.filter((record) => record.path?.startsWith("/gateway/")).length,
+          sourceRuns: invocations.filter((record) =>
+            record.command === "opencode" && record.argv.join(" ") === "models").length,
+          publisherCalls: requests.filter((record) => record.path?.startsWith("/gitea/"))
+            .length + invocations.filter((record) => record.command === "publisher-marker").length,
+          boundaryRequests: requests.length + invocations.length,
+          boundaryConnections: boundary.filter((record) => record.kind === "connection").length,
+        };
+      }
       const successful = traceRecords().filter((record) =>
         record.kind === "broker-response" && record.status >= 200 && record.status < 300);
+      const child = traceRecords().filter((record) => record.source === "child-protocol");
       return {
         launchNonces: successful.filter((record) => record.path === "/model-policy/probe-launch").length,
-        assignments: successful.filter((record) => record.path === "/model-policy/probe").length,
+        assignments: child.filter((record) => record.event === "broker-probe").length,
         leases: successful.filter((record) => record.path === "/lease").length,
-        safeRegistrations: successful.filter((record) => record.path === "/resolver-process/register").length,
+        safeRegistrations: child.filter((record) => record.event === "broker-registration").length,
         resolverRuns: effects.resolverRuns,
         brokerMutations: successful.filter((record) => record.policyChanged === true).length,
+        policyWrites: successful.filter((record) => record.path === "/model-policy/cas").length,
         externalCalls: effects.externalCalls,
+        gatewayCalls: traceRecords().filter((record) => record.event === "ordinary-gateway").length,
+        sourceRuns: 0,
+        publisherCalls: 0,
+        boundaryRequests: boundary.filter((record) =>
+          record.kind === "request" || record.kind === "invocation").length,
+        boundaryConnections: boundary.filter((record) => record.kind === "connection").length,
       };
     },
   };

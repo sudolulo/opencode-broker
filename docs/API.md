@@ -93,6 +93,17 @@ stderr diagnostics are bounded to 16 KiB and redacted by the parent. Shutdown is
 bounded and reaped: request shutdown, wait two seconds, `SIGTERM`, wait two
 seconds, then `SIGKILL` and await exit. `close()` is asynchronous and idempotent.
 
+The same bounded child-owned protocol carries observability frames for
+successful registration, assignment, gateway dispatch, and gateway release
+completion. The factory verifies each frame's PID against the actual spawned
+`ChildProcess.pid`, verifies fixed endpoint names and the configured broker socket,
+and forwards it only through the optional `onTrace` observer. A trace contains
+only event name, PID, request ID, endpoint path, broker socket path where
+applicable, and a SHA-256
+assignment correlation hash; registration also names its numeric generation. It
+never contains a token, nonce, authorization header, request or response body,
+session ID, model identity, or provider content.
+
 The helper requests one assignment per semantic probe, then calls the ordinary
 authenticated gateway endpoint with the ordinary model plus
 `x-opencode-probe-session` and `x-opencode-probe-nonce`. The gateway accepts these

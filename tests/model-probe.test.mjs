@@ -630,9 +630,11 @@ test("real fresh child owns registration broker probe and ordinary gateway reque
   let child = null;
   let childStdout = "";
   let childStderr = "";
+  const childTrace = [];
+  let results = [];
   const broker = createServer(async (request, response) => {
     const body = await readRequestBody(request);
-    brokerCalls.push({ path: request.url, body, pid: request.headers["x-opencode-probe-pid"] });
+    brokerCalls.push({ path: request.url, body });
     response.setHeader("content-type", "application/json");
     if (request.url === "/resolver-process/register") {
       assert.equal(body.probeLaunchNonce, sentinel.launchNonce);
@@ -663,7 +665,6 @@ test("real fresh child owns registration broker probe and ordinary gateway reque
       authorization: request.headers.authorization,
       sessionID: request.headers["x-opencode-probe-session"],
       nonce: request.headers["x-opencode-probe-nonce"],
-      pid: request.headers["x-opencode-probe-pid"],
     });
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify(body.tools ? {
@@ -688,6 +689,7 @@ test("real fresh child owns registration broker probe and ordinary gateway reque
       brokerSocketPath,
       gatewayURL: `http://127.0.0.1:${gateway.address().port}/v1/chat/completions`,
       gatewayHeaders: { Authorization: sentinel.gatewayAuthorization },
+      onTrace: (event) => childTrace.push(event),
       now: () => NOW,
     });
     const client = await factory.open({
@@ -704,7 +706,7 @@ test("real fresh child owns registration broker probe and ordinary gateway reque
       probeLaunchNonce: sentinel.launchNonce,
     });
     try {
-      const results = await runModelCompatibilityProbes({
+      results = await runModelCompatibilityProbes({
         probeClient: client,
         rolePolicy: ROLE_POLICY,
         ordinaryModel: "smart",
@@ -718,18 +720,58 @@ test("real fresh child owns registration broker probe and ordinary gateway reque
     assert.equal(child.exitCode, 0);
     assert.equal(brokerCalls[0].path, "/resolver-process/register");
     assert.equal(brokerCalls.slice(1).every((call) => call.path === "/model-policy/probe"), true);
-    assert.equal(brokerCalls.every((call) => call.pid === String(child.pid)), true);
     assert.equal(gatewayCalls.length, 3);
     assert.equal(gatewayCalls.every((call) => call.authorization === sentinel.gatewayAuthorization), true);
-    assert.equal(gatewayCalls.every((call) => call.pid === String(child.pid)), true);
     assert.equal(gatewayCalls.every((call) => call.body.model === "smart"), true);
     assert.equal(gatewayCalls.every((call) => call.nonce === sentinel.probeNonce), true);
+    assert.equal(childTrace.every((event) => event.pid === child.pid), true);
+    assert.equal(childTrace[0].generation, generation.generation);
+    assert.equal(childTrace.slice(1).every((event) => event.generation === null), true);
+    assert.deepEqual(childTrace.map(({ event, requestID, path, socketPath }) => ({
+      event,
+      requestID,
+      path,
+      socketPath,
+    })), [
+      {
+        event: "broker-registration",
+        requestID: "bootstrap",
+        path: "/resolver-process/register",
+        socketPath: brokerSocketPath,
+      },
+      ...results.flatMap(({ requestID }) => [
+        {
+          event: "broker-probe",
+          requestID,
+          path: "/model-policy/probe",
+          socketPath: brokerSocketPath,
+        },
+        {
+          event: "gateway-request",
+          requestID,
+          path: "/v1/chat/completions",
+          socketPath: null,
+        },
+        {
+          event: "gateway-release-complete",
+          requestID,
+          path: "/probe/release",
+          socketPath: null,
+        },
+      ]),
+    ]);
+    assert.equal(childTrace.filter((event) => event.event === "broker-probe")
+      .every((event) => typeof event.assignmentHash === "string" && event.assignmentHash.length === 64), true);
+    assert.equal(childTrace.filter((event) => event.requestID !== "bootstrap")
+      .every((event) => event.assignmentHash === childTrace.find((candidate) =>
+        candidate.requestID === event.requestID)?.assignmentHash), true);
     assert.equal(JSON.stringify(spawnRequests).includes(sentinel.gatewayAuthorization), false);
     assert.equal(JSON.stringify(spawnRequests).includes(sentinel.launchNonce), false);
     assert.equal(JSON.stringify(spawnRequests).includes(CANDIDATE_IDENTITY.modelID), false);
     for (const secret of Object.values(sentinel).concat(CANDIDATE_IDENTITY.modelID)) {
       assert.equal(childStdout.includes(secret), false);
       assert.equal(childStderr.includes(secret), false);
+      assert.equal(JSON.stringify(childTrace).includes(secret), false);
     }
     for (const line of childStdout.trim().split("\n")) {
       const frame = JSON.parse(line);

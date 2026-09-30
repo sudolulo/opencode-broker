@@ -136,6 +136,28 @@ const writeFrame = (frame) => new Promise((resolveWrite, rejectWrite) => {
   process.stdout.write(bytes, (error) => error ? rejectWrite(error) : resolveWrite());
 });
 
+// A bounded, non-secret observability stream rides the existing child-owned protocol. It carries
+// only process/correlation identity and fixed endpoint names: never request bodies, headers,
+// nonces, resolver tokens, gateway authorization, responses, or model identity.
+const writeTrace = ({
+  event,
+  requestID,
+  path,
+  socketPath = null,
+  assignmentHash = null,
+  generation = null,
+}) => writeFrame({
+  version: PROBE_PROTOCOL_VERSION,
+  type: "trace",
+  event,
+  pid: process.pid,
+  requestID,
+  path,
+  socketPath,
+  assignmentHash,
+  generation,
+});
+
 const brokerRequest = (bootstrap, path, body, { resolverToken } = {}) => new Promise((resolveRequest, rejectRequest) => {
   const payload = Buffer.from(JSON.stringify(body));
   const request = httpRequest({
@@ -231,6 +253,13 @@ const handleBootstrap = async (frame) => {
     throw new Error("broker returned an invalid fresh probe registration");
   }
   resolverToken = registration.resolverToken;
+  await writeTrace({
+    event: "broker-registration",
+    requestID: "bootstrap",
+    path: "/resolver-process/register",
+    socketPath: bootstrap.brokerSocketPath,
+    generation: bootstrap.generationAck.generation,
+  });
   await writeFrame({ version: PROBE_PROTOCOL_VERSION, type: "ready" });
 };
 
@@ -263,8 +292,22 @@ const handleProbe = async (frame) => {
     throw new Error("broker returned an invalid probe assignment");
   }
   outstanding.set(frame.requestID, assignment);
+  const assignmentHash = bytesHash(assignment.sessionID);
+  await writeTrace({
+    event: "broker-probe",
+    requestID: frame.requestID,
+    path: "/model-policy/probe",
+    socketPath: bootstrap.brokerSocketPath,
+    assignmentHash,
+  });
   let response;
   try {
+    await writeTrace({
+      event: "gateway-request",
+      requestID: frame.requestID,
+      path: new URL(bootstrap.gatewayURL).pathname,
+      assignmentHash,
+    });
     const gatewayResponse = await fetch(bootstrap.gatewayURL, {
       method: "POST",
       headers: {
@@ -278,6 +321,15 @@ const handleProbe = async (frame) => {
       signal: AbortSignal.timeout(25_000),
     });
     const body = await boundedGatewayBody(gatewayResponse);
+    // The production gateway does not finish this response until its finally block has awaited
+    // /probe/release. This event therefore proves what this child observed without exposing the
+    // assignment, nonce, authentication, request body, or response body.
+    await writeTrace({
+      event: "gateway-release-complete",
+      requestID: frame.requestID,
+      path: "/probe/release",
+      assignmentHash,
+    });
     response = normalizeGatewayResponse(frame.request.kind, gatewayResponse.status, body);
   } catch {
     await brokerRequest(bootstrap, "/probe/release", {
