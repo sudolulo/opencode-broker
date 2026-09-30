@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format is based on
 
 - **Duplicate failure reports are idempotent.** Once a session failure consumes its lease, repeated
   router/guard reports return the original result instead of extending or changing the circuit.
+- **Synthesized model modes inherit catalog reasoning capability.** Resolver-visible `-fast` and
+  `-standard` static targets now receive their base model's variants, so policy ceilings cannot
+  reject a valid lease merely because models.dev has no separate alias row.
 
 ## [1.22.0] — 2026-09-29
 

@@ -799,6 +799,35 @@ test("catalog metadata for an unresolvable model stays out of the inventory", ()
   assert.deepEqual(Object.keys(discovery.modelVariants), ["openai/gpt-5.6-luna"]);
 });
 
+test("resolvable synthesized static model IDs inherit base catalog variants", () => {
+  const discovery = R.discoverSubscriptionTargets({
+    connected: ["anthropic"],
+    all: [{
+      id: "anthropic",
+      models: {
+        "claude-opus-5-5": {
+          id: "claude-opus-5-5",
+          reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+        },
+      },
+    }],
+  }, { anthropic: "oauth" }, {
+    fast: { providerID: "anthropic", modelID: "claude-opus-5-5-fast", kind: "cloud" },
+    standard: { providerID: "anthropic", modelID: "claude-opus-5-5-standard", kind: "cloud" },
+  }, {
+    resolvableModels: [
+      "anthropic/claude-opus-5-5",
+      "anthropic/claude-opus-5-5-fast",
+      "anthropic/claude-opus-5-5-standard",
+    ],
+  });
+  assert.deepEqual(discovery.modelVariants, {
+    "anthropic/claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+    "anthropic/claude-opus-5-5-fast": ["low", "medium", "high", "xhigh", "max"],
+    "anthropic/claude-opus-5-5-standard": ["low", "medium", "high", "xhigh", "max"],
+  });
+});
+
 // The guard that needs no resolver view: a catalog id that is not a usable model
 // reference at all can never resolve, so it is dropped even when the caller handed us no
 // resolvable set -- and the tier keeps routing on its next candidate instead of going down.
