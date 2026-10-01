@@ -59,6 +59,11 @@ test("the router's own guard errors never indict the provider", () => {
     name: "NamedError",
     data: { message: "routed model mismatch: expected openai/gpt-5.6-luna/medium, got llamacpp/qwen3.5-9b" },
   }), "noop");
+  // The gateway refusing for lack of an eligible target is the broker talking to itself.
+  assert.equal(classifyRoutingFailure({
+    message: "Bad Gateway: {\"error\":{\"message\":\"gateway: no provider could serve the request: all lightweight routing targets are busy or unavailable\",\"type\":\"upstream_error\"}}",
+    statusCode: 502,
+  }), "noop");
   // A genuine provider fault in the same shape must still be classified.
   assert.equal(classifyRoutingFailure({ message: "model not found: gpt-9", statusCode: 404 }), "model");
 });

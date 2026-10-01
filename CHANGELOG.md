@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The gateway's own "no provider could serve the request" refusal no longer quarantines a
+  provider.** opencode's `anthropic` provider can sit behind the fleet gateway; when every target
+  was fenced, the gateway's 502 was recorded as an `other` failure against the anthropic target,
+  and two of them quarantined a healthy anthropic. It is now classified `noop`, like the router's
+  other self-inflicted errors.
+
 ## [1.24.0] — 2026-09-30
 
 ### Added
