@@ -37,6 +37,16 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **An account without usage credits fences the fast targets instead of failing every turn on
+  them.** Anthropic answers fast mode on such an account with HTTP 429 `rate_limit_error` "Usage
+  credits are required for fast mode." The gateway dropped the body, the router read its 502 as
+  the gateway's own refusal (`noop`), and nothing ever marked the `-fast` targets unusable. The
+  gateway now appends a fixed, gateway-owned phrase for that one upstream signal (no upstream
+  bytes are echoed), the classifier maps it to `model`, and the broker circuits every `-fast`
+  target of that provider for 6 hours (the lapsed-plan hold: an account setting a person has to
+  change), leaving the provider and its standard-speed models untouched. `fast-build` falls
+  through to its non-fast candidate meanwhile; `/rearm <targetID>` lifts the fence at once after
+  credits are bought.
 - **Session-bound requests on a speed-alias lease are forwarded instead of refused (#5).** OpenCode
   leases the synthesized alias (`claude-opus-5-5-fast`, `-standard`) but sends the base id
   (`claude-opus-5-5`) on the wire, so the exact-match check refused every such lease with HTTP 409

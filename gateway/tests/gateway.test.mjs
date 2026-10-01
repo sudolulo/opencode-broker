@@ -2343,6 +2343,224 @@ test("Anthropic Messages buffered upstream errors never echo provider details", 
   assert.ok(brokerCalls.some((call) => call.route === "/failure"));
 });
 
+test("Anthropic Messages carries the fast-mode-credits signal without echoing provider bytes", async () => {
+  // The upstream answers EXACTLY what Anthropic sends today when the account
+  // has no fast-mode credits. The gateway must relay the signal (phrase) while
+  // keeping its never-echo-provider-bytes contract, so neither the body nor
+  // other upstream fields escape.
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "rate_limit_error", message: "Usage credits are required for fast mode." },
+  });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-opus-5-fast" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 429, headers: { "content-type": "application/json" },
+    }),
+  });
+  let clientBody;
+  let clientStatus;
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base);
+    clientStatus = response.status;
+    clientBody = await response.text();
+  });
+  assert.equal(clientStatus, 502);
+  // The client's 502 names the signal with gateway-owned wording. The specific
+  // suffix the broker's classifier keys on must appear verbatim.
+  assert.match(clientBody, /Anthropic upstream HTTP 429: usage credits are required for fast mode/);
+  // The /failure the gateway sent carries the same suffixed message and the
+  // real upstream status, so the broker's own-lease classifier sees 429.
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.ok(failure, "the own-lease path reports a failure");
+  assert.equal(failure.body.error.statusCode, 429);
+  assert.equal(failure.body.error.message, "Anthropic upstream HTTP 429: usage credits are required for fast mode");
+});
+
+test("Anthropic Messages fast-mode-credits does not relay a session-bound /failure", async () => {
+  // External leases are the opencode plugin's to settle: a double-report would
+  // double-count usage and could drop a lease the session still holds. The
+  // 502 must still carry the fast-mode signal so the plugin's own report to
+  // /failure (statusCode 502, Bad Gateway wrapper) classifies as "model".
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "rate_limit_error", message: "Usage credits are required for fast mode." },
+  });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      if (route === "/lease/verify") {
+        return { held: true, leaseID: "lease-ext", target: { id: "claude-opus-5-fast", model: { providerID: "anthropic", id: "claude-opus-5-fast" } } };
+      }
+      if (route === "/lease") throw new Error("must not lease");
+      return { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 429, headers: { "content-type": "application/json" },
+    }),
+  });
+  let clientBody;
+  let clientStatus;
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base, { model: "claude-opus-5-fast" }, {
+      "x-opencode-session-id": "ses_ext_fast",
+      "x-opencode-lease-id": "lease-ext",
+    });
+    clientStatus = response.status;
+    clientBody = await response.text();
+  });
+  assert.equal(clientStatus, 502);
+  assert.match(clientBody, /Anthropic upstream HTTP 429: usage credits are required for fast mode/);
+  assert.equal(brokerCalls.filter((call) => call.route === "/failure").length, 0,
+    "external lease: the plugin owns /failure");
+});
+
+test("Anthropic Messages non-signal upstream errors still redact bytes and status wording stays today's", async () => {
+  // Only the exact fast-mode-credits wording is a recognised signal. Anything
+  // else -- including a 429 body with a different message -- must leave the
+  // client-facing text byte-identical to today's "Anthropic upstream HTTP XXX".
+  const privateDetail = "upstream-private-detail";
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "rate_limit_error", message: privateDetail },
+  });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-haiku-4-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 429, headers: { "content-type": "application/json" },
+    }),
+  });
+  let clientBody;
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base);
+    clientBody = await response.text();
+  });
+  assert.doesNotMatch(clientBody, new RegExp(privateDetail), "upstream body never relayed to the client");
+  const brokerJson = JSON.stringify(brokerCalls);
+  assert.equal(brokerJson.includes(privateDetail), false, "upstream body never relayed to the broker");
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.ok(failure);
+  assert.equal(failure.body.error.message, "Anthropic upstream HTTP 429",
+    "no signal, no suffix: byte-identical to today");
+});
+
+test("the gateway's fast-mode-credits 502 text classifies as 'model' when fed back through opencode's wrap", async () => {
+  // Agreement proof: the broker classifier reads the exact string opencode's
+  // HTTP client synthesises for a 502 from the gateway (`Bad Gateway: ` + body),
+  // so a drift between the two is a routing silent-fail. Dynamic import of the
+  // classifier after pointing OPENCODE_BROKER_CONFIG at the broker's fixture,
+  // then restore the previous value so an unrelated test later in the file is
+  // not accidentally run against the fixture.
+  const previousConfig = process.env.OPENCODE_BROKER_CONFIG;
+  process.env.OPENCODE_BROKER_CONFIG = new URL("../../tests/fixtures/config.json", import.meta.url).pathname;
+  let classifyRoutingFailure;
+  try {
+    ({ classifyRoutingFailure } = await import("../../lib/routing.js"));
+  } finally {
+    if (previousConfig === undefined) delete process.env.OPENCODE_BROKER_CONFIG;
+    else process.env.OPENCODE_BROKER_CONFIG = previousConfig;
+  }
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "rate_limit_error", message: "Usage credits are required for fast mode." },
+  });
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route) => route === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-opus-5-fast" } } }
+      : { ok: true },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 429, headers: { "content-type": "application/json" },
+    }),
+  });
+  let gatewayText;
+  await withServer(handler, async (base) => {
+    gatewayText = await (await askMessages(base)).text();
+  });
+  assert.equal(classifyRoutingFailure({
+    message: `Bad Gateway: ${gatewayText}`,
+    statusCode: 502,
+  }), "model");
+});
+
+test("OpenAI Responses carries the fast-mode-credits signal without echoing provider bytes", async () => {
+  // The same account-level refusal can arrive on the OpenAI Responses path
+  // (through an auth-shim that forwards to Anthropic, or a sibling provider
+  // adopting the wording). The gateway must relay the signal with its own
+  // "OpenAI Responses upstream HTTP <status>" wording and not echo the raw
+  // upstream body -- same contract as the Messages path.
+  const privateDetail = "upstream-private-detail-responses";
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "rate_limit_error", message: "Usage credits are required for fast mode.", internal: privateDetail },
+  });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      openai: { baseUrl: "http://openai.example/v1", chatApi: false, responsesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "openai", id: "gpt-5.4" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 429, headers: { "content-type": "application/json" },
+    }),
+  });
+  let clientBody;
+  let clientStatus;
+  await withServer(handler, async (base) => {
+    const response = await askResponses(base);
+    clientStatus = response.status;
+    clientBody = await response.text();
+  });
+  assert.equal(clientStatus, 502);
+  // Client-facing text names the signal exactly, keeps the real upstream
+  // status, and never relays other upstream bytes (`internal: ...`).
+  assert.match(clientBody, /upstream openai HTTP 429: usage credits are required for fast mode/);
+  assert.equal(clientBody.includes(privateDetail), false, "no raw upstream bytes beyond the fixed phrase");
+  // /failure body carries the same suffixed message and the real upstream
+  // status, so the broker's own-lease classifier sees 429.
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.ok(failure, "the own-lease path reports a failure");
+  assert.equal(failure.body.error.statusCode, 429);
+  assert.equal(failure.body.error.message,
+    "OpenAI Responses upstream HTTP 429: usage credits are required for fast mode");
+  assert.equal(JSON.stringify(failure.body).includes(privateDetail), false,
+    "the /failure body never relays raw upstream bytes beyond the fixed phrase");
+});
+
 test("Anthropic Messages names its own path when a streamed upstream answers JSON", async () => {
   const brokerCalls = [];
   const handler = createGatewayHandler({

@@ -57,6 +57,51 @@ const leaseCoversWireModel = (leasedModelID, wireModelID) => {
 
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
+
+// ☠️ WHY AN ALLOWLIST OF GATEWAY-OWNED PHRASES AND NOT THE UPSTREAM MESSAGE. The
+// Messages and Responses buffered error paths drop the upstream body on purpose
+// (gateway/tests/gateway.test.mjs "...never echo provider details"); the client
+// gets "Anthropic upstream HTTP <status>" and nothing else. A few upstream
+// facts, however, change what the BROKER should do about the failure: this
+// recogniser surfaces exactly those -- as fixed gateway-owned phrases, with no
+// upstream bytes passed through -- so the broker's classifier (lib/routing.js
+// isFastModeCreditsRequired / classifyRoutingFailure) can key on them.
+//   - "usage credits are required for fast mode": Anthropic refuses `speed:
+//     "fast"` requests on accounts without usage credits (400/403/429 with
+//     body `{type:"error",error:{type:"rate_limit_error",
+//     message:"Usage credits are required for fast mode."}}`). Account-level,
+//     speed-scoped, no reset -- without this suffix the plain 429 reads as a
+//     burst rate limit and every fast target re-fails forever.
+// ☠️ PROXIMITY, NOT TWO INDEPENDENT CONJUNCTS. The matcher must agree with
+// the broker's classifier (lib/routing.js isFastModeCreditsRequired); the
+// two-independent-regex form matched any body that happened to mention both
+// words anywhere, so an echoed stack trace could trip this. 80 chars tolerates
+// a rewording ("fast mode requires usage credits") while rejecting words
+// paragraphs apart.
+const UPSTREAM_SIGNALS = [
+  {
+    matches: (message) =>
+      /\busage credits?.{0,80}fast[ -]?mode\b|\bfast[ -]?mode.{0,80}usage credits?\b/i.test(message),
+    phrase: "usage credits are required for fast mode",
+  },
+];
+
+// Reads the upstream error message out of the shared Anthropic/OpenAI JSON
+// shape (`{..., error: { message } }`) and returns the first matching signal's
+// phrase, or null. The body has already been fully read by the caller; the
+// 16 KB cap here is only a parser-cost ceiling for JSON.parse. Silent on parse
+// failure. The phrase is a GATEWAY STRING; the raw body never escapes.
+const upstreamSignal = (body) => {
+  if (typeof body !== "string" || body.length === 0 || body.length > 16384) return null;
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+  const message = parsed?.error?.message;
+  if (typeof message !== "string" || !message) return null;
+  for (const signal of UPSTREAM_SIGNALS) {
+    if (signal.matches(message)) return signal.phrase;
+  }
+  return null;
+};
 // The shape a forwarded session fingerprint may take. Anything else is dropped at the
 // forward site, never an error: the hints steer cache and diagnostics, they are not
 // auth (see the x-opencode-session-* comment at the forward site).
@@ -1297,11 +1342,23 @@ export const createGatewayHandler = ({
         continue;
       }
       if (!response.ok) {
-        const text = (await response.text().catch(() => "")).slice(0, 400);
+        // The body is already read whole; `text` is a 400-char slice of it for
+        // the chat path (unchanged). `upstreamSignal` is a fixed gateway-owned
+        // phrase lookup -- no upstream bytes relay. Skipped on the chat path:
+        // its client-facing message is the raw text slice, so the signal
+        // suffix would never land there, and the broker reads the signal out
+        // of that text slice directly through the classifier's proximity
+        // regex. Messages and Responses, by contrast, DROP the upstream body
+        // and only name the status; the suffix is how the signal reaches the
+        // broker there.
+        const raw = await response.text().catch(() => "");
+        const text = raw.slice(0, 400);
+        const signal = api === CHAT ? null : upstreamSignal(raw);
+        const suffix = signal ? `: ${signal}` : "";
         const safeMessage = api === MESSAGES
-          ? `Anthropic upstream HTTP ${response.status}`
+          ? `Anthropic upstream HTTP ${response.status}${suffix}`
           : api === RESPONSES
-            ? `OpenAI Responses upstream HTTP ${response.status}`
+            ? `OpenAI Responses upstream HTTP ${response.status}${suffix}`
             : text || `upstream HTTP ${response.status}`;
         clearTimeout(stallTimer);
         await settle(leased, "/failure", {
@@ -1310,7 +1367,7 @@ export const createGatewayHandler = ({
         const error = new Error(api === MESSAGES
           ? safeMessage
           : api === RESPONSES
-            ? `upstream ${leased.providerID} HTTP ${response.status}`
+            ? `upstream ${leased.providerID} HTTP ${response.status}${suffix}`
             : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
         rememberForwardError(error);
         excludeLane(leased.providerID);

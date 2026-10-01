@@ -34,6 +34,8 @@ import {
   cloudTargetAdmitted,
   chooseTarget,
   classifyRoutingFailure,
+  FAST_MODE_CREDITS_REASON,
+  isFastModeCreditsRequired,
   isPlanLapsed,
   contextFits,
   ensureRoutingStateDir,
@@ -58,6 +60,7 @@ import {
   targetIDsFor,
   modelRefForTier,
 } from "../lib/routing.js";
+import { isSpeedVariant } from "../lib/model-candidates.js";
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
@@ -214,6 +217,16 @@ const CONNECT_MS = 60 * 1000;
 // Quota with no known reset: re-probe at a bounded cadence (one failed request
 // per probe) instead of holding the provider out until state surgery.
 const QUOTA_REPROBE_MS = 15 * 60 * 1000;
+// ☠️ FAST-MODE-CREDITS: SAME CLASS OF FACT AS A LAPSED PLAN, SAME HOLD. The
+// account owner must buy credits to lift it (a human action, no reset time
+// announced), and no background check can exercise fast mode for free -- so the
+// expiry IS the re-probe. One real request per hold window:
+//   - gateway own-lease path: fails over inside the same request.
+//   - bound session: one failed turn the session's router re-routes.
+// An operator who has just bought credits lifts it at once with /rearm per
+// target. This is NOT the model-probation machinery (lib/model-probation.js) --
+// that is the dormant-model promotion runtime, not circuit recovery.
+const FAST_MODE_CREDITS_HOLD_MS = LAPSED_HOLD_MS;
 // Hosts auto-compact a session near (context - output reserve) -- about 60-70%
 // of the declared window. A model whose window the session has burned past
 // this share of is one the host will imminently compress on; selection should
@@ -1831,6 +1844,10 @@ const serve = async () => {
           state.budgets = learnCapacityFromFailure(state.budgets, target.providerID, kind);
         }
         let circuitUntil = null;
+        // Extra reasons the per-kind branches may add to the failure-reported
+        // trail (e.g. the fast-mode fence names each circuited sibling). An
+        // ordinary failure's reasons stay exactly [kind, error.message].
+        let extraReasons = [];
         if (kind === "noop") {
           // A caller-side non-fault (empty/unparsed classifier output, caller
           // timeout). Release the lease, record NOTHING -- no circuit, no
@@ -1897,9 +1914,68 @@ const serve = async () => {
           // the token refresh fixes this, benching the provider does not.
           state.circuits[targetID] = { kind, until: Date.now() + 60_000, updatedAt: Date.now() };
         } else if (target && kind === "model") {
-          // A catalog can lead provider rollout. Reject only this immutable model
-          // version so the next lease can select the previous family member.
-          state.circuits[targetID] = { kind, until: null, updatedAt: Date.now() };
+          if (isFastModeCreditsRequired(error)) {
+            // ☠️ FAST-MODE-CREDITS IS ACCOUNT-LEVEL AND SPEED-SCOPED. Every fast
+            // sibling on the hit provider will fail identically on the next
+            // attempt; fencing only the hit one would make the retry ladder
+            // walk each sibling, one failed turn each, every hold window.
+            // ☆ Enumerate the siblings BEFORE writing any circuit so a
+            // zero-fence case (hit target is a standard model, or the provider
+            // has no speed variants) is distinguishable here. The siblings are
+            // only enumerated when the HIT target is itself a speed variant --
+            // a signal on a standard hit is caller-side, not a target fault.
+            // See the empty-fence noop below.
+            const until = Date.now() + FAST_MODE_CREDITS_HOLD_MS;
+            const fencedIDs = [];
+            if (isSpeedVariant(target.modelID)) {
+              for (const candidate of Object.values(allTargets(state))) {
+                if (candidate.providerID === target.providerID && isSpeedVariant(candidate.modelID)) {
+                  fencedIDs.push(candidate.id);
+                }
+              }
+            }
+            if (fencedIDs.length === 0) {
+              // ☠️ A FAST-MODE SIGNAL ON A NON-SPEED LEASE IS CALLER-SIDE. The
+              // hit target is a standard model (every speed variant is
+              // isSpeedVariant()) or the provider carries no speed variants at
+              // all; either way the client asked for fast mode on a target
+              // that cannot deliver it, so a target fault classification would
+              // close a circuit on the healthy standard target for 6h. Treat
+              // it as caller-side: no circuit, no health evidence, release the
+              // lease, and reply kind "noop" (the
+              // same reply as the noop branch above) so the plugin's auto
+              // re-engage does not loop the same failing request.
+              logDecision({
+                at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+                policy: "failure-ignored",
+                reasons: ["noop", "fast-mode-credits on a non-speed target", error.message].filter(Boolean),
+              });
+              return settleFailure({ ok: true, kind: "noop" });
+            }
+            // ☆ No circuit on a NON-SPEED target: a standard target serves
+            // standard speed fine; fencing it would take Opus out of build/smart
+            // for 6h because one client asked for fast. The loop above collects
+            // only speed variants, the hit target among them.
+            // ☆ Never a provider circuit, never health evidence: standard
+            // targets stay routable, and the retry ladder reaches gpt-terra
+            // (fast-build fallback) without any provider-wide quarantine.
+            circuitUntil = until;
+            for (const candidateID of fencedIDs) {
+              state.circuits[candidateID] = {
+                kind,
+                reason: FAST_MODE_CREDITS_REASON,
+                until,
+                updatedAt: Date.now(),
+              };
+            }
+            // Decision trail names the circuited ids so an operator reading
+            // decisions.jsonl can see which siblings this /failure closed on.
+            extraReasons = [FAST_MODE_CREDITS_REASON, `fenced:${fencedIDs.join(",")}`];
+          } else {
+            // A catalog can lead provider rollout. Reject only this immutable model
+            // version so the next lease can select the previous family member.
+            state.circuits[targetID] = { kind, until: null, updatedAt: Date.now() };
+          }
         } else if (target && kind === "overload") {
           // Transient provider capacity (529/overloaded): fence the target for a
           // few seconds so a quick recovery returns to the SAME provider, and
@@ -1944,7 +2020,8 @@ const serve = async () => {
         }
         logDecision({
           at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
-          policy: "failure-reported", reasons: [kind, error.message].filter(Boolean),
+          policy: "failure-reported",
+          reasons: [kind, ...extraReasons, error.message].filter(Boolean),
         });
         return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
       }

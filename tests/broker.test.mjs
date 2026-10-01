@@ -1117,6 +1117,207 @@ test("model-not-found circuits only that version, falls back, and is pruned with
   assert.equal(status.circuits[newest.id], undefined);
 }));
 
+test("fast-mode-credits fences every anthropic speed sibling, leaves non-fast anthropic alone, and reroutes fast-build", async () => withBroker(async ({ home, socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const before = Date.now();
+  // Bound-session envelope: opencode's HTTP client wraps the gateway's 502 as
+  // "Bad Gateway: " + the response text. The classifier reads the upstream 429
+  // out of the message, not from statusCode (which is the gateway's own 502).
+  const envelope = {
+    sessionID: "ses-fast-credits",
+    targetID: "claude-opus-5-fast",
+    error: {
+      statusCode: 502,
+      message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429: usage credits are required for fast mode","type":"upstream_error"}}',
+    },
+  };
+  const failure = await request(socketPath, "/failure", envelope);
+  assert.equal(failure.kind, "model");
+  assert.ok(Number.isFinite(failure.circuitUntil), "the fast-mode circuit has a finite expiry");
+  const status = await request(socketPath, "/status");
+  for (const siblingID of ["claude-opus-5-fast", "claude-opus-4-8-fast"]) {
+    const circuit = status.circuits[siblingID];
+    assert.ok(circuit, `${siblingID} must be circuited`);
+    assert.equal(circuit.kind, "model");
+    assert.equal(circuit.reason, "fast-mode-credits");
+    const renewsAt = Date.parse(circuit.renewsAt);
+    assert.ok(Number.isFinite(renewsAt), `${siblingID} renewsAt is a date`);
+    // LAPSED_HOLD_MS is 6h; allow 60s of slack for test wall-clock drift.
+    assert.ok(renewsAt >= before + 6 * 3600 * 1000 - 60_000,
+      `${siblingID} renewsAt within [now+6h-60s, now+6h+60s]: got ${renewsAt - before}ms`);
+    assert.ok(renewsAt <= Date.now() + 6 * 3600 * 1000 + 60_000,
+      `${siblingID} renewsAt within [now+6h-60s, now+6h+60s]: got ${renewsAt - before}ms`);
+  }
+  // Scope: the fact is account-level and model-neutral, but non-fast siblings
+  // on the same provider still serve ordinary speed and must not be fenced.
+  assert.equal(status.circuits["claude-opus-5"], undefined, "non-fast anthropic target stays routable");
+  assert.equal(status.circuits["claude-opus-4-8"], undefined, "non-fast anthropic target stays routable");
+  assert.equal(status.circuits["provider:anthropic"], undefined, "never a provider-wide circuit");
+  assert.equal(status.health.providers.anthropic, undefined, "never recorded as provider health evidence");
+  // The decision trail names the fenced ids, so an operator reading
+  // decisions.jsonl can see which siblings this /failure actually closed on.
+  const decisions = readFileSync(join(home, ".local/share/opencode/model-routing/decisions.jsonl"), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line));
+  const fastFailure = decisions.find((line) =>
+    line.sessionID === "ses-fast-credits" && line.policy === "failure-reported");
+  assert.ok(fastFailure, "the /failure emitted a failure-reported decision");
+  assert.ok(fastFailure.reasons.includes("fast-mode-credits"),
+    `failure-reported names the reason: ${JSON.stringify(fastFailure.reasons)}`);
+  const fencedReason = fastFailure.reasons.find((reason) => typeof reason === "string" && reason.startsWith("fenced:"));
+  assert.ok(fencedReason, `failure-reported includes a fenced:<ids> reason: ${JSON.stringify(fastFailure.reasons)}`);
+  const fencedIDs = new Set(fencedReason.slice("fenced:".length).split(","));
+  assert.ok(fencedIDs.has("claude-opus-5-fast") && fencedIDs.has("claude-opus-4-8-fast"),
+    `fenced ids cover both speed siblings: ${fencedReason}`);
+  // A fresh fast-build lease falls to gpt-terra now that both anthropic speed
+  // siblings are fenced.
+  const next = await request(socketPath, "/lease", {
+    sessionID: "ses-fast-credits-next", profile: "auto", tier: "fast-build", replace: true,
+  });
+  assert.equal(next.target.id, "gpt-terra");
+}));
+
+test("fast-mode-credits only triggers on the exact signal: an ordinary bound 502 wrap stays noop", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const failure = await request(socketPath, "/failure", {
+    sessionID: "ses-plain-429",
+    targetID: "claude-opus-5-fast",
+    error: {
+      statusCode: 502,
+      message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429","type":"upstream_error"}}',
+    },
+  });
+  assert.equal(failure.kind, "noop");
+  const status = await request(socketPath, "/status");
+  assert.equal(status.circuits["claude-opus-5-fast"], undefined, "noop opens no circuit");
+  assert.equal(status.circuits["claude-opus-4-8-fast"], undefined);
+}));
+
+test("fast-mode-credits classifies as model on an own-lease 429 straight from the gateway", async () => withBroker(async ({ socketPath }) => {
+  // Own-lease path: the gateway POSTs /failure with statusCode 429 and the
+  // suffixed message, no Bad Gateway wrapper. Both fast siblings fence with
+  // reason fast-mode-credits even when the hit target is the other speed
+  // sibling, because the signal is account-level and provider-scoped.
+  await request(socketPath, "/inventory", inventory({
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const failure = await request(socketPath, "/failure", {
+    sessionID: "ses-own-lease",
+    targetID: "claude-opus-4-8-fast",
+    error: { statusCode: 429, message: "Anthropic upstream HTTP 429: usage credits are required for fast mode" },
+  });
+  assert.equal(failure.kind, "model");
+  const status = await request(socketPath, "/status");
+  for (const siblingID of ["claude-opus-5-fast", "claude-opus-4-8-fast"]) {
+    const circuit = status.circuits[siblingID];
+    assert.ok(circuit, `${siblingID} must be circuited`);
+    assert.equal(circuit.kind, "model");
+    assert.equal(circuit.reason, "fast-mode-credits");
+  }
+  assert.equal(status.circuits["provider:anthropic"], undefined, "never a provider-wide circuit");
+  assert.equal(status.health.providers?.anthropic, undefined, "never recorded as provider health evidence");
+}));
+
+test("fast-mode-credits on a NON-speed target is a noop, not a target fence", async () => withBroker(async ({ socketPath }) => {
+  // A client asked for fast mode on a lease that is NOT a speed variant: the
+  // request is caller-side (opencode's chat path reaching the gateway with a
+  // standard model id), and no anthropic target should be fenced for it.
+  await request(socketPath, "/inventory", inventory({
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const failure = await request(socketPath, "/failure", {
+    sessionID: "ses-nonspeed",
+    targetID: "claude-opus-5",
+    error: { statusCode: 429, message: "Anthropic upstream HTTP 429: usage credits are required for fast mode" },
+  });
+  assert.equal(failure.kind, "noop",
+    "a fast-mode signal on a standard target is caller-side, not a target fault");
+  assert.equal(failure.circuitUntil, undefined, "no circuit expiry on noop");
+  const status = await request(socketPath, "/status");
+  assert.equal(status.circuits["claude-opus-5"], undefined, "the hit target itself stays routable");
+  assert.equal(status.circuits["claude-opus-5-fast"], undefined, "sibling speed targets stay routable");
+  assert.equal(status.circuits["claude-opus-4-8-fast"], undefined, "sibling speed targets stay routable");
+  assert.equal(status.circuits["claude-opus-4-8"], undefined, "every anthropic target stays routable");
+  assert.equal(status.circuits["provider:anthropic"], undefined, "never a provider-wide circuit");
+  assert.equal(status.health.providers?.anthropic, undefined, "never recorded as provider health evidence");
+}));
+
+test("fast-mode-credits circuits re-admit anthropic fast once their expiry passes, end to end", async () => withTempHome(async (home) => {
+  // End to end: a /failure writes the circuits, state is rewritten to make
+  // their until past, and after a restart the next lease rejoins anthropic.
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const first = await startBroker(home);
+  try {
+    await request(first.socketPath, "/inventory", inventory({
+      anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const fenced = await request(first.socketPath, "/failure", {
+      sessionID: "ses-fast-reopen",
+      targetID: "claude-opus-5-fast",
+      error: {
+        statusCode: 502,
+        message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429: usage credits are required for fast mode","type":"upstream_error"}}',
+      },
+    });
+    assert.equal(fenced.kind, "model");
+    // Confirm fast-build lands on gpt-terra while the circuits are still open.
+    const blocked = await request(first.socketPath, "/lease", {
+      sessionID: "ses-fast-reopen-while-blocked", profile: "auto", tier: "fast-build", replace: true,
+    });
+    assert.equal(blocked.target.id, "gpt-terra",
+      "with both fast circuits still open, fast-build picks gpt-terra");
+  } finally {
+    await stopBroker(first.child);
+  }
+  // Rewrite ONLY the `until` of the two fast-mode-credits circuits, keeping
+  // every other field. Nothing else is created to recreate them because the
+  // restart does not re-read the fence source -- a human bought the credits.
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  for (const siblingID of ["claude-opus-5-fast", "claude-opus-4-8-fast"]) {
+    const circuit = state.circuits[siblingID];
+    assert.ok(circuit, `pre-restart state carries ${siblingID} circuit`);
+    assert.equal(circuit.reason, "fast-mode-credits");
+    circuit.until = Date.now() - 1000;
+  }
+  writeFileSync(statePath, JSON.stringify(state));
+  const second = await startBroker(home);
+  try {
+    // Re-posting inventory after restart ensures catalog targets re-publish.
+    await request(second.socketPath, "/inventory", inventory({
+      anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 4 },
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const lease = await request(second.socketPath, "/lease", {
+      sessionID: "ses-fast-reopen-after-restart", profile: "auto", tier: "fast-build", replace: true,
+    });
+    // /lease returns a reduced `decision` (policy/reasons/registration only); the
+    // full choice -- including eligibleTargetIDs -- lives on /selection.
+    const selection = await request(second.socketPath, "/selection");
+    const eligible = new Set(selection.lastDecision?.eligibleTargetIDs ?? []);
+    const anthropicFastEligible = eligible.has("claude-opus-5-fast") || eligible.has("claude-opus-4-8-fast");
+    const landedOnAnthropic = ["claude-opus-5-fast", "claude-opus-4-8-fast"].includes(lease.target?.id);
+    assert.ok(anthropicFastEligible || landedOnAnthropic,
+      `expired circuits re-admit anthropic fast: landed ${lease.target?.id}, eligible ${[...eligible].join(",")}`);
+    const status = await request(second.socketPath, "/status");
+    assert.equal(status.circuits["claude-opus-5-fast"], undefined, "expired circuit was pruned");
+    assert.equal(status.circuits["claude-opus-4-8-fast"], undefined, "expired circuit was pruned");
+  } finally {
+    await stopBroker(second.child);
+  }
+}));
+
 test("a session keeps its pinned model across releases; only a NEW session is balanced", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },

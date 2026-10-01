@@ -8,7 +8,7 @@ import test from "node:test";
 process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.meta.url).pathname;
 
 const { normalizeProviderError } = await import("../lib/provider-health.js");
-const { classifyRoutingFailure } = await import("../lib/routing.js");
+const { classifyRoutingFailure, isFastModeCreditsRequired, FAST_MODE_CREDITS_REASON } = await import("../lib/routing.js");
 const {
   fetchPlanUsage,
   planUsageResetAt,
@@ -66,6 +66,89 @@ test("the router's own guard errors never indict the provider", () => {
   }), "noop");
   // A genuine provider fault in the same shape must still be classified.
   assert.equal(classifyRoutingFailure({ message: "model not found: gpt-9", statusCode: 404 }), "model");
+});
+
+test("fast-mode-credits is recognised through the gateway wrapper and in direct upstream wording", () => {
+  // The reason constant is exported so the broker and tests reference ONE name.
+  assert.equal(FAST_MODE_CREDITS_REASON, "fast-mode-credits");
+  // Bound-session envelope: the plugin surfaces the gateway's 502 as HTTP 502
+  // with the "Bad Gateway: " prefix opencode's HTTP client applies. The upstream
+  // 429 lives only inside the message text, which is why the classifier reads
+  // the gateway-wrapped status out of the string.
+  assert.equal(isFastModeCreditsRequired({
+    message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429: usage credits are required for fast mode","type":"upstream_error"}}',
+    statusCode: 502,
+  }), true);
+  assert.equal(classifyRoutingFailure({
+    message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429: usage credits are required for fast mode","type":"upstream_error"}}',
+    statusCode: 502,
+  }), "model");
+  // Own-lease path: the gateway POSTs /failure with the suffixed message and the
+  // real upstream status.
+  assert.equal(classifyRoutingFailure({
+    statusCode: 429, message: "Anthropic upstream HTTP 429: usage credits are required for fast mode",
+  }), "model");
+  // Direct provider wording. The classifier accepts 400/403/429 because the
+  // account-level refusal could arrive as any of those and all three are
+  // client-side refusals the broker should treat the same way.
+  assert.equal(classifyRoutingFailure({ statusCode: 429, message: "Usage credits are required for fast mode." }), "model");
+  assert.equal(classifyRoutingFailure({ statusCode: 400, message: "Usage credits are required for fast mode." }), "model");
+  assert.equal(classifyRoutingFailure({ statusCode: 403, message: "Usage credits are required for fast mode." }), "model");
+  // Responses wrap, as the gateway /failure body carries it when the OpenAI
+  // Responses path hits the same account refusal.
+  assert.equal(classifyRoutingFailure({
+    statusCode: 429, message: "OpenAI Responses upstream HTTP 429: usage credits are required for fast mode",
+  }), "model");
+  // Chat wrap as the plugin would see it: opencode's HTTP client prepends
+  // "Bad Gateway: " to the gateway's 502 body, and the chat path's text slice
+  // includes the raw upstream JSON (its 400-char slice is unchanged by the
+  // signal recogniser).
+  assert.equal(classifyRoutingFailure({
+    statusCode: 502,
+    message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: upstream openai HTTP 429: {\\"error\\":{\\"message\\":\\"Usage credits are required for fast mode.\\"}}","type":"upstream_error"}}',
+  }), "model");
+  // Reworded upstream message. The matcher must tolerate the account refusal
+  // being phrased either way around (proximity, not two independent conjuncts),
+  // so a later Anthropic rewording does not reopen the loop this change closed.
+  assert.equal(classifyRoutingFailure({
+    statusCode: 429, message: "Fast mode requires usage credits on this account.",
+  }), "model");
+});
+
+test("fast-mode-credits proximity: both words must co-occur, not merely appear in a long body", () => {
+  // Negative: both phrases present but separated by > 80 chars of unrelated
+  // text (a logged body, a dumped stack trace, ...) is NOT the account-refusal
+  // signal. The two independent-conjuncts form -- which is what preceded this
+  // change -- would have classified this as "model" and fenced every fast
+  // target on anthropic for six hours over a line in an error log.
+  const filler = "x".repeat(120);
+  const farApart = `missing usage credits header -- ${filler} -- the fast mode toggle was off`;
+  assert.equal(isFastModeCreditsRequired({ statusCode: 400, message: farApart }), false);
+  assert.notEqual(classifyRoutingFailure({ statusCode: 400, message: farApart }), "model");
+});
+
+test("fast-mode-credits classifier negatives keep today's behaviour", () => {
+  // Ordinary bound 502 WITHOUT the fast-mode phrase still falls through to the
+  // 8dfa882 gateway-refusal rule.
+  assert.equal(classifyRoutingFailure({
+    message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: Anthropic upstream HTTP 429","type":"upstream_error"}}',
+    statusCode: 502,
+  }), "noop");
+  // Own-lease 429 without the phrase is a burst rate limit, five-minute target
+  // fence, same as before.
+  assert.equal(classifyRoutingFailure({ statusCode: 429, message: "Anthropic upstream HTTP 429" }), "rate");
+  // Both phrases but no 400/403/429 anywhere (statusCode 500, no wrapped
+  // upstream status) is not the fast-mode signal.
+  assert.notEqual(classifyRoutingFailure({ statusCode: 500, message: "Usage credits are required for fast mode." }), "model");
+  // "usage credits are required" without "fast mode" is a different wording.
+  assert.notEqual(classifyRoutingFailure({ statusCode: 429, message: "Usage credits are required for your account." }), "model");
+  assert.equal(isFastModeCreditsRequired({ statusCode: 429, message: "Usage credits are required for your account." }), false);
+  // The gateway's own refusal text ("no live lease") stays noop -- it is the
+  // broker refusing itself, never a provider answer.
+  assert.equal(classifyRoutingFailure({
+    message: "route unavailable; resend the prompt (gateway: session holds no live lease, re-lease to resume)",
+    statusCode: 409,
+  }), "noop");
 });
 
 test("anthropic plan usage normalizes to windows with the exact reset", async () => {
