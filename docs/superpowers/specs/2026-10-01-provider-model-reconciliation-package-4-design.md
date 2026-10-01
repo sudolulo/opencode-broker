@@ -25,9 +25,14 @@ The reconciler owns these host paths:
 | Version-controlled raw base | `/home/dev/devbox/config/opencode/opencode.json` |
 | Managed overlay | `/home/dev/.local/share/opencode/model-routing/resolver-overlay.json` |
 | Immutable generations | `/home/dev/.local/share/opencode/model-routing/resolver-generations` |
-| Live generation link | `/home/dev/.local/share/opencode/model-routing/resolver-current` |
-| Generation registry | `/home/dev/.local/share/opencode/model-routing/resolver-generations.json` |
+| Live generation link | `/home/dev/.local/share/opencode/model-routing/resolver-generations/current` |
+| Generation registry | `/home/dev/.local/share/opencode/model-routing/resolver-generations/resolver-generations.json` |
 | Reconciliation ledger | `/home/dev/.local/share/opencode/model-routing/model-reconciliation.json` |
+
+The live generation link and the registry live inside the generations root because Package 3's
+generation manager (`lib/resolver-generations.js`) requires the current link to be a direct child of
+that root and keeps its registry and lock there; Package 4 reuses that manager rather than
+reimplementing registry, lock, or link writes.
 
 Runtime directories are mode `0700`; runtime files are mode `0600`. Generation directories and
 their contents are immutable after publication. The live link is switched atomically and points
@@ -92,7 +97,7 @@ This ledger record controls the outer config link and is mutable for cutover/rol
 
 - `mode` is `generated` for normal operation or `raw-emergency` for rollback.
 - `target` is the exact approved absolute target:
-  - Generated mode: `/home/dev/.local/share/opencode/model-routing/resolver-current/opencode.json`
+  - Generated mode: `/home/dev/.local/share/opencode/model-routing/resolver-generations/current/opencode.json`
    - Raw-emergency mode: `/home/dev/devbox/config/opencode/opencode.json`
 - `generation` is `0` for bootstrap, a non-negative integer for provider stages, or `null` for
   raw-emergency.
@@ -113,25 +118,25 @@ the regular mode-0600 file `/home/dev/devbox/config/opencode/opencode.json`.
 
 Normal Package 4 cutover must:
 1. Build generation 0 from `/home/dev/devbox/config/opencode/opencode.json` (raw base)
-2. Point `/home/dev/.local/share/opencode/model-routing/resolver-current` atomically to the immutable generation 0 directory
-3. Atomically retarget `/home/dev/.config/opencode/opencode.json` to `/home/dev/.local/share/opencode/model-routing/resolver-current/opencode.json`
+2. Point `/home/dev/.local/share/opencode/model-routing/resolver-generations/current` atomically to the immutable generation 0 directory
+3. Atomically retarget `/home/dev/.config/opencode/opencode.json` to `/home/dev/.local/share/opencode/model-routing/resolver-generations/current/opencode.json`
 
 The two symlink swaps cannot be jointly atomic. Apply remains disabled throughout the entire
-cutover window. After `resolver-current` switches to generation 0 and before the outer config
+cutover window. After `resolver-generations/current` switches to generation 0 and before the outer config
 link retargets, a newly starting process may load the canonical raw base through the existing
 outer link and register legacy/base-only eligibility. This is explicitly safe because generation
 0 is byte-derived only from that same raw base, and the process cannot receive overlay-only
 models. The outer-link retarget must immediately follow under the same reconciliation lock;
 completion requires verification that its exact target is
-`/home/dev/.local/share/opencode/model-routing/resolver-current/opencode.json`.
+`/home/dev/.local/share/opencode/model-routing/resolver-generations/current/opencode.json`.
 
 Recovery must use the persisted `configCutover` evidence to detect this intermediate state:
-when `resolver-current` points to the exact validated generation 0 but the outer link still
+when `resolver-generations/current` points to the exact validated generation 0 but the outer link still
 resolves through the pre-cutover chain, recovery may complete the outer-link retarget under the
 reconciliation lock and then verify the exact generated target. Any other link, ledger, hash, or
 acknowledgement mismatch blocks recovery and mutation.
 
-New OpenCode processes load the generated `opencode.json` through the deployed symlink; the router plugin resolves `resolver-current` once and registers its matching manifest. Existing TUIs keep their startup-captured config/generation and are not killed.
+New OpenCode processes load the generated `opencode.json` through the deployed symlink; the router plugin resolves `resolver-generations/current` once and registers its matching manifest. Existing TUIs keep their startup-captured config/generation and are not killed.
 
 Fleet-core/devbox-sync owns routine convergence of `/home/dev/.config/opencode/opencode.json` but never changes ledger state. Its recovery decision tree is explicit: unreadable, corrupt, or schema-invalid `generationRegistryInitialized` or `configCutover` makes the verifier exit nonzero, leaves the outer link unchanged, and emits a durable alert. Generated mode requires a readable current link, the exact generation directory, config, manifest, hashes, and registry; any missing or mismatched item blocks with no link change. Raw-emergency mode hashes the exact canonical devbox raw target first, and only after that match preserves or recreates the outer link to that exact target. Pre-bootstrap raw linking is allowed only when both ledger records and all generation artifacts are absent. No mode or target is inferred from filesystem presence.
 
@@ -269,8 +274,8 @@ The operator performs these stages in order; a failed validation stops progressi
 1. Deploy product and fleet changes with apply disabled.
 2. Build generation 0 from `/home/dev/devbox/config/opencode/opencode.json` (raw base); pin and verify its base hash,
     initialize the renderer-only registry and persist the `generationRegistryInitialized`
-    acknowledgement, then validate without switching `resolver-current`. Step 6 performs the first
-    normal `resolver-current` switch. If crash recovery finds it already points to the exact validated
+    acknowledgement, then validate without switching `resolver-generations/current`. Step 6 performs the first
+    normal `resolver-generations/current` switch. If crash recovery finds it already points to the exact validated
     generation-0 manifest, skip replacement idempotently and continue outer-link retargeting; any other
     target/hash blocks.
 3. After generation-0 validation and before old-watch quiescence, run one complete manual
@@ -281,8 +286,8 @@ The operator performs these stages in order; a failed validation stops progressi
 4. Execute verified prepare, then stop and disable the old timer and await service exit.
 5. Perform the final delta import and preserve the writable legacy ledger plus its read-only copy.
 6. Execute verified commit with apply still disabled throughout the cutover window, atomically switch
-   `resolver-current` to generation 0 directory, then immediately and under the same reconciliation
-   lock atomically retarget `/home/dev/.config/opencode/opencode.json` to `resolver-current/opencode.json`.
+   `resolver-generations/current` to generation 0 directory, then immediately and under the same reconciliation
+   lock atomically retarget `/home/dev/.config/opencode/opencode.json` to `resolver-generations/current/opencode.json`.
    The swaps are not jointly atomic: a process starting between them may load the canonical raw base,
    register only legacy/base-only eligibility, and cannot receive overlay-only models. Record all saga
    acknowledgements and require the exact generated outer target before completing cutover.
@@ -319,8 +324,8 @@ cycle must complete before the old watch is retired.
 If quiescence cannot be confirmed, abort rollback without publishing another generation and alert
 loudly.
 
-Normal rollback atomically switches `resolver-current` to the immutable generation 0 directory
-while leaving the deployed config link through `resolver-current/opencode.json` intact. This
+Normal rollback atomically switches `resolver-generations/current` to the immutable generation 0 directory
+while leaving the deployed config link through `resolver-generations/current/opencode.json` intact. This
 restores the pre-cutover state where new OpenCode processes load generation 0 through the
 deployed symlink.
 
@@ -378,8 +383,8 @@ Operational completion requires evidence of all of the following:
 - the authoritative ledger contains a durable `generationRegistryInitialized` acknowledgement for
   generation 0 with the registry hash, generation-0 manifest hash, raw-base hash, and ledger
   revision; no partial or regressed registry/artifact state is initialized from empty;
-- the `configCutover` ledger record is present with `mode=generated` and `target=/home/dev/.local/share/opencode/model-routing/resolver-current/opencode.json` in generated mode, or `mode=raw-emergency` and `target=/home/dev/devbox/config/opencode/opencode.json` in raw-emergency mode;
-- new OpenCode processes resolve the generated config through `/home/dev/.config/opencode/opencode.json` -> `resolver-current/opencode.json`; the router plugin resolves `resolver-current` once and registers its matching manifest;
+- the `configCutover` ledger record is present with `mode=generated` and `target=/home/dev/.local/share/opencode/model-routing/resolver-generations/current/opencode.json` in generated mode, or `mode=raw-emergency` and `target=/home/dev/devbox/config/opencode/opencode.json` in raw-emergency mode;
+- new OpenCode processes resolve the generated config through `/home/dev/.config/opencode/opencode.json` -> `resolver-generations/current/opencode.json`; the router plugin resolves `resolver-generations/current` once and registers its matching manifest;
 - existing TUIs retain their startup-captured config generation and are not killed; future fleet sync preserves the deployed runtime symlink;
 - every listed runtime directory is `0700` and every listed runtime file is `0600`;
 - apply is disabled during bootstrap, prepare, and dry-run; dry-run records zero publisher calls
@@ -403,7 +408,7 @@ Operational completion requires evidence of all of the following:
 - `/home/dev/devbox` remains the single registered unit source in `/home/dev/fleet-core/units.toml`,
   with old and new units delivered through `/home/dev/devbox/systemd`; before cutover sync maintains
   the raw-base chain, and after atomic cutover it validates the exact runtime target and preserves or
-  recreates only `/home/dev/.local/share/opencode/model-routing/resolver-current/opencode.json`;
+  recreates only `/home/dev/.local/share/opencode/model-routing/resolver-generations/current/opencode.json`;
 - devbox-sync fails loudly rather than relinking raw base when initialization evidence exists but
   the deployed link or validation is wrong, while normal raw-base linking remains valid without
   initialization evidence; devbox-sync never relinks to fleet-core raw config unless a verified
@@ -420,11 +425,11 @@ Operational completion requires evidence of all of the following:
 - raw-base emergency restoration from `/home/dev/devbox/config/opencode/opencode.json` is verified
   and auditable with hash checks, integrity confirmation, and logged evidence;
 - new OpenCode processes successfully resolve the generated config through the deployed symlink
-  and the router plugin registers the matching manifest from `resolver-current`;
+  and the router plugin registers the matching manifest from `resolver-generations/current`;
 - future fleet sync preserves the deployed runtime symlink and does not replace it with raw base;
 - normal generation swaps affect only future processes; existing TUIs retain their startup-captured
   config generation;
-- acceptance covers a process started after the `resolver-current` generation-0 switch but before
+- acceptance covers a process started after the `resolver-generations/current` generation-0 switch but before
   the outer-link retarget: it may load the canonical raw base and register legacy/base-only
   eligibility, must not receive overlay-only models, and recovery must then complete and verify the
   exact generated outer target from `configCutover` evidence under the reconciliation lock;
