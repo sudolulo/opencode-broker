@@ -24,6 +24,16 @@ All notable changes to this project are documented here. The format is based on
 - **`planUsage.keyFile`** for the `http` plan-usage source: the credential is read from an
   owner-only key file (refused if group- or world-readable), as the gateway reads its provider
   keys, instead of from an `authRef` entry in opencode's `auth.json`.
+- **`forwardSessionHints` per gateway provider.** The router plugin's session hints
+  (`x-opencode-session-id`, `x-opencode-session-kind`) are now forwarded to a provider that
+  opts in with `forwardSessionHints: true`, on every api it serves. llm-auth-proxy uses the
+  kind to pick its prompt-cache TTL (subagent 5m, otherwise 1h) and the id to link request
+  fingerprints for prefix-change diagnostics, and strips both before calling Anthropic; until
+  now the gateway dropped both on every forward, so every request took the 1h TTL and the
+  fingerprint linking saw nothing. The decision is per provider at the forward site, so a
+  failover to a lane that did not opt in leaves the hints behind, and invalid values (a kind
+  other than `primary`/`subagent`, an id outside `[A-Za-z0-9_-]{1,128}`) are dropped silently.
+  A session id is a fleet-internal identity and must never reach a third-party upstream.
 
 ### Fixed
 

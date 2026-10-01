@@ -57,6 +57,10 @@ const leaseCoversWireModel = (leasedModelID, wireModelID) => {
 
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
+// The shape a forwarded session fingerprint may take. Anything else is dropped at the
+// forward site, never an error: the hints steer cache and diagnostics, they are not
+// auth (see the x-opencode-session-* comment at the forward site).
+const SESSION_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
 // A GPU model swap measures ~2m40s. The wait is bounded, config-overridable,
 // and only ever spent before the first byte -- see leaseWithPrepare().
 const PREPARE_WAIT_MS = 180_000;
@@ -1013,6 +1017,13 @@ export const createGatewayHandler = ({
     probeAssignment = null,
     boundLease = null,
   ) => {
+    // The session hints are validated once per request; whether they go out at all is
+    // decided per provider, per attempt, at the forward site (forwardHeaders).
+    const forwardSessionID = typeof requestHeaders.sessionID === "string"
+      && SESSION_ID_SHAPE.test(requestHeaders.sessionID)
+      ? requestHeaders.sessionID : null;
+    const forwardSessionKind = requestHeaders.sessionKind === "primary" || requestHeaders.sessionKind === "subagent"
+      ? requestHeaders.sessionKind : null;
     let lastError = null;
     let lastForwardError = null;
     const rememberForwardError = (error) => {
@@ -1236,6 +1247,23 @@ export const createGatewayHandler = ({
           ...(api === MESSAGES && requestHeaders.anthropicBeta
             ? { "anthropic-beta": requestHeaders.anthropicBeta } : {}),
           ...(providerConfig.headers && typeof providerConfig.headers === "object" ? providerConfig.headers : {}),
+          // The opencode session hints: which session is asking, and whether it is a
+          // subagent. llm-auth-proxy uses the kind to pick the prompt-cache TTL
+          // (subagent 5m, otherwise 1h) and the id to link request fingerprints for
+          // prefix-change diagnostics; it strips both before calling Anthropic. They
+          // are opt-in per provider on purpose: a session id is a fleet-internal
+          // identity, and a third-party upstream (alibaba, a direct llama.cpp) must
+          // never receive it. So the decision is made HERE, per providerConfig, per
+          // attempt: a request that fails over to a lane that did not opt in leaves
+          // the hints behind. Only validated values reach this point -- an invalid
+          // one is dropped, silently, because the hints steer cache and diagnostics,
+          // they are not auth.
+          ...(providerConfig.forwardSessionHints === true
+            ? {
+              ...(forwardSessionID ? { "x-opencode-session-id": forwardSessionID } : {}),
+              ...(forwardSessionKind ? { "x-opencode-session-kind": forwardSessionKind } : {}),
+            }
+            : {}),
         };
         if (providerConfig.keyFile) {
           for (const name of Object.keys(forwardHeaders)) {
@@ -1743,6 +1771,10 @@ export const createGatewayHandler = ({
           ? request.headers["anthropic-version"][0] : request.headers["anthropic-version"],
         anthropicBeta: Array.isArray(request.headers["anthropic-beta"])
           ? request.headers["anthropic-beta"][0] : request.headers["anthropic-beta"],
+        sessionID: Array.isArray(request.headers["x-opencode-session-id"])
+          ? request.headers["x-opencode-session-id"][0] : request.headers["x-opencode-session-id"],
+        sessionKind: Array.isArray(request.headers["x-opencode-session-kind"])
+          ? request.headers["x-opencode-session-kind"][0] : request.headers["x-opencode-session-kind"],
       }, probeAssignment, boundLease);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
