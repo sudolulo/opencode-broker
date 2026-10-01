@@ -5,11 +5,16 @@
     "qwen-flash": { "providerID": "alibaba-token-plan", "modelID": "qwen3.6-flash", "kind": "cloud" },
     "haiku": { "providerID": "anthropic", "modelID": "claude-haiku-4-5", "kind": "cloud" }
   },
-  "tiers": { "worker": ["gpt-luna", "qwen-flash", "haiku"] },
+  "tiers": {
+    "worker": ["gpt-luna", "qwen-flash", "haiku"],
+    "build": ["lan-memory", "gpt-luna"],
+    "review": ["lan-memory", "haiku"]
+  },
   "profiles": {
     "memory": ["lan-memory", "gpt-luna", "qwen-flash", "haiku"],
     "mixed-unshared": ["lan-memory", "gpt-luna"]
   },
   "profileCloudEgress": ["memory", "mixed-unshared"],
-  "profileLocalShare": { "memory": 2, "mixed-unshared": 1, "no-such-profile": 2 }
+  "profileLocalShare": { "memory": 2, "mixed-unshared": 1, "no-such-profile": 2 },
+  "tierLocalShare": { "build": 4, "review": 4, "worker": 4, "no-such-tier": 2 }
 }

@@ -22,8 +22,33 @@ const choose = (profile, cursor, extra = {}) => R.chooseTarget({
   ...extra,
 });
 
+const chooseTier = (tier, cursor, extra = {}) => R.chooseTarget({
+  profile: "auto",
+  tier,
+  localModels,
+  contextTokens: 1000,
+  cursors: { [`auto:${tier}:mixed`]: cursor },
+  ...extra,
+});
+
 test("only a configured profile with an integer share of at least 2 is kept", () => {
   assert.deepEqual({ ...CONFIG.profileLocalShare }, { memory: 2 });
+});
+
+// Worker is deliberately excluded from tierLocalShare to avoid a silently ignored duplicate control.
+test("only configured non-Worker tiers with an integer share of at least 2 are kept", () => {
+  assert.deepEqual({ ...CONFIG.tierLocalShare }, { build: 4, review: 4 });
+});
+
+test("Auto Build and Review independently reserve one in four assignments for local", () => {
+  for (const tier of ["build", "review"]) {
+    assert.equal(chooseTier(tier, 0).target.id, "lan-memory");
+    assert.equal(chooseTier(tier, 1).target.kind, "cloud");
+    assert.equal(chooseTier(tier, 2).target.kind, "cloud");
+    assert.equal(chooseTier(tier, 3).target.kind, "cloud");
+    assert.equal(chooseTier(tier, 4).target.id, "lan-memory");
+    assert.equal(chooseTier(tier, 0).decision.policy, "weighted-depletion-with-local-share");
+  }
 });
 
 test("a shared profile sends every Nth lease to its local target", () => {

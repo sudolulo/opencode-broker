@@ -75,13 +75,19 @@ const publishTrustedApiInventoryInChild = (home, publisher) => {
   const cachePath = join(home, "models.json");
   const authDir = join(home, ".local/share/opencode");
   mkdirSync(authDir, { recursive: true });
-  writeFileSync(configPath, JSON.stringify({ trustedSubscriptionProviders: ["anthropic"] }) + "\n");
+  writeFileSync(configPath, JSON.stringify({
+    trustedSubscriptionProviders: ["anthropic"],
+    targets: {
+      "opus-fast": { providerID: "anthropic", modelID: "claude-opus-5-5-fast", kind: "cloud" },
+    },
+  }) + "\n");
   writeFileSync(join(authDir, "auth.json"), JSON.stringify({ anthropic: { type: "api" } }) + "\n");
   writeFileSync(cachePath, JSON.stringify({
     anthropic: { id: "anthropic", models: {
       "claude-opus-5-5": {
         id: "claude-opus-5-5", family: "claude-opus", release_date: "2026-09-18",
         status: "active", tool_call: true,
+        reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
       },
     } },
   }) + "\n");
@@ -101,7 +107,7 @@ const publishTrustedApiInventoryInChild = (home, publisher) => {
     } else {
       await routing.publishCachedSubscriptionInventory({
         cachePath: ${JSON.stringify(cachePath)},
-        listResolvableModels: () => new Set(["anthropic/claude-opus-5-5"]),
+        listResolvableModels: () => new Set(["anthropic/claude-opus-5-5", "anthropic/claude-opus-5-5-fast"]),
         request,
       });
     }
@@ -784,9 +790,12 @@ test("cached inventory publishes only authenticated catalog providers", async ()
   assert.equal(Object.values(calls[0].body.targets)[0].modelID, "claude-fable-5");
 }));
 
-test("live cached publication keeps configured trusted API targets dormant by default", async () => withTempHome(async (home) => {
+test("live cached publication admits explicitly trusted API subscriptions", async () => withTempHome(async (home) => {
   const published = publishTrustedApiInventoryInChild(home, "cached");
-  assert.deepEqual(published.targets, {});
+  assert.equal(published.providers.anthropic.admission, "admitted");
+  assert.ok(Object.values(published.targets).some((target) =>
+    target.modelID === "claude-opus-5-5" && target.source === "subscription-trusted"));
+  assert.deepEqual(published.modelVariants["anthropic/claude-opus-5-5-fast"], ["low", "medium", "high"]);
 }));
 
 test("cached inventory errors are actionable", async () => withTempHome(async (home) => {
@@ -1786,6 +1795,11 @@ test("a client-version gate fences the model, never the provider", () => {
   assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: tooOld }), "model");
   assert.equal(R.classifyRoutingFailure("the gateway does not support the model you requested"), "model");
   assert.equal(R.classifyRoutingFailure("this endpoint requires a newer client"), "model");
+  // OpenAI ChatGPT OAuth rejects Codex models with a 400 and a message naming the model.
+  assert.equal(R.classifyRoutingFailure({
+    statusCode: 400,
+    message: "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+  }), "model");
   // Must not swallow unrelated version talk that says nothing about a model.
   assert.equal(R.classifyRoutingFailure({ statusCode: 500, message: "api version mismatch" }), "other");
 });
