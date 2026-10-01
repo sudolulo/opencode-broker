@@ -234,18 +234,21 @@ A session caught in a loop (a compaction that repeats, a context-pruning plugin
 that keeps invalidating the prompt cache) can spend a large share of a
 subscription window in minutes. Every opencode process already reports each
 provider request's tokens to the broker, and the router plugin names the
-session's **root** when the session has a parent, so the broker watches the
-rate per session TREE and acts on two kinds of signal:
+session's **root** when the session has a parent, so the broker watches rate on
+two shapes at once -- per actual sessionID for stops, and summed over the
+session TREE for the fan-out notify:
 
 - **Stop.** A session that re-sends most of its prompt uncached again and again,
-  or whose tree spends far more than any working session does, has its own turn
-  aborted by the router plugin, with a toast saying why. Stops are per actual
-  sessionID: the looping child is stopped, never the whole tree. Nothing is
-  deleted; sending another message continues deliberately, and the counters
-  start over.
-- **Notify.** Fast spend by one session tree runs `burnWatch.notifyCommand`, at
-  most once per root per cooldown. Every stop is announced the same way and
-  logged to `decisions.jsonl` as `policy: "burn-stop"`.
+  or that spends more weighted tokens on its OWN than any working session does
+  in five minutes, has its own turn aborted by the router plugin, with a toast
+  saying why. Stops are per actual session on its own spend: the looping child
+  is stopped, never the tree, and no sibling's spend can push another over the
+  line. Nothing is deleted; sending another message continues deliberately, and
+  the counters restart from zero for the continued session.
+- **Notify.** Fast spend by one session tree -- the session plus every subagent
+  whose `rootSessionID` names it -- runs `burnWatch.notifyCommand`, at most once
+  per root per cooldown. The tree only notifies; it never stops. Every stop is
+  announced the same way and logged to `decisions.jsonl` as `policy: "burn-stop"`.
 
 The all-sessions aggregate signals (provider-spend and plan-rise) were removed:
 healthy parallel sessions trip any fixed sum, and plan-rise could only fire for
@@ -265,8 +268,8 @@ under `burnWatch`:
 | `rewriteCount` | 4 | Stop after this many full re-sends inside `rewriteWindowMs` ... |
 | `rewriteVolumeTokens` | 1500000 | ... that carry at least this many tokens between them. |
 | `rewriteWindowMs` | 300000 | |
-| `sessionSpendTokens` | 3000000 | Notify when one session TREE (the session plus every subagent whose `rootSessionID` names it) spends this much inside `sessionSpendWindowMs`. |
-| `sessionStopTokens` | 6000000 | Stop the session whose report tipped the tree past this much inside `sessionSpendWindowMs`. |
+| `sessionSpendTokens` | 3000000 | Notify when one session TREE (the session plus every subagent whose `rootSessionID` names it) spends this much inside `sessionSpendWindowMs`. The tree only notifies; it never stops. |
+| `sessionStopTokens` | 6000000 | Stop a session whose OWN weighted spend inside `sessionSpendWindowMs` crosses this. Per actual session, not per tree -- a sibling's spend never pushes another session over the line. |
 | `sessionSpendWindowMs` | 300000 | |
 | `notifyCooldownMs` | 900000 | At most one notification per root in this long. |
 

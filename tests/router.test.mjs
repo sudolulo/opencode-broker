@@ -1100,7 +1100,11 @@ test("classifier failures report without arming the local watchdog, aborting, or
   }
   assert.equal(result.timersBeforeFailure, 0, "classifier children do not arm the local inactivity watchdog");
   assert.equal(result.intervals.length, 3, "classifier leases retain ordinary heartbeat coverage");
-  assert.deepEqual(result.timers, [], "classifier failures never schedule generic re-engagement");
+  // The /usage report path races root-session resolution against a 1500 ms deadline (so a
+  // hung session.get cannot hold the report hostage). That timer is scheduled here, used
+  // on timeout, and cleared when the race resolves -- it is not a re-engagement.
+  const reengageTimers = result.timers.filter((timer) => timer.delay !== 1500);
+  assert.deepEqual(reengageTimers, [], "classifier failures never schedule generic re-engagement");
   assert.deepEqual(result.aborts, [], "generic retry and burn handling never abort the guard-owned child");
   assert.deepEqual(result.prompts, []);
 }));

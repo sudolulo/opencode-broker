@@ -519,6 +519,51 @@ test("rootSessionID on /usage is validated, logged only when different, and drop
   assert.equal(bySession["ses-plain"].rootSessionID, undefined, "junk is dropped silently");
 }));
 
+// Local providers cost no plan, so the burn watch must stay out of their reports. The
+// usage log still records them -- the log is for tuning the local window.
+test("a local-provider usage report carrying rootSessionID is excluded from the burn watch but still logged", async () => withTempHome(async (home) => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8")
+    .replace(/^\s*\/\/.*$/gm, ""));
+  const sent = join(home, "notified.txt");
+  const notifier = join(home, "notify.sh");
+  writeFileSync(notifier, `#!/bin/sh\nprintf '%s|' "$@" >> "${sent}"\necho >> "${sent}"\n`);
+  chmodSync(notifier, 0o755);
+  fixture.burnWatch = { notifyCommand: [notifier, "{title}", "{body}", "{kind}"] };
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const { child, socketPath } = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath });
+  try {
+    // Eight huge re-sends on llamacpp (the fixture's local provider). The pattern is a
+    // classic rewrite-signature burn: on anthropic it would stop; on llamacpp it must not.
+    for (let i = 0; i < 8; i++) {
+      const reply = await request(socketPath, "/usage", {
+        sessionID: "ses-local-child", rootSessionID: "ses-local-parent",
+        providerID: "llamacpp", modelID: "qwen3.5-9b-coder",
+        observedAt: Date.now(), requests: 1,
+        tokens: { input: 5, output: 400, cacheRead: 17_000, cacheWrite: 500_000 },
+      });
+      assert.equal(reply.burn, undefined, "local providers are never counted by the burn watch");
+    }
+    // Give any detached notify command time to fail to appear.
+    await new Promise((r) => setTimeout(r, 100));
+    let notifiedText = "";
+    try { notifiedText = readFileSync(sent, "utf8"); } catch {}
+    assert.equal(notifiedText, "", "nothing is notified for local traffic, whatever the shape");
+    // The usage log still has the lines -- it is the record used to tune the local
+    // window, so missing it would blind the operator to local load.
+    const usage = readFileSync(join(home, ".local/share/opencode/model-routing/usage.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(usage.length, 8);
+    for (const line of usage) {
+      assert.equal(line.sessionID, "ses-local-child");
+      assert.equal(line.rootSessionID, "ses-local-parent", "the root is still written to the log");
+      assert.equal(line.local, true);
+    }
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 // A caller waiting out a busy local slot re-leases every few seconds; each attempt must not
 // become a line in decisions.jsonl, or a burst of waiters truncates the whole trace.
 test("a session's repeated waits are logged once, not once per poll", async () => withTempHome(async (home) => {

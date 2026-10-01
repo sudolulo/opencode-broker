@@ -11,14 +11,23 @@ All notable changes to this project are documented here. The format is based on
 - **Burn-watch alerts fire per session TREE, and the all-sessions aggregates were removed.** The
   router plugin now walks `parentID` up to the root and names it on every `/usage` report, so the
   burn watch rolls a fan-out of subagents into their root for the session-spend check. Stops stay
-  per actual sessionID — only the looping child is stopped, never its tree — and the stop title
-  no longer carries the provider id; the body names the model as `providerID/modelID` and, for a
-  subagent, says `(a subagent of <root>)`. The two all-sessions signals that lived here, `provider-spend`
-  and `plan-rise`, are gone: in the fourteen days before the removal they fired 47 of 49 alerts
-  for 2 real stops (17 provider-spend, 30 plan-rise), always a parallel burst of healthy sessions
-  summing past a fixed line. The fan-out case they existed for is now handled by the tree rollup
-  of the per-session check instead. `rootSessionID` lands in `usage.jsonl` only when it differs
-  from the session itself, so older readers of the log keep parsing it unchanged.
+  per actual session on its OWN weighted spend inside `sessionSpendWindowMs` — only the looping
+  child is stopped, never its tree, and no sibling's spend can push another session over the
+  line. The tree only notifies; it never stops. After a stop the counters restart from zero for
+  the continued session, and the stopped session's entries are dropped from the tree history
+  (that spend has been acted on). The stop title no longer carries the provider id; the body
+  names the model as `providerID/modelID` and, for a subagent, says `(a subagent of <root>)`. The
+  session-spend notify body says `across N subagent session(s)` only when `N > 0`, counting
+  distinct children of the root (never the root itself). Two `{kind}` values the notifier used
+  to receive, `provider-spend` and `plan-rise`, no longer occur; the surviving `{kind}` values
+  are `session-spend` (title: `Burn watch: session <root> is burning abnormally`) and `stop`
+  (title: `Burn watch stopped a session`). The two all-sessions signals that lived here,
+  `provider-spend` and `plan-rise`, are gone: in the fourteen days before the removal they fired
+  47 of 49 alerts for 2 real stops (17 provider-spend, 30 plan-rise), always a parallel burst of
+  healthy sessions summing past a fixed line. The fan-out case they existed for is now handled
+  by the tree rollup of the per-session check instead. `rootSessionID` lands in `usage.jsonl`
+  only when it differs from the session itself, so older readers of the log keep parsing it
+  unchanged.
 
 ### Removed
 

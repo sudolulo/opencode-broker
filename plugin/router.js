@@ -142,6 +142,27 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     ? options.localChildInactivityWatchdogMs
     : LOCAL_CHILD_INACTIVITY_WATCHDOG_MS;
   const scheduleTimeout = typeof options.setTimeout === "function" ? options.setTimeout : setTimeout;
+  // Max time the root walk may spend before the /usage reporter gives up and sends the
+  // report WITHOUT rootSessionID: the broker counts the session as its own root (safe
+  // fallback -- see lib/burn-watch.js) and the burn-stop reply can still come back.
+  // ☠️ Not optional. On 2026-10 reviewers found that a hung session.get held the whole
+  // /usage chain hostage, which also held the burn.stop reply hostage, which meant a
+  // runaway could not be aborted at all. 1500 ms is well above a healthy session read
+  // (~5 ms on the local SDK) and well under any human-perceptible abort delay.
+  const rootResolveTimeoutMs = Number.isFinite(options.rootResolveTimeoutMs) && options.rootResolveTimeoutMs >= 0
+    ? options.rootResolveTimeoutMs
+    : 1500;
+  // Negative memo for a FAILED root walk: a cycle, an 8-hop exhaustion, or a session.get
+  // error. Without it the next step of a looping subagent calls session.get again, and
+  // again, and again -- measured 2026-10: a subagent that could not resolve its root
+  // issued one SDK call per step-finish. 60 s is long enough to collapse a burst and
+  // short enough that a transient error does not stick when the lookup starts working.
+  const ROOT_FAILURE_TTL_MS = 60_000;
+  const sessionRootFailures = new Map(); // sessionID -> at
+  // Dedupe concurrent FIRST lookups for the same session: a burst of step-finish parts
+  // on a fresh session triggers one resolveRootSessionID per part, each walking back
+  // through session.get. Fold them onto one in-flight promise so the SDK is called once.
+  const sessionRootInflight = new Map(); // sessionID -> promise
   // How long a prompt waits for a busy or loading local model before failing, and the retry step.
   const leaseWaitMaxMs = Number.isFinite(options.leaseWaitMaxMs) && options.leaseWaitMaxMs >= 0 ? options.leaseWaitMaxMs : 10 * 60 * 1000;
   const leaseWaitStepMs = Number.isFinite(options.leaseWaitStepMs) && options.leaseWaitStepMs >= 0 ? options.leaseWaitStepMs : 3000;
@@ -299,7 +320,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       query: { directory },
     });
     const session = result?.data ?? result;
-    if (session?.id) sessions.set(session.id, session);
+    // ☠️ The SDK returns an error envelope { error: ... } on NotFound and similar, which
+    // has no `id` field. A caller walking parentID on that object sees undefined and
+    // (before this check) memoized the walker's current hop as its own root -- the
+    // broker then counted a subagent's spend under the WRONG tree. A result without a
+    // string id counts as a failed lookup; nothing cached, nothing returned.
+    if (typeof session?.id !== "string" || !session.id) return null;
+    sessions.set(session.id, session);
     return session;
   };
 
@@ -312,28 +339,75 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   // root in the broker's tree rollup, which is the safe fallback (worst case: a subagent
   // alerts under its own key instead of its parent's). Never throw: this runs inside the
   // fire-and-forget /usage report chain and must not break anything.
+  //
+  // Failures are negatively memoized for ROOT_FAILURE_TTL_MS, and concurrent first lookups
+  // for the same session share one in-flight promise -- otherwise every step-finish of a
+  // subagent whose root cannot be resolved re-issues session.get on every hop, every step.
   const resolveRootSessionID = async (sessionID) => {
     if (!sessionID) return null;
     if (sessionRoots.has(sessionID)) return sessionRoots.get(sessionID);
-    let current = sessionID;
-    const visited = new Set();
-    for (let hop = 0; hop < 8; hop += 1) {
-      if (visited.has(current)) break;
-      visited.add(current);
-      let session = sessions.get(current);
-      if (!session) {
-        try { session = await getSession(current); } catch { return null; }
+    const failedAt = sessionRootFailures.get(sessionID);
+    if (failedAt !== undefined && Date.now() - failedAt < ROOT_FAILURE_TTL_MS) return null;
+    if (failedAt !== undefined) sessionRootFailures.delete(sessionID);
+    const inflight = sessionRootInflight.get(sessionID);
+    if (inflight) return inflight;
+    const walk = (async () => {
+      let current = sessionID;
+      const visited = new Set();
+      for (let hop = 0; hop < 8; hop += 1) {
+        if (visited.has(current)) {
+          sessionRootFailures.set(sessionID, Date.now());
+          trimTracker(sessionRootFailures);
+          return null;
+        }
+        visited.add(current);
+        let session = sessions.get(current);
+        if (!session) {
+          try { session = await getSession(current); } catch { session = null; }
+        }
+        if (!session) {
+          sessionRootFailures.set(sessionID, Date.now());
+          trimTracker(sessionRootFailures);
+          return null;
+        }
+        const parent = session.parentID;
+        if (!parent) {
+          sessionRoots.set(sessionID, current);
+          trimTracker(sessionRoots);
+          return current;
+        }
+        current = parent;
       }
-      if (!session) return null;
-      const parent = session.parentID;
-      if (!parent) {
-        sessionRoots.set(sessionID, current);
-        trimTracker(sessionRoots);
-        return current;
-      }
-      current = parent;
+      // 8-hop exhaustion: a chain this long is a bug, memoize the failure so later steps
+      // do not pay for it again.
+      sessionRootFailures.set(sessionID, Date.now());
+      trimTracker(sessionRootFailures);
+      return null;
+    })();
+    sessionRootInflight.set(sessionID, walk);
+    try {
+      return await walk;
+    } finally {
+      sessionRootInflight.delete(sessionID);
     }
-    return null;
+  };
+
+  // Race the root walk against a bounded timeout. On timeout the walk continues (its
+  // result is cached if it ever lands), and the caller gets null so the /usage report
+  // can go out WITHOUT rootSessionID instead of waiting on an SDK that may never answer.
+  const resolveRootSessionIDBounded = async (sessionID) => {
+    if (!sessionID) return null;
+    if (sessionRoots.has(sessionID)) return sessionRoots.get(sessionID);
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = scheduleTimeout(() => resolve(null), rootResolveTimeoutMs);
+      timer?.unref?.();
+    });
+    try {
+      return await Promise.race([resolveRootSessionID(sessionID), timeout]);
+    } finally {
+      cancelTimeout(timer);
+    }
   };
 
   const failLease = (resolved, error) => {
@@ -1146,7 +1220,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             // by broker or session-API latency. The whole chain (resolveRootSessionID
             // then POST /usage then burn-stop handling) runs detached.
             Promise.resolve().then(async () => {
-              const rootSessionID = await resolveRootSessionID(sessionID);
+              // Bounded resolve: a hung session.get must not hold the /usage report
+              // (and its burn.stop reply) hostage. On timeout the field is omitted and
+              // the broker counts the session as its own root; the next step will try
+              // again (negative memo collapses repeated misses within its TTL).
+              const rootSessionID = await resolveRootSessionIDBounded(sessionID);
               return brokerRequest("/usage", {
                 sessionID,
                 // Omitted when the walk failed (the broker falls back to self-root).

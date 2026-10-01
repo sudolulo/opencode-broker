@@ -214,16 +214,20 @@ test("burnWatch defaults to on, takes its thresholds from config, and borrows wa
 });
 
 // The removed provider-spend and plan-rise signals must not crash parsing. A config that
-// still carries any of their keys gets ONE stderr line per key explaining they are ignored,
-// and the remaining thresholds keep tuning normally.
-test("the removed burnWatch keys are ignored with a warning, never crash, and the rest still tune", async () => {
+// still carries any of their keys surfaces one DEPRECATIONS entry per key -- printed once
+// at `serve` start and returned by `/status` -- rather than one stderr line per importer
+// (the HUD plugin, the model watcher, the usage CLI all import this module and were each
+// re-printing the same warnings on load). The remaining thresholds keep tuning normally.
+test("the removed burnWatch keys surface as DEPRECATIONS entries, never crash, and the rest still tune", async () => {
   const { BURN_DEFAULTS } = await import("../lib/burn-watch.js");
   const removed = ["providerSpendTokens", "providerSpendWindowMs", "planWindow", "planRisePoints", "planRiseWindowMs"];
-  const warnings = [];
+  // import time is quiet now -- a stale key must not print at every importer's boot.
+  const stderrLines = [];
   const original = console.error;
-  console.error = (...args) => { warnings.push(args.join(" ")); };
+  console.error = (...args) => { stderrLines.push(args.join(" ")); };
+  let module;
   try {
-    const tuned = (await loadConfig(`{
+    module = await loadConfig(`{
       "burnWatch": {
         "sessionStopTokens": 8000000,
         "providerSpendTokens": 3000000,
@@ -232,22 +236,32 @@ test("the removed burnWatch keys are ignored with a warning, never crash, and th
         "planRisePoints": 6,
         "planRiseWindowMs": 600000
       }
-    }`)).CONFIG.burnWatch;
-    // The remaining keys still tune.
-    assert.equal(tuned.enabled, true);
-    assert.equal(tuned.sessionStopTokens, 8000000);
-    for (const key of Object.keys(BURN_DEFAULTS)) assert.ok(tuned[key] !== undefined, `${key} is still present`);
-    // The removed keys do not survive to the CONFIG.
-    for (const key of removed) assert.equal(tuned[key], undefined, `${key} is gone`);
-    // One stderr line per removed key, each naming the key and saying it is ignored.
-    for (const key of removed) {
-      assert.ok(
-        warnings.some((line) => line.includes(`burnWatch.${key}`) && /no longer used/.test(line) && /ignoring/.test(line)),
-        `one warning per removed key, missing ${key}: ${JSON.stringify(warnings)}`,
-      );
-    }
+    }`);
   } finally {
     console.error = original;
+  }
+  const tuned = module.CONFIG.burnWatch;
+  // The remaining keys still tune.
+  assert.equal(tuned.enabled, true);
+  assert.equal(tuned.sessionStopTokens, 8000000);
+  for (const key of Object.keys(BURN_DEFAULTS)) assert.ok(tuned[key] !== undefined, `${key} is still present`);
+  // The removed keys do not survive to the CONFIG.
+  for (const key of removed) assert.equal(tuned[key], undefined, `${key} is gone`);
+  // Reported through DEPRECATIONS, one entry per removed key.
+  for (const key of removed) {
+    assert.ok(
+      module.DEPRECATIONS.some((note) => note.includes(`burnWatch.${key}`) && /no longer used/.test(note)),
+      `one DEPRECATIONS entry per removed key, missing ${key}: ${JSON.stringify(module.DEPRECATIONS)}`,
+    );
+  }
+  // Nothing printed to stderr at import time for the stale keys: those are the lines that
+  // used to show up on every importer's boot. (Other stderr lines in the same import --
+  // e.g. legacy env-var warnings from a different test's setup -- are unrelated.)
+  for (const key of removed) {
+    assert.ok(
+      !stderrLines.some((line) => line.includes(`burnWatch.${key}`)),
+      `burnWatch.${key} must not print at import time; got: ${JSON.stringify(stderrLines)}`,
+    );
   }
 });
 

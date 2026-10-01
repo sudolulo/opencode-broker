@@ -118,9 +118,117 @@ test("eight children of one root each under 3M but summing past it raise one tre
   assert.equal(spend.length, 1, "exactly one alert for the root tree");
   assert.equal(spend[0].title, "Burn watch: session ses_root is burning abnormally",
     "the title names the ROOT and carries no provider id");
-  assert.match(spend[0].body, /including 8 subagent session\(s\)/,
+  assert.match(spend[0].body, /across 8 subagent session\(s\)/,
     "the body names the subagent count when the tree has more than one session");
   assert.match(spend[0].body, /It was not stopped/);
+});
+
+// A tree whose children's SUMMED spend crosses the stop line but no single child's own
+// spend does -- stops are per actual session, so none is stopped; the tree is only notified.
+test("a tree summing past 6M with no single child's OWN spend over 6M is only notified, never stopped", () => {
+  const watch = createBurnWatch();
+  const alerts = [];
+  let stops = 0;
+  // Ten children, each ~700K weighted. Summed: ~7M, past the 6M stop line. No child
+  // alone passes it.
+  for (let i = 0; i < 70; i++) {
+    const r = watch.recordUsage({
+      sessionID: `ses_child_${i % 10}`, rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 100_000 }, at: i * 3_000,
+    });
+    alerts.push(...r.alerts);
+    if (r.stop) stops += 1;
+  }
+  assert.equal(stops, 0, "no child alone crosses its own stop line; stops are per actual session");
+  const spend = alerts.filter((a) => a.kind === "session-spend");
+  assert.equal(spend.length, 1, "exactly one tree notify for the root");
+});
+
+// Lone session, once stopped, must re-earn 6M of its OWN spend before being stopped again:
+// after sessions.delete the per-session window is empty, and the stop check uses that
+// window -- not the tree's -- so the pre-stop evidence does not count again.
+test("a lone session, once stopped, continues at the same rate without a second stop until its own 6M is re-earned", () => {
+  const watch = createBurnWatch();
+  const step = (i) => watch.recordUsage({
+    sessionID: "ses_lone", providerID: "openai", modelID: "gpt-sol",
+    tokens: { input: 1_000, output: 100_000 }, at: i * 3_000,
+  });
+  const results = Array.from({ length: 100 }, (_, i) => step(i));
+  const firstStop = results.findIndex((r) => r.stop);
+  assert.ok(firstStop > 0, `the lone session is stopped exactly once; got firstStop=${firstStop}`);
+  // The 20 steps that immediately follow the stop re-enter at ~101K/step. If the stopped
+  // window still sat in trees/own, the next few steps would stop again on pre-stop evidence.
+  const nextTwenty = results.slice(firstStop + 1, firstStop + 21).filter((r) => r.stop).length;
+  assert.equal(nextTwenty, 0,
+    "the continued lone session must not be stopped again until it re-earns its own 6M");
+});
+
+// Pre-stop entries of a stopped session must not keep the TREE above the notify line
+// after the stop, either: that spend has been acted on. Keep other members' entries.
+test("after a stop, the stopped session's entries are removed from the tree history (other members keep theirs)", () => {
+  const watch = createBurnWatch();
+  // Child A trips the rewrite signature with ~1.7M of fresh writes.
+  for (let i = 0; i < 4; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_A", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: rewrite(430_000), at: i * 10_000,
+    });
+    if (i < 3) assert.equal(r.stop, null);
+    else assert.ok(r.stop, "A is stopped on its 4th full re-send");
+  }
+  // Child B now spends 1.5M weighted on its own -- well under 3M alone. If A's pre-stop
+  // entries persisted in trees[root], A's ~1.75M-weighted history plus B's 1.5M would push
+  // the tree past the 3M notify line. They do not persist, so B alone does not notify.
+  const alerts = [];
+  for (let i = 0; i < 15; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_B", rootSessionID: "ses_root",
+      providerID: "openai", modelID: "gpt-sol",
+      tokens: { input: 1_000, output: 100_000 }, at: 60_000 + i * 1_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  const spend = alerts.filter((a) => a.kind === "session-spend");
+  assert.equal(spend.length, 0,
+    "B's own 1.5M is under 3M; A's pre-stop spend has been acted on and must not count");
+});
+
+// Subagent count is distinct sessions in the tree window EXCLUDING the root; and the
+// phrase appears only when at least one subagent reported.
+test("subagent count excludes the root and the phrase disappears when the root is alone", () => {
+  const watch = createBurnWatch();
+  const alerts = [];
+  // Root reports some, plus two children -- distinct subagent sessions = 2, not 3.
+  for (let i = 0; i < 30; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_root", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  for (let i = 0; i < 30; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_child_A", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: 100_000 + i * 3_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  for (let i = 0; i < 30; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_child_B", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: 200_000 + i * 3_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  const spend = alerts.filter((a) => a.kind === "session-spend");
+  assert.ok(spend.length >= 1);
+  assert.match(spend[0].body, /across 2 subagent session\(s\)/,
+    `the subagent count counts children only (not the root): ${spend[0].body}`);
 });
 
 // Cooldown still applies to a root key.

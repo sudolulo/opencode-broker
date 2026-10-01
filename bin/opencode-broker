@@ -2125,10 +2125,10 @@ const serve = async () => {
         logUsage(usageRecord({
           at: Date.now(), sessionID, providerID,
           modelID,
-          // rootSessionID lands in usage.jsonl only when it is present and names a DIFFERENT
-          // session -- the root carries no new signal when it is itself. Keeping the field
-          // off a self-root line keeps the log readable and makes tree-aware analyses easy.
-          ...(rootSessionID && rootSessionID !== sessionID ? { rootSessionID } : {}),
+          // rootSessionID is passed as-is; usageRecord drops it from the written line when
+          // it equals the session itself (the root carries no new signal when it is its own
+          // root). One self-root filter, in the one place that writes the file.
+          rootSessionID,
           lease: assignment,
           tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
           local: localProviderIDs(allTargets(state)).has(providerID),
