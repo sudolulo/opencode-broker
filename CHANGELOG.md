@@ -6,8 +6,35 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Session-bound gateway requests.** opencode reaches its subscription providers through the
+  fleet gateway, and the router plugin has already leased the turn's model by then. A request
+  carrying `x-opencode-session-id` (plus `x-opencode-lease-id`, which the plugin now sends for
+  `anthropic` and `openai`) is forwarded on that session's own lease, for exactly the model it
+  names, after a new read-only broker check, `/lease/verify`. The gateway makes one attempt and
+  does no lease accounting of its own; the plugin owns the lease. Loopback only; a session with
+  no matching live lease gets a 409 the plugin classifies as its own route error. Before this,
+  the gateway re-leased every such request from its default worker tier, so Claude turns failed
+  whenever the worker lanes were fenced.
+
+- **Per-tier local share.** `tierLocalShare` (e.g. `{ "build": 4, "review": 4 }`) reserves one in N
+  new assignments on a non-Worker Auto tier for its local target. Worker keeps
+  `workerLocalShareDenominator`; a `tierLocalShare.worker` entry is rejected, not silently ignored.
+- **`planUsage.keyFile`** for the `http` plan-usage source: the credential is read from an
+  owner-only key file (refused if group- or world-readable), as the gateway reads its provider
+  keys, instead of from an `authRef` entry in opencode's `auth.json`.
+
 ### Fixed
 
+- **llm-auth-proxy plan usage is read again.** Its OpenAI route reports `{ windows: [{ percent,
+  resetsAt (epoch s), durationSeconds }] }`, not the canonical shape, and the configured `authRef`
+  named an `auth.json` entry that never existed. Both readings failed, the last good report served
+  indefinitely, and an OpenAI plan at 100% kept reading 89%, so new sessions balanced onto it and
+  failed. The proxy shape is now accepted (strictly), and an exhausted window locks the provider
+  until its reset.
+- **ChatGPT's "model is not supported when using Codex with a ChatGPT account"** opens a model
+  circuit for that one model rather than a five-minute target failure with provider evidence.
 - **The gateway's own "no provider could serve the request" refusal no longer quarantines a
   provider.** opencode's `anthropic` provider can sit behind the fleet gateway; when every target
   was fenced, the gateway's 502 was recorded as an `other` failure against the anthropic target,

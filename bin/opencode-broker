@@ -1769,6 +1769,21 @@ const serve = async () => {
         writeState(state);
         return reply(response, 200, { ok: true, present });
       }
+      // Read-only: does this session hold a live lease, and on what? The gateway asks before
+      // forwarding an opencode session's request on that session's own lease, so a session id
+      // alone can never reach a model the broker did not grant it.
+      if (request.url === "/lease/verify") {
+        if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        const lease = state.leases[body.sessionID];
+        const leaseMatches = lease && (body.leaseID === undefined || body.leaseID === lease.leaseID);
+        const target = leaseMatches ? targetForID(lease.targetID, allTargets(state)) : null;
+        if (!target) return reply(response, 200, { held: false });
+        return reply(response, 200, {
+          held: true,
+          leaseID: lease.leaseID,
+          target: { id: target.id, kind: target.kind, model: { providerID: target.providerID, id: target.modelID } },
+        });
+      }
       if (request.url === "/failure") {
         const binding = settlementBinding(state, body);
         const lease = state.leases[body.sessionID];

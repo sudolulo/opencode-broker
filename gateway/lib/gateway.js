@@ -899,6 +899,10 @@ export const createGatewayHandler = ({
   };
 
   const settle = async (leased, path, body = {}) => {
+    // A session-bound request rides the opencode session's OWN lease: the plugin that minted it
+    // reports its usage, failure and release, so the gateway settling it too would double-count
+    // spend and could drop a lease the session still holds for its next step.
+    if (leased?.external) return;
     try {
       await brokerRequest(path, {
         sessionID: leased.sessionID,
@@ -932,6 +936,7 @@ export const createGatewayHandler = ({
     caller = null,
     requestHeaders = {},
     probeAssignment = null,
+    boundLease = null,
   ) => {
     const streaming = Boolean(sink);
     const wantedJson = Boolean(requestBody?.response_format?.type?.startsWith?.("json"));
@@ -967,6 +972,7 @@ export const createGatewayHandler = ({
         keepUsageFrames,
         requestHeaders,
         probeAssignment,
+        boundLease,
       );
     } finally {
       callers.delete(sessionID);
@@ -990,6 +996,7 @@ export const createGatewayHandler = ({
     keepUsageFrames,
     requestHeaders,
     probeAssignment = null,
+    boundLease = null,
   ) => {
     let lastError = null;
     let lastForwardError = null;
@@ -1017,9 +1024,14 @@ export const createGatewayHandler = ({
     // A mapped name may shorten (or refuse) the wait; anything else gets the deployment default.
     const deadline = now() + waitFor(route);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+      // ☠️ A SESSION-BOUND REQUEST GETS EXACTLY ONE ATTEMPT, ON EXACTLY ITS MODEL. Choosing a
+      // different target is the session's own router's job (it holds the pin and the transcript
+      // context); a gateway retry onto another lane would answer a Claude turn from whatever the
+      // worker tier had free, which is how every opencode prompt failed on 2026-10-01.
+      if (boundLease && attempt > 0) break;
       let leased;
       try {
-        leased = await leaseWithPrepare(
+        leased = boundLease ?? await leaseWithPrepare(
           sessionID,
           requestBody,
           excluded,
@@ -1591,6 +1603,50 @@ export const createGatewayHandler = ({
         },
       };
     }
+    // ☠️ AN OPENCODE SESSION HAS ALREADY BEEN ROUTED. Its router plugin leased a target in
+    // chat.message and sent that exact model here, so leasing again from this gateway's default
+    // tier would discard the choice (and, with the worker lanes fenced, refuse a Claude turn the
+    // session's own lease could serve). A request carrying the session id is forwarded on the
+    // session's live lease instead -- but only from loopback, only when the broker confirms the
+    // lease is held, and only for the exact model that lease names, so the header cannot be used
+    // to reach a model the broker did not grant.
+    let boundLease = null;
+    const rawBoundSession = request.headers["x-opencode-session-id"];
+    const boundSessionID = Array.isArray(rawBoundSession) ? rawBoundSession[0] : rawBoundSession;
+    if (boundSessionID !== undefined && !hasProbeMarker) {
+      if (!loopbackAddress(request.socket?.remoteAddress)) {
+        return respondJson(response, 403, { error: { message: "session-bound requests require loopback" } });
+      }
+      const rawBoundLease = request.headers["x-opencode-lease-id"];
+      const boundLeaseID = Array.isArray(rawBoundLease) ? rawBoundLease[0] : rawBoundLease;
+      let held = null;
+      try {
+        held = await brokerRequest("/lease/verify", {
+          sessionID: boundSessionID,
+          ...(typeof boundLeaseID === "string" && boundLeaseID ? { leaseID: boundLeaseID } : {}),
+        });
+      } catch { held = null; }
+      const model = held?.target?.model;
+      if (!held?.held || typeof model?.providerID !== "string" || model.id !== requestedModel ||
+        !config.providers[model.providerID]) {
+        // The plugin classifies this wording as its own route error (noop), so a stale binding
+        // never indicts the provider; the session re-leases on the next prompt.
+        return respondJson(response, 409, {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "${requestedModel}")`,
+          },
+        });
+      }
+      boundLease = {
+        sessionID: boundSessionID,
+        leaseID: held.leaseID,
+        providerID: model.providerID,
+        modelID: model.id,
+        external: true,
+      };
+    }
     const streaming = parsed.stream === true;
     // Anything that is not an explicit `stream: true` keeps the buffered
     // shape byte for byte, and the key never reaches the upstream -- a lane
@@ -1664,7 +1720,7 @@ export const createGatewayHandler = ({
           ? request.headers["anthropic-version"][0] : request.headers["anthropic-version"],
         anthropicBeta: Array.isArray(request.headers["anthropic-beta"])
           ? request.headers["anthropic-beta"][0] : request.headers["anthropic-beta"],
-      }, probeAssignment);
+      }, probeAssignment, boundLease);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
     }

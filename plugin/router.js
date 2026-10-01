@@ -113,6 +113,8 @@ const contextTokensOf = (message) => {
 
 // opencode's internal agents that run on `small_model` rather than the session's model.
 const SMALL_MODEL_AGENTS = new Set(["title"]);
+// Subscription providers opencode reaches through the fleet gateway (see chat.headers).
+const GATEWAY_BOUND_PROVIDERS = new Set(["anthropic", "openai"]);
 
 export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const brokerRequest = await createResolverProcessBrokerRequest({
@@ -839,16 +841,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // Code requests on 2026-09-28: 97% of main-session writes were 1h, 99.9% of subagent writes
     // 5m. Only sent to the anthropic provider (the proxy); an unknown session sends nothing and
     // the proxy keeps the safe 1-hour default.
+    // The same session id, plus the turn's lease id, is how the fleet gateway recognizes a
+    // request this plugin already routed: it forwards on that exact lease instead of leasing
+    // again from its own default tier. Sent for both subscription providers behind the gateway.
     "chat.headers": async (input, output) => {
-      if (input?.model?.providerID !== "anthropic" || !input?.sessionID || !output?.headers) return;
+      if (!GATEWAY_BOUND_PROVIDERS.has(input?.model?.providerID) || !input?.sessionID || !output?.headers) return;
+      // Lets the proxy's prompt fingerprints compare consecutive requests of one session, and the
+      // gateway find the lease below. Set before the session lookup, which can fail.
+      output.headers["x-opencode-session-id"] = input.sessionID;
+      const leaseID = routes.get(input.sessionID)?.leaseID;
+      if (typeof leaseID === "string" && leaseID) output.headers["x-opencode-lease-id"] = leaseID;
       let session = sessions.get(input.sessionID);
       if (!session) {
         try { session = await getSession(input.sessionID); } catch { return; }
       }
       if (!session?.id) return;
       output.headers["x-opencode-session-kind"] = session.parentID ? "subagent" : "primary";
-      // Lets the proxy's prompt fingerprints compare consecutive requests of one session.
-      output.headers["x-opencode-session-id"] = session.id;
     },
     "chat.params": async (input) => {
       const sessionID = input?.sessionID;

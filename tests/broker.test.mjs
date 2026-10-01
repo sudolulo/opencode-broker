@@ -3627,3 +3627,17 @@ test("health reports ok on a responsive broker and unhealthy when nothing answer
     rmSync(emptyHome, { recursive: true, force: true });
   }
 }));
+
+test("/lease/verify answers only for the exact live lease, and changes nothing", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({ openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 } }));
+  const lease = await request(socketPath, "/lease", { sessionID: "ses-verify", profile: "auto", tier: "worker", preferredModel: { providerID: "openai", id: "gpt-5.6-luna" }, replace: true });
+  const held = await request(socketPath, "/lease/verify", { sessionID: "ses-verify", leaseID: lease.leaseID });
+  assert.equal(held.held, true);
+  assert.equal(held.leaseID, lease.leaseID);
+  assert.deepEqual(held.target.model, { providerID: lease.target.model.providerID, id: lease.target.model.id });
+  assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-verify" })).held, true);
+  assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-verify", leaseID: "00000000-0000-4000-8000-000000000000" })).held, false);
+  assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-nobody" })).held, false);
+  await request(socketPath, "/forget", { sessionID: "ses-verify", leaseID: lease.leaseID });
+  assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-verify", leaseID: lease.leaseID })).held, false);
+}));

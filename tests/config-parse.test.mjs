@@ -154,7 +154,8 @@ test("HTTP plan usage keeps its type, URL, and exact auth reference", async () =
         "planUsage": {
           "type": "http",
           "url": "https://usage.example.invalid/v1/plan-usage",
-          "authRef": "provider-credential"
+          "authRef": "provider-credential",
+          "keyFile": "/run/example/key"
         }
       }
     }
@@ -163,6 +164,7 @@ test("HTTP plan usage keeps its type, URL, and exact auth reference", async () =
     type: "http",
     url: "https://usage.example.invalid/v1/plan-usage",
     authRef: "provider-credential",
+    keyFile: "/run/example/key",
   });
 });
 

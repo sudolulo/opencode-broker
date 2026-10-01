@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1001,4 +1001,39 @@ test("without a tierAliases entry the build agent keeps its own lane", () => {
     writeFileSync(configPath, JSON.stringify({}));
     assert.deepEqual(runLeaseWait([{ ok: true }], "build", configPath).tiers, ["build"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The llm-auth-proxy front-door key lives in its own owner-only file, not in opencode's
+// auth.json; and its OpenAI route reports epoch-second resets in a non-canonical shape. Before
+// both were read, neither proxy reading ever landed and a stale 89% stood in for a spent plan.
+test("HTTP plan usage reads a keyFile and the proxy's OpenAI window shape", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const dir = mkdtempSync(join(tmpdir(), "plan-usage-keyfile-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const keyFile = join(dir, "key");
+  writeFileSync(keyFile, "proxy-secret\n", { mode: 0o600 });
+  let sent;
+  const report = await fetchPlanUsage("openai", httpPlanConfig(join(dir, "missing-auth.json"), { authRef: undefined, keyFile }), {
+    fetchImpl: async (_url, options) => {
+      sent = options.headers["x-api-key"];
+      return { ok: true, json: async () => ({ provider: "openai", plan: "pro", windows: [{ id: "primary", percent: 100, resetsAt: 1791309426, durationSeconds: 604800 }], stale: false }) };
+    },
+  });
+  assert.equal(sent, "proxy-secret");
+  assert.deepEqual(report, {
+    windows: [{ id: "wk", percent: 100, resetsAt: new Date(1791309426 * 1000).toISOString(), active: true, severity: null }],
+    lockedUntil: 1791309426 * 1000,
+    plan: "pro",
+  });
+
+  // A group- or world-readable key file is refused, as the gateway refuses it.
+  __resetPlanUsageCacheForTests();
+  writeFileSync(keyFile, "proxy-secret\n");
+  chmodSync(keyFile, 0o644);
+  let called = false;
+  const loose = await fetchPlanUsage("openai", httpPlanConfig(join(dir, "missing-auth.json"), { authRef: undefined, keyFile }), {
+    fetchImpl: async () => { called = true; return { ok: true, json: async () => canonicalUsage() }; },
+  });
+  assert.equal(loose, null);
+  assert.equal(called, false);
 });

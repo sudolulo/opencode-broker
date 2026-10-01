@@ -37,7 +37,7 @@ const runPlugin = (body) => {
           leases.push(lease);
           // The broker honours an eligible preference; otherwise it balances onto sol.
           const model = lease.preferredModel ?? { providerID: "openai", id: "gpt-5.6-sol" };
-          reply = { target: { id: model.id, model }, decision: { policy: "weighted-depletion", reasons: [] } };
+          reply = { leaseID: "lease-" + leases.length, target: { id: model.id, model }, decision: { policy: "weighted-depletion", reasons: [] } };
         }
         response.emit("data", JSON.stringify(reply));
         response.emit("end");
@@ -73,7 +73,7 @@ const runPlugin = (body) => {
   }
 };
 
-test("chat.headers marks anthropic requests as primary or subagent, with the session id, and nothing else", () => {
+test("chat.headers marks gateway-bound requests as primary or subagent, with the session id, and nothing else", () => {
   const result = runPlugin(`
     const anthropic = { providerID: "anthropic", id: "claude-opus-5" };
     const run = async (sessionID, model) => {
@@ -85,13 +85,32 @@ test("chat.headers marks anthropic requests as primary or subagent, with the ses
       root: await run("ses-root", anthropic),
       child: await run("ses-child", anthropic),
       openai: await run("ses-root", { providerID: "openai", id: "gpt-5.6-sol" }),
+      local: await run("ses-root", { providerID: "llamacpp", id: "qwen3.5-9b" }),
     }));
   `);
   assert.deepEqual(result, {
     root: { "x-opencode-session-kind": "primary", "x-opencode-session-id": "ses-root" },
     child: { "x-opencode-session-kind": "subagent", "x-opencode-session-id": "ses-child" },
-    openai: {},
+    openai: { "x-opencode-session-kind": "primary", "x-opencode-session-id": "ses-root" },
+    local: {},
   });
+});
+
+// The gateway forwards a routed session's request on that session's own lease, so the
+// header must name the lease the turn actually holds.
+test("chat.headers carries the routed turn's lease id", () => {
+  const result = runPlugin(`
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-root", agent: "smart" } } } });
+    await hooks["chat.message"](
+      { sessionID: "ses-root", agent: "smart", model: { providerID: "openai", id: "gpt-5.6-sol" } },
+      { message: { agent: "smart", model: { providerID: "openai", modelID: "gpt-5.6-sol" } }, parts: [{ type: "text", text: "go" }] },
+    );
+    const output = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "ses-root", agent: "smart", model: { providerID: "openai", id: "gpt-5.6-sol" }, message: {} }, output);
+    console.log(JSON.stringify(output.headers));
+  `);
+  assert.equal(result["x-opencode-session-id"], "ses-root");
+  assert.match(result["x-opencode-lease-id"] ?? "", /^lease-\d+$/);
 });
 
 test("a routed subagent keeps its model when a message arrives stamped with another", () => {

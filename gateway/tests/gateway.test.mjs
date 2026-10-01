@@ -2788,3 +2788,73 @@ test("a waiter that gives up leaves the line, and the next one is still served",
   });
   assert.deepEqual(state.served, ["B"]);
 });
+
+// An opencode session has already been routed by its plugin: the gateway must forward on that
+// session's own lease, for exactly the model the lease names, and leave all of the lease's
+// accounting to the plugin that owns it (2026-10-01: re-leasing from the worker tier refused
+// every Claude turn while the worker lanes were fenced).
+test("a session-bound request rides the session's own lease and never re-leases", async () => {
+  const scenario = async ({ held, model = "claude-opus-5-5", upstreamStatus = 200 }) => {
+    const calls = [];
+    const forwards = [];
+    const handler = createGatewayHandler({
+      config: {
+        tier: "worker",
+        profile: "auto",
+        providers: { anthropic: { baseUrl: "http://anthropic.example/v1" } },
+      },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (path, body) => {
+        calls.push({ path, body });
+        if (path === "/lease/verify") {
+          return held
+            ? { held: true, leaseID: "lease-1", target: { id: "claude-opus-5-5", model: { providerID: "anthropic", id: "claude-opus-5-5" } } }
+            : { held: false };
+        }
+        if (path === "/lease") throw new Error("must not lease");
+        return { ok: true };
+      },
+      fetchImpl: async (url, init) => {
+        forwards.push({ url, body: JSON.parse(init.body) });
+        return upstreamStatus === 200
+          ? { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "pong" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) }
+          : { ok: false, status: upstreamStatus, text: async () => "failed" };
+      },
+    });
+    let status;
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer gw-secret",
+          "Content-Type": "application/json",
+          "x-opencode-session-id": "ses_abc",
+          "x-opencode-lease-id": "lease-1",
+        },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }] }),
+      });
+      status = response.status;
+      await response.arrayBuffer();
+    });
+    return { status, calls, forwards };
+  };
+
+  const ok = await scenario({ held: true });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.calls.map((call) => call.path), ["/lease/verify"],
+    "no lease, usage, complete or release: the plugin owns this lease's accounting");
+  assert.deepEqual(ok.calls[0].body, { sessionID: "ses_abc", leaseID: "lease-1" });
+  assert.equal(ok.forwards.length, 1);
+  assert.match(ok.forwards[0].url, /^http:\/\/anthropic\.example\/v1\//);
+  assert.equal(ok.forwards[0].body.model, "claude-opus-5-5");
+
+  const failing = await scenario({ held: true, upstreamStatus: 500 });
+  assert.equal(failing.forwards.length, 1, "one attempt, on the leased model only");
+  assert.deepEqual(failing.calls.map((call) => call.path), ["/lease/verify"],
+    "the plugin reports the failure itself; the gateway must not file a second one");
+
+  for (const refused of [await scenario({ held: false }), await scenario({ held: true, model: "claude-haiku-4-5" })]) {
+    assert.equal(refused.status, 409);
+    assert.equal(refused.forwards.length, 0, "a session id alone never reaches an ungranted model");
+  }
+});
