@@ -58,7 +58,7 @@ const leaseCoversWireModel = (leasedModelID, wireModelID) => {
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
 
-// ☠️ WHY AN ALLOWLIST OF GATEWAY-OWNED PHRASES AND NOT THE UPSTREAM MESSAGE. The
+// TRAP: WHY AN ALLOWLIST OF GATEWAY-OWNED PHRASES AND NOT THE UPSTREAM MESSAGE. The
 // Messages and Responses buffered error paths drop the upstream body on purpose
 // (gateway/tests/gateway.test.mjs "...never echo provider details"); the client
 // gets "Anthropic upstream HTTP <status>" and nothing else. A few upstream
@@ -72,7 +72,7 @@ const ATTEMPTS = 2;
 //     message:"Usage credits are required for fast mode."}}`). Account-level,
 //     speed-scoped, no reset -- without this suffix the plain 429 reads as a
 //     burst rate limit and every fast target re-fails forever.
-// ☠️ PROXIMITY, NOT TWO INDEPENDENT CONJUNCTS. The matcher must agree with
+// TRAP: PROXIMITY, NOT TWO INDEPENDENT CONJUNCTS. The matcher must agree with
 // the broker's classifier (lib/routing.js isFastModeCreditsRequired); the
 // two-independent-regex form matched any body that happened to mention both
 // words anywhere, so an echoed stack trace could trip this. 80 chars tolerates

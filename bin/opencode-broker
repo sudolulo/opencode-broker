@@ -217,7 +217,7 @@ const CONNECT_MS = 60 * 1000;
 // Quota with no known reset: re-probe at a bounded cadence (one failed request
 // per probe) instead of holding the provider out until state surgery.
 const QUOTA_REPROBE_MS = 15 * 60 * 1000;
-// ☠️ FAST-MODE-CREDITS: SAME CLASS OF FACT AS A LAPSED PLAN, SAME HOLD. The
+// TRAP: FAST-MODE-CREDITS: SAME CLASS OF FACT AS A LAPSED PLAN, SAME HOLD. The
 // account owner must buy credits to lift it (a human action, no reset time
 // announced), and no background check can exercise fast mode for free -- so the
 // expiry IS the re-probe. One real request per hold window:
@@ -1915,7 +1915,7 @@ const serve = async () => {
           state.circuits[targetID] = { kind, until: Date.now() + 60_000, updatedAt: Date.now() };
         } else if (target && kind === "model") {
           if (isFastModeCreditsRequired(error)) {
-            // ☠️ FAST-MODE-CREDITS IS ACCOUNT-LEVEL AND SPEED-SCOPED. Every fast
+            // TRAP: FAST-MODE-CREDITS IS ACCOUNT-LEVEL AND SPEED-SCOPED. Every fast
             // sibling on the hit provider will fail identically on the next
             // attempt; fencing only the hit one would make the retry ladder
             // walk each sibling, one failed turn each, every hold window.
@@ -1935,7 +1935,7 @@ const serve = async () => {
               }
             }
             if (fencedIDs.length === 0) {
-              // ☠️ A FAST-MODE SIGNAL ON A NON-SPEED LEASE IS CALLER-SIDE. The
+              // TRAP: A FAST-MODE SIGNAL ON A NON-SPEED LEASE IS CALLER-SIDE. The
               // hit target is a standard model (every speed variant is
               // isSpeedVariant()) or the provider carries no speed variants at
               // all; either way the client asked for fast mode on a target
