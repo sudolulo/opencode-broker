@@ -233,18 +233,25 @@ local estimates.
 A session caught in a loop (a compaction that repeats, a context-pruning plugin
 that keeps invalidating the prompt cache) can spend a large share of a
 subscription window in minutes. Every opencode process already reports each
-provider request's tokens to the broker, so the broker watches the rate across
-all sessions and acts on two kinds of signal:
+provider request's tokens to the broker, and the router plugin names the
+session's **root** when the session has a parent, so the broker watches the
+rate per session TREE and acts on two kinds of signal:
 
 - **Stop.** A session that re-sends most of its prompt uncached again and again,
-  or spends far more than any working session does, has its turn aborted by the
-  router plugin, with a toast saying why. Nothing is deleted; sending another
-  message continues deliberately, and the counters start over.
-- **Notify.** Fast spend by one session, fast spend by one provider across all
-  sessions, or a plan window climbing fast (read from the provider's own usage
-  report, where `planUsage` is configured) runs `burnWatch.notifyCommand`, at
-  most once per subject per cooldown. Every stop is announced the same way and
+  or whose tree spends far more than any working session does, has its own turn
+  aborted by the router plugin, with a toast saying why. Stops are per actual
+  sessionID: the looping child is stopped, never the whole tree. Nothing is
+  deleted; sending another message continues deliberately, and the counters
+  start over.
+- **Notify.** Fast spend by one session tree runs `burnWatch.notifyCommand`, at
+  most once per root per cooldown. Every stop is announced the same way and
   logged to `decisions.jsonl` as `policy: "burn-stop"`.
+
+The all-sessions aggregate signals (provider-spend and plan-rise) were removed:
+healthy parallel sessions trip any fixed sum, and plan-rise could only fire for
+providers that publish a plan percent. A fan-out of children each under the
+per-session line is now covered by rolling every subagent into its root for the
+session-spend check instead.
 
 Local providers are never counted. Spend is weighted tokens: input + output +
 cache write + 0.1 x cache read. The defaults were chosen by replaying a week of
@@ -258,19 +265,14 @@ under `burnWatch`:
 | `rewriteCount` | 4 | Stop after this many full re-sends inside `rewriteWindowMs` ... |
 | `rewriteVolumeTokens` | 1500000 | ... that carry at least this many tokens between them. |
 | `rewriteWindowMs` | 300000 | |
-| `sessionSpendTokens` | 3000000 | Notify when one session spends this much inside `sessionSpendWindowMs`. |
-| `sessionStopTokens` | 6000000 | Stop when one session spends this much inside `sessionSpendWindowMs`. |
+| `sessionSpendTokens` | 3000000 | Notify when one session TREE (the session plus every subagent whose `rootSessionID` names it) spends this much inside `sessionSpendWindowMs`. |
+| `sessionStopTokens` | 6000000 | Stop the session whose report tipped the tree past this much inside `sessionSpendWindowMs`. |
 | `sessionSpendWindowMs` | 300000 | |
-| `providerSpendTokens` | 3000000 | Notify when one provider, across all sessions, spends this much inside `providerSpendWindowMs`. |
-| `providerSpendWindowMs` | 300000 | |
-| `planWindow` | `"5h"` | The plan-usage window id to watch for a fast climb. |
-| `planRisePoints` | 6 | Notify when that window rises this many percentage points inside `planRiseWindowMs`. |
-| `planRiseWindowMs` | 600000 | |
-| `notifyCooldownMs` | 900000 | At most one notification per session, provider or plan in this long. |
+| `notifyCooldownMs` | 900000 | At most one notification per root in this long. |
 
-The notify command gets a short title and body, and `{kind}` is one of `stop`,
-`session-spend`, `provider-spend` or `plan-rise`. For a notifier that takes a
-priority and a tag after the message:
+The notify command gets a short title and body, and `{kind}` is one of `stop`
+or `session-spend`. For a notifier that takes a priority and a tag after the
+message:
 
 ```jsonc
 "burnWatch": {

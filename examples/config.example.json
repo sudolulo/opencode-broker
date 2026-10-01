@@ -472,8 +472,7 @@
   // notifyCommand defaults to watch.notifyCommand; [] only logs to the broker's stderr.
   "burnWatch": {
     "notifyCommand": ["/usr/local/bin/notify", "{title}", "{body}", "high", "{kind}"],
-    "sessionStopTokens": 6000000,
-    "planWindow": "5h"
+    "sessionStopTokens": 6000000
   },
   // The HUD (hud/tui.js). Every key is optional.
   "hud": {

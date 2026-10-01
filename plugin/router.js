@@ -134,6 +134,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const contextSizes = new Map();
   const messageModels = new Map();
   const reportedSteps = new Set();
+  // sessionID -> root sessionID (its own id when it has no parent, or lookup failed).
+  // A session's root never changes, so one memoized walk per id is enough; the bounded
+  // trimTracker pattern below applies here too.
+  const sessionRoots = new Map();
   const localChildInactivityWatchdogMs = Number.isFinite(options.localChildInactivityWatchdogMs) && options.localChildInactivityWatchdogMs >= 0
     ? options.localChildInactivityWatchdogMs
     : LOCAL_CHILD_INACTIVITY_WATCHDOG_MS;
@@ -297,6 +301,39 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     const session = result?.data ?? result;
     if (session?.id) sessions.set(session.id, session);
     return session;
+  };
+
+  // Resolve the ROOT of a session by walking parentID up through the sessions cache,
+  // reaching for the API only when a hop is unknown. A session's root never changes, so
+  // the answer is memoized per sessionID in a bounded map and reused forever.
+  //
+  // Cycle guard: at most 8 hops. If the walk hits an unknown session the lookup CANNOT
+  // read, the field is simply omitted from /usage -- the session then counts as its own
+  // root in the broker's tree rollup, which is the safe fallback (worst case: a subagent
+  // alerts under its own key instead of its parent's). Never throw: this runs inside the
+  // fire-and-forget /usage report chain and must not break anything.
+  const resolveRootSessionID = async (sessionID) => {
+    if (!sessionID) return null;
+    if (sessionRoots.has(sessionID)) return sessionRoots.get(sessionID);
+    let current = sessionID;
+    const visited = new Set();
+    for (let hop = 0; hop < 8; hop += 1) {
+      if (visited.has(current)) break;
+      visited.add(current);
+      let session = sessions.get(current);
+      if (!session) {
+        try { session = await getSession(current); } catch { return null; }
+      }
+      if (!session) return null;
+      const parent = session.parentID;
+      if (!parent) {
+        sessionRoots.set(sessionID, current);
+        trimTracker(sessionRoots);
+        return current;
+      }
+      current = parent;
+    }
+    return null;
   };
 
   const failLease = (resolved, error) => {
@@ -1104,19 +1141,28 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           if (model?.providerID) {
             reportedSteps.add(part.id);
             trimTracker(reportedSteps);
-            brokerRequest("/usage", {
-              sessionID,
-              ...(routes.get(sessionID)?.leaseID ? { leaseID: routes.get(sessionID).leaseID } : {}),
-              providerID: model.providerID,
-              modelID: model.modelID,
-              observedAt: Date.now(),
-              requests: 1,
-              tokens: {
-                input: Number(part.tokens.input) || 0,
-                output: Number(part.tokens.output) || 0,
-                cacheRead: Number(part.tokens.cache?.read) || 0,
-                cacheWrite: Number(part.tokens.cache?.write) || 0,
-              },
+            // Fire-and-forget. ☠️ The root resolution MUST NOT await here: the event
+            // handler must return immediately so step-finish processing is not held up
+            // by broker or session-API latency. The whole chain (resolveRootSessionID
+            // then POST /usage then burn-stop handling) runs detached.
+            Promise.resolve().then(async () => {
+              const rootSessionID = await resolveRootSessionID(sessionID);
+              return brokerRequest("/usage", {
+                sessionID,
+                // Omitted when the walk failed (the broker falls back to self-root).
+                ...(rootSessionID && rootSessionID !== sessionID ? { rootSessionID } : {}),
+                ...(routes.get(sessionID)?.leaseID ? { leaseID: routes.get(sessionID).leaseID } : {}),
+                providerID: model.providerID,
+                modelID: model.modelID,
+                observedAt: Date.now(),
+                requests: 1,
+                tokens: {
+                  input: Number(part.tokens.input) || 0,
+                  output: Number(part.tokens.output) || 0,
+                  cacheRead: Number(part.tokens.cache?.read) || 0,
+                  cacheWrite: Number(part.tokens.cache?.write) || 0,
+                },
+              });
             }).then((reply) => {
               // The broker's burn watch (lib/burn-watch.js) judged this session a runaway.
               // This process owns it, so this is the one place that can stop it: abort the

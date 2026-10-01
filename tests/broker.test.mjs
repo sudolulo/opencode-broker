@@ -436,7 +436,10 @@ test("the broker stops a runaway session on the /usage reply and notifies, and n
       await new Promise((r) => setTimeout(r, 50));
       try { text = readFileSync(sent, "utf8"); } catch {}
     }
-    assert.match(text, /Burn watch stopped a session \(anthropic\)\|Session ses_runaway was stopped because .*\|urgent\|stop\|/);
+    // The stop title no longer carries the provider id (the all-sessions aggregate alerts
+    // were removed; a stop is per-session and now also says which provider/model it was on
+    // in the body).
+    assert.match(text, /Burn watch stopped a session\|Session ses_runaway was stopped because .* on anthropic\/m\.\|urgent\|stop\|/);
   } finally {
     await stopBroker(child);
   }
@@ -482,6 +485,38 @@ test("every /usage report is logged with its prompt size, and the usage command 
   assert.equal(report.status, 0, report.stderr);
   assert.match(report.stdout, /cloud {2}openai\/gpt-5\.6-luna/);
   assert.match(report.stdout, /session peaks \(2 sessions\): p50 \d+K? {2}p90 40K/);
+}));
+
+// The /usage handler accepts an optional rootSessionID: it is validated with the same rule
+// as sessionID, written to usage.jsonl only when it names a DIFFERENT session (a self-root
+// carries no new signal), and quietly dropped when it does not look like a session id.
+test("rootSessionID on /usage is validated, logged only when different, and dropped when invalid", async () => withBroker(async ({ home, socketPath }) => {
+  // A tree member reporting under a parent root -- logged.
+  await request(socketPath, "/usage", {
+    sessionID: "ses-child", rootSessionID: "ses-parent",
+    providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1,
+    tokens: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+  });
+  // A session that is its own root -- the field is not written back, so older readers of
+  // usage.jsonl keep working unchanged.
+  await request(socketPath, "/usage", {
+    sessionID: "ses-root", rootSessionID: "ses-root",
+    providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1,
+    tokens: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+  });
+  // A junk root does not crash the handler and does not land in the log.
+  const reply = await request(socketPath, "/usage", {
+    sessionID: "ses-plain", rootSessionID: "not valid!",
+    providerID: "openai", modelID: "gpt-5.6-luna", observedAt: Date.now(), requests: 1,
+    tokens: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+  });
+  assert.equal(reply.ok, true);
+  const lines = readFileSync(join(home, ".local/share/opencode/model-routing/usage.jsonl"), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line));
+  const bySession = Object.fromEntries(lines.map((line) => [line.sessionID, line]));
+  assert.equal(bySession["ses-child"].rootSessionID, "ses-parent", "a different root is written to the log");
+  assert.equal(bySession["ses-root"].rootSessionID, undefined, "a self-root is not written");
+  assert.equal(bySession["ses-plain"].rootSessionID, undefined, "junk is dropped silently");
 }));
 
 // A caller waiting out a busy local slot re-leases every few seconds; each attempt must not

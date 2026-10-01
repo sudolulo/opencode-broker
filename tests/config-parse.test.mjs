@@ -200,21 +200,55 @@ test("burnWatch defaults to on, takes its thresholds from config, and borrows wa
     "burnWatch": {
       "notifyCommand": ["/usr/local/bin/alert", "{title}", "{body}", "high"],
       "sessionStopTokens": 8000000,
-      "planWindow": "wk",
-      "rewriteCount": "banana",
-      "providerSpendTokens": -1
+      "rewriteCount": "banana"
     }
   }`)).CONFIG.burnWatch;
   assert.deepEqual(tuned.notifyCommand, ["/usr/local/bin/alert", "{title}", "{body}", "high"]);
   assert.equal(tuned.sessionStopTokens, 8000000);
-  assert.equal(tuned.planWindow, "wk");
   assert.equal(tuned.rewriteCount, BURN_DEFAULTS.rewriteCount, "junk falls back to the default");
-  assert.equal(tuned.providerSpendTokens, BURN_DEFAULTS.providerSpendTokens);
 
   const off = (await loadConfig(`{ "burnWatch": { "enabled": false, "notifyCommand": [] } }`)).CONFIG.burnWatch;
   assert.equal(off.enabled, false);
   assert.deepEqual(off.notifyCommand, []);
   assert.deepEqual((await loadConfig(`{}`)).CONFIG.burnWatch.notifyCommand, [], "no notifier anywhere: log only");
+});
+
+// The removed provider-spend and plan-rise signals must not crash parsing. A config that
+// still carries any of their keys gets ONE stderr line per key explaining they are ignored,
+// and the remaining thresholds keep tuning normally.
+test("the removed burnWatch keys are ignored with a warning, never crash, and the rest still tune", async () => {
+  const { BURN_DEFAULTS } = await import("../lib/burn-watch.js");
+  const removed = ["providerSpendTokens", "providerSpendWindowMs", "planWindow", "planRisePoints", "planRiseWindowMs"];
+  const warnings = [];
+  const original = console.error;
+  console.error = (...args) => { warnings.push(args.join(" ")); };
+  try {
+    const tuned = (await loadConfig(`{
+      "burnWatch": {
+        "sessionStopTokens": 8000000,
+        "providerSpendTokens": 3000000,
+        "providerSpendWindowMs": 300000,
+        "planWindow": "5h",
+        "planRisePoints": 6,
+        "planRiseWindowMs": 600000
+      }
+    }`)).CONFIG.burnWatch;
+    // The remaining keys still tune.
+    assert.equal(tuned.enabled, true);
+    assert.equal(tuned.sessionStopTokens, 8000000);
+    for (const key of Object.keys(BURN_DEFAULTS)) assert.ok(tuned[key] !== undefined, `${key} is still present`);
+    // The removed keys do not survive to the CONFIG.
+    for (const key of removed) assert.equal(tuned[key], undefined, `${key} is gone`);
+    // One stderr line per removed key, each naming the key and saying it is ignored.
+    for (const key of removed) {
+      assert.ok(
+        warnings.some((line) => line.includes(`burnWatch.${key}`) && /no longer used/.test(line) && /ignoring/.test(line)),
+        `one warning per removed key, missing ${key}: ${JSON.stringify(warnings)}`,
+      );
+    }
+  } finally {
+    console.error = original;
+  }
 });
 
 // The reconciliation projections ship OFF. A fresh install must open no Gitea issue and send no

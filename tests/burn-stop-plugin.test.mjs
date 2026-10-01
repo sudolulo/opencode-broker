@@ -44,10 +44,18 @@ test("a burn stop on the /usage reply aborts that session and toasts the reason"
     writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
     const aborts = [];
     const toasts = [];
+    // The session store answers for parentID chains too: ses-child has ses-parent, which
+    // has no parent (a root). The plugin walks it to resolve rootSessionID.
+    const sessionData = {
+      "ses-healthy": { id: "ses-healthy", agent: "smart", parentID: null },
+      "ses-runaway": { id: "ses-runaway", agent: "smart", parentID: null },
+      "ses-child": { id: "ses-child", agent: "smart", parentID: "ses-parent" },
+      "ses-parent": { id: "ses-parent", agent: "smart", parentID: null },
+    };
     const client = {
       provider: { list: async () => ({ data: { connected: [], all: [] } }) },
       session: {
-        get: async () => ({ id: "x", agent: "smart" }),
+        get: async (input) => ({ data: sessionData[input?.path?.id] ?? { id: input?.path?.id, agent: "smart" } }),
         messages: async () => ({ data: [] }),
         abort: async (input) => { aborts.push(input.path.id); return { data: true }; },
         prompt: async () => ({ data: true }),
@@ -65,8 +73,9 @@ test("a burn stop on the /usage reply aborts that session and toasts the reason"
     };
     await step("ses-healthy", 1);
     await step("ses-runaway", 1);
-    await new Promise((r) => setTimeout(r, 50));
-    console.log(JSON.stringify({ usage: usage.length, aborts, toasts }));
+    await step("ses-child", 1);
+    await new Promise((r) => setTimeout(r, 100));
+    console.log(JSON.stringify({ usage, aborts, toasts }));
   `;
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
@@ -75,11 +84,18 @@ test("a burn stop on the /usage reply aborts that session and toasts the reason"
   try {
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
-    assert.equal(result.usage, 2, "every step is still reported");
+    assert.equal(result.usage.length, 3, "every step is still reported");
     assert.deepEqual(result.aborts, ["ses-runaway"], "only the session the broker named is stopped");
     assert.equal(result.toasts.length, 1);
     assert.equal(result.toasts[0].title, "Burn watch stopped this session");
     assert.match(result.toasts[0].message, /re-sent its whole prompt uncached 4 times .*send a message to continue deliberately/);
+    // The plugin forwards rootSessionID only when it resolves to a different session (the
+    // walk reached a parent). A root with no parent does not carry a self-root in the body.
+    const bySession = Object.fromEntries(result.usage.map((body) => [body.sessionID, body]));
+    assert.equal(bySession["ses-healthy"].rootSessionID, undefined, "a root with no parent does not carry rootSessionID");
+    assert.equal(bySession["ses-runaway"].rootSessionID, undefined, "a root with no parent does not carry rootSessionID");
+    assert.equal(bySession["ses-child"].rootSessionID, "ses-parent",
+      "a subagent walks its parentID chain and names its root in the /usage body");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

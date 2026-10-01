@@ -25,14 +25,19 @@ test("a recorded runaway is stopped on its fourth re-send, 70 seconds in", () =>
     [44, cached(445_000)], [53, cached(445_000)], [70, rewrite(429_000)], [75, cached(446_000)],
   ];
   const results = steps.map(([s, tokens]) =>
-    watch.recordUsage({ sessionID: "ses_runaway", providerID: "anthropic", tokens, at: t0 + s * 1000 }));
+    watch.recordUsage({ sessionID: "ses_runaway", providerID: "anthropic", modelID: "claude-opus-5", tokens, at: t0 + s * 1000 }));
   const stops = results.map((result) => result.stop);
   assert.deepEqual(stops.map(Boolean), [false, false, false, false, false, false, true, false],
     "stops at the 4th re-send (1.71M re-sent), and the counters restart after it");
   assert.match(stops[6].reason, /re-sent its whole prompt uncached 4 times in 5 min \(1\.71M tokens\)/);
   const alert = results[6].alerts.find((a) => a.kind === "stop");
   assert.ok(alert, "a stop is also announced");
-  assert.match(alert.title, /Burn watch stopped a session \(anthropic\)/);
+  // Title no longer carries the provider id.
+  assert.equal(alert.title, "Burn watch stopped a session");
+  // Body names the session, the reason, and the model as providerID/modelID.
+  assert.match(alert.body, /Session ses_runaway was stopped because .*anthropic\/claude-opus-5/);
+  // A lone session is a tree of one -- never names a subagent.
+  assert.ok(!/subagent of/.test(alert.body), "no subagent-of phrase for a root with no children");
 });
 
 test("re-sends that are cheap do not stop a session: the volume floor is what separates a burst", () => {
@@ -49,79 +54,179 @@ test("a big session doing ordinary cached work for five minutes is never stopped
   // The busiest honest shape: a 440K context, a step every 5 s, all cache reads.
   let stopped = false;
   for (let i = 0; i < 60; i++) {
-    stopped ||= Boolean(watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", tokens: cached(440_000), at: i * 5_000 }).stop);
+    stopped ||= Boolean(watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", modelID: "claude-opus-5", tokens: cached(440_000), at: i * 5_000 }).stop);
   }
   assert.equal(stopped, false);
   // A restart re-send on top pushes it past 3M: that is worth a notification, not a stop.
-  const restart = watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", tokens: rewrite(900_000), at: 301_000 });
+  const restart = watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", modelID: "claude-opus-5", tokens: rewrite(900_000), at: 301_000 });
   assert.equal(restart.stop, null);
-  assert.ok(restart.alerts.some((a) => a.kind === "session-spend" && /one session is spending fast/.test(a.title) && /It was not stopped/.test(a.body)));
+  const alert = restart.alerts.find((a) => a.kind === "session-spend");
+  assert.ok(alert, "a session-spend alert is announced");
+  assert.equal(alert.title, "Burn watch: session ses_busy is burning abnormally",
+    "the title names the root session with no provider id");
+  assert.match(alert.body, /It was not stopped/);
+  assert.match(alert.body, /anthropic\/claude-opus-5/, "the provider/model pair that spent appears in the body");
 });
 
 test("session spend stops a runaway of any shape only at 6M weighted in five minutes", () => {
   const watch = createBurnWatch();
   // Output-heavy: nothing re-sent, but 101K weighted per step, every 4.5 s.
   const results = Array.from({ length: 64 }, (_, i) =>
-    watch.recordUsage({ sessionID: "ses_output", providerID: "openai", tokens: { input: 1_000, output: 100_000 }, at: i * 4_500 }));
-  assert.equal(results.findIndex((r) => r.alerts.some((a) => /one session/.test(a.title))), 29, "3.03M alerts");
+    watch.recordUsage({ sessionID: "ses_output", providerID: "openai", modelID: "gpt-sol", tokens: { input: 1_000, output: 100_000 }, at: i * 4_500 }));
+  assert.equal(results.findIndex((r) => r.alerts.some((a) => /is burning abnormally/.test(a.title))), 29, "3.03M alerts");
   const first = results.findIndex((r) => r.stop);
   assert.equal(first, 59, "60 x 101K = 6.06M is the first step over the stop limit");
   assert.match(results[first].stop.reason, /spent 6\.06M weighted tokens in 5 min \(stop limit 6\.00M\)/);
+  // The report that stops emits ONLY the stop alert, never ALSO a session-spend alert on it.
+  const kinds = results[first].alerts.map((a) => a.kind);
+  assert.deepEqual(kinds, ["stop"], "a stop report never also carries a session-spend alert");
 });
 
-test("provider spend across sessions alerts without stopping anyone, once per cooldown", () => {
+// ☠️ The removed signal: eight unrelated healthy sessions used to trip provider-spend by
+// sheer parallelism. They must not alert at all now.
+test("eight unrelated sessions whose combined spend exceeds 3M in five minutes raise no alert", () => {
   const watch = createBurnWatch();
   const alerts = [];
   let stops = 0;
   for (let i = 0; i < 80; i++) {
-    const r = watch.recordUsage({ sessionID: `ses_child_${i % 8}`, providerID: "anthropic", tokens: { input: 1_000, output: 40_000 }, at: i * 3_000 });
+    const r = watch.recordUsage({
+      sessionID: `ses_child_${i % 8}`, providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+    });
     alerts.push(...r.alerts);
     if (r.stop) stops += 1;
   }
-  assert.equal(stops, 0, "each of eight children stays far under its own limit");
-  assert.equal(alerts.length, 1);
-  assert.equal(alerts[0].kind, "provider-spend");
-  assert.match(alerts[0].title, /anthropic is spending fast/);
+  assert.equal(stops, 0, "each of eight independent sessions stays far under its own limit");
+  assert.deepEqual(alerts, [], "no all-sessions aggregate alert fires anymore");
 });
 
-test("plan velocity alerts on +6 points inside ten minutes, reading the provider's own percent", () => {
+// The reason the signal existed: fan-out that stayed below the per-session line. Now rolled
+// up into the ROOT (the parent that spawned the children).
+test("eight children of one root each under 3M but summing past it raise one tree alert for the root", () => {
   const watch = createBurnWatch();
-  const plan = (percent) => [{ id: "wk", percent: 18 }, { id: "5h", percent }];
-  assert.deepEqual(watch.recordPlan({ providerID: "anthropic", windows: plan(5), at: 0 }), []);
-  assert.deepEqual(watch.recordPlan({ providerID: "anthropic", windows: plan(10), at: 5 * MIN }), [], "+5 is heavy use, not a runaway");
-  const alerts = watch.recordPlan({ providerID: "anthropic", windows: plan(13), at: 9 * MIN });
-  assert.equal(alerts.length, 1);
-  assert.equal(alerts[0].kind, "plan-rise");
-  assert.match(alerts[0].body, /5h window went from 5% to 13% within 10 min/);
-  assert.deepEqual(watch.recordPlan({ providerID: "anthropic", windows: plan(20), at: 12 * MIN }), [], "cooldown");
+  const alerts = [];
+  for (let i = 0; i < 80; i++) {
+    const r = watch.recordUsage({
+      sessionID: `ses_child_${i % 8}`, rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+    });
+    alerts.push(...r.alerts);
+    assert.equal(r.stop, null, "no child is itself over the stop line");
+  }
+  const spend = alerts.filter((a) => a.kind === "session-spend");
+  assert.equal(spend.length, 1, "exactly one alert for the root tree");
+  assert.equal(spend[0].title, "Burn watch: session ses_root is burning abnormally",
+    "the title names the ROOT and carries no provider id");
+  assert.match(spend[0].body, /including 8 subagent session\(s\)/,
+    "the body names the subagent count when the tree has more than one session");
+  assert.match(spend[0].body, /It was not stopped/);
 });
 
-test("a slow climb never alerts, and a window reset is not a rise", () => {
+// Cooldown still applies to a root key.
+test("same root again inside cooldown raises no second tree alert", () => {
   const watch = createBurnWatch();
-  const at = (m) => m * MIN;
-  const readings = [[0, 40], [5, 44], [10, 48], [15, 52], [20, 2], [25, 5]];
-  const alerts = readings.flatMap(([m, percent]) =>
-    watch.recordPlan({ providerID: "anthropic", windows: [{ id: "5h", percent }], at: at(m) }));
-  assert.deepEqual(alerts, []);
+  const alerts = [];
+  for (let i = 0; i < 80; i++) {
+    const r = watch.recordUsage({
+      sessionID: `ses_child_${i % 8}`, rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  const first = alerts.filter((a) => a.kind === "session-spend");
+  assert.equal(first.length, 1);
+  // Another big step from the same tree, well before the cooldown expires.
+  const again = watch.recordUsage({
+    sessionID: "ses_child_0", rootSessionID: "ses_root",
+    providerID: "anthropic", modelID: "claude-opus-5",
+    tokens: { input: 1_000, output: 100_000 }, at: 240_000 + 3_000,
+  });
+  assert.deepEqual(again.alerts.filter((a) => a.kind === "session-spend"), [],
+    "the root's cooldown blocks a second alert");
 });
 
-test("thresholds and the watched plan window come from config", () => {
-  const watch = createBurnWatch({ config: { rewriteCount: 2, rewriteVolumeTokens: 200_000, planWindow: "wk", planRisePoints: 2 } });
+// Stops stay per actual sessionID -- the looping child, never the whole tree.
+test("a looping child still gets a per-session stop that names its root, and the tree does not also alert", () => {
+  const watch = createBurnWatch();
+  const t0 = 1_000_000;
+  const steps = [
+    [0, rewrite(427_000)], [6, cached(444_000)], [16, rewrite(427_000)], [39, rewrite(428_000)],
+    [44, cached(445_000)], [53, cached(445_000)], [70, rewrite(429_000)], [75, cached(446_000)],
+  ];
+  const results = steps.map(([s, tokens]) =>
+    watch.recordUsage({
+      sessionID: "ses_child", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens, at: t0 + s * 1000,
+    }));
+  const stopIndex = results.findIndex((r) => r.stop);
+  assert.equal(stopIndex, 6, "the per-session rewrite signature still trips on the 4th re-send");
+  const stopAlerts = results[stopIndex].alerts;
+  assert.equal(stopAlerts.length, 1, "a stop report emits only the stop alert");
+  assert.equal(stopAlerts[0].kind, "stop");
+  assert.equal(stopAlerts[0].title, "Burn watch stopped a session");
+  assert.match(stopAlerts[0].body, /Session ses_child.*\(a subagent of ses_root\)/,
+    "the stop body names the child and its root");
+  assert.match(stopAlerts[0].body, /anthropic\/claude-opus-5/);
+});
+
+// Tree-spend is provider-agnostic: two providers are summed and both pairs listed.
+test("a tree spending on two providers is summed, and both provider/model pairs appear in the body", () => {
+  const watch = createBurnWatch();
+  // Child A on anthropic, child B on openai -- each child alone stays under 3M.
+  const alerts = [];
+  for (let i = 0; i < 40; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_child_A", rootSessionID: "ses_root",
+      providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 6_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  for (let i = 0; i < 40; i++) {
+    const r = watch.recordUsage({
+      sessionID: "ses_child_B", rootSessionID: "ses_root",
+      providerID: "openai", modelID: "gpt-sol",
+      tokens: { input: 1_000, output: 40_000 }, at: i * 6_000 + 3_000,
+    });
+    alerts.push(...r.alerts);
+  }
+  const spend = alerts.filter((a) => a.kind === "session-spend");
+  assert.ok(spend.length >= 1, "the summed tree crosses 3M even though each child does not");
+  assert.ok(/anthropic\/claude-opus-5/.test(spend[0].body) && /openai\/gpt-sol/.test(spend[0].body),
+    `both provider/model pairs appear in the body, got: ${spend[0].body}`);
+});
+
+test("thresholds come from config", () => {
+  const watch = createBurnWatch({ config: { rewriteCount: 2, rewriteVolumeTokens: 200_000 } });
   assert.equal(watch.recordUsage({ sessionID: "ses_a", providerID: "openai", tokens: rewrite(120_000), at: 0 }).stop, null);
   assert.ok(watch.recordUsage({ sessionID: "ses_a", providerID: "openai", tokens: rewrite(120_000), at: 1_000 }).stop);
-  const plan = (week) => [{ id: "5h", percent: 50 }, { id: "wk", percent: week }];
-  assert.deepEqual(watch.recordPlan({ providerID: "openai", windows: plan(10), at: 0 }), []);
-  assert.equal(watch.recordPlan({ providerID: "openai", windows: plan(12), at: MIN }).length, 1);
 });
 
-// The broker runs for weeks and a gateway mints a session id per request: sessions whose
-// windows have passed must not stay in memory.
-test("finished sessions and expired cooldowns are dropped from memory", () => {
+// The broker runs for weeks and a gateway mints a session id per request: sessions, trees
+// and cooldowns whose windows have passed must not stay in memory.
+test("finished sessions, trees and expired cooldowns are dropped from memory", () => {
   const watch = createBurnWatch();
   for (let i = 0; i < 100; i++) {
-    watch.recordUsage({ sessionID: `gw-${i}`, providerID: "anthropic", tokens: cached(10_000), at: i * 100 });
+    watch.recordUsage({
+      sessionID: `gw-${i}`, rootSessionID: `root-${i % 10}`,
+      providerID: "anthropic", tokens: cached(10_000), at: i * 100,
+    });
   }
-  assert.equal(watch.tracked().sessions, 100);
+  const held = watch.tracked();
+  assert.equal(held.sessions, 100);
+  assert.equal(held.trees, 10, "trees are tracked distinct from sessions");
   watch.recordUsage({ sessionID: "ses_later", providerID: "anthropic", tokens: cached(10_000), at: 60 * MIN });
-  assert.deepEqual(watch.tracked(), { sessions: 1, cooldowns: 0 });
+  assert.deepEqual(watch.tracked(), { sessions: 1, trees: 1, cooldowns: 0 });
+});
+
+// The factory no longer exports recordPlan: the plan-rise signal was removed because it
+// could only fire for providers that publish a plan percent and never caught a runaway.
+test("createBurnWatch exposes only recordUsage and tracked", () => {
+  const watch = createBurnWatch();
+  assert.equal(typeof watch.recordUsage, "function");
+  assert.equal(typeof watch.tracked, "function");
+  assert.equal(watch.recordPlan, undefined, "recordPlan is gone");
 });

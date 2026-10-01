@@ -1711,14 +1711,9 @@ const serve = async () => {
       } : resolverProcesses.authorize({ resolverToken: body.resolverToken });
       sweep(state);
       const planRefresh = refreshPlanUsage(state);
-      // Plan velocity: every reading the refresh leaves behind, however it resolves.
-      if (burnWatch) {
-        planRefresh.then(() => {
-          for (const [providerID, plan] of Object.entries(planUsageSnapshot())) {
-            for (const alert of burnWatch.recordPlan({ providerID, windows: plan?.windows })) notifyBurn(alert);
-          }
-        }, () => {});
-      }
+      // The burn watch's all-sessions plan-rise signal was removed (see lib/burn-watch.js
+      // for the fourteen-day numbers that retired it). The plan refresh still runs for the
+      // budgets, HUD, and admission gate below -- only the burn-watch feed is gone.
       if (request.url === "/lease") {
         // Admission must see the provider's latest plan window. A background refresh let
         // the first request after Anthropic reached 100% lease Opus before its circuit opened.
@@ -2088,10 +2083,16 @@ const serve = async () => {
         // A leased usage report is accepted only for its exact broker-minted binding.
         // Validate before mutating the ledger so a stale report has no side effects.
         const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
+        // rootSessionID identifies the parent session for a subagent, so the burn watch
+        // can roll a fan-out of children back into their root. Validated with the same
+        // rule as sessionID; anything else drops to null (the session then counts as its
+        // own root, which is the safe fallback -- see lib/burn-watch.js).
+        const rootSessionID = validSessionID(body.rootSessionID) ? body.rootSessionID : null;
+        const modelID = typeof body.modelID === "string" ? body.modelID : null;
         const assignment = settlementBinding(state, body, { usage: true });
         state.budgets = recordBudgetUsage(state.budgets, providerID, {
           requests,
-          modelID: typeof body.modelID === "string" ? body.modelID : undefined,
+          modelID: modelID ?? undefined,
           tokens: {
             input: clampTokens(raw.input),
             output: clampTokens(raw.output),
@@ -2107,7 +2108,7 @@ const serve = async () => {
         let burn = null;
         if (burnWatch && !localProviderIDs(allTargets(state)).has(providerID)) {
           const watched = burnWatch.recordUsage({
-            sessionID, providerID,
+            sessionID, rootSessionID, providerID, modelID,
             tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
             at: Date.now(),
           });
@@ -2123,7 +2124,11 @@ const serve = async () => {
         }
         logUsage(usageRecord({
           at: Date.now(), sessionID, providerID,
-          modelID: typeof body.modelID === "string" ? body.modelID : null,
+          modelID,
+          // rootSessionID lands in usage.jsonl only when it is present and names a DIFFERENT
+          // session -- the root carries no new signal when it is itself. Keeping the field
+          // off a self-root line keeps the log readable and makes tree-aware analyses easy.
+          ...(rootSessionID && rootSessionID !== sessionID ? { rootSessionID } : {}),
           lease: assignment,
           tokens: { input: clampTokens(raw.input), output: clampTokens(raw.output), cacheRead: clampTokens(raw.cacheRead), cacheWrite: clampTokens(raw.cacheWrite) },
           local: localProviderIDs(allTargets(state)).has(providerID),

@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Burn-watch alerts fire per session TREE, and the all-sessions aggregates were removed.** The
+  router plugin now walks `parentID` up to the root and names it on every `/usage` report, so the
+  burn watch rolls a fan-out of subagents into their root for the session-spend check. Stops stay
+  per actual sessionID — only the looping child is stopped, never its tree — and the stop title
+  no longer carries the provider id; the body names the model as `providerID/modelID` and, for a
+  subagent, says `(a subagent of <root>)`. The two all-sessions signals that lived here, `provider-spend`
+  and `plan-rise`, are gone: in the fourteen days before the removal they fired 47 of 49 alerts
+  for 2 real stops (17 provider-spend, 30 plan-rise), always a parallel burst of healthy sessions
+  summing past a fixed line. The fan-out case they existed for is now handled by the tree rollup
+  of the per-session check instead. `rootSessionID` lands in `usage.jsonl` only when it differs
+  from the session itself, so older readers of the log keep parsing it unchanged.
+
+### Removed
+
+- **`burnWatch.providerSpendTokens`, `providerSpendWindowMs`, `planWindow`, `planRisePoints`, and
+  `planRiseWindowMs` are no longer used.** A config that still carries any of them loads
+  unchanged with one stderr line per key explaining it is ignored; the remaining thresholds keep
+  tuning normally.
+
 ### Added
 
 - **Session-bound gateway requests.** opencode reaches its subscription providers through the
