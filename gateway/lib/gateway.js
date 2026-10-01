@@ -40,6 +40,21 @@ const loopbackAddress = (value) => {
   return address === "::1" || /^127(?:\.\d{1,3}){3}$/.test(address);
 };
 
+// ☠️ KEEP IN STEP WITH catalogModelForID() IN lib/model-candidates.js. OpenCode synthesizes the
+// speed aliases `<base>-fast` and `<base>-standard` from the base catalog record, so the broker
+// leases the alias id while the request on the wire names the base id (the speed travels in other
+// body fields). A lease therefore covers the wire model when the ids are equal, or when the lease
+// id is the wire id plus exactly one of those suffixes -- never the reverse, and never any other
+// prefix or suffix. Plain string comparison, not a RegExp built from the client-supplied id. The
+// gateway takes no imports from the broker's lib/, hence the copy rather than a shared helper.
+const SPEED_ALIAS_SUFFIXES = ["-fast", "-standard"];
+const leaseCoversWireModel = (leasedModelID, wireModelID) => {
+  if (typeof leasedModelID !== "string") return false;
+  if (leasedModelID === wireModelID) return true;
+  return wireModelID !== "" &&
+    SPEED_ALIAS_SUFFIXES.some((suffix) => leasedModelID === `${wireModelID}${suffix}`);
+};
+
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
 // A GPU model swap measures ~2m40s. The wait is bounded, config-overridable,
@@ -1135,7 +1150,9 @@ export const createGatewayHandler = ({
         // bridge: strip response_format, demand raw JSON in an appended
         // instruction. Haiku-class models comply reliably; a rare miss is one
         // failed attempt, not a dead lane.
-        let forwardBody = { ...requestBody, model: leased.modelID };
+        // A session-bound lease may name a speed alias the upstream does not know; it carries the
+        // id the client sent as wireModelID (see leaseCoversWireModel). Gateway leases have none.
+        let forwardBody = { ...requestBody, model: leased.wireModelID ?? leased.modelID };
         const extras = api === MESSAGES ? {} : {
           ...(providerConfig.bodyExtras && typeof providerConfig.bodyExtras === "object" ? providerConfig.bodyExtras : {}),
           ...(route?.bodyExtras ?? {}),
@@ -1608,8 +1625,13 @@ export const createGatewayHandler = ({
     // tier would discard the choice (and, with the worker lanes fenced, refuse a Claude turn the
     // session's own lease could serve). A request carrying the session id is forwarded on the
     // session's live lease instead -- but only from loopback, only when the broker confirms the
-    // lease is held, and only for the exact model that lease names, so the header cannot be used
-    // to reach a model the broker did not grant.
+    // lease is held, and only for the model that lease names, so the header cannot be used to
+    // reach a model the broker did not grant. "The model that lease names" is the exact id, or
+    // its base when the lease is on a synthesized speed alias: OpenCode leases
+    // `claude-opus-5-5-fast` but puts `claude-opus-5-5` on the wire, and only the base id exists
+    // upstream (2026-10-01: every -fast build lease was refused 409). leaseCoversWireModel() holds
+    // the exact rule. The forward therefore sends the client's own id (wireModelID), while
+    // modelID stays the lease's id so the lease identity is never rewritten.
     let boundLease = null;
     const rawBoundSession = request.headers["x-opencode-session-id"];
     const boundSessionID = Array.isArray(rawBoundSession) ? rawBoundSession[0] : rawBoundSession;
@@ -1627,8 +1649,8 @@ export const createGatewayHandler = ({
         });
       } catch { held = null; }
       const model = held?.target?.model;
-      if (!held?.held || typeof model?.providerID !== "string" || model.id !== requestedModel ||
-        !config.providers[model.providerID]) {
+      if (!held?.held || typeof model?.providerID !== "string" ||
+        !leaseCoversWireModel(model.id, requestedModel) || !config.providers[model.providerID]) {
         // The plugin classifies this wording as its own route error (noop), so a stale binding
         // never indicts the provider; the session re-leases on the next prompt.
         return respondJson(response, 409, {
@@ -1644,6 +1666,7 @@ export const createGatewayHandler = ({
         leaseID: held.leaseID,
         providerID: model.providerID,
         modelID: model.id,
+        wireModelID: requestedModel,
         external: true,
       };
     }

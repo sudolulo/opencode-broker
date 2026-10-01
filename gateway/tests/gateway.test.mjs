@@ -2858,3 +2858,75 @@ test("a session-bound request rides the session's own lease and never re-leases"
     assert.equal(refused.forwards.length, 0, "a session id alone never reaches an ungranted model");
   }
 });
+
+// OpenCode synthesizes speed aliases (`-fast`, `-standard`) from a base catalog record: the broker
+// leases the ALIAS id, but the request on the wire carries the BASE id (the speed travels in other
+// body fields). The bound check must accept exactly that pairing and forward the base id upstream,
+// which is the only id the provider knows (2026-10-01: every -fast build lease was refused 409).
+test("a session-bound lease on a speed alias serves its base model, and nothing else", async () => {
+  const scenario = async ({ leasedModel, model }) => {
+    const calls = [];
+    const forwards = [];
+    const handler = createGatewayHandler({
+      config: {
+        tier: "worker",
+        profile: "auto",
+        providers: { anthropic: { baseUrl: "http://anthropic.example/v1" } },
+      },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (path, body) => {
+        calls.push({ path, body });
+        if (path === "/lease/verify") {
+          return { held: true, leaseID: "lease-1", target: { id: leasedModel, model: { providerID: "anthropic", id: leasedModel } } };
+        }
+        if (path === "/lease") throw new Error("must not lease");
+        return { ok: true };
+      },
+      fetchImpl: async (url, init) => {
+        forwards.push({ url, body: JSON.parse(init.body) });
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "pong" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) };
+      },
+    });
+    let status;
+    let payload;
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer gw-secret",
+          "Content-Type": "application/json",
+          "x-opencode-session-id": "ses_abc",
+          "x-opencode-lease-id": "lease-1",
+        },
+        body: JSON.stringify({ model, speed: "fast", messages: [{ role: "user", content: "ping" }] }),
+      });
+      status = response.status;
+      payload = await response.json();
+    });
+    return { status, payload, calls, forwards };
+  };
+
+  for (const suffix of ["-fast", "-standard"]) {
+    const ok = await scenario({ leasedModel: `claude-opus-5-5${suffix}`, model: "claude-opus-5-5" });
+    assert.equal(ok.status, 200, `a ${suffix} lease serves its base id`);
+    assert.deepEqual(ok.calls.map((call) => call.path), ["/lease/verify"]);
+    assert.equal(ok.forwards.length, 1);
+    assert.equal(ok.forwards[0].body.model, "claude-opus-5-5",
+      "upstream gets the id the client sent, never the synthesized alias");
+    assert.equal(ok.forwards[0].body.speed, "fast", "the speed fields pass through untouched");
+  }
+
+  for (const [leasedModel, model] of [
+    ["claude-opus-5-5-fast", "claude-opus-5"],
+    ["claude-opus-5-5-fast", "claude-sonnet-5-5"],
+    ["claude-opus-5-5-fast", "claude-opus-5-5-fast-x"],
+    ["claude-opus-5-5-fast-x", "claude-opus-5-5"],
+    ["claude-opus-5-5", "claude-opus-5-5-fast"],
+  ]) {
+    const refused = await scenario({ leasedModel, model });
+    assert.equal(refused.status, 409, `a ${leasedModel} lease must not authorize ${model}`);
+    assert.equal(refused.forwards.length, 0);
+    assert.equal(refused.payload.error.message,
+      `[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "${model}")`);
+  }
+});

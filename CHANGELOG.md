@@ -27,6 +27,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Session-bound requests on a speed-alias lease are forwarded instead of refused (#5).** OpenCode
+  leases the synthesized alias (`claude-opus-5-5-fast`, `-standard`) but sends the base id
+  (`claude-opus-5-5`) on the wire, so the exact-match check refused every such lease with HTTP 409
+  and every build-tier subagent on a `-fast` target ended with no output. A lease now also covers
+  the id it is an alias of (exactly one trailing `-fast` or `-standard`, nothing looser), and the
+  upstream receives the id the client sent rather than the alias, which does not exist upstream.
+  Known widening: the rule is lexical, so a lease on a REAL catalog id ending in `-fast` would also
+  cover its base id; none is configured today, and the durable fix is for `/lease/verify` to name
+  the wire id itself.
 - **llm-auth-proxy plan usage is read again.** Its OpenAI route reports `{ windows: [{ percent,
   resetsAt (epoch s), durationSeconds }] }`, not the canonical shape, and the configured `authRef`
   named an `auth.json` entry that never existed. Both readings failed, the last good report served
