@@ -164,6 +164,7 @@ test("unknown versions, unknown v2 fields and a malformed revision fail loudly",
     [{ ...emptyReconciliationState(), version: 3 }, /unsupported reconciliation state version 3/],
     [{ ...emptyReconciliationState(), surprise: true }, /unknown reconciliation state field surprise/],
     [{ ...emptyReconciliationState(), revision: -1 }, /reconciliation state has an invalid revision -1/],
+    [{ ...emptyReconciliationState(), revision: Number.MAX_SAFE_INTEGER + 1 }, /reconciliation state has an invalid revision/],
     [{ ...emptyReconciliationState(), scheduledRuns: {} }, /reconciliation state field scheduledRuns is not an array/],
   ];
   for (const [value, pattern] of cases) {
@@ -347,7 +348,7 @@ test("legacyMigration baseline phase allows null sourceLedgerRevision; final pha
         ...state,
         legacyMigration: { ...state.legacyMigration, sourceLedgerRevision: revision + 1 },
       }), /legacyMigration\.sourceLedgerRevision \d+ is ahead of ledger revision \d+/);
-      // Final phase with null finalCount: sourceLedgerRevision must be set even if finalCount is null
+      // Final phase (finalCount set): sourceLedgerRevision must be set and not ahead of the ledger
       assertRefused(store, (state, { revision }) => ({
         ...state,
         legacyMigration: { ...state.legacyMigration, sourceLedgerRevision: null },
