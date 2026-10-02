@@ -27,7 +27,6 @@
 // commands return before constructing any dependency unless the complete apply configuration is
 // explicitly enabled; Package 4 owns that cutover. Even when enabled, this binary publishes no
 // inventory directly: the applier moves only the overlay/generation/policy saga described in STATE.
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { CONFIG, CONFIG_ERROR } from "../lib/config.js";
@@ -38,7 +37,7 @@ import {
   readReconciliationStatus,
   runDryReconciliation,
 } from "../lib/model-reconcile.js";
-import { createReconciliationApplier } from "../lib/reconcile-apply.js";
+import { applyProviderOptionsFromConfig, createReconciliationApplier } from "../lib/reconcile-apply.js";
 import { evidenceQueueStatus } from "../lib/reconcile-evidence.js";
 import { createResolverOverlayStore } from "../lib/reconcile-overlay.js";
 import { createResolverGenerationManager } from "../lib/resolver-generations.js";
@@ -363,9 +362,14 @@ const createApplyRuntime = (store) => {
     root: applyConfig.generationsRoot,
     currentLinkPath: applyConfig.currentLinkPath,
   });
-  const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  // Contract v2: every generation is built from the canonical RAW base, never from the deployed
+  // outer link. After cutover ~/.config/opencode/opencode.json points at the generated
+  // resolver-generations/current/opencode.json, so building from it would stack generated config
+  // on generated config and break the pinned rawBaseHash. OPENCODE_RECONCILE_BASE_CONFIG stays as
+  // the explicit test/override hook; OPENCODE_RECONCILE_RAW_BASE is the shared Package 4 override.
   const baseConfigPath = process.env.OPENCODE_RECONCILE_BASE_CONFIG
-    || join(configHome, "opencode/opencode.json");
+    || process.env.OPENCODE_RECONCILE_RAW_BASE
+    || "/home/dev/devbox/config/opencode/opencode.json";
   const collectSources = () => collectApplyReconciliationSources({ baseConfigPath });
   // Read only when an enabled apply command constructs its runtime. The value stays in this
   // process until createProbeClientFactory writes its bootstrap frame to the probe child's stdin;
@@ -380,6 +384,8 @@ const createApplyRuntime = (store) => {
       || "http://127.0.0.1:8790/v1/chat/completions",
     gatewayHeaders: { Authorization: `Bearer ${gatewayKey}` },
   });
+  // The dormant gate in run() guarantees apply is enabled here, so lib/config.js has already
+  // required a nonempty trusted allowlist; the applier re-checks it and refuses on drift (RF4).
   return createReconciliationApplier({
     store,
     overlayStore,
@@ -387,6 +393,7 @@ const createApplyRuntime = (store) => {
     brokerRequest,
     probeClientFactory,
     collectSources,
+    ...applyProviderOptionsFromConfig(CONFIG),
   });
 };
 

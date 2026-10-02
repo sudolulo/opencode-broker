@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { createReconciliationApplier } from "../lib/reconcile-apply.js";
+import {
+  PROVIDER_NOT_ALLOWLISTED,
+  applyProviderOptionsFromConfig,
+  createReconciliationApplier,
+} from "../lib/reconcile-apply.js";
 import { collectApplyReconciliationSources } from "../lib/model-reconcile.js";
 
 const NOW = 1_800_000_000_000;
@@ -147,6 +151,8 @@ const makeFixture = ({
   uncertainResultKind = null,
   crashAfter = null,
   sourceOverrides = {},
+  providers = ["openai"],
+  trustedProviders = ["openai"],
 } = {}) => {
   const events = [];
   let crashed = false;
@@ -437,7 +443,7 @@ const makeFixture = ({
     return clone(source);
   };
 
-  const applier = () => createReconciliationApplier({
+  const applier = (overrides = {}) => createReconciliationApplier({
     store,
     overlayStore,
     generationManager,
@@ -445,9 +451,13 @@ const makeFixture = ({
     probeClientFactory,
     collectSources,
     now: () => NOW,
+    providers,
+    trustedProviders,
+    ...overrides,
   });
   return {
     applier,
+    overlay: () => clone(overlay),
     events,
     counts,
     openCalls,
@@ -505,7 +515,7 @@ test("recover-all skips completed probation transitions", async () => {
   await fixture.applier().apply({ transitionID: TRANSITION_ID });
   const before = clone(fixture.counts);
   const result = await fixture.applier().recover();
-  assert.deepEqual(result, { ok: true, mutated: false, results: [] });
+  assert.deepEqual(result, { ok: true, mutated: false, results: [], excluded: [] });
   assert.deepEqual(fixture.counts, { ...before, sourceCollections: before.sourceCollections + 1 });
 });
 
@@ -880,4 +890,153 @@ test("dry-run preserves durable state and makes no publisher, resolver, broker, 
   assert.equal(fixture.counts.generationPublishes, 0);
   assert.equal(fixture.counts.brokerChanges, 0);
   assert.equal(fixture.counts.probeLaunches, 0);
+});
+
+const ANTHROPIC_TRANSITION_ID = "f0e1d2c3b4a5968778695a4b";
+const ANTHROPIC_ROLE = "anthropic:claude-opus";
+
+const anthropicRecord = (overrides = {}) => approvedRecord({
+  transitionID: ANTHROPIC_TRANSITION_ID,
+  roleKey: ANTHROPIC_ROLE,
+  providerID: "anthropic",
+  roleID: "claude-opus",
+  candidateModelID: "claude-opus-5-5",
+  candidateFamily: "claude-opus",
+  candidateVersion: "5.5",
+  incumbentModelID: "claude-opus-4-8",
+  ...overrides,
+});
+
+// The OpenAI record stays under ROLE so the fixture's ledger-event classifier keeps working. The
+// Anthropic record deliberately has no model role or catalog entry in the fixture sources: any path
+// that lets it reach the overlay renderer fails, which is exactly the leak this task closes.
+const twoProviderState = (anthropic = anthropicRecord()) => ({
+  ...initialState(),
+  roles: { [ROLE]: approvedRecord(), [ANTHROPIC_ROLE]: anthropic },
+});
+
+const anthropicExclusion = (state) => ({
+  transitionID: ANTHROPIC_TRANSITION_ID,
+  providerID: "anthropic",
+  state,
+  reason: "provider-not-allowlisted",
+});
+
+test("the exclusion reason is the literal provider-not-allowlisted", () => {
+  assert.equal(PROVIDER_NOT_ALLOWLISTED, "provider-not-allowlisted");
+});
+
+test("applier provider options come from reconcile.apply.providers and trustedSubscriptionProviders", () => {
+  assert.deepEqual(applyProviderOptionsFromConfig({
+    trustedSubscriptionProviders: ["alibaba-token-plan", "anthropic", "openai"],
+    reconcile: { apply: { enabled: true, providers: ["openai"] } },
+  }), { providers: ["openai"], trustedProviders: ["alibaba-token-plan", "anthropic", "openai"] });
+  assert.deepEqual(applyProviderOptionsFromConfig({}), { providers: undefined, trustedProviders: undefined });
+});
+
+test("RF4: an applier whose allowlist names a no-longer-trusted provider refuses to construct", () => {
+  const fixture = makeFixture({ state: twoProviderState() });
+  const before = fixture.state();
+  assert.throws(
+    () => fixture.applier({ providers: ["openai", "anthropic"], trustedProviders: ["openai"] }),
+    /reconciliation applier provider "anthropic" is not a trusted subscription provider/,
+  );
+  assert.deepEqual(fixture.state(), before);
+  assert.deepEqual(fixture.events, []);
+  assert.equal(fixture.counts.sourceCollections, 0);
+});
+
+test("the applier refuses a missing, empty, duplicated or malformed provider allowlist", () => {
+  const fixture = makeFixture();
+  const cases = [
+    [{ providers: undefined }, /needs a nonempty reconcile\.apply\.providers allowlist/],
+    [{ providers: [] }, /needs a nonempty reconcile\.apply\.providers allowlist/],
+    [{ providers: "openai" }, /needs a nonempty reconcile\.apply\.providers allowlist/],
+    [{ providers: ["openai", "openai"] }, /provider "openai" is listed twice/],
+    [{ providers: ["OpenAI"], trustedProviders: ["OpenAI"] }, /provider "OpenAI" is not a valid provider ID/],
+    [{ providers: [""] }, /provider "" is not a valid provider ID/],
+    [{ trustedProviders: undefined }, /needs the trustedSubscriptionProviders list/],
+  ];
+  for (const [options, pattern] of cases) {
+    assert.throws(() => fixture.applier(options), pattern, JSON.stringify(options));
+  }
+  assert.equal(fixture.counts.sourceCollections, 0);
+});
+
+test("refresh drives only allowlisted providers and reports the rest without touching them", async () => {
+  const dry = await makeFixture({ state: twoProviderState() }).applier().refresh({ dryRun: true });
+  assert.deepEqual(dry, {
+    ok: true, dryRun: true, mutated: false,
+    transitions: [TRANSITION_ID],
+    excluded: [anthropicExclusion("approved")],
+  });
+
+  const fixture = makeFixture({ state: twoProviderState() });
+  const seeded = fixture.state().roles[ANTHROPIC_ROLE];
+  const result = await fixture.applier().refresh();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.results.map((entry) => entry.transitionID), [TRANSITION_ID]);
+  assert.deepEqual(result.excluded, [anthropicExclusion("approved")]);
+  assert.deepEqual(fixture.state().roles[ANTHROPIC_ROLE], seeded);
+  assert.equal(fixture.state().roles[ROLE].state, "probation");
+  // The generation rendered for the OpenAI stage carries no Anthropic model.
+  assert.deepEqual(Object.keys(fixture.overlay().entries), [`openai/${CANDIDATE_MODEL_ID}`]);
+  assert.deepEqual(fixture.openCalls.map((call) => call.candidateIdentity.providerID), ["openai"]);
+});
+
+test("recover leaves an in-flight transition of a non-allowlisted provider durable and reports it", async () => {
+  const inFlight = anthropicRecord({
+    state: "probing",
+    transitions: ["discovered", "awaiting-approval", "approved", "probing"],
+    applyIntent: { transitionID: ANTHROPIC_TRANSITION_ID, revision: "f".repeat(64) },
+  });
+  const fixture = makeFixture({ state: twoProviderState(inFlight) });
+  const before = fixture.state();
+
+  const all = await fixture.applier().recover();
+  assert.deepEqual(all, { ok: true, mutated: false, results: [], excluded: [anthropicExclusion("probing")] });
+  assert.deepEqual(fixture.state(), before);
+
+  const single = await fixture.applier().recover({ transitionID: ANTHROPIC_TRANSITION_ID });
+  assert.deepEqual(single, { ok: false, dryRun: false, mutated: false, ...anthropicExclusion("probing") });
+  assert.deepEqual(fixture.state(), before);
+  assert.equal(fixture.counts.brokerChanges, 0);
+  assert.equal(fixture.counts.overlayChanges, 0);
+  assert.equal(fixture.counts.generationBuilds, 0);
+  assert.equal(fixture.counts.probeLaunches, 0);
+});
+
+test("a provider removed from the allowlist can still be rolled back but is never driven forward", async () => {
+  const fixture = makeFixture();
+  await fixture.applier().apply({ transitionID: TRANSITION_ID });
+  const narrowed = { providers: ["anthropic"], trustedProviders: ["anthropic", "openai"] };
+  const before = fixture.state();
+  const brokerChanges = fixture.counts.brokerChanges;
+
+  const exclusion = {
+    transitionID: TRANSITION_ID, providerID: "openai", state: "probation", reason: "provider-not-allowlisted",
+  };
+  assert.deepEqual(await fixture.applier(narrowed).apply({ transitionID: TRANSITION_ID }),
+    { ok: false, dryRun: false, mutated: false, ...exclusion });
+  assert.deepEqual(await fixture.applier(narrowed).apply({ transitionID: TRANSITION_ID, dryRun: true }),
+    { ok: false, dryRun: true, mutated: false, ...exclusion });
+  assert.deepEqual(await fixture.applier(narrowed).recover({ transitionID: TRANSITION_ID }),
+    { ok: false, dryRun: false, mutated: false, ...exclusion });
+  assert.deepEqual(fixture.state(), before);
+  assert.equal(fixture.counts.brokerChanges, brokerChanges);
+
+  const rolledBack = await fixture.applier(narrowed).rollback({
+    transitionID: TRANSITION_ID,
+    reason: "provider-stage-failed",
+  });
+  assert.equal(rolledBack.ok, true);
+  assert.equal(rolledBack.mutated, true);
+  assert.equal(fixture.state().roles[ROLE].state, "rolled-back");
+  assert.equal(fixture.policy().activeModelID, INCUMBENT_MODEL_ID);
+});
+
+test("the applier exposes its frozen allowlist for scheduled-run bookkeeping", () => {
+  const applier = makeFixture({ providers: ["openai"], trustedProviders: ["anthropic", "openai"] }).applier();
+  assert.deepEqual(applier.providers, ["openai"]);
+  assert.equal(Object.isFrozen(applier.providers), true);
 });

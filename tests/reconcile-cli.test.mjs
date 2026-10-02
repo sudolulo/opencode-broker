@@ -814,3 +814,19 @@ test("no command prints a credential or names a network endpoint", () => {
     }
   });
 });
+
+test("apply runtime builds from the raw base, not the deployed outer link", () => {
+  const dir = mkdtempSync(join(tmpdir(), "reconcile-rawbase-"));
+  const raw = join(dir, "raw-opencode.json");
+  const outerHome = join(dir, "xdg");
+  mkdirSync(join(outerHome, "opencode"), { recursive: true });
+  writeFileSync(raw, JSON.stringify({ provider: { marker: { name: "raw" } } }), { mode: 0o600 });
+  writeFileSync(join(outerHome, "opencode/opencode.json"), JSON.stringify({ provider: { marker: { name: "generated" } } }));
+  const source = readFileSync(new URL("../bin/opencode-broker-reconcile", import.meta.url), "utf8");
+  // Static pin: the resolution chain must not consult XDG_CONFIG_HOME or the outer link at all.
+  const block = source.slice(source.indexOf("const baseConfigPath"), source.indexOf("const collectSources"));
+  assert.match(block, /OPENCODE_RECONCILE_RAW_BASE/);
+  assert.match(block, /\/home\/dev\/devbox\/config\/opencode\/opencode\.json/);
+  assert.doesNotMatch(block, /XDG_CONFIG_HOME|\.config/);
+  rmSync(dir, { recursive: true, force: true });
+});

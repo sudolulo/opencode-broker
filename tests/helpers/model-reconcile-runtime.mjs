@@ -539,6 +539,8 @@ if (basename(process.argv[1]) === "opencode" && process.argv[2] === "models") {
     gatewayHeaders: { Authorization: `Bearer ${RUNTIME_GATEWAY_KEY}` },
     onTrace: (event) => recordTrace({ source: "child-protocol", kind: "trace", ...event }),
   });
+  // Literal, not read from `config`: this applier is built in both enabled and dormant runtimes, and
+  // a dormant config has no reconcile.apply block. The runtime only ever drives the openai ROLE.
   const realApplier = createReconciliationApplier({
     store,
     overlayStore,
@@ -547,6 +549,8 @@ if (basename(process.argv[1]) === "opencode" && process.argv[2] === "models") {
     probeClientFactory,
     collectSources: async () => sources,
     now: () => NOW,
+    providers: ["openai"],
+    trustedProviders: ["openai"],
   });
 
   const inventoryFor = (descriptor) => discoverSubscriptionTargets(
