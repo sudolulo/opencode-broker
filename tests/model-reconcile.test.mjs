@@ -694,7 +694,7 @@ test("populated status is a sorted, bounded projection with no evidence or issue
     dryRun({ store });
     const status = readReconciliationStatus(store);
     assert.equal(status.exists, true);
-    assert.equal(status.version, 1);
+    assert.equal(status.version, 2);
     assert.equal(status.updatedAt, NOW);
     assert.deepEqual(status.counts, {
       "blocked-conflict": 1, "blocked-unresolvable": 1, "evidence-pending": 3,

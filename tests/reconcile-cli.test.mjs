@@ -295,7 +295,7 @@ test("dry-run JSON is machine-readable and cannot touch live routing inputs", ()
     assert.deepEqual(readdirSync(fixture.stateRoot).sort(),
       ["model-reconciliation.json", "resolvable-models.json"]);
     const ledger = JSON.parse(readFileSync(fixture.statePath, "utf8"));
-    assert.equal(ledger.version, 1);
+    assert.equal(ledger.version, 2);
     assert.deepEqual(Object.keys(ledger.roles).sort(), ["anthropic:claude-opus", "openai:gpt-sol"]);
     assert.equal(Object.keys(ledger.evidenceRequests).length, 1);
     assert.equal(statSync(fixture.statePath).mode & 0o777, 0o600);
@@ -349,14 +349,14 @@ test("status reports the ledger a dry run wrote", () => {
     assert.equal(result.status, 0, result.stderr);
     const status = JSON.parse(result.stdout);
     assert.equal(status.exists, true);
-    assert.equal(status.version, 1);
+    assert.equal(status.version, 2);
     assert.deepEqual(status.roles.map((role) => role.roleKey), ["anthropic:claude-opus", "openai:gpt-sol"]);
     assert.deepEqual(status.counts, { "blocked-unresolvable": 1, "evidence-pending": 1 });
     assert.ok(result.stdout.endsWith("\n"));
 
     const human = runCLI(fixture, ["status"]);
     assert.equal(human.status, 0, human.stderr);
-    assert.match(human.stdout, /^reconciliation state v1, updated /);
+    assert.match(human.stdout, /^reconciliation state v2, updated /);
     assert.match(human.stdout, /openai:gpt-sol -> blocked-unresolvable \(gpt-6-sol\)/);
 
     // status is a pure read: it neither rewrites the ledger nor takes the writer lock.

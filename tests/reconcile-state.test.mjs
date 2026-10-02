@@ -110,7 +110,7 @@ test("state round-trips atomically with private permissions", () => {
       ...state,
       roles: { "openai:gpt-sol": ROLE_RECORD },
     }));
-    assert.equal(saved.version, 1);
+    assert.equal(saved.version, 2);
     assert.equal(saved.version, RECONCILIATION_STATE_VERSION);
     assert.equal(saved.updatedAt, 1_700_000_000_000);
     assert.equal(statSync(root).mode & 0o777, 0o700);
@@ -128,7 +128,8 @@ test("an absent ledger reads as the empty state and constructing a store writes 
     const store = createReconciliationStore({ root });
     assert.deepEqual(store.read(), emptyReconciliationState());
     assert.deepEqual(emptyReconciliationState(), {
-      version: 1, updatedAt: 0, roles: {}, unknown: {}, evidenceRequests: {},
+      version: 2, updatedAt: 0, revision: 0, roles: {}, unknown: {}, evidenceRequests: {},
+      providerStages: {}, scheduledRuns: [],
     });
     // Reading is not a reason to create state: status output must be able to say "absent".
     assert.equal(existsSync(root), false);
@@ -409,7 +410,7 @@ test("a live lock owner is never reclaimed when the wait elapses", async () => {
     assert.equal(JSON.parse(readFileSync(join(store.paths().lock, "owner"), "utf8")).pid, ownerPID);
     assert.equal(await held, ownerPID);
     assert.equal(existsSync(store.paths().lock), false);
-    assert.equal(store.update((state) => state).version, 1);
+    assert.equal(store.update((state) => state).version, RECONCILIATION_STATE_VERSION);
   });
 });
 
@@ -435,7 +436,7 @@ test("an empty lock directory is taken over at once, without waiting out the loc
     // the takeover needs no waiting period and no deletion of anything.
     mkdirSync(store.paths().lock, { mode: 0o700 });
     const started = Date.now();
-    assert.equal(store.update((state) => state).version, 1);
+    assert.equal(store.update((state) => state).version, RECONCILIATION_STATE_VERSION);
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 500, `took ${elapsed}ms to take over an empty lock directory`);
     assert.deepEqual(lockDebris(root), []);
@@ -494,7 +495,7 @@ test("a recorded process start time that does not match proves the recorded pid 
     // Same boot, same live pid, different process: this pid was recycled after the writer died.
     const owner = { pid: process.pid, acquiredAt: 1_700_000_000_000, uuid, bootId: currentBootID(), starttime: "1" };
     plantLock(store.paths().lock, owner, [`instance.${process.pid}.${uuid}`]);
-    assert.equal(store.update((state) => state).version, 1);
+    assert.equal(store.update((state) => state).version, RECONCILIATION_STATE_VERSION);
     assert.equal(existsSync(store.paths().lock), false);
     assert.deepEqual(lockDebris(root), []);
   });
@@ -527,7 +528,7 @@ test("a dead owner whose instance is already gone is cleared so the lock can be 
     // A writer killed between unlinking its instance and unlinking its owner. Nothing can
     // publish over the leftover record, so refusing to clear it would wedge the ledger forever.
     plantLock(store.paths().lock, { pid: await deadPID(), acquiredAt: 1_700_000_000_000, uuid, bootId: currentBootID(), starttime: "1" });
-    assert.equal(store.update((state) => state).version, 1);
+    assert.equal(store.update((state) => state).version, RECONCILIATION_STATE_VERSION);
     assert.equal(existsSync(store.paths().lock), false);
     assert.deepEqual(lockDebris(root), []);
   });
@@ -564,7 +565,7 @@ test("a warning sink that throws during the post-acquire sweep cannot leak the p
     try {
       withCapturedStderr((stderr) => {
         const store = createReconciliationStore({ root, lockWaitMs: 50, onWarning: explodingSink });
-        assert.equal(store.update((state) => state).version, 1);
+        assert.equal(store.update((state) => state).version, RECONCILIATION_STATE_VERSION);
         assert.equal(existsSync(store.paths().lock), false);
         // The orphan it could not remove is still there and still reported, which is correct:
         // only the reporting was made unable to fail.
