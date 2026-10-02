@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **The session burn alarm is calibrated to 3.5M weighted tokens in five minutes.** An 8.5-day
+  replay of 41,872 real cloud requests across 1,787 session trees (subagents rolled into their
+  roots through parent links recovered from the session DB, task-tool records and workflow child
+  records) measured a healthy tree p99 of 0.95M in 5 min and a worst case of 2.71M after
+  attributing every deleted-session request to the busiest tree. 3.5M sits 1.29x above that
+  worst-case healthy peak and still catches the worst runaway of the original calibration week
+  (3.94M). `sessionStopTokens` (6M) and the rewrite thresholds are unchanged. See the
+  calibration paragraph in `lib/burn-watch.js` for the full numbers.
+
 - **Burn-watch alerts fire per session TREE, and the all-sessions aggregates were removed.** The
   router plugin now walks `parentID` up to the root and names it on every `/usage` report, so the
   burn watch rolls a fan-out of subagents into their root for the session-spend check. Stops stay

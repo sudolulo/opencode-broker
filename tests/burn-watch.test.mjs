@@ -57,7 +57,7 @@ test("a big session doing ordinary cached work for five minutes is never stopped
     stopped ||= Boolean(watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", modelID: "claude-opus-5", tokens: cached(440_000), at: i * 5_000 }).stop);
   }
   assert.equal(stopped, false);
-  // A restart re-send on top pushes it past 3M: that is worth a notification, not a stop.
+  // A restart re-send on top pushes it past 3.5M: that is worth a notification, not a stop.
   const restart = watch.recordUsage({ sessionID: "ses_busy", providerID: "anthropic", modelID: "claude-opus-5", tokens: rewrite(900_000), at: 301_000 });
   assert.equal(restart.stop, null);
   const alert = restart.alerts.find((a) => a.kind === "session-spend");
@@ -68,12 +68,49 @@ test("a big session doing ordinary cached work for five minutes is never stopped
   assert.match(alert.body, /anthropic\/claude-opus-5/, "the provider/model pair that spent appears in the body");
 });
 
+// The default session-tree notify line is 3.5M weighted in five minutes, calibrated from
+// an 8.5-day replay of real usage.jsonl. A lone session reaching ~3.2M stays silent; one
+// reaching ~3.6M crosses the line and raises exactly one session-spend alert. Steps are
+// cache-read-heavy so no step's fresh prompt reaches `rewriteTokens`, isolating the spend
+// signal from the rewrite stop.
+test("the session-spend notify default is 3.5M in five minutes: 3.2M stays silent, 3.6M alerts once", () => {
+  // weighted per step = input + output + cacheWrite + 0.1 * cacheRead
+  //                   = 1_000 + 1_000 + 0 + 0.1 * 480_000 = 50_000
+  // Fresh (input + cacheWrite) = 1_000, far under rewriteTokens (100_000), so isFullRewrite is false.
+  const step = { input: 1_000, output: 1_000, cacheRead: 480_000, cacheWrite: 0 };
+
+  const under = createBurnWatch();
+  const underAlerts = [];
+  for (let i = 0; i < 64; i++) {
+    const r = under.recordUsage({
+      sessionID: "ses_x", providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: step, at: i * 4_000,
+    });
+    underAlerts.push(...r.alerts);
+    assert.equal(r.stop, null, "no step pushes own-spend past the 6M stop line");
+  }
+  assert.deepEqual(underAlerts, [], "64 steps = 3.20M weighted stays under the 3.5M notify line");
+
+  const over = createBurnWatch();
+  const overAlerts = [];
+  for (let i = 0; i < 72; i++) {
+    const r = over.recordUsage({
+      sessionID: "ses_x", providerID: "anthropic", modelID: "claude-opus-5",
+      tokens: step, at: i * 4_000,
+    });
+    overAlerts.push(...r.alerts);
+    assert.equal(r.stop, null, "no step pushes own-spend past the 6M stop line");
+  }
+  const spend = overAlerts.filter((a) => a.kind === "session-spend");
+  assert.equal(spend.length, 1, "72 steps = 3.60M weighted crosses the 3.5M line exactly once");
+});
+
 test("session spend stops a runaway of any shape only at 6M weighted in five minutes", () => {
   const watch = createBurnWatch();
   // Output-heavy: nothing re-sent, but 101K weighted per step, every 4.5 s.
   const results = Array.from({ length: 64 }, (_, i) =>
     watch.recordUsage({ sessionID: "ses_output", providerID: "openai", modelID: "gpt-sol", tokens: { input: 1_000, output: 100_000 }, at: i * 4_500 }));
-  assert.equal(results.findIndex((r) => r.alerts.some((a) => /is burning abnormally/.test(a.title))), 29, "3.03M alerts");
+  assert.equal(results.findIndex((r) => r.alerts.some((a) => /is burning abnormally/.test(a.title))), 34, "35 * 101K = 3.535M is the first step over the 3.5M notify line");
   const first = results.findIndex((r) => r.stop);
   assert.equal(first, 59, "60 x 101K = 6.06M is the first step over the stop limit");
   assert.match(results[first].stop.reason, /spent 6\.06M weighted tokens in 5 min \(stop limit 6\.00M\)/);
@@ -101,15 +138,16 @@ test("eight unrelated sessions whose combined spend exceeds 3M in five minutes r
 });
 
 // The reason the signal existed: fan-out that stayed below the per-session line. Now rolled
-// up into the ROOT (the parent that spawned the children).
-test("eight children of one root each under 3M but summing past it raise one tree alert for the root", () => {
+// up into the ROOT (the parent that spawned the children). Each child here sees 10 steps
+// at 51K weighted = 510K on its own (far under 3.5M); the tree sums to 80 x 51K = 4.08M.
+test("eight children of one root each under 3.5M but summing past it raise one tree alert for the root", () => {
   const watch = createBurnWatch();
   const alerts = [];
   for (let i = 0; i < 80; i++) {
     const r = watch.recordUsage({
       sessionID: `ses_child_${i % 8}`, rootSessionID: "ses_root",
       providerID: "anthropic", modelID: "claude-opus-5",
-      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+      tokens: { input: 1_000, output: 50_000 }, at: i * 3_000,
     });
     alerts.push(...r.alerts);
     assert.equal(r.stop, null, "no child is itself over the stop line");
@@ -178,11 +216,12 @@ test("after a stop, the stopped session's entries are removed from the tree hist
     if (i < 3) assert.equal(r.stop, null);
     else assert.ok(r.stop, "A is stopped on its 4th full re-send");
   }
-  // Child B now spends 1.5M weighted on its own -- well under 3M alone. If A's pre-stop
-  // entries persisted in trees[root], A's ~1.75M-weighted history plus B's 1.5M would push
-  // the tree past the 3M notify line. They do not persist, so B alone does not notify.
+  // Child B now spends 2.02M weighted on its own -- under 3.5M alone. If A's pre-stop
+  // entries persisted in trees[root], A's ~1.73M-weighted history plus B's 2.02M (= 3.75M)
+  // would push the tree past the 3.5M notify line. They do not persist, so B alone does
+  // not notify.
   const alerts = [];
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 20; i++) {
     const r = watch.recordUsage({
       sessionID: "ses_B", rootSessionID: "ses_root",
       providerID: "openai", modelID: "gpt-sol",
@@ -192,7 +231,7 @@ test("after a stop, the stopped session's entries are removed from the tree hist
   }
   const spend = alerts.filter((a) => a.kind === "session-spend");
   assert.equal(spend.length, 0,
-    "B's own 1.5M is under 3M; A's pre-stop spend has been acted on and must not count");
+    "B's own 2.02M is under 3.5M; A's pre-stop spend has been acted on and must not count");
 });
 
 // Subagent count is distinct sessions in the tree window EXCLUDING the root; and the
@@ -231,7 +270,8 @@ test("subagent count excludes the root and the phrase disappears when the root i
     `the subagent count counts children only (not the root): ${spend[0].body}`);
 });
 
-// Cooldown still applies to a root key.
+// Cooldown still applies to a root key. 80 steps of 51K weighted = 4.08M, over the
+// 3.5M notify line; per-child own-spend 10 x 51K = 510K stays far under 6M.
 test("same root again inside cooldown raises no second tree alert", () => {
   const watch = createBurnWatch();
   const alerts = [];
@@ -239,7 +279,7 @@ test("same root again inside cooldown raises no second tree alert", () => {
     const r = watch.recordUsage({
       sessionID: `ses_child_${i % 8}`, rootSessionID: "ses_root",
       providerID: "anthropic", modelID: "claude-opus-5",
-      tokens: { input: 1_000, output: 40_000 }, at: i * 3_000,
+      tokens: { input: 1_000, output: 50_000 }, at: i * 3_000,
     });
     alerts.push(...r.alerts);
   }
@@ -283,13 +323,14 @@ test("a looping child still gets a per-session stop that names its root, and the
 // Tree-spend is provider-agnostic: two providers are summed and both pairs listed.
 test("a tree spending on two providers is summed, and both provider/model pairs appear in the body", () => {
   const watch = createBurnWatch();
-  // Child A on anthropic, child B on openai -- each child alone stays under 3M.
+  // Child A on anthropic, child B on openai. Each child alone: 40 x 51K = 2.04M, under
+  // the 3.5M line. Tree sum: 80 x 51K = 4.08M, over the line.
   const alerts = [];
   for (let i = 0; i < 40; i++) {
     const r = watch.recordUsage({
       sessionID: "ses_child_A", rootSessionID: "ses_root",
       providerID: "anthropic", modelID: "claude-opus-5",
-      tokens: { input: 1_000, output: 40_000 }, at: i * 6_000,
+      tokens: { input: 1_000, output: 50_000 }, at: i * 6_000,
     });
     alerts.push(...r.alerts);
   }
@@ -297,12 +338,12 @@ test("a tree spending on two providers is summed, and both provider/model pairs 
     const r = watch.recordUsage({
       sessionID: "ses_child_B", rootSessionID: "ses_root",
       providerID: "openai", modelID: "gpt-sol",
-      tokens: { input: 1_000, output: 40_000 }, at: i * 6_000 + 3_000,
+      tokens: { input: 1_000, output: 50_000 }, at: i * 6_000 + 3_000,
     });
     alerts.push(...r.alerts);
   }
   const spend = alerts.filter((a) => a.kind === "session-spend");
-  assert.ok(spend.length >= 1, "the summed tree crosses 3M even though each child does not");
+  assert.ok(spend.length >= 1, "the summed tree crosses 3.5M even though each child does not");
   assert.ok(/anthropic\/claude-opus-5/.test(spend[0].body) && /openai\/gpt-sol/.test(spend[0].body),
     `both provider/model pairs appear in the body, got: ${spend[0].body}`);
 });

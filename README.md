@@ -268,7 +268,7 @@ under `burnWatch`:
 | `rewriteCount` | 4 | Stop after this many full re-sends inside `rewriteWindowMs` ... |
 | `rewriteVolumeTokens` | 1500000 | ... that carry at least this many tokens between them. |
 | `rewriteWindowMs` | 300000 | |
-| `sessionSpendTokens` | 3000000 | Notify when one session TREE (the session plus every subagent whose `rootSessionID` names it) spends this much inside `sessionSpendWindowMs`. The tree only notifies; it never stops. |
+| `sessionSpendTokens` | 3500000 | Notify when one session TREE (the session plus every subagent whose `rootSessionID` names it) spends this much inside `sessionSpendWindowMs`. The tree only notifies; it never stops. See the calibration paragraph in `lib/burn-watch.js` for the 8.5-day replay the number was chosen from. |
 | `sessionStopTokens` | 6000000 | Stop a session whose OWN weighted spend inside `sessionSpendWindowMs` crosses this. Per actual session, not per tree -- a sibling's spend never pushes another session over the line. |
 | `sessionSpendWindowMs` | 300000 | |
 | `notifyCooldownMs` | 900000 | At most one notification per root in this long. |
