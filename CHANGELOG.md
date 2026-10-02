@@ -75,6 +75,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **One session can no longer quarantine a provider.** A provider is quarantined only on
+  failures across at least two models *and* at least two sessions; evidence now records its
+  session. A content-filter block (`content filter`, `content_policy_violation`) is classified
+  `payload`: no circuit, no health evidence, no auto re-engage onto a sibling. On 2026-10-01 a
+  single blocked turn, re-sent from opus-5-5 to opus-5, quarantined anthropic while openai and
+  alibaba were already out, and every large smart session was refused at send.
 - **An account without usage credits fences the fast targets instead of failing every turn on
   them.** Anthropic answers fast mode on such an account with HTTP 429 `rate_limit_error` "Usage
   credits are required for fast mode." The gateway dropped the body, the router read its 502 as

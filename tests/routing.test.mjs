@@ -1756,6 +1756,13 @@ test("routing failures distinguish durable quota exhaustion from transient rate 
   assert.equal(R.classifyRoutingFailure("connection reset"), "other");
 });
 
+test("a content-filter block belongs to the session and never indicts a provider", () => {
+  // The exact text that quarantined anthropic on 2026-10-01 across opus-5-5 and opus-5.
+  assert.equal(R.classifyRoutingFailure({ message: "The response was blocked by the provider's content filter" }), "payload");
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, code: "content_filter", message: "blocked" }), "payload");
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "content_policy_violation: request rejected" }), "payload");
+});
+
 test("malformed-request and caller-close failures never indict a provider", () => {
   // The three shapes that quarantined anthropic, alibaba-token-plan and llamacpp on
   // 2026-09-17. Each is deterministic per SESSION or per CALLER, so failover reproduces

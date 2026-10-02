@@ -2008,6 +2008,7 @@ const serve = async () => {
           state.health = recordFailureEvidence(state.health, target.providerID, {
             targetID: target.id,
             modelID: target.modelID,
+            sessionID: body.sessionID,
             reasonCode: kind,
             error,
             at: Date.now(),

@@ -85,6 +85,22 @@ test("repeating the same target does not quarantine the provider even when the m
   assert.equal(health.providers.anthropic.evidence.length, 1);
 });
 
+test("one session failing on two models never quarantines the provider; a second session does", () => {
+  // 2026-10-01: one session's content was blocked on opus-5-5, failover re-sent it to
+  // opus-5, and the two distinct models quarantined anthropic for every session.
+  let health = normalizeHealth({});
+  health = recordFailureEvidence(health, "anthropic", baseFailure({ sessionID: "ses_a" }));
+  health = recordFailureEvidence(health, "anthropic", baseFailure({
+    targetID: "anthropic-opus", modelID: "claude-opus-4-6", sessionID: "ses_a", at: 72_000,
+  }));
+  assert.equal(health.providers.anthropic.state, "observing");
+  assert.equal(providerEligible(health, "anthropic", 72_000), true);
+  health = recordFailureEvidence(health, "anthropic", baseFailure({ sessionID: "ses_b", at: 90_000 }));
+  assert.equal(health.providers.anthropic.state, "quarantined");
+  assert.equal(health.providers.anthropic.evidence.length, 3);
+  assert.equal(health.providers.anthropic.evidence[0].sessionID, "ses_a");
+});
+
 test("evidence expires and stays bounded", () => {
   const now = 20 * 60 * 1000;
   const health = normalizeHealth({
