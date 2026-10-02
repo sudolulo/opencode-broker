@@ -361,3 +361,94 @@ test("a hung session.get does not block /usage: the report is sent without rootS
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// If a hung session.get never settles, the walk promise must still settle so its
+// sessionRootInflight entry is removed and a failure is memoized. Otherwise every
+// later step-finish on the same session waits the full rootResolveTimeoutMs again
+// (because resolveRootSessionIDBounded races a NEW outer timer against the stuck
+// in-flight promise), and the in-flight map leaks forever.
+test("after one hung session.get the failure is memoized; the next step on the same session skips the resolution wait", () => {
+  const home = mkdtempSync(join(tmpdir(), "broker-burn-plugin-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    const usage = [];
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        const body = payload ? JSON.parse(payload) : {};
+        if (options.path === "/usage") usage.push({ sessionID: body.sessionID, rootSessionID: body.rootSessionID, at: Date.now() });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        response.emit("data", JSON.stringify({ ok: true }));
+        response.emit("end");
+      };
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.on = EventEmitter.prototype.on;
+      return req;
+    };
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    let getSessionCalls = 0;
+    const client = {
+      provider: { list: async () => ({ data: { connected: [], all: [] } }) },
+      session: {
+        get: () => { getSessionCalls += 1; return new Promise(() => {}); },
+        messages: async () => ({ data: [] }),
+        abort: async () => ({ data: true }),
+        prompt: async () => ({ data: true }),
+      },
+    };
+    // 50 ms is short enough that the whole test stays well under a second, and far
+    // enough above node_test's clock jitter to tell "no wait" apart from "one wait".
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, { rootResolveTimeoutMs: 50 });
+    const step = async (sessionID, n) => {
+      await hooks.event({ event: { type: "message.updated", properties: { info: {
+        id: "msg-" + sessionID + n, sessionID, role: "assistant", providerID: "anthropic", modelID: "claude-opus-5" } } } });
+      await hooks.event({ event: { type: "message.part.updated", properties: { part: {
+        id: "prt-" + sessionID + n, messageID: "msg-" + sessionID + n, sessionID, type: "step-finish",
+        tokens: { input: 5, output: 400 } } } } });
+    };
+    await step("ses-hung", 1);
+    // Wait > rootResolveTimeoutMs * 2 so the walk's inner getSession race has fired,
+    // the walk has settled with null, the in-flight entry has been removed, and the
+    // failure has been memoized.
+    await new Promise((r) => setTimeout(r, 200));
+    const step2At = Date.now();
+    await step("ses-hung", 2);
+    // Short post-step wait: the second /usage must not require another resolution
+    // round-trip. With the memo in place it is detached as a microtask.
+    await new Promise((r) => setTimeout(r, 20));
+    console.log(JSON.stringify({ usage, getSessionCalls, step2At }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.equal(result.getSessionCalls, 1,
+      "session.get is called at most once; the failure memo short-circuits later steps within its TTL");
+    assert.equal(result.usage.length, 2,
+      "both /usage reports must land -- the second one must not be held hostage by the stale in-flight walk");
+    const step2Usage = result.usage.find((entry) => entry.at >= result.step2At);
+    assert.ok(step2Usage, "step 2's /usage must be among the reports");
+    assert.ok(step2Usage.at - result.step2At < 40,
+      "step 2's /usage must not wait another rootResolveTimeoutMs; got " + (step2Usage.at - result.step2At) + " ms");
+    assert.equal(step2Usage.rootSessionID, undefined,
+      "step 2 still omits rootSessionID: the failure memo keeps the fallback path");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -1064,6 +1064,11 @@ test("classifier failures report without arming the local watchdog, aborting, or
       abort: async (request) => { aborts.push(request); },
       prompt: async (request) => { prompts.push(request); },
     } }, directory: process.env.HOME }, {
+      // Sentinel delay for the root-resolution race -- used only to tag the
+      // outer timer so the test can filter it out and assert it was cleared.
+      // The value is otherwise meaningless; 987654 ms is well above any delay
+      // the plugin schedules for anything else.
+      rootResolveTimeoutMs: 987654,
       setTimeout: (callback, delay) => {
         const timer = { callback, delay, unref() {} };
         timers.push(timer);
@@ -1100,10 +1105,20 @@ test("classifier failures report without arming the local watchdog, aborting, or
   }
   assert.equal(result.timersBeforeFailure, 0, "classifier children do not arm the local inactivity watchdog");
   assert.equal(result.intervals.length, 3, "classifier leases retain ordinary heartbeat coverage");
-  // The /usage report path races root-session resolution against a 1500 ms deadline (so a
-  // hung session.get cannot hold the report hostage). That timer is scheduled here, used
-  // on timeout, and cleared when the race resolves -- it is not a re-engagement.
-  const reengageTimers = result.timers.filter((timer) => timer.delay !== 1500);
+  // The /usage report path races root-session resolution against a bounded
+  // deadline so a hung session.get cannot hold the report hostage. We inject
+  // 987654 ms as the sentinel. The outer bounded race uses that delay; the
+  // walk's per-hop getSession race uses twice it (`rootResolveTimeoutMs * 2`)
+  // so a healthy session.get finishes well inside the hop budget. Both are
+  // scheduled here, used on timeout, and must be cleared when the race
+  // resolves -- not left running, not treated as a re-engagement.
+  const rootResolveSentinels = new Set([987654, 987654 * 2]);
+  const rootResolveTimers = result.timers.filter((timer) => rootResolveSentinels.has(timer.delay));
+  assert.ok(rootResolveTimers.length > 0, "the root-resolution race must schedule its sentinel timers on at least the classifier-burn step");
+  for (const timer of rootResolveTimers) {
+    assert.equal(timer.cleared, true, "every root-resolution race timer must be cleared after the race, never left running");
+  }
+  const reengageTimers = result.timers.filter((timer) => !rootResolveSentinels.has(timer.delay));
   assert.deepEqual(reengageTimers, [], "classifier failures never schedule generic re-engagement");
   assert.deepEqual(result.aborts, [], "generic retry and burn handling never abort the guard-owned child");
   assert.deepEqual(result.prompts, []);

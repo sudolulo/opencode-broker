@@ -363,7 +363,33 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         visited.add(current);
         let session = sessions.get(current);
         if (!session) {
-          try { session = await getSession(current); } catch { session = null; }
+          // ☠️ A hung client.session.get must not strand this walk: if the SDK
+          // never answers, the outer awaiter's finally (sessionRootInflight.delete,
+          // sessionRootFailures.set) never runs either, so every later step on the
+          // same session enters a fresh outer race against the same stuck promise
+          // and waits rootResolveTimeoutMs AGAIN. The in-flight map also leaks.
+          // Race the per-hop lookup against rootResolveTimeoutMs * 2 (twice the
+          // outer deadline, so a healthy session.get finishes well inside the hop
+          // budget) and treat a timeout as a failed lookup.
+          const timeoutSentinel = Symbol("rootHopTimeout");
+          let hopTimer;
+          const hopTimeout = new Promise((resolve) => {
+            hopTimer = scheduleTimeout(() => resolve(timeoutSentinel), rootResolveTimeoutMs * 2);
+            hopTimer?.unref?.();
+          });
+          try {
+            session = await Promise.race([
+              getSession(current).catch(() => null),
+              hopTimeout,
+            ]);
+          } finally {
+            cancelTimeout(hopTimer);
+          }
+          if (session === timeoutSentinel) {
+            sessionRootFailures.set(sessionID, Date.now());
+            trimTracker(sessionRootFailures);
+            return null;
+          }
         }
         if (!session) {
           sessionRootFailures.set(sessionID, Date.now());
@@ -385,6 +411,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       return null;
     })();
     sessionRootInflight.set(sessionID, walk);
+    trimTracker(sessionRootInflight);
     try {
       return await walk;
     } finally {
@@ -1222,8 +1249,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             Promise.resolve().then(async () => {
               // Bounded resolve: a hung session.get must not hold the /usage report
               // (and its burn.stop reply) hostage. On timeout the field is omitted and
-              // the broker counts the session as its own root; the next step will try
-              // again (negative memo collapses repeated misses within its TTL).
+              // the broker counts the session as its own root; within the 60 s failure
+              // TTL later steps short-circuit on the negative memo (set by the walk's
+              // own per-hop timeout) instead of re-walking.
               const rootSessionID = await resolveRootSessionIDBounded(sessionID);
               return brokerRequest("/usage", {
                 sessionID,
