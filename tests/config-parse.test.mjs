@@ -358,8 +358,9 @@ test("an enabled Gitea projection must name its own baseURL, owner and repo", as
 
 test("reconcile apply defaults off with null paths and requires all absolute paths", async () => {
   const defaults = (await loadConfig(`{}`)).CONFIG.reconcile.apply;
-  assert.deepEqual({ ...defaults }, {
+  assert.deepEqual({ ...defaults, providers: [...defaults.providers] }, {
     enabled: false,
+    providers: [],
     overlayPath: null,
     generationsRoot: null,
     currentLinkPath: null,
@@ -367,8 +368,10 @@ test("reconcile apply defaults off with null paths and requires all absolute pat
   });
 
   const enabled = (await loadConfig(`{
+    "trustedSubscriptionProviders": ["openai"],
     "reconcile": { "apply": {
       "enabled": true,
+      "providers": ["openai"],
       "overlayPath": "/var/lib/opencode-broker/resolver-overlay.json",
       "generationsRoot": "/var/lib/opencode-broker/generations",
       "currentLinkPath": "/var/lib/opencode-broker/current"
@@ -378,8 +381,10 @@ test("reconcile apply defaults off with null paths and requires all absolute pat
   assert.equal(enabled.configError, null);
 
   const invalid = (await loadConfig(`{
+    "trustedSubscriptionProviders": ["openai"],
     "reconcile": { "apply": {
       "enabled": true,
+      "providers": ["openai"],
       "overlayPath": "relative/overlay.json",
       "generationsRoot": "/var/lib/opencode-broker/generations"
     } }
@@ -401,8 +406,9 @@ test("reconcile apply defaults off with null paths and requires all absolute pat
       "currentLinkPath": "/tmp/current"
     } }
   }`)).CONFIG.reconcile.apply;
-  assert.deepEqual({ ...truthy }, {
+  assert.deepEqual({ ...truthy, providers: [...truthy.providers] }, {
     enabled: false,
+    providers: [],
     overlayPath: null,
     generationsRoot: null,
     currentLinkPath: null,
@@ -421,4 +427,89 @@ test("the shipped example configs parse and declare targets", async () => {
     assert.ok(Object.keys(CONFIG.targets).length >= 3, name);
     assert.ok(Object.keys(CONFIG.profiles).includes("private"), name);
   }
+});
+
+const APPLY_PATHS = Object.freeze({
+  overlayPath: "/var/lib/opencode-broker/resolver-overlay.json",
+  generationsRoot: "/var/lib/opencode-broker/generations",
+  currentLinkPath: "/var/lib/opencode-broker/current",
+});
+const applyConfig = (apply, trusted = ["openai", "anthropic"]) => loadConfig(JSON.stringify({
+  trustedSubscriptionProviders: trusted,
+  reconcile: { apply },
+}));
+
+test("reconcile.apply.providers accepts absent, empty, or trusted lists while apply is disabled", async () => {
+  assert.deepEqual([...(await applyConfig({ enabled: false })).CONFIG.reconcile.apply.providers], []);
+  assert.deepEqual([...(await applyConfig({ enabled: false, providers: [] })).CONFIG.reconcile.apply.providers], []);
+  const listed = (await applyConfig({ enabled: false, providers: ["openai"] })).CONFIG.reconcile.apply;
+  assert.equal(listed.enabled, false);
+  assert.deepEqual([...listed.providers], ["openai"]);
+  assert.equal(Object.isFrozen(listed.providers), true);
+});
+
+// An invalid allowlist never throws (the router plugin in every OpenCode process imports this
+// module). It is reported in configError, apply is forced off, and the list is empty.
+const rejectedApply = async (apply, pattern, trusted) => {
+  const result = (await applyConfig(apply, trusted)).CONFIG.reconcile.apply;
+  assert.match(String(result.configError), pattern);
+  assert.equal(result.enabled, false);
+  assert.deepEqual([...result.providers], []);
+  return result;
+};
+
+test("enabled apply requires a nonempty reconcile.apply.providers allowlist", async () => {
+  await rejectedApply({ enabled: true, ...APPLY_PATHS },
+    /reconcile\.apply\.providers is required and must be nonempty when reconcile\.apply\.enabled is true/);
+  await rejectedApply({ enabled: true, ...APPLY_PATHS, providers: [] },
+    /reconcile\.apply\.providers is required and must be nonempty/);
+  const enabled = (await applyConfig({ enabled: true, ...APPLY_PATHS, providers: ["openai"] })).CONFIG.reconcile.apply;
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.configError, null);
+  assert.deepEqual([...enabled.providers], ["openai"]);
+});
+
+test("malformed, duplicate, or non-array provider allowlists are reported even while apply is disabled", async () => {
+  await rejectedApply({ enabled: false, providers: "openai" },
+    /reconcile\.apply\.providers must be an array of provider IDs, got "openai"/);
+  await rejectedApply({ enabled: false, providers: ["OpenAI"] },
+    /reconcile\.apply\.providers\[0\] "OpenAI" is not a valid provider ID/);
+  await rejectedApply({ enabled: false, providers: [7] },
+    /reconcile\.apply\.providers\[0\] 7 is not a valid provider ID/);
+  await rejectedApply({ enabled: false, providers: ["openai", "openai"] },
+    /reconcile\.apply\.providers\[1\] "openai" is a duplicate/);
+});
+
+// RF4 pin: a provider dropped from the operator's attestation list while still allowlisted for
+// mutation is reported at load, naming the provider, and apply is forced off rather than mutating
+// without trust. Routing itself keeps loading.
+test("a provider removed from trustedSubscriptionProviders but still allowlisted is reported at load naming it", async () => {
+  await rejectedApply({ enabled: false, providers: ["openai", "alibaba-token-plan"] },
+    /reconcile\.apply\.providers\[1\] "alibaba-token-plan" is not a trustedSubscriptionProviders member/, ["openai"]);
+  const enabled = await rejectedApply({ enabled: true, ...APPLY_PATHS, providers: ["openai"] },
+    /reconcile\.apply\.providers\[0\] "openai" is not a trustedSubscriptionProviders member/, []);
+  assert.equal(enabled.overlayPath, null);
+});
+
+test("an apply-path error and an allowlist error are both reported", async () => {
+  await rejectedApply({ enabled: true, overlayPath: "relative.json", generationsRoot: APPLY_PATHS.generationsRoot,
+    currentLinkPath: APPLY_PATHS.currentLinkPath, providers: ["OpenAI"] },
+    /overlayPath must be an absolute path; .*"OpenAI" is not a valid provider ID/);
+});
+
+test("reconcile.notifyCommand is optional and watch.notifyCommand stays configured beside it", async () => {
+  const both = (await loadConfig(JSON.stringify({
+    watch: { notifyCommand: ["/usr/local/bin/watch-notify", "{title}"] },
+    reconcile: { notifyCommand: ["/usr/local/bin/reconcile-notify", "{body}"] },
+  }))).CONFIG;
+  assert.deepEqual([...both.reconcile.notifyCommand], ["/usr/local/bin/reconcile-notify", "{body}"]);
+  assert.deepEqual([...both.watch.notifyCommand], ["/usr/local/bin/watch-notify", "{title}"]);
+  assert.deepEqual([...both.burnWatch.notifyCommand], ["/usr/local/bin/watch-notify", "{title}"]);
+
+  const fallback = (await loadConfig(JSON.stringify({
+    watch: { notifyCommand: ["/usr/local/bin/watch-notify"] },
+    reconcile: { apply: { enabled: false, providers: [] } },
+  }))).CONFIG;
+  assert.deepEqual([...fallback.reconcile.notifyCommand], ["/usr/local/bin/watch-notify"]);
+  assert.deepEqual([...fallback.watch.notifyCommand], ["/usr/local/bin/watch-notify"]);
 });

@@ -408,9 +408,12 @@
     }
   },
   // Reconciliation mutation is default-OFF. Package 4 cutover supplies absolute deployment paths.
+  // `providers` lists the only providers the reconciler may mutate once apply is enabled; every
+  // entry must also appear in trustedSubscriptionProviders above, and Package 4 adds one at a time.
   "reconcile": {
     "apply": {
       "enabled": false,
+      "providers": ["alibaba-token-plan"],
       "overlayPath": null,
       "generationsRoot": null,
       "currentLinkPath": null

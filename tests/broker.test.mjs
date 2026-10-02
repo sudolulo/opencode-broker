@@ -1820,6 +1820,7 @@ const applyConfigPath = (home) => {
   fixture.reconcile = {
     apply: {
       enabled: true,
+      providers: ["alibaba-token-plan"],
       overlayPath: join(home, "state/resolver-overlay.json"),
       generationsRoot: join(home, "state/generations"),
       currentLinkPath: join(home, "state/generations/current"),

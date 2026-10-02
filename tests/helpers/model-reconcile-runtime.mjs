@@ -391,7 +391,9 @@ if (basename(process.argv[1]) === "opencode" && process.argv[2] === "models") {
       },
     },
     tiers: { smart: ["gpt-incumbent"] },
-    trustedSubscriptionProviders: ["anthropic"],
+    // openai is attested only on apply-enabled runs, because reconcile.apply.providers may name
+    // trustedSubscriptionProviders members only; dormant runs keep the original attestation.
+    trustedSubscriptionProviders: applyEnabled ? ["anthropic", "openai"] : ["anthropic"],
     burnWatch: { enabled: false },
     slotWatch: { enabled: false },
     reconcile: {
@@ -405,6 +407,7 @@ if (basename(process.argv[1]) === "opencode" && process.argv[2] === "models") {
       notifyCommand: [join(markerBin, "publisher-marker")],
       apply: applyEnabled ? {
         enabled: true,
+        providers: ["openai"],
         overlayPath,
         generationsRoot,
         currentLinkPath,

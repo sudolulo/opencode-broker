@@ -118,10 +118,12 @@ const build = (name, {
   mkdirSync(dirname(configPath), { recursive: true });
   const effectiveConfig = typeof config === "string" || !applyEnabled ? config : {
     ...config,
+    trustedSubscriptionProviders: [...new Set([...(config.trustedSubscriptionProviders ?? []), "openai"])],
     reconcile: {
       ...(config.reconcile ?? {}),
       apply: {
         enabled: true,
+        providers: ["openai"],
         overlayPath: join(stateRoot, "resolver-overlay.json"),
         generationsRoot: join(stateRoot, "generations"),
         currentLinkPath: join(stateRoot, "generations/current"),
