@@ -446,6 +446,11 @@ test("reconcile.apply.providers accepts absent, empty, or trusted lists while ap
   assert.equal(listed.enabled, false);
   assert.deepEqual([...listed.providers], ["openai"]);
   assert.equal(Object.isFrozen(listed.providers), true);
+  // Order is preserved as configured: the allowlist is never sorted or rewritten.
+  const ordered = (await applyConfig({ enabled: false, providers: ["openai", "anthropic"] })).CONFIG.reconcile.apply;
+  assert.deepEqual([...ordered.providers], ["openai", "anthropic"]);
+  const defaults = (await loadConfig(`{}`)).CONFIG.reconcile.apply;
+  assert.equal(Object.isFrozen(defaults.providers), true);
 });
 
 // An invalid allowlist never throws (the router plugin in every OpenCode process imports this
@@ -455,6 +460,7 @@ const rejectedApply = async (apply, pattern, trusted) => {
   assert.match(String(result.configError), pattern);
   assert.equal(result.enabled, false);
   assert.deepEqual([...result.providers], []);
+  assert.equal(Object.isFrozen(result.providers), true);
   return result;
 };
 
