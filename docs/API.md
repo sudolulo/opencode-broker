@@ -38,6 +38,24 @@ no remote address and is local by construction; any future TCP peer must have an
 IPv4 or IPv6 loopback address. A non-loopback peer is rejected before a control
 body is parsed. The broker enforces exact mode `0600` on the socket; that
 same-UID boundary is checked again before issuing a probe-launch nonce.
+
+## Gateway embeddings API
+
+The authenticated gateway also accepts buffered `POST /v1/embeddings` requests in the OpenAI
+shape: `{ model, input, encoding_format?, dimensions? }`, where `input` is a string, an array of
+strings, or an array of token arrays. Unlike chat, an embeddings request must name a configured
+`modelProfiles` entry; it never falls through to the default lane. The leased target must carry
+`embedding: true`; the gateway sends `api: "embeddings"` on that broker lease, and the broker
+refuses embedding targets without it or an embeddings lease on any other target. Embedding-only
+profiles remain valid only for this gateway path and are not offered by OpenCode's F11 picker.
+Chat, Responses, and Messages requests refuse such a target. The gateway
+forwards the body to the leased provider's `/embeddings`, returns the upstream JSON unchanged, and
+settles the one-shot lease exactly as other buffered requests do. It records
+`usage.prompt_tokens` as input usage when present; otherwise it records an input-only estimate
+(`ceil(chars / 4)` per string or token-array length, summed across the batch), output `0`, and
+`estimated: true`. `stream: true` is refused with `400`; batches are limited to 2,048 items and
+bodies to 1 MiB (declared or streamed oversize returns `413`). Per-slot eligibility uses the largest
+single input estimate, not the serialized batch size.
 When apply is disabled, every mutable control operation in this table returns
 `409` with `code: "reconcile-apply-disabled"` before parsing its control body,
 reading a generation path, minting a nonce/token, or changing state. The read-only

@@ -75,6 +75,23 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Configured cloud-model pins now retire older discovered models in their own catalog family.**
+  Discovery resolves each standard pin against its provider catalog and reports older, same-family
+  subscription candidates as `superseded by pin <targetID>` instead of letting them compete in a
+  tier. Newer models, other family lines, and fast-versus-standard variants remain eligible.
+  `opencode-broker-watch` prints these retirements to stdout as `discovery retired ...`; genuine
+  admission failures stay on stderr.
+
+### Added
+
+- **The gateway serves `POST /v1/embeddings`.** A request names a gateway model whose profile maps
+  to the new `embedding` tier; the gateway leases with `api: "embeddings"` and forwards to the
+  leased provider's `/embeddings` (buffered only, `stream: true` is refused). Targets marked
+  `embedding: true` are leasable only by such requests, and embedding requests can reach only
+  them, so chat work never lands on an embedding model and the reverse. Eligibility uses the
+  largest single input, not the whole batch; a batch is capped at 2,048 inputs and the body at
+  1 MiB (413). Usage comes from the upstream or is estimated from the inputs alone.
+
 - **Busy local lanes now name a shared model ID once instead of repeating it.** A target's
   identity is its config key, while its `modelID` may be shared across several lanes; wait
   messages now group those busy lanes and retain the original single-target wording.

@@ -57,6 +57,8 @@ const leaseCoversWireModel = (leasedModelID, wireModelID) => {
 
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
+export const MAX_EMBEDDING_BATCH_ITEMS = 2048;
+export const MAX_EMBEDDINGS_BODY_BYTES = 1024 * 1024;
 
 // TRAP: WHY AN ALLOWLIST OF GATEWAY-OWNED PHRASES AND NOT THE UPSTREAM MESSAGE. The
 // Messages and Responses buffered error paths drop the upstream body on purpose
@@ -535,9 +537,9 @@ const responsesErrorFrame = (message) => `event: error\ndata: ${JSON.stringify({
 // so a reader of the ledger can tell a measurement from a guess (the broker
 // ignores fields it does not know).
 // ── the three request shapes ────────────────────────────────────────────────
-// The gateway forwards OpenAI's Chat Completions and Responses APIs plus native Anthropic
-// Messages. Leasing, failover and accounting are shared; provider eligibility, request shaping,
-// upstream paths, usage fields and stream terminals are protocol-specific.
+// The gateway forwards OpenAI's Chat Completions, Responses and Embeddings APIs plus native
+// Anthropic Messages. Leasing, failover and accounting are shared; provider eligibility, request
+// shaping, upstream paths, usage fields and stream terminals are protocol-specific.
 // ☠️ A LANE SERVES /responses ONLY WHEN ITS CONFIG SAYS SO (`responsesApi: true`). llama.cpp
 // serves it natively; Anthropic's compat endpoint and most OpenAI-compatible clouds do not.
 // Offering them a /responses lease would get a 404 scored as a provider fault, and every such
@@ -545,6 +547,7 @@ const responsesErrorFrame = (message) => `event: error\ndata: ${JSON.stringify({
 const CHAT = { name: "chat", path: "/chat/completions" };
 const RESPONSES = { name: "responses", path: "/responses" };
 const MESSAGES = { name: "messages", path: "/messages" };
+const EMBEDDINGS = { name: "embeddings", path: "/embeddings" };
 // This is control flow, unlike the human-facing sentence on the Error.
 const LOCAL_FORWARDABLE_EXHAUSTION = "gateway-local-forwardable-exhaustion";
 
@@ -552,7 +555,9 @@ const providerServes = (provider, api) => api === CHAT
   ? provider.chatApi !== false
   : api === RESPONSES
     ? provider.responsesApi === true
-    : provider.messagesApi === true;
+    : api === MESSAGES
+      ? provider.messagesApi === true
+      : provider.embeddingsApi === true;
 
 // Usage in either dialect: chat says prompt/completion, responses says input/output.
 const readUsage = (usage) => ({
@@ -581,6 +586,19 @@ const estimateUsage = (requestBody, outputChars) => ({
   output: Math.ceil(outputChars / 4),
   estimated: true,
 });
+
+const embeddingInputItems = (input) => Array.isArray(input) && !input.every((entry) => Number.isInteger(entry)) ? input : [input];
+const embeddingInputTokens = (input) => embeddingInputItems(input).reduce((max, item) => Math.max(max,
+  typeof item === "string" ? Math.ceil(item.length / 4) : Array.isArray(item) ? item.length : 0), 0);
+const estimateEmbeddingUsage = (input) => ({
+  input: embeddingInputItems(input).reduce((total, item) => total + (typeof item === "string" ? Math.ceil(item.length / 4) : item.length), 0),
+  output: 0,
+  estimated: true,
+});
+
+const validEmbeddingInput = (input) => typeof input === "string" || (Array.isArray(input) && (
+  input.every((token) => Number.isInteger(token)) || input.every((entry) =>
+    typeof entry === "string" || (Array.isArray(entry) && entry.every((token) => Number.isInteger(token))))));
 
 // Pump an upstream SSE body at the client, learning usage on the way.
 //
@@ -769,7 +787,9 @@ export const createGatewayHandler = ({
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. chars/4 is the usual
     // serviceable estimate for OpenAI-shaped payloads.
-    const contextTokens = Math.ceil(JSON.stringify(requestBody ?? {}).length / 4);
+    const contextTokens = api === EMBEDDINGS
+      ? embeddingInputTokens(requestBody?.input)
+      : Math.ceil(JSON.stringify(requestBody ?? {}).length / 4);
     // A prompt can FIT a local model's context window and still be hopeless on
     // its hardware: a 26k-token prefill pinned the single llama.cpp slot for
     // many minutes and starved every other consumer (measured live). Providers
@@ -813,6 +833,7 @@ export const createGatewayHandler = ({
       // lets the broker's assignment cap spend these before any real session's sticky pin;
       // without it, gateway traffic evicted live sessions' models purely by being newer.
       oneShot: true,
+      ...(api === EMBEDDINGS ? { api: "embeddings" } : {}),
       contextTokens,
       // How long THIS caller has already queued for a slot on this lane. The broker holds a
       // delayed fallback rung shut until this reaches the rung's threshold, so a lane that is
@@ -840,6 +861,7 @@ export const createGatewayHandler = ({
       leaseID: lease?.leaseID,
       providerID: model.providerID,
       modelID: model.id,
+      embedding: lease?.target?.embedding === true,
     };
   };
 
@@ -1123,6 +1145,17 @@ export const createGatewayHandler = ({
       }
       acquiredLease = true;
       lastLeased = leased;
+      // A broker lease is authoritative about target capability. Releasing here keeps a
+      // misconfigured chain from pinning a slot while ensuring request types never cross.
+      if (api === EMBEDDINGS ? !leased.embedding : leased.embedding) {
+        await settle(leased, "/release");
+        return {
+          status: 400,
+          payload: { error: { message: api === EMBEDDINGS
+            ? "gateway: embeddings require an embedding target"
+            : "gateway: chat, responses and messages require a chat target", type: "invalid_request_error" } },
+        };
+      }
       const providerConfig = config.providers[leased.providerID];
       if (!providerConfig?.baseUrl) {
         await settle(leased, "/release");
@@ -1510,7 +1543,12 @@ export const createGatewayHandler = ({
           }
         }
       }
-      if (payload?.usage) await reportUsage(leased, readUsage(payload.usage));
+      if (api === EMBEDDINGS) {
+        const inputTokens = Number(payload?.usage?.prompt_tokens);
+        await reportUsage(leased, Number.isFinite(inputTokens) && inputTokens > 0
+          ? { input: inputTokens, output: 0 }
+            : estimateEmbeddingUsage(requestBody?.input));
+      } else if (payload?.usage) await reportUsage(leased, readUsage(payload.usage));
       await settle(leased, "/complete");
       return { status: 200, payload, providerID: leased.providerID, modelID: leased.modelID };
     }
@@ -1652,15 +1690,28 @@ export const createGatewayHandler = ({
     }
     const api = url === "/v1/chat/completions" ? CHAT
       : url === "/v1/responses" ? RESPONSES
-        : url === "/v1/messages" ? MESSAGES
+      : url === "/v1/messages" ? MESSAGES
+        : url === "/v1/embeddings" ? EMBEDDINGS
           : null;
     if (request.method !== "POST" || !api) {
       response.writeHead(404, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: { message: "only POST /v1/chat/completions, POST /v1/responses, POST /v1/messages and GET /v1/models" } }));
+      response.end(JSON.stringify({ error: { message: "only POST /v1/chat/completions, POST /v1/responses, POST /v1/messages, POST /v1/embeddings and GET /v1/models" } }));
       return;
     }
+    const declaredBytes = Number(request.headers["content-length"]);
+    if (api === EMBEDDINGS && Number.isFinite(declaredBytes) && declaredBytes > MAX_EMBEDDINGS_BODY_BYTES) {
+      return respondJson(response, 413, { error: { message: "gateway: embeddings request body exceeds 1048576 bytes", type: "invalid_request_error" } });
+    }
     let body = "";
-    for await (const chunk of request) body += chunk;
+    let bodyBytes = 0;
+    for await (const chunk of request) {
+      bodyBytes += Buffer.byteLength(chunk);
+      if (api === EMBEDDINGS && bodyBytes > MAX_EMBEDDINGS_BODY_BYTES) {
+        request.pause();
+        return respondJson(response, 413, { error: { message: "gateway: embeddings request body exceeds 1048576 bytes", type: "invalid_request_error" } });
+      }
+      body += chunk;
+    }
     let parsed;
     try { parsed = JSON.parse(body); } catch {
       response.writeHead(400, { "Content-Type": "application/json" });
@@ -1668,6 +1719,20 @@ export const createGatewayHandler = ({
       return;
     }
     const requestedModel = String(parsed?.model ?? "");
+    if (api === EMBEDDINGS) {
+      if (!modelRoute(config, requestedModel)) {
+        return respondJson(response, 400, { error: { message: "gateway: embeddings require a mapped model", type: "invalid_request_error", param: "model" } });
+      }
+      if (!validEmbeddingInput(parsed?.input)) {
+        return respondJson(response, 400, { error: { message: "gateway: embeddings input must be a string, string array, or token array", type: "invalid_request_error", param: "input" } });
+      }
+      if (parsed.stream === true) {
+        return respondJson(response, 400, { error: { message: "gateway: embeddings do not support stream: true", type: "invalid_request_error", param: "stream" } });
+      }
+      if (embeddingInputItems(parsed.input).length > MAX_EMBEDDING_BATCH_ITEMS) {
+        return respondJson(response, 400, { error: { message: "gateway: embeddings input has more than 2048 items", type: "invalid_request_error", param: "input" } });
+      }
+    }
     if (config.strictModelNames && !advertisedModelIDs(config).includes(requestedModel)) {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({

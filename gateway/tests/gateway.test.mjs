@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import http from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
@@ -31,6 +32,112 @@ const authFile = () => {
   process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
   return path;
 };
+
+test("embeddings use per-item context, the embeddings lease API, and input-only estimated usage", async () => {
+  const brokerCalls = [];
+  const forwarded = [];
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker", profile: "auto",
+      providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true, maxContextTokens: 1250 } },
+      modelProfiles: { embedding: { profile: "embedding", tier: "embedding" } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      brokerCalls.push({ path, body });
+      if (path === "/lease") return { leaseID: "embedding-lease", target: { embedding: true, model: { providerID: "llamacpp", id: "qwen3-embedding-0.6b" } } };
+      return { ok: true };
+    },
+    fetchImpl: async (url, options) => {
+      forwarded.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    },
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "embedding", input: ["x".repeat(5000), "tiny"], stream: false }),
+    });
+    assert.equal(response.status, 200);
+    const tokenIDs = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "embedding", input: Array.from({ length: 1250 }, (_, index) => index) }),
+    });
+    assert.equal(tokenIDs.status, 200);
+    const capped = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "embedding", input: "x".repeat(5001) }),
+    });
+    assert.equal(capped.status, 502, "a 1251-token item must not be offered to a 1250-token lane");
+  });
+  const lease = brokerCalls.find((call) => call.path === "/lease");
+  assert.equal(lease.body.api, "embeddings");
+  assert.equal(lease.body.contextTokens, 1250);
+  assert.equal(brokerCalls.filter((call) => call.path === "/lease")[1].body.contextTokens, 1250,
+    "token-ID input uses element count, not serialized JSON length");
+  assert.equal(forwarded[0].body.stream, undefined);
+  const usage = brokerCalls.find((call) => call.path === "/usage");
+  assert.deepEqual(usage.body.tokens, { input: 1251, output: 0 });
+  assert.equal(usage.body.estimated, true);
+});
+
+test("embeddings reject streaming, oversized batches, and oversized bodies before leasing", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true } }, modelProfiles: { embedding: { profile: "embedding", tier: "embedding" } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path) => { brokerCalls.push(path); throw new Error("must not lease"); },
+    fetchImpl: async () => { throw new Error("must not forward"); },
+  });
+  await withServer(handler, async (base) => {
+    for (const body of [
+      { model: "embedding", input: "x", stream: true },
+      { model: "embedding", input: Array.from({ length: 2048 }, () => "x") },
+      { model: "embedding", input: Array.from({ length: 2049 }, () => "x") },
+    ]) {
+      const response = await fetch(`${base}/v1/embeddings`, {
+        method: "POST", headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, body.input.length === 2048 ? 502 : 400);
+    }
+  });
+  assert.deepEqual(brokerCalls, ["/lease"], "the 2,048-item boundary reaches routing; 2,049 does not");
+});
+
+test("embeddings reject declared and chunked oversized bodies with 413", async () => {
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true } }, modelProfiles: { embedding: { profile: "embedding", tier: "embedding" } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async () => { throw new Error("must not lease"); },
+    fetchImpl: async () => { throw new Error("must not forward"); },
+  });
+  const oversized = JSON.stringify({ model: "embedding", input: "x".repeat(1024 * 1024) });
+  const post = (base, { chunked }) => new Promise((resolve, reject) => {
+    const url = new URL(`${base}/v1/embeddings`);
+    const request = http.request({
+      host: url.hostname, port: url.port, path: url.pathname, method: "POST",
+      headers: {
+        Authorization: "Bearer gw-secret", "Content-Type": "application/json",
+        ...(chunked ? {} : { "Content-Length": Buffer.byteLength(oversized) }),
+      },
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+    });
+    request.on("error", reject);
+    if (chunked) {
+      request.write(oversized.slice(0, 512 * 1024));
+      request.end(oversized.slice(512 * 1024));
+    } else request.end(oversized);
+  });
+  await withServer(handler, async (base) => {
+    assert.equal(await post(base, { chunked: false }), 413);
+    assert.equal(await post(base, { chunked: true }), 413);
+  });
+});
 
 test("config loader validates and applies defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "gw-cfg-"));
@@ -2775,15 +2882,115 @@ test("a /responses error event before any output fails over; after output it end
   assert.ok(calls.some((call) => call.route === "/failure"));
 });
 
-test("an unknown path is a 404 that names both endpoints", async () => {
+test("embeddings lease, forward, report measured usage, and settle", async () => {
+  const calls = [];
+  const upstream = [];
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker", profile: "auto",
+      providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true } },
+      modelProfiles: { "qwen3-embedding-0.6b": { profile: "embedding", tier: "embedding" } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/lease") return {
+        leaseID: "lease-embedding",
+        target: { embedding: true, model: { providerID: "llamacpp", id: "qwen3-embedding-0.6b" } },
+      };
+      return { ok: true };
+    },
+    fetchImpl: async (url, options) => {
+      upstream.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => ({ data: [{ embedding: [0.1], index: 0 }], usage: { prompt_tokens: 7, total_tokens: 7 } }) };
+    },
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "qwen3-embedding-0.6b", input: ["one", "two"], encoding_format: "float", dimensions: 256 }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).data[0].embedding, [0.1]);
+  });
+  assert.equal(upstream[0].url, "http://local.example/v1/embeddings");
+  assert.equal(upstream[0].body.model, "qwen3-embedding-0.6b");
+  assert.deepEqual(upstream[0].body.input, ["one", "two"]);
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(lease.body.profile, "embedding");
+  assert.equal(lease.body.tier, "embedding");
+  assert.equal(lease.body.oneShot, true);
+  assert.ok(Number.isInteger(lease.body.contextTokens) && lease.body.contextTokens > 0);
+  assert.deepEqual(calls.find((call) => call.path === "/usage").body.tokens, { input: 7, output: 0 });
+  assert.ok(calls.some((call) => call.path === "/complete"));
+});
+
+test("an embedding upstream failure reports failure and returns an error", async () => {
+  const calls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true } }, modelProfiles: { embed: { profile: "embedding", tier: "embedding" } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { leaseID: "lease-bad-embedding", target: { embedding: true, model: { providerID: "llamacpp", id: "embed" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => ({ ok: false, status: 500, text: async () => "embedding model exploded" }),
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/embeddings`, {
+      method: "POST", headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "embed", input: "text" }),
+    });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error.message, /embedding model exploded/);
+  });
+  assert.match(calls.find((call) => call.path === "/failure").body.error.message, /embedding model exploded/);
+});
+
+test("embeddings refuse non-embedding leases, unmapped models, and embedding targets for chat", async () => {
+  const calls = [];
+  let upstreamCalls = 0;
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://local.example/v1", embeddingsApi: true } }, modelProfiles: { embed: { profile: "embedding", tier: "embedding" }, chat: { profile: "auto", tier: "worker" } } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path !== "/lease") return { ok: true };
+      return body.tier === "embedding"
+        ? { leaseID: "lease-not-embed", target: { model: { providerID: "llamacpp", id: "chat" } } }
+        : { leaseID: "lease-is-embed", target: { embedding: true, model: { providerID: "llamacpp", id: "embed" } } };
+    },
+    fetchImpl: async () => { upstreamCalls += 1; throw new Error("must not forward"); },
+  });
+  await withServer(handler, async (base) => {
+    const headers = { Authorization: "Bearer gw-secret", "Content-Type": "application/json" };
+    const nonEmbedding = await fetch(`${base}/v1/embeddings`, { method: "POST", headers, body: JSON.stringify({ model: "embed", input: "text" }) });
+    assert.equal(nonEmbedding.status, 400);
+    assert.equal((await nonEmbedding.json()).error.message, "gateway: embeddings require an embedding target");
+    const unmapped = await fetch(`${base}/v1/embeddings`, { method: "POST", headers, body: JSON.stringify({ model: "unknown", input: "text" }) });
+    assert.equal(unmapped.status, 400);
+    assert.equal((await unmapped.json()).error.message, "gateway: embeddings require a mapped model");
+    const chat = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "chat", messages: [] }) });
+    assert.equal(chat.status, 400);
+    assert.equal((await chat.json()).error.message, "gateway: chat, responses and messages require a chat target");
+  });
+  assert.equal(upstreamCalls, 0);
+  assert.equal(calls.filter((call) => call.path === "/lease").length, 2);
+  assert.equal(calls.filter((call) => call.path === "/release").length, 2);
+});
+
+test("an unknown path is a 404 that names every endpoint", async () => {
   const handler = createGatewayHandler({
     config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://x/v1" } } },
     gatewayKey: "gw-secret", brokerRequest: async () => ({ ok: true }),
   });
   await withServer(handler, async (base) => {
-    const response = await fetch(`${base}/v1/embeddings`, { method: "POST", headers: { Authorization: "Bearer gw-secret" }, body: "{}" });
+    const response = await fetch(`${base}/v1/unknown`, { method: "POST", headers: { Authorization: "Bearer gw-secret" }, body: "{}" });
     assert.equal(response.status, 404);
-    assert.match((await response.json()).error.message, /POST \/v1\/chat\/completions, POST \/v1\/responses/);
+    assert.match((await response.json()).error.message, /POST \/v1\/embeddings/);
   });
 });
 

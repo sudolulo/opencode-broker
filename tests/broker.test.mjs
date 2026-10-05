@@ -201,6 +201,43 @@ const startModelsServer = async (models) => {
   };
 };
 
+test("embedding leases use the shared tier set and are isolated to embedding API callers", async () => withTempHome(async (home) => {
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8").replace(/^\s*\/\/.*$/gm, ""));
+  fixture.targets.embedding = {
+    providerID: "llamacpp", modelID: "qwen3-embedding-0.6b", kind: "local", embedding: true, capacity: 8, context: 1250,
+  };
+  fixture.targets.chat = { providerID: "llamacpp", modelID: "qwen3.5-9b-coder", kind: "local", capacity: 1, context: 1000 };
+  fixture.tiers.embedding = ["embedding"];
+  fixture.profiles.embedding = ["embedding"];
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const modelsServer = await startModelsServer(["qwen3-embedding-0.6b", "qwen3.5-9b-coder"]);
+  let child;
+  let socketPath;
+  try {
+    ({ child, socketPath } = await startBroker(home, {
+      OPENCODE_BROKER_CONFIG: configPath,
+      OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url,
+    }));
+    await assert.rejects(request(socketPath, "/lease", {
+      sessionID: "gw-embedding-chat", profile: "embedding", tier: "embedding", contextTokens: 1, replace: true,
+    }), /embedding targets require api: embeddings/);
+    const embedding = await request(socketPath, "/lease", {
+      sessionID: "gw-embedding-ok", profile: "embedding", tier: "embedding", api: "embeddings", contextTokens: 1, replace: true,
+    });
+    assert.equal(embedding.target.id, "embedding");
+    await assert.rejects(request(socketPath, "/lease", {
+      sessionID: "gw-embedding-wrong", profile: "local", tier: "worker", api: "embeddings", contextTokens: 1, replace: true,
+    }), /api: embeddings requires an embedding target/);
+  } finally {
+    await stopBroker(child);
+    await modelsServer.stop();
+  }
+}));
+
 const withBroker = async (fn, { resolvableModels = DEFAULT_RESOLVABLE_MODELS } = {}) => withTempHome(async (home) => {
   const authDirectory = join(home, ".local/share/opencode");
   mkdirSync(authDirectory, { recursive: true });

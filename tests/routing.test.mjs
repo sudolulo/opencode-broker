@@ -1001,6 +1001,129 @@ test("a pinned fast variant does not suppress the standard model of the same fam
     ["claude-opus-5-turbo"]);
 });
 
+const subscriptionDiscovery = ({ providerID = "openai", models, pins = {} }) => R.discoverSubscriptionTargets({
+  connected: [providerID],
+  all: [{ id: providerID, models }],
+}, { [providerID]: "oauth" }, pins, {
+  resolvableModels: Object.keys(models).map((modelID) => `${providerID}/${modelID}`),
+});
+
+const catalogModel = (id, family, releaseDate) => ({
+  id, status: "active", tool_call: true, family, release_date: releaseDate,
+});
+
+test("a newer Luna pin retires an older discovered Luna target", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-luna": catalogModel("gpt-5.6-luna", "gpt-luna", "2026-07-09"),
+      "gpt-6-luna": catalogModel("gpt-6-luna", "gpt-luna", "2026-09-22"),
+    },
+    pins: { "gpt-luna": { providerID: "openai", modelID: "gpt-6-luna", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.keys(discovery.targets), []);
+  assert.deepEqual(discovery.skipped, [
+    { providerID: "openai", modelID: "gpt-5.6-luna", tiers: ["worker"], reason: "superseded by pin gpt-luna" },
+  ]);
+});
+
+test("the newest of two family pins retires an intervening alias without removing the older pin", () => {
+  const pins = {
+    "claude-opus-4-8": R.TARGETS["claude-opus-4-8"],
+    "claude-opus-5": R.TARGETS["claude-opus-5"],
+  };
+  const discovery = subscriptionDiscovery({
+    providerID: "anthropic",
+    models: {
+      "claude-opus-4-8": catalogModel("claude-opus-4-8", "claude-opus", "2026-04-08"),
+      "claude-opus-4-9": catalogModel("claude-opus-4-9", "claude-opus", "2026-06-01"),
+      "claude-opus-5": catalogModel("claude-opus-5", "claude-opus", "2026-09-18"),
+    },
+    pins,
+  });
+  assert.deepEqual(discovery.skipped, [{
+    providerID: "anthropic", modelID: "claude-opus-4-9", tiers: ["build", "smart"],
+    reason: "superseded by pin claude-opus-5",
+  }]);
+  assert.ok(R.targetEligibleIDsFor("auto", "smart", pins).includes("claude-opus-4-8"));
+  const choice = R.chooseTarget({
+    profile: "auto", tier: "smart", targets: pins,
+    circuits: { "claude-opus-5": { until: null } },
+  });
+  assert.equal(choice.target.id, "claude-opus-4-8");
+});
+
+test("a newer Sol pin retires an older discovered Sol target", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-sol": catalogModel("gpt-5.6-sol", "gpt-sol", "2026-07-09"),
+      "gpt-6-sol": catalogModel("gpt-6-sol", "gpt-sol", "2026-09-22"),
+    },
+    pins: { "gpt-flagship": { providerID: "openai", modelID: "gpt-6-sol", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.keys(discovery.targets), []);
+  assert.equal(discovery.skipped[0].reason, "superseded by pin gpt-flagship");
+});
+
+test("an Opus pin retires an older discovered Opus target in its catalog family", () => {
+  const discovery = subscriptionDiscovery({
+    providerID: "anthropic",
+    models: {
+      "claude-opus-4-7": catalogModel("claude-opus-4-7", "claude-opus", "2026-04-14"),
+      "claude-opus-5-5": catalogModel("claude-opus-5-5", "claude-opus", "2026-09-18"),
+    },
+    pins: { "claude-opus-5-5": { providerID: "anthropic", modelID: "claude-opus-5-5", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.keys(discovery.targets), []);
+  assert.equal(discovery.skipped[0].reason, "superseded by pin claude-opus-5-5");
+});
+
+test("a newer discovered model remains available beside an older pin", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-luna": catalogModel("gpt-5.6-luna", "gpt-luna", "2026-07-09"),
+      "gpt-6-luna": catalogModel("gpt-6-luna", "gpt-luna", "2026-09-22"),
+    },
+    pins: { "gpt-luna": { providerID: "openai", modelID: "gpt-5.6-luna", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID), ["gpt-6-luna"]);
+  assert.deepEqual(discovery.skipped, []);
+});
+
+test("a pin does not retire a discovered target from a different family", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-terra": catalogModel("gpt-5.6-terra", "gpt-terra", "2026-07-09"),
+      "gpt-6-luna": catalogModel("gpt-6-luna", "gpt-luna", "2026-09-22"),
+    },
+    pins: { "gpt-luna": { providerID: "openai", modelID: "gpt-6-luna", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID), ["gpt-5.6-terra"]);
+  assert.deepEqual(discovery.skipped, []);
+});
+
+test("a pin without catalog metadata retires no discovered targets", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-luna": catalogModel("gpt-5.6-luna", "gpt-luna", "2026-07-09"),
+    },
+    pins: { "gpt-luna": { providerID: "openai", modelID: "gpt-6-luna", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID), ["gpt-5.6-luna"]);
+  assert.deepEqual(discovery.skipped, []);
+});
+
+test("a fast pin does not retire a standard discovered model", () => {
+  const discovery = subscriptionDiscovery({
+    models: {
+      "gpt-5.6-luna": catalogModel("gpt-5.6-luna", "gpt-luna", "2026-07-09"),
+      "gpt-6-luna-fast": catalogModel("gpt-6-luna-fast", "gpt-luna", "2026-09-22"),
+    },
+    pins: { "gpt-luna-fast": { providerID: "openai", modelID: "gpt-6-luna-fast", kind: "cloud" } },
+  });
+  assert.deepEqual(Object.values(discovery.targets).map((target) => target.modelID), ["gpt-5.6-luna"]);
+  assert.deepEqual(discovery.skipped, []);
+});
+
 // The other half of the shared guard: every character class the id shape accepts, and the
 // length boundary. A tightened helper would drop a legitimate dated alias from its lane.
 test("discovery admits the full catalog id shape and rejects what can never resolve", () => {

@@ -57,7 +57,11 @@ try {
   // A catalog model that would have taken a lane but which OpenCode cannot resolve is a
   // real finding, not noise: it is why a tier went down on 2026-09-22. Name every one.
   for (const skip of skipped) {
-    console.error(`discovery skipped ${skip.providerID}/${skip.modelID} (${skip.reason}) for ${skip.tiers.join(", ")}`);
+    if (skip.reason.startsWith("superseded by pin ")) {
+      console.log(`discovery retired ${skip.providerID}/${skip.modelID} (${skip.reason})`);
+    } else {
+      console.error(`discovery skipped ${skip.providerID}/${skip.modelID} (${skip.reason}) for ${skip.tiers.join(", ")}`);
+    }
   }
 } catch (error) {
   console.error(`inventory republish skipped: ${error?.message ?? error}`);

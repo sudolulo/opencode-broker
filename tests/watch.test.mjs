@@ -10,7 +10,7 @@ process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.me
 const { normalizeModelLine, watchReport, formatReport } = await import("../lib/watch.js");
 const watchScript = new URL("../bin/opencode-broker-watch", import.meta.url).pathname;
 
-const runWatch = async ({ brokerResponse, startBroker = true } = {}) => {
+const runWatch = async ({ brokerResponse, catalog = {}, startBroker = true } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "opencode-broker-watch-"));
   const cacheDir = join(home, ".cache/opencode");
   const authDir = join(home, ".local/share/opencode");
@@ -20,7 +20,7 @@ const runWatch = async ({ brokerResponse, startBroker = true } = {}) => {
   mkdirSync(cacheDir, { recursive: true });
   mkdirSync(routingDir, { recursive: true });
   mkdirSync(binDir, { recursive: true });
-  writeFileSync(join(cacheDir, "models.json"), "{}\n");
+  writeFileSync(join(cacheDir, "models.json"), JSON.stringify(catalog) + "\n");
   writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
   const opencode = join(binDir, "opencode");
   writeFileSync(opencode, `#!/usr/bin/env node\nif (process.argv.includes("--pure")) process.stdout.write("openai/test\\n");\n`);
@@ -130,4 +130,27 @@ test("watch exits nonzero and omits success when inventory publication throws", 
   assert.equal(result.status, 1, result.stderr);
   assert.doesNotMatch(result.stdout, /broker inventory republished from the fresh cache/);
   assert.match(result.stderr, /inventory republish skipped/);
+});
+
+test("watch reports retired discovery aliases as information and admission failures as errors", async () => {
+  const result = await runWatch({
+    brokerResponse: { changed: true },
+    catalog: {
+      openai: { id: "openai", models: {
+        "gpt-5.5-luna": {
+          id: "gpt-5.5-luna", family: "gpt-luna", release_date: "2026-06-01", status: "active", tool_call: true,
+        },
+        "gpt-5.6-luna": {
+          id: "gpt-5.6-luna", family: "gpt-luna", release_date: "2026-07-09", status: "active", tool_call: true,
+        },
+        "gpt-6-luna": {
+          id: "gpt-6-luna", family: "gpt-luna", release_date: "2026-09-22", status: "active", tool_call: true,
+        },
+      } },
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /discovery retired openai\/gpt-5\.5-luna \(superseded by pin gpt-luna\)/);
+  assert.doesNotMatch(result.stderr, /gpt-5\.5-luna/);
+  assert.match(result.stderr, /discovery skipped openai\/gpt-6-luna \(unresolvable\) for worker/);
 });
