@@ -47,6 +47,18 @@ const config = (marker) => ({
     },
     "lan-solo": { providerID: "llamacpp", modelID: "lan-solo", kind: "local", capacity: 1, context: 65536 },
     "lan-extra": { providerID: "llamacpp", modelID: "lan-extra", kind: "local", capacity: 1, context: 65536 },
+    "local-27b": { providerID: "llamacpp", modelID: "qwen3.8-27b", kind: "local", capacity: 1, context: 65536 },
+    "vision-27b": { providerID: "llamacpp", modelID: "qwen3.8-27b", kind: "local", capacity: 1, context: 65536 },
+    "frigate-27b": { providerID: "llamacpp", modelID: "qwen3.8-27b", kind: "local", capacity: 1, context: 65536 },
+    "busy-a": { providerID: "llamacpp", modelID: "a", kind: "local", capacity: 1, context: 65536 },
+    "busy-b": { providerID: "llamacpp", modelID: "b", kind: "local", capacity: 1, context: 65536 },
+    "busy-mixed-a": { providerID: "llamacpp", modelID: "A", kind: "local", capacity: 1, context: 65536 },
+    "busy-mixed-b1": { providerID: "llamacpp", modelID: "B", kind: "local", capacity: 1, context: 65536 },
+    "busy-mixed-b2": { providerID: "llamacpp", modelID: "B", kind: "local", capacity: 1, context: 65536 },
+    "busy-mixed-b3": { providerID: "llamacpp", modelID: "B", kind: "local", capacity: 1, context: 65536 },
+    "busy-one": { providerID: "llamacpp", modelID: "one", kind: "local", capacity: 1, context: 65536 },
+    "busy-two": { providerID: "llamacpp", modelID: "two", kind: "local", capacity: 1, context: 65536 },
+    "busy-three": { providerID: "llamacpp", modelID: "three", kind: "local", capacity: 1, context: 65536 },
     "cloud-a": { providerID: "openai", modelID: "cloud-a-1", kind: "cloud" },
     "cloud-b": { providerID: "openai", modelID: "cloud-b-1", kind: "cloud" },
   },
@@ -58,6 +70,10 @@ const config = (marker) => ({
     uncensored: ["swap-me"],
     local: ["lan-solo"],
     private: ["lan-solo", "lan-extra"],
+    "shared-busy": ["local-27b", "vision-27b", "frigate-27b"],
+    "different-busy": ["busy-a", "busy-b"],
+    "mixed-busy": ["busy-mixed-a", "busy-mixed-b1", "busy-mixed-b2", "busy-mixed-b3"],
+    "three-busy": ["busy-one", "busy-two", "busy-three"],
   },
   localContextHeadroom: 0.6,
 });
@@ -287,6 +303,71 @@ test("target-busy: a resident local model with every slot taken is a wait, not a
     const granted = await post(socketPath, "/lease", { sessionID: "ses-waiter", profile: "local", tier: "worker", replace: true, contextTokens: 100 });
     assert.equal(granted.statusCode, 200);
     assert.equal(granted.body.target.id, "lan-solo");
+  });
+});
+
+test("target-busy names shared-model lanes once", async () => {
+  await withBroker({ resident: () => ["qwen3.8-27b"] }, async ({ socketPath }) => {
+    for (const sessionID of ["ses-shared-1", "ses-shared-2", "ses-shared-3"]) {
+      const held = await post(socketPath, "/lease", {
+        sessionID, profile: "shared-busy", tier: "worker", replace: true, contextTokens: 100,
+      });
+      assert.equal(held.statusCode, 200, JSON.stringify(held.body));
+    }
+    const waiting = await post(socketPath, "/lease", {
+      sessionID: "ses-shared-waiter", profile: "shared-busy", tier: "worker", replace: true, contextTokens: 100,
+    });
+    assert.equal(waiting.body.error,
+      "3 qwen3.8-27b lanes are busy (every slot in use); waiting for a free slot -- resend the prompt in a moment");
+    assert.doesNotMatch(waiting.body.error, /qwen3\.8-27b and qwen3\.8-27b/);
+  });
+});
+
+test("target-busy joins two distinct model IDs with and", async () => {
+  await withBroker({ resident: () => ["a", "b"] }, async ({ socketPath }) => {
+    for (const sessionID of ["ses-different-1", "ses-different-2"]) {
+      const held = await post(socketPath, "/lease", {
+        sessionID, profile: "different-busy", tier: "worker", replace: true, contextTokens: 100,
+      });
+      assert.equal(held.statusCode, 200, JSON.stringify(held.body));
+    }
+    const waiting = await post(socketPath, "/lease", {
+      sessionID: "ses-different-waiter", profile: "different-busy", tier: "worker", replace: true, contextTokens: 100,
+    });
+    assert.equal(waiting.body.error,
+      "a and b are busy (every slot in use); waiting for a free slot -- resend the prompt in a moment");
+  });
+});
+
+test("target-busy combines one model with grouped shared-model lanes", async () => {
+  await withBroker({ resident: () => ["A", "B"] }, async ({ socketPath }) => {
+    for (const sessionID of ["ses-mixed-1", "ses-mixed-2", "ses-mixed-3", "ses-mixed-4"]) {
+      const held = await post(socketPath, "/lease", {
+        sessionID, profile: "mixed-busy", tier: "worker", replace: true, contextTokens: 100,
+      });
+      assert.equal(held.statusCode, 200, JSON.stringify(held.body));
+    }
+    const waiting = await post(socketPath, "/lease", {
+      sessionID: "ses-mixed-waiter", profile: "mixed-busy", tier: "worker", replace: true, contextTokens: 100,
+    });
+    assert.equal(waiting.body.error,
+      "A and 3 B lanes are busy (every slot in use); waiting for a free slot -- resend the prompt in a moment");
+  });
+});
+
+test("target-busy joins three distinct model IDs as an English list", async () => {
+  await withBroker({ resident: () => ["one", "two", "three"] }, async ({ socketPath }) => {
+    for (const sessionID of ["ses-three-1", "ses-three-2", "ses-three-3"]) {
+      const held = await post(socketPath, "/lease", {
+        sessionID, profile: "three-busy", tier: "worker", replace: true, contextTokens: 100,
+      });
+      assert.equal(held.statusCode, 200, JSON.stringify(held.body));
+    }
+    const waiting = await post(socketPath, "/lease", {
+      sessionID: "ses-three-waiter", profile: "three-busy", tier: "worker", replace: true, contextTokens: 100,
+    });
+    assert.equal(waiting.body.error,
+      "one, two and three are busy (every slot in use); waiting for a free slot -- resend the prompt in a moment");
   });
 });
 

@@ -75,6 +75,9 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Busy local lanes now name a shared model ID once instead of repeating it.** A target's
+  identity is its config key, while its `modelID` may be shared across several lanes; wait
+  messages now group those busy lanes and retain the original single-target wording.
 - **One session can no longer quarantine a provider.** A provider is quarantined only on
   failures across at least two models *and* at least two sessions; evidence now records its
   session. A content-filter block (`content filter`, `content_policy_violation`) is classified

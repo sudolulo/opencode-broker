@@ -1358,10 +1358,22 @@ const acquire = async (state, request, {
         ![state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((value) =>
           value && (value.until === null || Number(value.until) > nowMs)) &&
         targetFull(target, activeNow));
+    const formatBusyTargets = (targets) => {
+      const countsByModelID = new Map();
+      for (const target of targets) {
+        countsByModelID.set(target.modelID, (countsByModelID.get(target.modelID) ?? 0) + 1);
+      }
+      const parts = [...countsByModelID].map(([modelID, count]) =>
+        count === 1 ? modelID : `${count} ${modelID} lanes`);
+      const models = parts.length === 1 ? parts[0]
+        : parts.length === 2 ? parts.join(" and ")
+          : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+      return `${models} ${targets.length === 1 ? "is" : "are"} busy (every slot in use); waiting for a free slot -- resend the prompt in a moment`;
+    };
     const reason = prepared
       ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
       : busy.length
-        ? `${busy.map((target) => target.modelID).join(" and ")} ${busy.length > 1 ? "are" : "is"} busy (every slot in use); waiting for a free slot -- resend the prompt in a moment`
+        ? formatBusyTargets(busy)
         : localOnly
           ? "no eligible local model is currently deployed, free, or within its context window"
           : "all lightweight routing targets are busy or unavailable";
