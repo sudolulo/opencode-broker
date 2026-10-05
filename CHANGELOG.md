@@ -75,6 +75,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Engine-owned compaction can finish after a local context-overflow failover.** The router now
+  temporarily accepts the failed model only for that session's `compaction` turn, continues to
+  reject every other routed-model mismatch, and clears the exception after the replacement turn
+  completes. Before this, a subagent that overflowed a local window was re-leased to a larger
+  model while the engine's own compaction still ran on the local one, and that compaction died as
+  a "routed model mismatch". A compaction error on the displaced model is still not charged to
+  the replacement lease; the queued re-engage continues the session there.
+
 - **Malformed string reconciliation provider IDs now fail closed before apply or overlay writes.** Empty,
   uppercase, and non-slug provider IDs report `provider-id-invalid`; non-string provider IDs continue
   to reach the existing loud identity validation, while well-formed IDs outside the allowlist remain

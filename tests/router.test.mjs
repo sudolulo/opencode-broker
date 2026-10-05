@@ -634,6 +634,97 @@ test("chat.params refuses a provider model that differs from the message-time le
   assert.match(result.error, /routed model mismatch: expected openai\/gpt-5\.6-sol/);
 }));
 
+test("a failed local model remains valid only for its engine compaction until a later success", async () => withTempHome(async (home) => {
+  // Removing the displaced-model exception makes the first compaction assertion fail:
+  // an engine-owned compaction retains the overflowed local model while the synthetic
+  // continuation has already leased haiku.
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    let leases = 0;
+    const leaseTargets = [
+      { id: "local-coder", kind: "local", model: { providerID: "llamacpp", id: "qwen3.5-9b" } },
+      { id: "haiku", kind: "cloud", model: { providerID: "anthropic", id: "claude-haiku-4-5" } },
+      { id: "sonnet", kind: "cloud", model: { providerID: "anthropic", id: "claude-sonnet-4-5" } },
+    ];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { target: leaseTargets[leases++] }
+          : options.path === "/failure" ? { kind: "context" } : {};
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ anthropic: { type: "oauth" } }) + "\\n");
+    const timers = [];
+    const client = { session: {
+      get: async () => ({ id: "ses-overflow", agent: "standard" }),
+      messages: async () => ({ data: [] }),
+      abort: async () => ({ data: true }),
+      prompt: async () => ({ data: true }),
+    } };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimeout: () => {},
+    });
+    const local = { providerID: "llamacpp", id: "qwen3.5-9b" };
+    const haiku = { providerID: "anthropic", id: "claude-haiku-4-5" };
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-overflow", agent: "standard" } } } });
+    await hooks["chat.message"]({ sessionID: "ses-overflow", agent: "standard" }, { message: { model: {} } });
+    await hooks.event({ event: { type: "session.error", properties: {
+      sessionID: "ses-overflow",
+      error: { message: "request (145364 tokens) exceeds the context window" },
+    } } });
+    const secondReengage = timers.shift();
+    if (secondReengage) await secondReengage();
+    await hooks["chat.message"]({ sessionID: "ses-overflow", agent: "standard" }, { message: { model: {} } });
+    const errorOf = async (input) => {
+      try { await hooks["chat.params"](input); return ""; }
+      catch (error) { return String(error.message ?? error); }
+    };
+    const compactionOnDisplaced = await errorOf({ sessionID: "ses-overflow", agent: "compaction", model: local });
+    const normalOnDisplaced = await errorOf({ sessionID: "ses-overflow", agent: "standard", model: local });
+    const compactionOnOther = await errorOf({ sessionID: "ses-overflow", agent: "compaction", model: { providerID: "openai", id: "gpt-5.6-luna" } });
+    await hooks.event({ event: { type: "session.error", properties: {
+      sessionID: "ses-overflow", message: { providerID: "llamacpp" }, error: { message: "compaction request failed" },
+    } } });
+    const compactionFailureCount = requests.filter((request) => request.path === "/failure").length;
+    const postCompactionReengage = timers.shift();
+    if (postCompactionReengage) await postCompactionReengage();
+    await hooks["chat.message"]({ sessionID: "ses-overflow", agent: "standard" }, { message: { model: {} } });
+    await hooks.event({ event: { type: "message.updated", properties: {
+      sessionID: "ses-overflow", message: { role: "assistant", time: { completed: Date.now() } },
+    } } });
+    const afterSuccess = await errorOf({ sessionID: "ses-overflow", agent: "compaction", model: haiku });
+    process.stdout.write(JSON.stringify({ compactionOnDisplaced, normalOnDisplaced, compactionOnOther, compactionFailureCount, afterSuccess }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.equal(result.compactionOnDisplaced, "");
+  assert.match(result.normalOnDisplaced, /routed model mismatch/);
+  assert.match(result.compactionOnOther, /routed model mismatch/);
+  assert.equal(result.compactionFailureCount, 1,
+    "a compaction error on the displaced provider is not charged to the current lease");
+  assert.match(result.afterSuccess, /routed model mismatch/, "a completed replacement turn clears the exemption");
+}));
+
 test("an uncached routed session blocks when session.get fails", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", `

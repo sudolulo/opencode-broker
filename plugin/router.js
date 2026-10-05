@@ -127,6 +127,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
   const sessions = new Map();
   const successCandidates = new Map();
+  // The model that failed before the engine's own compaction can consume the failure.
+  // This is distinct from markDisplaced's provider-quota restoration marker.
+  const displacedModels = new Map(); // sessionID -> { providerID, modelID, variant? }
   const heartbeats = new Map();
   const localChildInactivityWatchdogs = new Map();
   const localChildInactivityCleanups = new Map();
@@ -1022,6 +1025,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const actualVariant = input?.message?.model?.variant ?? undefined;
       if (input?.model?.providerID !== providerID || input?.model?.id !== modelID ||
         actualVariant !== (variant ?? undefined)) {
+        const displaced = displacedModels.get(sessionID);
+        if (input?.agent === "compaction" &&
+          input?.model?.providerID === displaced?.providerID &&
+          input?.model?.id === displaced?.modelID &&
+          actualVariant === (displaced?.variant ?? undefined)) return;
         throw new Error(`routed model mismatch: expected ${providerID}/${modelID}${variant ? `/${variant}` : ""}, got ${input?.model?.providerID}/${input?.model?.id}${actualVariant ? `/${actualVariant}` : ""}; resend the prompt`);
       }
     },
@@ -1065,6 +1073,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (event?.type === "session.deleted") {
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
+        displacedModels.delete(sessionID);
         try { removeFallbackMarker(sessionID); } catch {}
         await cleanupDeletedSession({
           sessionID,
@@ -1167,6 +1176,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (errorEvent) {
         const failedProvider = messageRecordFrom(properties)?.providerID;
         const leasedProvider = routes.get(sessionID)?.target?.model?.providerID;
+        // ☆ This also covers the engine's overflow compaction failing on the DISPLACED local
+        // model: charging that to the current lease would indict a provider that never served
+        // the turn, and nothing is stranded -- the re-engage queued by the original overflow
+        // still runs on the current lease once the failed compaction ends.
         if (typeof failedProvider === "string" && failedProvider &&
           typeof leasedProvider === "string" && leasedProvider &&
           failedProvider !== leasedProvider) {
@@ -1183,6 +1196,18 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         const targetID = failedTarget?.id;
         const failedOnLocal = failedTarget?.kind === "local" || modelIsLocalTarget(failedTarget?.model);
         const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
+        const failedModel = failedTarget?.model;
+        const failedModelID = failedModel?.modelID ?? failedModel?.id;
+        displacedModels.delete(sessionID);
+        if (typeof failedModel?.providerID === "string" && failedModel.providerID &&
+          typeof failedModelID === "string" && failedModelID) {
+          displacedModels.set(sessionID, {
+            providerID: failedModel.providerID,
+            modelID: failedModelID,
+            ...(typeof failedModel.variant === "string" && failedModel.variant ? { variant: failedModel.variant } : {}),
+          });
+          trimTracker(displacedModels);
+        }
         routes.delete(sessionID);
         successCandidates.delete(sessionID);
         let failure = null;
@@ -1299,6 +1324,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       if (event?.type === "message.updated" && isCompletedAssistantMessage(properties) && !error) {
         successCandidates.set(sessionID, true);
+        displacedModels.delete(sessionID);
         retryWaits.delete(sessionID);
         return;
       }
