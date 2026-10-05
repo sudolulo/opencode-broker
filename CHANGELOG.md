@@ -75,6 +75,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **Malformed string reconciliation provider IDs now fail closed before apply or overlay writes.** Empty,
+  uppercase, and non-slug provider IDs report `provider-id-invalid`; non-string provider IDs continue
+  to reach the existing loud identity validation, while well-formed IDs outside the allowlist remain
+  `provider-not-allowlisted`.
+
 - **Configured cloud-model pins now retire older discovered models in their own catalog family.**
   Discovery resolves each standard pin against its provider catalog and reports older, same-family
   subscription candidates as `superseded by pin <targetID>` instead of letting them compete in a

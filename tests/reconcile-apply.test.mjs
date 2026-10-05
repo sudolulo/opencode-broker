@@ -922,6 +922,74 @@ const anthropicExclusion = (state) => ({
   reason: "provider-not-allowlisted",
 });
 
+const malformedProviderCases = [
+  ["empty", ""],
+  ["underscore", "anthropic_test"],
+  ["uppercase", "Anthropic"],
+];
+
+test("apply rejects malformed string provider IDs before any intent or overlay write", async () => {
+  for (const [label, providerID] of malformedProviderCases) {
+    const fixture = makeFixture({ state: initialState(approvedRecord({ providerID })) });
+    const before = fixture.state();
+
+    const result = await fixture.applier().apply({ transitionID: TRANSITION_ID });
+
+    assert.deepEqual(result, {
+      ok: false,
+      dryRun: false,
+      mutated: false,
+      transitionID: TRANSITION_ID,
+      providerID,
+      state: "approved",
+      reason: "provider-id-invalid",
+    }, label);
+    assert.deepEqual(fixture.state(), before, `${label} must not write a ledger intent`);
+    assert.equal(fixture.counts.overlayChanges, 0, `${label} must not write an overlay`);
+    assert.deepEqual(fixture.events, [], `${label} must not start the drive path`);
+  }
+});
+
+test("refresh reports malformed string provider IDs without entering the overlay path", async () => {
+  for (const [label, providerID] of malformedProviderCases) {
+    const fixture = makeFixture({ state: initialState(approvedRecord({ providerID })) });
+    const before = fixture.state();
+
+    const result = await fixture.applier().refresh();
+
+    assert.deepEqual(result, {
+      ok: true,
+      mutated: false,
+      results: [],
+      excluded: [{
+        transitionID: TRANSITION_ID,
+        providerID,
+        state: "approved",
+        reason: "provider-id-invalid",
+      }],
+    }, label);
+    assert.deepEqual(fixture.state(), before, `${label} must not write a ledger intent`);
+    assert.equal(fixture.counts.overlayChanges, 0, `${label} must not write an overlay`);
+    assert.deepEqual(fixture.events, [], `${label} must not start the drive path`);
+  }
+});
+
+test("a non-string provider ID still reaches the loud identity validation", async () => {
+  const direct = makeFixture({ state: initialState(approvedRecord({ providerID: null })) });
+  await assert.rejects(
+    direct.applier().apply({ transitionID: TRANSITION_ID }),
+    /has incomplete candidate identity/,
+  );
+  assert.equal(direct.state().roles[ROLE].state, "blocked-conflict");
+
+  const refreshed = makeFixture({ state: initialState(approvedRecord({ providerID: null })) });
+  await assert.rejects(
+    refreshed.applier().refresh(),
+    /has incomplete candidate identity/,
+  );
+  assert.equal(refreshed.state().roles[ROLE].state, "blocked-conflict");
+});
+
 test("the exclusion reason is the literal provider-not-allowlisted", () => {
   assert.equal(PROVIDER_NOT_ALLOWLISTED, "provider-not-allowlisted");
 });
