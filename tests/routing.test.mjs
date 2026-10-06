@@ -1886,6 +1886,29 @@ test("a content-filter block belongs to the session and never indicts a provider
   assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "content_policy_violation: request rejected" }), "payload");
 });
 
+test("a missing model id belongs to that target and never indicts a provider", () => {
+  // The exact text that quarantined openai on 2026-10-06 at 02:07:15. One unavailable id
+  // took gpt-terra, gpt-flagship, gpt-astra and gpt-6-1-sol down with it: the build tier
+  // was left with a busy local-27b and the broker answered 432 worker and 17 build lease
+  // requests "target-busy". It then cycled, because probation admits one lease and that
+  // lease hit the same id. The account's offered list is gated by Codex client version
+  // (devbox 50a57b1), so the id is legitimately configured and resolves at other times --
+  // which is exactly why this is a fact about one target, not about the provider.
+  // "model" is the dedicated target-scoped kind: /failure fences this target and records
+  // nothing against provider health. The class name is the evidence -- opencode raises it
+  // client-side, so there is no HTTP status for the 404 gate to match.
+  assert.equal(R.classifyRoutingFailure({
+    message: "ProviderModelNotFoundError: Model not found: openai/gpt-6-luna. Did you mean: gpt-5.6-luna, gpt-5.6-luna-fast?",
+  }), "model");
+  assert.equal(R.classifyRoutingFailure({
+    name: "ProviderModelNotFoundError", message: "Model not found: openai/gpt-6-luna",
+  }), "model");
+  // Already classified before this fix, via the provider's own code and a 404: keep it.
+  assert.equal(R.classifyRoutingFailure({ statusCode: 404, code: "model_not_found", message: "that model does not exist" }), "model");
+  // The alibaba shim's unimplemented-route text keeps the classification it already had.
+  assert.equal(R.classifyRoutingFailure({ statusCode: 404, message: "Not Found: Not support" }), "payload");
+});
+
 test("malformed-request and caller-close failures never indict a provider", () => {
   // The three shapes that quarantined anthropic, alibaba-token-plan and llamacpp on
   // 2026-09-17. Each is deterministic per SESSION or per CALLER, so failover reproduces

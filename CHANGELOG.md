@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model id the provider no longer offers fences that target instead of quarantining the
+  provider.** opencode raises `ProviderModelNotFoundError` client-side with no HTTP status, so
+  the `404 && modelEvidence` gate never matched it and the fault scored `other` — the default
+  evidence path, which indicts the provider. On 2026-10-06 at 02:07:15 `openai/gpt-6-luna`
+  sat in `resolvable-models.json` (refreshed 00:08) and answered "Model not found: ... Did you
+  mean: gpt-5.6-luna" at 02:07, because the ChatGPT account gates its offered list on the
+  Codex client version. openai went dark whole — `gpt-terra`, `gpt-flagship`, `gpt-astra` and
+  `gpt-6-1-sol` with it — leaving the build tier one busy `local-27b`, and the broker answered
+  432 worker and 17 build lease requests `target-busy`, which callers see as a failed dispatch.
+  It then cycled every 30 minutes: probation admits one lease, that lease hit the same id, and
+  the probation branch re-quarantines on contact. The error class is now evidence in its own
+  right, so the fault takes the existing `model` scope that fences the hit target and records
+  nothing against provider health; the next inventory refresh is what removes the id.
+
 ### Changed
 
 - **The session burn alarm is calibrated to 3.5M weighted tokens in five minutes.** An 8.5-day
