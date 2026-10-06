@@ -267,6 +267,95 @@ const inventory = (providers) => {
   };
 };
 
+test("resolvableModels narrows leases, held leases, and session pins without changing legacy callers", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const base = { profile: "auto", tier: "worker", contextTokens: 100 };
+
+  // The host resolver admits Luna and it wins this tier. A process started before Luna
+  // was added must be narrowed to the model catalog it actually loaded.
+  const legacy = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-legacy", replace: true,
+  });
+  assert.equal(legacy.target.model.id, "gpt-5.6-luna");
+
+  const narrowed = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-fresh", replace: true,
+    resolvableModels: ["alibaba-token-plan/qwen3.8-flash"],
+  });
+  assert.equal(narrowed.target.model.id, "qwen3.8-flash");
+  assert.deepEqual(narrowed.decision.reasons.filter((reason) => reason.startsWith("resolvable-models-filter-dropped:")), [
+    "resolvable-models-filter-dropped: openai/gpt-5.6-luna, llamacpp/qwen3.5-9b-coder",
+  ], "the routing trail names only models dropped from this worker lane");
+
+  const pinned = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-pinned", replace: true,
+  });
+  assert.equal(pinned.target.model.id, "gpt-5.6-luna");
+  await request(socketPath, "/forget", { sessionID: "ses-resolvable-pinned", leaseID: pinned.leaseID });
+
+  const movedPin = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-pinned",
+    resolvableModels: ["alibaba-token-plan/qwen3.8-flash"],
+  });
+  assert.equal(movedPin.target.model.id, "qwen3.8-flash", "a session pin cannot bypass the caller catalog");
+
+  const held = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-held", replace: true,
+  });
+  assert.equal(held.target.model.id, "gpt-5.6-luna");
+  const movedHeld = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-held",
+    resolvableModels: ["alibaba-token-plan/qwen3.8-flash"],
+  });
+  assert.equal(movedHeld.target.model.id, "qwen3.8-flash", "a held lease cannot bypass the caller catalog");
+
+  const replaced = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-replaced", replace: true,
+  });
+  assert.equal(replaced.target.model.id, "gpt-5.6-luna");
+  const movedReplacement = await request(socketPath, "/lease", {
+    ...base, sessionID: "ses-resolvable-replaced", replace: true,
+    resolvableModels: ["alibaba-token-plan/qwen3.8-flash"],
+  });
+  assert.equal(movedReplacement.target.model.id, "qwen3.8-flash", "a replacement lease cannot bypass the caller catalog");
+}));
+
+test("resolvableModels refuses an unresolvable lane and rejects malformed catalogs", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const base = { sessionID: "ses-resolvable-refused", profile: "auto", tier: "worker", replace: true };
+  const refused = await rawRequest(socketPath, "/lease", {
+    body: { ...base, resolvableModels: ["anthropic/claude-fable-5"] },
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, "no-resolvable-target", JSON.stringify(refused.body));
+  assert.match(refused.body.error, /cannot resolve any eligible model and must be restarted/);
+  assert.match(refused.body.error, /gpt-5\.6-luna/);
+  const selection = await request(socketPath, "/selection");
+  assert.ok(selection.lastDecision.reasons.some((reason) => reason.includes("gpt-5.6-luna")));
+
+  for (const resolvableModels of ["openai/gpt-5.6-luna", [42], ["openai"], [""]]) {
+    const invalid = await rawRequest(socketPath, "/lease", { body: { ...base, resolvableModels } });
+    assert.equal(invalid.status, 400, JSON.stringify(invalid.body));
+    assert.match(invalid.body.error, /resolvableModels/);
+  }
+}));
+
+test("resolvableModels rejects catalogs over 2048 entries before reading the request body limit", async () => withBroker(async ({ socketPath }) => {
+  const rejected = await rawRequest(socketPath, "/lease", {
+    body: {
+      sessionID: "ses-resolvable-limit", profile: "auto", tier: "worker", replace: true,
+      resolvableModels: Array.from({ length: 2049 }, (_, index) => `provider/model-${index}`),
+    },
+  });
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.body.error, /at most 2048 non-empty provider\/model strings/);
+}));
+
 test("held leases reject changed profile/tier and oversized context", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },

@@ -1609,6 +1609,263 @@ test("a brand-new session never seeds stickiness from the agent's pinned model",
     "the broker's fit-led choice lands on the message");
 }));
 
+test("router leases use the calling process provider catalog lazily and cache it", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  let providerCatalogCalls = 0;
+  const client = {
+    config: {
+      providers: async ({ query }) => {
+        providerCatalogCalls += 1;
+        assert.deepEqual(query, { directory: home });
+        return { data: { providers: [
+          { id: "openai", models: { "gpt-5.6-luna": {} } },
+          { id: "anthropic", models: { "claude-opus-5": {} } },
+        ] } };
+      },
+    },
+    session: {
+      get: async () => ({ id: "ses-process-catalog", agent: "standard" }),
+      messages: async () => ({ data: [] }),
+    },
+    app: { log: async (entry) => { logs.push(entry.body); } },
+  };
+  const hooks = await ModelRouter({ client, directory: home }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+        : {};
+    },
+  });
+  assert.equal(providerCatalogCalls, 0, "factory initialization must not call the in-process config server");
+
+  for (const message of [{}, {}]) {
+    await hooks["chat.message"]({ sessionID: "ses-process-catalog", agent: "standard" }, { message, parts: [] });
+  }
+  const leases = calls.filter((call) => call.path === "/lease");
+  assert.equal(leases.length, 2);
+  assert.deepEqual(leases[0].body.resolvableModels, ["openai/gpt-5.6-luna", "anthropic/claude-opus-5"]);
+  assert.deepEqual(leases[1].body.resolvableModels, ["openai/gpt-5.6-luna", "anthropic/claude-opus-5"]);
+  assert.equal(providerCatalogCalls, 1, "the successful catalog result is cached for later leases");
+  assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 0);
+}));
+
+test("router continues leasing without a catalog when the provider config endpoint fails", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => { throw new Error("config endpoint unavailable"); } },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-failure", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async (entry) => { logs.push(entry.body); } },
+    },
+    directory: home,
+  }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+        : {};
+    },
+  });
+  await hooks["chat.message"]({ sessionID: "ses-process-catalog-failure", agent: "standard" }, { message: {}, parts: [] });
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
+  assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
+}));
+
+test("router times out a hung provider catalog and leases without resolvableModels", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => new Promise(() => {}) },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-timeout", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async (entry) => { logs.push(entry.body); } },
+    },
+    directory: home,
+  }, {
+    resolvableModelsTimeoutMs: 5,
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+        : {};
+    },
+  });
+  await hooks["chat.message"]({ sessionID: "ses-process-catalog-timeout", agent: "standard" }, { message: {}, parts: [] });
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
+  assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
+}));
+
+test("router omits a provider catalog whose JSON field would exceed the broker request budget", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  const models = Object.fromEntries(Array.from({ length: 2000 }, (_, index) => [`model-${index.toString().padStart(30, "0")}`, {}]));
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => ({ data: { providers: [{ id: "openai", models }] } }) },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-oversized", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async (entry) => { logs.push(entry.body); } },
+    },
+    directory: home,
+  }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease"
+        ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+        : {};
+    },
+  });
+  await hooks["chat.message"]({ sessionID: "ses-process-catalog-oversized", agent: "standard" }, { message: {}, parts: [] });
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
+  const warning = logs.find((entry) => entry.level === "warn" && /provider catalog/.test(entry.message));
+  assert.match(warning?.message ?? "", /\d+ characters/);
+}));
+
+test("router omits a provider catalog with more models than the broker accepts", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  const models = Object.fromEntries(Array.from({ length: 2049 }, (_, index) => [`model-${index}`, {}]));
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => ({ data: { providers: [{ id: "openai", models }] } }) },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-too-many", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async (entry) => { logs.push(entry.body); } },
+    },
+    directory: home,
+  }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease" ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } } : {};
+    },
+  });
+  await hooks["chat.message"]({ sessionID: "ses-process-catalog-too-many", agent: "standard" }, { message: {}, parts: [] });
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
+  assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
+}));
+
+test("router omits a provider catalog with a model id the broker rejects", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const calls = [];
+  const logs = [];
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt invalid": {} } }] } }) },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-invalid", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async (entry) => { logs.push(entry.body); } },
+    },
+    directory: home,
+  }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      return path === "/lease" ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } } : {};
+    },
+  });
+  await hooks["chat.message"]({ sessionID: "ses-process-catalog-invalid", agent: "standard" }, { message: {}, parts: [] });
+  const lease = calls.find((call) => call.path === "/lease");
+  assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
+  assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
+}));
+
+test("router caches a timed-out provider catalog failure for sixty seconds", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  const timers = [];
+  let now = 10_000;
+  let providerCatalogCalls = 0;
+  const providerReadStarted = [];
+  const providerReads = [
+    new Promise((resolve) => { providerReadStarted.push(resolve); }),
+    new Promise((resolve) => { providerReadStarted.push(resolve); }),
+  ];
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => {
+        providerCatalogCalls += 1;
+        providerReadStarted[providerCatalogCalls - 1]();
+        return new Promise(() => {});
+      } },
+      session: {
+        get: async () => ({ id: "ses-process-catalog-negative-cache", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async () => {} },
+    },
+    directory: home,
+  }, {
+    now: () => now,
+    resolvableModelsTimeoutMs: 1,
+    setTimeout: (callback) => { timers.push(callback); return callback; },
+    clearTimeout: () => {},
+    brokerRequest: async () => ({ target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }),
+  });
+  const lease = () => hooks["chat.message"]({ sessionID: "ses-process-catalog-negative-cache", agent: "standard" }, { message: {}, parts: [] });
+  const first = lease();
+  await providerReads[0];
+  timers.shift()();
+  await first;
+  await lease();
+  assert.equal(providerCatalogCalls, 1, "the cached timeout avoids another provider read");
+  now += 60_000;
+  const expired = lease();
+  await providerReads[1];
+  timers.shift()();
+  await expired;
+  assert.equal(providerCatalogCalls, 2, "the failure cache expires after sixty seconds");
+}));
+
+test("router shares one in-flight provider catalog read between concurrent leases", async () => withTempHome(async (home) => {
+  const { ModelRouter } = await import("../plugin/router.js");
+  let providerCatalogCalls = 0;
+  let resolveCatalog;
+  let providerReadStarted;
+  const providerRead = new Promise((resolve) => { providerReadStarted = resolve; });
+  const catalog = new Promise((resolve) => { resolveCatalog = resolve; });
+  const hooks = await ModelRouter({
+    client: {
+      config: { providers: async () => { providerCatalogCalls += 1; providerReadStarted(); return catalog; } },
+      session: {
+        get: async ({ path }) => ({ id: path.id, agent: "standard" }),
+        messages: async () => ({ data: [] }),
+      },
+      app: { log: async () => {} },
+    },
+    directory: home,
+  }, {
+    brokerRequest: async () => ({ target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } }),
+  });
+  const first = hooks["chat.message"]({ sessionID: "ses-process-catalog-concurrent-one", agent: "standard" }, { message: {}, parts: [] });
+  const second = hooks["chat.message"]({ sessionID: "ses-process-catalog-concurrent-two", agent: "standard" }, { message: {}, parts: [] });
+  await providerRead;
+  assert.equal(providerCatalogCalls, 1, "concurrent leases share the first catalog read");
+  resolveCatalog({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } });
+  await Promise.all([first, second]);
+}));
+
 // The router's messages used to go to console.error, which reaches the TUI ONLY and
 // never opencode.log -- so routine telemetry looked like an unexplained on-screen error
 // and was unfindable afterwards. These three properties are the ones that break in

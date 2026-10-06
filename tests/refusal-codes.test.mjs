@@ -61,6 +61,9 @@ const config = (marker) => ({
     "busy-three": { providerID: "llamacpp", modelID: "three", kind: "local", capacity: 1, context: 65536 },
     "cloud-a": { providerID: "openai", modelID: "cloud-a-1", kind: "cloud" },
     "cloud-b": { providerID: "openai", modelID: "cloud-b-1", kind: "cloud" },
+    "resolvable-primary": { providerID: "openai", modelID: "new-primary", kind: "cloud" },
+    "resolvable-local-fallback": { providerID: "llamacpp", modelID: "old-local", kind: "local", capacity: 1, context: 65536 },
+    "resolvable-cloud-fallback": { providerID: "anthropic", modelID: "old-cloud", kind: "cloud" },
   },
   tiers: { worker: ["cloud-a", "cloud-b"] },
   // A local rung under a cloud-only lane: the shape a local-only request has to be able
@@ -74,7 +77,14 @@ const config = (marker) => ({
     "different-busy": ["busy-a", "busy-b"],
     "mixed-busy": ["busy-mixed-a", "busy-mixed-b1", "busy-mixed-b2", "busy-mixed-b3"],
     "three-busy": ["busy-one", "busy-two", "busy-three"],
+    resolvable: ["resolvable-primary"],
+    "resolvable-cloud": ["resolvable-primary"],
   },
+  profileFallbacks: {
+    resolvable: [["resolvable-local-fallback"]],
+    "resolvable-cloud": [["resolvable-cloud-fallback"]],
+  },
+  profileCloudEgress: ["resolvable", "resolvable-cloud"],
   localContextHeadroom: 0.6,
 });
 
@@ -89,7 +99,7 @@ const withBroker = async ({ resident = () => [], auth = true } = {}, run) => {
   });
   await new Promise((resolve) => models.listen(0, "127.0.0.1", resolve));
   mkdirSync(join(home, ".local/share/opencode"), { recursive: true });
-  if (auth) writeFileSync(join(home, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }));
+  if (auth) writeFileSync(join(home, ".local/share/opencode/auth.json"), JSON.stringify(auth === true ? { openai: { type: "oauth" } } : auth));
   const env = {
     ...process.env, HOME: home,
     OPENCODE_BROKER_CONFIG: configPath,
@@ -303,6 +313,47 @@ test("target-busy: a resident local model with every slot taken is a wait, not a
     const granted = await post(socketPath, "/lease", { sessionID: "ses-waiter", profile: "local", tier: "worker", replace: true, contextTokens: 100 });
     assert.equal(granted.statusCode, 200);
     assert.equal(granted.body.target.id, "lan-solo");
+  });
+});
+
+test("resolvableModels keeps fallback waits and ordinary ineligible answers ahead of terminal restart guidance", async () => {
+  await withBroker({
+    resident: () => ["old-local"],
+    auth: { openai: { type: "oauth" }, anthropic: { type: "oauth" } },
+  }, async ({ socketPath }) => {
+    const localCatalog = ["llamacpp/old-local"];
+    const holder = await post(socketPath, "/lease", {
+      sessionID: "ses-resolvable-local-holder", profile: "resolvable", tier: "worker", replace: true,
+      contextTokens: 100, resolvableModels: localCatalog,
+    });
+    assert.equal(holder.statusCode, 200, JSON.stringify(holder.body));
+    const busy = await post(socketPath, "/lease", {
+      sessionID: "ses-resolvable-local-waiter", profile: "resolvable", tier: "worker", replace: true,
+      contextTokens: 100, resolvableModels: localCatalog,
+    });
+    assert.equal(busy.body.code, "target-busy", JSON.stringify(busy.body));
+
+    const cloudCatalog = ["anthropic/old-cloud"];
+    const cloudLease = await post(socketPath, "/lease", {
+      sessionID: "ses-resolvable-cloud-holder", profile: "resolvable-cloud", tier: "worker", replace: true,
+      contextTokens: 100, resolvableModels: cloudCatalog,
+    });
+    assert.equal(cloudLease.statusCode, 200, JSON.stringify(cloudLease.body));
+    await post(socketPath, "/failure", {
+      sessionID: "ses-resolvable-cloud-holder", leaseID: cloudLease.body.leaseID,
+      targetID: "resolvable-cloud-fallback", error: "rate limit exceeded",
+    });
+    const circuit = await post(socketPath, "/lease", {
+      sessionID: "ses-resolvable-cloud-circuit", profile: "resolvable-cloud", tier: "worker", replace: true,
+      contextTokens: 100, resolvableModels: cloudCatalog,
+    });
+    assert.equal(circuit.body.code, "no-eligible-target", JSON.stringify(circuit.body));
+
+    const empty = await post(socketPath, "/lease", {
+      sessionID: "ses-resolvable-empty", profile: "resolvable", tier: "worker", replace: true,
+      contextTokens: 100, resolvableModels: ["anthropic/not-in-this-lane"],
+    });
+    assert.equal(empty.body.code, "no-resolvable-target", JSON.stringify(empty.body));
   });
 });
 

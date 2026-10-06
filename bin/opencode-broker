@@ -852,7 +852,7 @@ const prepareTarget = (target, { sessionID } = {}) => {
 // rather than a fourth one invented at the call site -- an unclassified refusal is
 // honest, an over-specific taxonomy is a contract nobody can rely on. The auth-store
 // refusal above is the one such path today.
-const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target"]);
+const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target"]);
 // ☠️ `refusalCode`, NOT `code`. This handler's catch sees EVERY error, and node puts
 // its own `code` on system errors (ENOENT from a state write, EPIPE from a socket) --
 // forwarding that field would publish "ENOENT" as a routing refusal code, outside the
@@ -962,6 +962,12 @@ const acquire = async (state, request, {
   if (oneShot && !ONE_SHOT_SESSION_PREFIX.test(sessionID)) {
     throw new Error("oneShot requires a per-request session id (gw- prefix)");
   }
+  const hasResolvableModels = request.resolvableModels !== undefined;
+  if (hasResolvableModels && (!Array.isArray(request.resolvableModels) || request.resolvableModels.length > 2048 ||
+    request.resolvableModels.some((model) => typeof model !== "string" || !/^\S+\/\S+$/.test(model)))) {
+    throw new Error("resolvableModels must be an array of at most 2048 non-empty provider/model strings");
+  }
+  const resolvableModels = hasResolvableModels ? new Set(request.resolvableModels) : null;
   const api = request.api === "embeddings" ? "embeddings" : null;
   const requestedTargets = targetEligibleIDsFor(profile, tier, allTargets(state))
     .map((targetID) => targetForID(targetID, allTargets(state))).filter(Boolean);
@@ -1018,11 +1024,24 @@ const acquire = async (state, request, {
   // inherits only this one property from the session it belongs to.
   // ☠️ "keep only local", never "drop cloud" -- same reason as everywhere else.
   const localOnlyRequest = request.localOnly === true;
-  let admittedTargets = Object.fromEntries(Object.entries(targets)
+  const admittedBeforeResolvableModels = Object.fromEntries(Object.entries(targets)
     .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers))
     .filter(([, target]) => !localOnlyRequest || target.kind === "local")
     .filter(([, target]) => !providerAllowlist || providerAllowlist.has(target.providerID))
     .filter(([, target]) => (target.embedding === true) === (api === "embeddings")));
+  // The host snapshot proves what is installed now, not what this OpenCode process loaded at
+  // spawn. A caller catalog may only narrow that admission, never add a target the host denied.
+  let admittedTargets = Object.fromEntries(Object.entries(admittedBeforeResolvableModels)
+    .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`)));
+  const droppedResolvableLaneModelIDs = resolvableModels
+    ? targetEligibleIDsFor(profile, tier, admittedBeforeResolvableModels)
+      .map((targetID) => admittedBeforeResolvableModels[targetID])
+      .filter((target) => target && !resolvableModels.has(`${target.providerID}/${target.modelID}`))
+      .map((target) => `${target.providerID}/${target.modelID}`)
+    : [];
+  const resolvableModelsReason = droppedResolvableLaneModelIDs.length
+    ? `resolvable-models-filter-dropped: ${[...new Set(droppedResolvableLaneModelIDs)].slice(0, 5).join(", ")}`
+    : null;
   if (probeAssignment) {
     const exact = Object.fromEntries(Object.entries(admittedTargets).filter(([, target]) =>
       target.providerID === probeAssignment.preferredModel.providerID
@@ -1119,7 +1138,8 @@ const acquire = async (state, request, {
           tier,
           policy: "held-lease-revalidation",
           reasons: ["revalidated-held-lease", ...(policyLane.reason ? [policyLane.reason] : []),
-            ...(policyLane.blockedGeneration ? ["blocked-generation"] : [])],
+            ...(policyLane.blockedGeneration ? ["blocked-generation"] : []),
+            ...(resolvableModelsReason ? [resolvableModelsReason] : [])],
           ...(policyLane.blockedGeneration ? { blockedGeneration: true } : {}),
           eligibleTargetIDs: [target.id],
           balancedTargetIDs: [target.id],
@@ -1381,10 +1401,15 @@ const acquire = async (state, request, {
           : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
       return `${models} ${targets.length === 1 ? "is" : "are"} busy (every slot in use); waiting for a free slot -- resend the prompt in a moment`;
     };
+    const noResolvableTarget = droppedResolvableLaneModelIDs.length > 0 &&
+      !targetEligibleIDsFor(profile, tier, admittedTargets)
+        .some((targetID) => targetForID(targetID, admittedTargets));
     const reason = prepared
       ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
       : busy.length
         ? formatBusyTargets(busy)
+        : noResolvableTarget
+          ? `the calling OpenCode process cannot resolve any eligible model and must be restarted to load current provider config; dropped models: ${[...new Set(droppedResolvableLaneModelIDs)].slice(0, 5).join(", ")}`
         : localOnly
           ? "no eligible local model is currently deployed, free, or within its context window"
           : "all lightweight routing targets are busy or unavailable";
@@ -1396,6 +1421,7 @@ const acquire = async (state, request, {
     const code = prepared
       ? "target-preparing"
       : busy.length ? "target-busy"
+        : noResolvableTarget ? "no-resolvable-target"
         : localOnly ? "no-eligible-local-target" : "no-eligible-target";
     const subject = prepared ? absent[0] : busy.length === 1 ? busy[0] : wanted.length === 1 ? wanted[0] : null;
     // ☠️ A preparing target is NOT a refusal, and filing it as one makes the decision log
@@ -1412,7 +1438,7 @@ const acquire = async (state, request, {
       // machine-readable too -- that log is where refusals get read after the fact, and
       // until now that reading was done by eye. `targetID` stays null: on a decision it
       // means the target that was LEASED, and neither a refusal nor a wait leased anything.
-      policy, code, reasons: [reason],
+      policy, code, reasons: [reason, ...(resolvableModelsReason ? [resolvableModelsReason] : [])],
       contextTokens,
       eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
     });
@@ -1422,6 +1448,9 @@ const acquire = async (state, request, {
   if (choice.cursorKey) {
     ensureActive();
     state.cursors[choice.cursorKey] = choice.nextCursor;
+  }
+  if (resolvableModelsReason && choice.decision) {
+    choice.decision.reasons = [...(choice.decision.reasons ?? []), resolvableModelsReason];
   }
   ensureActive();
   const leasedAt = Date.now();

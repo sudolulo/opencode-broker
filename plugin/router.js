@@ -200,6 +200,90 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (level !== "error") mirror();
     }
   };
+  const RESOLVABLE_MODELS_CACHE_MS = 5 * 60 * 1000;
+  const RESOLVABLE_MODELS_FAILURE_CACHE_MS = 60 * 1000;
+  const resolvableModelsTimeoutMs = Number.isFinite(options.resolvableModelsTimeoutMs) && options.resolvableModelsTimeoutMs >= 0
+    ? options.resolvableModelsTimeoutMs
+    : 2000;
+  const RESOLVABLE_MODELS_MAX_JSON_BYTES = 48 * 1024;
+  // Keep these aligned with acquire() in bin/opencode-broker so a bad local catalog
+  // degrades this plugin rather than causing the broker to reject every prompt.
+  const RESOLVABLE_MODELS_MAX_ENTRIES = 2048;
+  const RESOLVABLE_MODEL_PATTERN = /^\S+\/\S+$/;
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  let resolvableModelsCache = null;
+  let resolvableModelsInflight = null;
+  let resolvableModelsFailureReported = false;
+  let resolvableModelsSuccessReported = false;
+  const callingProcessResolvableModels = () => {
+    if (resolvableModelsCache) {
+      const cacheMs = resolvableModelsCache.models === null
+        ? RESOLVABLE_MODELS_FAILURE_CACHE_MS
+        : RESOLVABLE_MODELS_CACHE_MS;
+      if (now() - resolvableModelsCache.at < cacheMs) return Promise.resolve(resolvableModelsCache.models);
+    }
+    if (resolvableModelsInflight) return resolvableModelsInflight;
+    resolvableModelsInflight = (async () => {
+      let timeout;
+      try {
+        // The host resolver snapshot can change after this OpenCode process starts, but this
+        // process's provider catalog is frozen at spawn. Ask only while leasing: calling the
+        // in-process server during plugin initialization can deadlock startup.
+        // A client without the endpoint is a failure to report, not a reason to skip silently:
+        // without the catalog this process can be leased models it cannot resolve.
+        if (typeof client?.config?.providers !== "function") throw new Error("plugin client has no config.providers()");
+        const response = await Promise.race([
+          client.config.providers({ query: { directory } }),
+          new Promise((_, reject) => {
+            timeout = scheduleTimeout(() => reject(new Error(`provider catalog timed out after ${resolvableModelsTimeoutMs}ms`)), resolvableModelsTimeoutMs);
+          }),
+        ]);
+        const payload = response?.data ?? response;
+        if (!Array.isArray(payload?.providers) || payload.providers.length === 0) {
+          throw new Error("provider catalog response has no providers array");
+        }
+        const models = [];
+        for (const provider of payload.providers) {
+          if (typeof provider?.id !== "string" || !provider.id || !provider.models ||
+            typeof provider.models !== "object" || Array.isArray(provider.models)) {
+            throw new Error("provider catalog response has an invalid provider entry");
+          }
+          for (const modelID of Object.keys(provider.models)) {
+            if (!modelID) throw new Error("provider catalog response has an empty model id");
+            models.push(`${provider.id}/${modelID}`);
+          }
+        }
+        if (models.length === 0) throw new Error("provider catalog response has no models");
+        if (models.length > RESOLVABLE_MODELS_MAX_ENTRIES) {
+          throw new Error(`provider catalog has ${models.length} models, exceeding the ${RESOLVABLE_MODELS_MAX_ENTRIES}-model broker limit`);
+        }
+        if (models.some((model) => !RESOLVABLE_MODEL_PATTERN.test(model))) {
+          throw new Error("provider catalog has a model id the broker cannot accept");
+        }
+        const modelsCharacters = JSON.stringify(models).length;
+        if (modelsCharacters > RESOLVABLE_MODELS_MAX_JSON_BYTES) {
+          throw new Error(`provider catalog is ${modelsCharacters} characters, exceeding the ${RESOLVABLE_MODELS_MAX_JSON_BYTES}-character lease budget`);
+        }
+        resolvableModelsCache = { at: now(), models };
+        resolvableModelsFailureReported = false;
+        if (!resolvableModelsSuccessReported) {
+          resolvableModelsSuccessReported = true;
+          report("info", `leasing with this process's provider catalog (${models.length} models)`);
+        }
+        return models;
+      } catch (error) {
+        resolvableModelsCache = { at: now(), models: null };
+        if (!resolvableModelsFailureReported) {
+          resolvableModelsFailureReported = true;
+          report("warn", `could not read calling process provider catalog; leasing without resolvableModels: ${String(error?.message ?? error)}`);
+        }
+        return null;
+      } finally {
+        if (timeout !== undefined) cancelTimeout(timeout);
+      }
+    })().finally(() => { resolvableModelsInflight = null; });
+    return resolvableModelsInflight;
+  };
   const trimTracker = (tracker, limit = 2000) => {
     if (tracker.size <= limit) return;
     for (const key of tracker.keys()) {
@@ -638,6 +722,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         try { removeFallbackMarker(session.id); } catch {}
         report("info", `${session.id}: displacement window over -- releasing model stickiness for rebalance`);
       }
+      const resolvableModels = await callingProcessResolvableModels();
       const leaseBody = {
         sessionID: session.id,
         profile: resolved.profile,
@@ -652,6 +737,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           ? { fallbackTargetID: marker.targetID }
           : {}),
         ...(contextTokens !== null && contextTokens !== undefined ? { contextTokens } : {}),
+        ...(resolvableModels ? { resolvableModels } : {}),
       };
       // ☠️ A WAIT IS NOT A FAILURE. `target-busy` (every slot of a resident local model is
       // taken) and `target-preparing` (the model is being swapped onto its card) both clear

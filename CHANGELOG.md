@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **OpenCode processes started before a provider-model update are no longer leased the new model.** The router sends its process-local provider catalog on each lease (cached for five minutes); the broker uses it only to narrow admission, including held leases and session pins. A caller whose catalog empties its full profile/tier lane receives `no-resolvable-target` with restart guidance instead of a later `ModelNotFoundError`; busy or preparing resolvable fallbacks remain retryable.
+
 - **A model id the provider no longer offers fences that target instead of quarantining the
   provider.** opencode raises `ProviderModelNotFoundError` client-side with no HTTP status, so
   the `404 && modelEvidence` gate never matched it and the fault scored `other` — the default
