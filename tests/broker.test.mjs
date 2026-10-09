@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import http from "node:http";
@@ -1070,6 +1070,267 @@ test("ordinary leased settlements require the exact broker-minted lease id", asy
   assert.equal(exact.status, 200, JSON.stringify(exact.body));
 }));
 
+test("canonical gateway 502 trusts only the verified bound target", async () => withBroker(async ({ home, socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  }));
+  const first = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-binding", profile: "auto", tier: "worker", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+  });
+  const stale = first.leaseID;
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-binding", profile: "auto", tier: "worker", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+  });
+  const other = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-other", profile: "auto", tier: "worker", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+  });
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const failureBody = (leaseID, targetID = lease.target.id) => ({
+    sessionID: "ses-gateway-binding", leaseID, targetID,
+    internalContext: { targetProviderID: "openai" },
+    error: {
+      targetProviderID: "openai",
+      data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+    },
+  });
+  const before = await request(socketPath, "/status");
+  const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+  const decisionCount = readFileSync(decisionsPath, "utf8").trim().split("\n").length;
+
+  for (const [name, body, expectedError] of [
+    ["missing", (() => { const body = failureBody(lease.leaseID); delete body.leaseID; return body; })(), /lease id is required/i],
+    ["malformed", failureBody(""), /invalid lease id/i],
+    // Non-string ids: `null` is present-but-null (never the "missing" branch), and the
+    // array/object shapes are what a buggy caller serialising the wrong field sends.
+    ["null", failureBody(null), /invalid lease id/i],
+    ["array", failureBody([]), /invalid lease id/i],
+    ["object", failureBody({}), /invalid lease id/i],
+    ["other session", failureBody(other.leaseID), /unknown or stale lease id/i],
+    ["replaced", failureBody(stale), /unknown or stale lease id/i],
+    ["unknown", failureBody("00000000-0000-4000-8000-000000000000"), /unknown or stale lease id/i],
+    ["target mismatch", failureBody(lease.leaseID, "claude-fable-5"), /target id does not match lease id/i],
+  ]) {
+    const rejected = await rawRequest(socketPath, "/failure", { body });
+    assert.equal(rejected.status, 400, `${name}: ${JSON.stringify(rejected.body)}`);
+    assert.match(rejected.body.error, expectedError, `${name}: ${JSON.stringify(rejected.body)}`);
+    const after = await request(socketPath, "/status");
+    assert.deepEqual(after.circuits, before.circuits, `${name}: a rejected binding must not circuit a target`);
+    assert.deepEqual(after.health, before.health, `${name}: a rejected binding must not record health evidence`);
+    assert.deepEqual(after.leases, before.leases, `${name}: a rejected binding must preserve leases`);
+    assert.deepEqual(after.assignments, before.assignments, `${name}: a rejected binding must preserve assignments`);
+    // Every refusal above is thrown before any decision is logged, so the trail does not
+    // grow by a single line -- not just "no failure-reported", nothing at all.
+    assert.equal(readFileSync(decisionsPath, "utf8").trim().split("\n").length, decisionCount,
+      `${name}: a rejected binding must not append to decisions.jsonl`);
+  }
+  const rejectedDecisions = readFileSync(decisionsPath, "utf8").trim().split("\n").slice(decisionCount)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(rejectedDecisions, [], "rejected bindings must not emit any decision, failure-reported included");
+
+  const mismatchedProvider = await rawRequest(socketPath, "/failure", {
+    body: {
+      ...failureBody(lease.leaseID),
+      internalContext: { targetProviderID: "anthropic" },
+      error: {
+        targetProviderID: "anthropic",
+        data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: "gateway: no provider could serve the request: upstream anthropic HTTP 502" } })}` },
+      },
+    },
+  });
+  assert.equal(mismatchedProvider.status, 200, JSON.stringify(mismatchedProvider.body));
+  assert.equal(mismatchedProvider.body.kind, "noop");
+  const afterMismatch = await request(socketPath, "/status");
+  assert.deepEqual(afterMismatch.circuits, before.circuits, "a provider mismatch must not circuit the bound target");
+  assert.deepEqual(afterMismatch.health, before.health, "a provider mismatch must not record health evidence");
+
+  const legacyBefore = await request(socketPath, "/status");
+  const legacy = await rawRequest(socketPath, "/failure", {
+    body: {
+      sessionID: "ses-gateway-legacy", targetID: "gpt-terra",
+      internalContext: { targetProviderID: "openai" },
+      error: {
+        targetProviderID: "openai",
+        data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+      },
+    },
+  });
+  assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
+  assert.equal(legacy.body.kind, "noop");
+  const afterLegacy = await request(socketPath, "/status");
+  assert.deepEqual(afterLegacy.circuits, legacyBefore.circuits, "an unbound report must not circuit its body target");
+  assert.deepEqual(afterLegacy.health, legacyBefore.health, "an unbound report must not record health evidence");
+  assert.deepEqual(afterLegacy.leases, legacyBefore.leases, "an unbound report must preserve active leases");
+}, { resolvableModels: ["openai/gpt-5.6-luna", "anthropic/claude-fable-5"] }));
+
+test("a verified OpenAI lease turns canonical SDK-wrapped gateway 502 into a target overload", async () => withBroker(async ({ home, socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  }));
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-502", profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-terra" },
+    resolvableModels: ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"],
+  });
+  assert.equal(lease.target.id, "gpt-terra");
+  const healthBefore = (await request(socketPath, "/status")).health;
+  const before = Date.now();
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const failure = await rawRequest(socketPath, "/failure", {
+    body: {
+      sessionID: "ses-gateway-502", leaseID: lease.leaseID, targetID: lease.target.id,
+      error: {
+        name: "AI_APICallError",
+        data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+      },
+    },
+  });
+  assert.equal(failure.status, 200, JSON.stringify(failure.body));
+  assert.equal(failure.body.kind, "overload");
+  const status = await request(socketPath, "/status");
+  assert.equal(status.circuits[lease.target.id]?.kind, "overload");
+  const renewsAt = Date.parse(status.circuits[lease.target.id].renewsAt);
+  assert.ok(renewsAt - before >= 14_000 && renewsAt - before <= 16_000,
+    `gateway overload must use the target-only 15s hold, got ${renewsAt - before}ms`);
+  assert.equal(status.circuits["provider:openai"], undefined);
+  assert.deepEqual(status.health, healthBefore, "a transient gateway overload is not provider health evidence");
+
+  const fallback = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-502-fallback", profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-terra" },
+    resolvableModels: ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"],
+  });
+  assert.notEqual(fallback.target.id, lease.target.id, "the active target circuit must force a different lease");
+  assert.equal(fallback.target.model.providerID, "anthropic", "a provider sibling is not fenced");
+
+  // Snapshot AFTER the fallback lease so the duplicate is measured against the state it
+  // actually arrives in: the sticky settled-failure branch answers from the assignment
+  // and must write nothing -- no circuit change, no lease/assignment change, no decision.
+  const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+  const decisionLines = () => readFileSync(decisionsPath, "utf8").trim().split("\n");
+  const beforeDuplicate = await request(socketPath, "/status");
+  const decisionsBeforeDuplicate = decisionLines().length;
+  const replayed = await rawRequest(socketPath, "/failure", {
+    body: {
+      sessionID: "ses-gateway-502", leaseID: lease.leaseID, targetID: lease.target.id,
+      error: { data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` } },
+    },
+  });
+  assert.deepEqual(replayed, failure, "an exact duplicate keeps the original reply");
+  const afterReplay = await request(socketPath, "/status");
+  assert.equal(afterReplay.circuits[lease.target.id].renewsAt, status.circuits[lease.target.id].renewsAt,
+    "an idempotent duplicate must not extend the circuit");
+  assert.deepEqual(afterReplay.circuits, beforeDuplicate.circuits, "a duplicate changes no circuit at all");
+  assert.deepEqual(afterReplay.health, healthBefore, "a duplicate has no health side effect");
+  assert.deepEqual(afterReplay.leases, beforeDuplicate.leases, "a duplicate must not touch any live lease");
+  assert.deepEqual(afterReplay.assignments, beforeDuplicate.assignments, "a duplicate must not touch any assignment");
+  assert.equal(decisionLines().length, decisionsBeforeDuplicate, "a duplicate appends nothing to decisions.jsonl");
+}, { resolvableModels: ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"] }));
+
+test("gateway raw message /failure keeps noncanonical input noop without circuit or health", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const before = await request(socketPath, "/status");
+  for (const [sessionID, error] of [
+    ["ses-gateway-raw-plain", { message: `${canonical}\n` }],
+    ["ses-gateway-raw-sdk", { name: "AI_APICallError", data: { message: `Bad Gateway: {\"error\":{\"message\":${JSON.stringify(`${canonical}\r\n`)}}}` } }],
+  ]) {
+    const lease = await request(socketPath, "/lease", {
+      sessionID, profile: "auto", tier: "worker", replace: true,
+      preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+    });
+    const failure = await rawRequest(socketPath, "/failure", {
+      body: { sessionID, leaseID: lease.leaseID, targetID: lease.target.id, error },
+    });
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.kind, "noop", `${sessionID}: noncanonical raw gateway text is not provider evidence`);
+    const after = await request(socketPath, "/status");
+    assert.deepEqual(after.circuits, before.circuits, `${sessionID}: no target circuit`);
+    assert.deepEqual(after.health, before.health, `${sessionID}: no provider health evidence`);
+  }
+}));
+
+test("a canonical gateway 502 reported without a target id fences the lease's verified target", async () => withBroker(async ({ home, socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+    anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  }));
+  const sessionID = "ses-gateway-502-no-target";
+  const resolvableModels = ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"];
+  const lease = await request(socketPath, "/lease", {
+    sessionID, profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-terra" }, resolvableModels,
+  });
+  assert.equal(lease.target.id, "gpt-terra");
+  assert.equal(lease.target.model.providerID, "openai");
+  const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+  const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+  const decisionLines = () => readFileSync(decisionsPath, "utf8").trim().split("\n");
+  const before = await request(socketPath, "/status");
+  assert.equal(before.circuits[lease.target.id], undefined, "the leased target starts unfenced");
+  const decisionCount = decisionLines().length;
+
+  // EXACTLY the three fields: no targetID, no context, no provider hint anywhere. The
+  // bound target comes from the lease record (bin/opencode-broker bindingTargetID falls
+  // through to binding.targetID when the body carries none), and the provider the
+  // classifier trusts comes from resolving THAT target -- the body has no say in it.
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const body = {
+    sessionID,
+    leaseID: lease.leaseID,
+    error: { name: "AI_APICallError", data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` } },
+  };
+  assert.deepEqual(Object.keys(body).sort(), ["error", "leaseID", "sessionID"]);
+  assert.equal("targetID" in body, false);
+  const sentAt = Date.now();
+  const failure = await rawRequest(socketPath, "/failure", { body });
+  const repliedAt = Date.now();
+  assert.equal(failure.status, 200, JSON.stringify(failure.body));
+  assert.equal(failure.body.kind, "overload");
+  assert.equal(typeof failure.body.circuitUntil, "number");
+  assert.ok(failure.body.circuitUntil - sentAt >= 14_000 && failure.body.circuitUntil - repliedAt <= 16_000,
+    `the reply names the 15s target hold, got until-sent=${failure.body.circuitUntil - sentAt}ms until-replied=${failure.body.circuitUntil - repliedAt}ms`);
+
+  const status = await request(socketPath, "/status");
+  assert.deepEqual(Object.keys(status.circuits).sort(), [...Object.keys(before.circuits), lease.target.id].sort(),
+    "exactly the lease's own target gains a circuit: no provider circuit, no sibling fence");
+  const circuit = status.circuits[lease.target.id];
+  assert.equal(circuit.kind, "overload");
+  // The persisted field is `until` (epoch ms); /status adds `renewsAt` as its ISO view.
+  assert.equal(circuit.until, failure.body.circuitUntil);
+  assert.equal(circuit.renewsAt, new Date(failure.body.circuitUntil).toISOString());
+  assert.equal(status.circuits["provider:openai"], undefined);
+  const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(persisted.circuits[lease.target.id].kind, "overload");
+  assert.equal(persisted.circuits[lease.target.id].until, failure.body.circuitUntil);
+  assert.ok(persisted.circuits[lease.target.id].until - sentAt >= 14_000 && persisted.circuits[lease.target.id].until - repliedAt <= 16_000,
+    `persisted until must be the 15s hold, got ${persisted.circuits[lease.target.id].until - sentAt}ms`);
+  assert.deepEqual(status.health, before.health, "a transient gateway overload is not provider health evidence");
+  assert.equal(status.leases[sessionID], undefined, "the failed lease is released so the retry selects fresh");
+  assert.equal(status.assignments[sessionID].settledFailure?.targetID, lease.target.id,
+    "the settlement is pinned to the lease's target although the body named none");
+  const decisions = decisionLines();
+  assert.equal(decisions.length, decisionCount + 1, "exactly one failure-reported line is appended");
+  const reported = JSON.parse(decisions.at(-1));
+  assert.equal(reported.policy, "failure-reported");
+  assert.equal(reported.sessionID, sessionID);
+  assert.equal(reported.targetID, lease.target.id, "the trail names the binding's target, not a body field");
+  assert.equal(reported.reasons[0], "overload");
+
+  const fallback = await request(socketPath, "/lease", {
+    sessionID: "ses-gateway-502-no-target-next", profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-terra" }, resolvableModels,
+  });
+  assert.notEqual(fallback.target.id, lease.target.id, "the target circuit must move the next lease");
+  assert.equal(fallback.target.model.providerID, "anthropic", "a provider sibling is not fenced");
+}, { resolvableModels: ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"] }));
+
 test("a confirmed Alibaba allocation quota blocks every Alibaba model until its reported reset", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
@@ -2056,11 +2317,13 @@ const publishProbationCandidate = async (socketPath, configPath) => {
   return candidateID;
 };
 
-const startLiveProbationCandidate = async (home, { offerEvery = 1 } = {}) => {
+// `extraEnv` reaches the daemon's spawn environment untouched (a models-server URL, a test
+// clock); the config path this helper writes always wins over it.
+const startLiveProbationCandidate = async (home, { offerEvery = 1, extraEnv = {} } = {}) => {
   writeAuth(home);
   const generation = await createProbeGeneration(home);
   const configPath = applyConfigPath(home);
-  const broker = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath },
+  const broker = await startBroker(home, { ...extraEnv, OPENCODE_BROKER_CONFIG: configPath },
     [...DEFAULT_RESOLVABLE_MODELS, "openai/gpt-6-sol"]);
   try {
     const registration = await rawRequest(broker.socketPath, "/resolver-process/register", {
@@ -2102,6 +2365,7 @@ const startLiveProbationCandidate = async (home, { offerEvery = 1 } = {}) => {
     return {
       ...broker,
       candidateID,
+      configPath,
       resolverToken: registration.body.resolverToken,
       firstLeaseID: first.body.leaseID,
     };
@@ -2815,6 +3079,519 @@ test("a delayed L1 failure after forget and L2 cannot settle or indict L2", asyn
     assert.equal(after.probation.leases[second.body.leaseID].settlement.outcome, "failure");
   } finally {
     await stopBroker(broker.child);
+  }
+}));
+
+test("an archived candidate lease replays canonical gateway 502 without affecting its replacement", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const sessionID = "probation-live-candidate";
+    const oldLeaseID = broker.firstLeaseID;
+    const completed = await rawRequest(broker.socketPath, "/complete", {
+      body: { sessionID, leaseID: oldLeaseID },
+    });
+    assert.equal(completed.status, 200, JSON.stringify(completed.body));
+
+    const replacement = await leaseCompatibleSmartSession(
+      broker.socketPath,
+      broker.resolverToken,
+      sessionID,
+    );
+    assert.equal(replacement.status, 200, JSON.stringify(replacement.body));
+    assert.equal(replacement.body.target.model.id, "gpt-6-sol");
+    assert.notEqual(replacement.body.leaseID, oldLeaseID,
+      "the current binding must be a new lease, not sticky assignment replay");
+
+    const newLeaseID = replacement.body.leaseID;
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+    const before = readState();
+    const beforeRole = before.modelPolicy.roles["openai:gpt-sol"];
+    const oldRecord = beforeRole.probation.leases[oldLeaseID];
+    assert.equal(before.leases[sessionID].leaseID, newLeaseID,
+      "the current live lease belongs to the replacement");
+    assert.equal(before.assignments[sessionID].leaseID, newLeaseID,
+      "the current assignment belongs to the replacement");
+    assert.notEqual(before.assignments[sessionID].leaseID, oldLeaseID);
+    // No sticky settled failure exists on the assignment, so the duplicate-reply branch in
+    // /failure cannot be what answers below: the old id can only bind through the archived
+    // policy record (bin/opencode-broker policyLeaseBinding), i.e. the HISTORICAL path.
+    assert.equal(before.assignments[sessionID].settledFailure, undefined);
+    assert.ok(oldRecord?.settlement, "the original candidate lease remains archived with its settlement");
+    assert.equal(oldRecord.sessionID, sessionID);
+    assert.equal(oldRecord.targetID, broker.candidateID);
+    assert.equal(oldRecord.settlement.outcome, "success");
+    assert.equal(oldRecord.settlement.source, "complete");
+    assert.equal(beforeRole.probation.phase, "probation");
+    assert.equal(beforeRole.probation.leases[newLeaseID].settlement, null,
+      "the replacement lease is live and unsettled before any replay");
+
+    const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+    const decisionLines = () => readFileSync(decisionsPath, "utf8").trim().split("\n");
+    const decisionCount = decisionLines().length;
+    const failureReportedCount = () => decisionLines()
+      .filter((line) => JSON.parse(line).policy === "failure-reported").length;
+    const beforeFailureReported = failureReportedCount();
+    const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+    const sdkCanonical = {
+      name: "AI_APICallError",
+      data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+    };
+    // Everything a report against the archived lease may NOT move: the live replacement
+    // lease and assignment, every circuit, all health evidence, the whole model policy
+    // (every probation counter, phase, cursor and opportunity field, every lease record),
+    // and the decision trail as a whole -- not merely its failure-reported subset.
+    const assertUntouched = (after, label) => {
+      assert.deepEqual(after.modelPolicy, before.modelPolicy, `${label}: the model policy is unchanged in full`);
+      assert.deepEqual(after.circuits, before.circuits, `${label}: no circuit is opened or extended`);
+      assert.deepEqual(after.health, before.health, `${label}: no health evidence is recorded`);
+      assert.deepEqual(after.leases, before.leases, `${label}: the replacement lease survives untouched`);
+      assert.deepEqual(after.assignments, before.assignments, `${label}: the replacement assignment is untouched`);
+      assert.equal(decisionLines().length, decisionCount, `${label}: decisions.jsonl does not grow by any line`);
+      assert.equal(failureReportedCount(), beforeFailureReported, `${label}: no failure-reported line`);
+    };
+
+    // Wrong SESSION for a real archived lease id. The archived record names
+    // probation-live-candidate, so this refuses inside policyLeaseBinding -- the policy
+    // branch -- and never reaches the non-policy "unknown or stale" fallthrough. The
+    // refusal is thrown before any write, so the persisted file is identical afterwards.
+    const wrongSession = await rawRequest(broker.socketPath, "/failure", {
+      body: { sessionID: "probation-other", leaseID: oldLeaseID, targetID: broker.candidateID, error: sdkCanonical },
+    });
+    assert.equal(wrongSession.status, 400, JSON.stringify(wrongSession.body));
+    assert.match(wrongSession.body.error, /lease id does not match session id/);
+    assert.deepEqual(readState(), before, "a refused cross-session report leaves the persisted state identical");
+    assertUntouched(readState(), "wrong session");
+
+    // Right session, wrong target for the archived lease: bindingTargetID refuses against
+    // the archived record's own target, again before any settlement or write.
+    const wrongTarget = await rawRequest(broker.socketPath, "/failure", {
+      body: { sessionID, leaseID: oldLeaseID, targetID: "not-the-candidate", error: sdkCanonical },
+    });
+    assert.equal(wrongTarget.status, 400, JSON.stringify(wrongTarget.body));
+    assert.match(wrongTarget.body.error, /target id does not match lease id/);
+    assert.deepEqual(readState(), before, "a refused target mismatch leaves the persisted state identical");
+    assertUntouched(readState(), "wrong target");
+
+    for (const [label, body] of [
+      ["plain", { sessionID, leaseID: oldLeaseID, targetID: broker.candidateID, error: { message: canonical } }],
+      ["sdk", { sessionID, leaseID: oldLeaseID, targetID: broker.candidateID, error: sdkCanonical }],
+      // No targetID at all: the archived record supplies it (bindingTargetID fallback).
+      ["sdk without target id", { sessionID, leaseID: oldLeaseID, error: sdkCanonical }],
+    ]) {
+      const replay = await rawRequest(broker.socketPath, "/failure", { body });
+      assert.equal(replay.status, 200, `${label}: ${JSON.stringify(replay.body)}`);
+      assert.deepEqual(replay.body, { ok: true, kind: "replayed" }, `${label}: a settled archived lease only replays`);
+      const after = readState();
+      const afterRole = after.modelPolicy.roles["openai:gpt-sol"];
+      assert.equal(afterRole.probation.leases[newLeaseID].settlement, null,
+        `${label}: the replacement lease must stay unsettled -- a non-qualifying failure against the old id cannot land on it`);
+      assert.deepEqual(afterRole.probation.leases[oldLeaseID].settlement, oldRecord.settlement,
+        `${label}: the archived settlement remains the actual native policy completion`);
+      assert.deepEqual(afterRole.probation, beforeRole.probation,
+        `${label}: the full probation record (successes, failures, phase, offerEvery, opportunity cursor/ms/at/until, leases) is unchanged`);
+      assert.deepEqual(afterRole, beforeRole, `${label}: the whole role record is unchanged`);
+      assertUntouched(after, label);
+    }
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+// THE DAEMON HAS NO CLOCK SEAM. Every time-based rule in bin/opencode-broker reads
+// Date.now() directly -- reclaimIdleLeases defaults `now = Date.now()` and RECLAIM_IDLE_MS is
+// twelve minutes -- so a test that needs a lease to have gone QUIET can neither wait it out
+// nor edit broker.json to pretend it did. This CommonJS preload is injected into the DAEMON
+// process alone via NODE_OPTIONS --require: it shifts Date.now() by the integer offset (ms)
+// held in the file named by BROKER_TEST_CLOCK_OFFSET_PATH, re-read on every call, so the test
+// moves the daemon's clock between requests by rewriting one file. Nothing under bin/ or lib/
+// knows the hook exists; it lives in the temp HOME and is removed with it.
+// Only Date.now() is shifted. bin/ and lib/ never call `new Date()` without an argument
+// (checked 2026-10-08), so there is no second clock to drift against.
+const TEST_CLOCK_HOOK = `
+const { readFileSync } = require("node:fs");
+const realNow = Date.now;
+const offsetPath = process.env.BROKER_TEST_CLOCK_OFFSET_PATH;
+Date.now = () => {
+  let offset = 0;
+  try {
+    offset = Number(readFileSync(offsetPath, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return realNow() + (Number.isFinite(offset) ? offset : 0);
+};
+`;
+
+const installTestClock = (home) => {
+  const hookPath = join(home, "test-clock-hook.cjs");
+  const offsetPath = join(home, "test-clock-offset-ms");
+  writeFileSync(hookPath, TEST_CLOCK_HOOK);
+  let offsetMs = 0;
+  return {
+    env: {
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require "${hookPath}"`].filter(Boolean).join(" "),
+      BROKER_TEST_CLOCK_OFFSET_PATH: offsetPath,
+    },
+    // Absolute offset from real time. Written to a sibling and renamed into place so the
+    // daemon's per-call read never sees a half-written number.
+    advanceTo: (ms) => {
+      offsetMs = ms;
+      writeFileSync(`${offsetPath}.tmp`, String(ms));
+      renameSync(`${offsetPath}.tmp`, offsetPath);
+    },
+    // What the daemon's Date.now() reads right now, for comparing against its timestamps.
+    now: () => Date.now() + offsetMs,
+  };
+};
+
+// The HISTORICAL-UNSETTLED sibling of the archived-lease replay above. reclaimIdleLeases
+// (bin/opencode-broker) deletes a quiet lease from state.leases WITHOUT settlePolicyLease, so
+// a candidate lease it reclaims survives only as a policy record whose settlement is null.
+// Once the session leases again, the old id binds through policyLeaseBinding alone (not the
+// current lease, not the assignment), and /failure against it must settle that record EXACTLY
+// ONCE with the ordinary overload consequences on the record's own target -- while the
+// session's live replacement lease, its assignment, provider health and every other policy
+// field stay untouched, and every later report only replays.
+// The reclaim is only reachable on a LOCAL target with a capacity, and a candidate is only
+// leased on a target the policy lane holds. A discovered target enters a lane either as a
+// subscription source (cloud) or by carrying the ID of a configured static pin, which
+// allTargets() lets the publication shadow -- so a LOCAL-kind /inventory target reusing the
+// static smart pin's id is exactly the published shape that reaches this branch, and
+// normalizeDiscoveredInventory accepts it (kind "local", integer capacity, resolvable model).
+test("a candidate lease the idle reclaim dropped unsettled settles once from policy history on a canonical 502, then only replays", async () => withTempHome(async (home) => {
+  // The llama.cpp stand-in says the candidate model is resident; nothing else is.
+  const modelsServer = await startModelsServer(["gpt-6-sol"]);
+  const clock = installTestClock(home);
+  let broker = null;
+  try {
+    broker = await startLiveProbationCandidate(home, {
+      extraEnv: { OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url, ...clock.env },
+    });
+    const roleKey = "openai:gpt-sol";
+    // The static smart pin (tests/fixtures/config.json: openai/gpt-5.6-sol, kind cloud). The
+    // publication below reuses this ID for a LOCAL gpt-6-sol target.
+    const shadowID = "gpt-flagship";
+    const sessionID = "probation-reclaimed-candidate";
+    const triggerID = "probation-reclaim-trigger";
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+    const roleOf = (state) => state.modelPolicy.roles[roleKey];
+    const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+    const decisionLines = () => readFileSync(decisionsPath, "utf8").trim().split("\n");
+
+    // End the helper's own candidate lease the ORDINARY way, so the one unsettled record this
+    // test ends with is the reclaimed one and nothing else: /release settles as abandoned.
+    const released = await rawRequest(broker.socketPath, "/release", {
+      body: { sessionID: "probation-live-candidate", leaseID: broker.firstLeaseID },
+    });
+    assert.equal(released.status, 200, JSON.stringify(released.body));
+    assert.equal(roleOf(readState()).probation.leases[broker.firstLeaseID].settlement?.outcome, "abandoned",
+      "an ordinary lease end settles its policy record; the reclaim below is the one path that does not");
+
+    // Publish the collision: a LOCAL-kind target carrying the static pin's id. It joins the smart
+    // lane through that id alone (targetIDsFor lists CONFIG.tiers.smart; allTargets() resolves
+    // the id to the publication, not the static cloud pin). Every field here is one
+    // normalizeDiscoveredInventory keeps for kind "local"; the model is in the resolver view.
+    const published = inventory({
+      openai: { authType: "oauth", connected: true, admission: "admitted", models: 1 },
+    });
+    published.targets = {
+      [shadowID]: {
+        id: shadowID,
+        providerID: "openai",
+        modelID: "gpt-6-sol",
+        kind: "local",
+        capacity: 1,
+        tiers: ["smart"],
+        fit: { smart: 9 },
+        family: "gpt-sol",
+        releaseDate: "2026-09-22",
+        speed: "standard",
+        capabilities: { toolCall: true },
+        context: 400_000,
+        output: 96_000,
+        variants: ["low", "medium"],
+      },
+    };
+    published.modelContexts = { ...published.modelContexts, "openai/gpt-6-sol": 400_000 };
+    published.modelOutputs = { "openai/gpt-6-sol": 96_000 };
+    published.modelVariants = { "openai/gpt-6-sol": ["low", "medium"] };
+    published.configFingerprint = createHash("sha256").update(readFileSync(broker.configPath)).digest("hex");
+    const ingest = await rawRequest(broker.socketPath, "/inventory", { body: published });
+    assert.equal(ingest.status, 200, JSON.stringify(ingest.body));
+    assert.equal(ingest.body.accepted, true, JSON.stringify(ingest.body));
+    const stored = ingest.body.inventory.targets[shadowID];
+    assert.ok(stored, "the ingest filter stores the local-kind shadow under the static pin's id");
+    assert.equal(stored.providerID, "openai");
+    assert.equal(stored.modelID, "gpt-6-sol");
+    assert.equal(stored.kind, "local");
+    assert.equal(stored.capacity, 1);
+    assert.deepEqual(stored.variants, ["low", "medium"]);
+    assert.doesNotMatch(broker.stderr(), /\/inventory dropped/, "nothing in the publication was refused");
+
+    // The candidate the policy offers IS the shadow: the lease lands on a target whose id is
+    // the static pin's but whose kind and model are the publication's, and the broker mints the
+    // real policy binding for it.
+    const first = await leaseCompatibleSmartSession(broker.socketPath, broker.resolverToken, sessionID, { contextTokens: 100 });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.target.id, shadowID);
+    assert.equal(first.body.target.kind, "local", "the static pin is cloud; the leased target is the local shadow");
+    assert.equal(first.body.target.model.providerID, "openai");
+    assert.equal(first.body.target.model.id, "gpt-6-sol", "the static pin is gpt-5.6-sol; the leased model is the candidate");
+    const oldLeaseID = first.body.leaseID;
+    const leased = readState();
+    assert.equal(leased.leases[sessionID].leaseID, oldLeaseID);
+    assert.equal(leased.leases[sessionID].targetID, shadowID);
+    assert.equal(leased.leases[sessionID].modelPolicyRoleKey, roleKey, "the lease carries the minted policy role");
+    const minted = roleOf(leased).probation.leases[oldLeaseID];
+    assert.deepEqual(
+      { sessionID: minted.sessionID, targetID: minted.targetID, synthetic: minted.synthetic, settlement: minted.settlement },
+      { sessionID, targetID: shadowID, synthetic: false, settlement: null },
+      "recordCandidateLease archived the production lease against the shadow id, unsettled");
+
+    // Reclaim is demand-driven: it runs inside ANOTHER session's /lease, over every admitted
+    // target (not only that request's lane), and frees a full local target only when its
+    // holder has been quiet for more than RECLAIM_IDLE_MS. A worker request keeps the shadow in
+    // its admitted set (providers: openai) without the smart lane's candidate rule hiding it,
+    // which is what lets the reclaim see it while the candidate is held.
+    // Nine quiet minutes: under the threshold, the holder keeps its slot.
+    clock.advanceTo(9 * 60_000);
+    const early = await leaseCompatibleSmartSession(broker.socketPath, broker.resolverToken, triggerID, { tier: "worker", contextTokens: 100 });
+    assert.equal(early.status, 200, JSON.stringify(early.body));
+    assert.equal(early.body.target.id, "gpt-luna", "the trigger session leases its own worker lane, not the shadow");
+    assert.deepEqual(readState().leases[sessionID], leased.leases[sessionID],
+      "a lease quiet for nine minutes is under RECLAIM_IDLE_MS and is not reclaimed");
+    assert.doesNotMatch(broker.stderr(), /reclaimed idle lease/);
+
+    // Thirteen quiet minutes: reclaimIdleLeases deletes the lease -- and does NOT settle it.
+    clock.advanceTo(13 * 60_000);
+    const trigger = await leaseCompatibleSmartSession(broker.socketPath, broker.resolverToken, triggerID, { tier: "worker", contextTokens: 100 });
+    assert.equal(trigger.status, 200, JSON.stringify(trigger.body));
+    const reclaimed = readState();
+    assert.equal(reclaimed.leases[sessionID], undefined, "reclaimIdleLeases deleted the quiet candidate lease");
+    assert.match(broker.stderr(), new RegExp(`reclaimed idle lease\\(s\\): ${sessionID} on ${shadowID}`),
+      "the daemon reports the reclaim on stderr");
+    assert.deepEqual(roleOf(reclaimed).probation.leases[oldLeaseID], minted,
+      "the reclaim leaves the policy record exactly as minted: settlement still null");
+    assert.equal(reclaimed.assignments[sessionID].leaseID, oldLeaseID,
+      "until the session leases again its pin still names the reclaimed lease id");
+
+    // The session leases again: a NEW lease and a NEW assignment, both on the candidate, so the
+    // old id is now bound by nothing current.
+    const replacement = await leaseCompatibleSmartSession(broker.socketPath, broker.resolverToken, sessionID, { contextTokens: 100 });
+    assert.equal(replacement.status, 200, JSON.stringify(replacement.body));
+    assert.equal(replacement.body.existing, false, "a fresh selection, not a held-lease revalidation");
+    assert.equal(replacement.body.target.id, shadowID);
+    assert.equal(replacement.body.target.kind, "local");
+    const newLeaseID = replacement.body.leaseID;
+    assert.notEqual(newLeaseID, oldLeaseID);
+
+    // PRECONDITIONS for the historical-unsettled branch, asserted rather than assumed.
+    const before = readState();
+    const beforeRole = roleOf(before);
+    assert.equal(before.leases[sessionID].leaseID, newLeaseID, "the current live lease is the replacement");
+    assert.equal(before.leases[sessionID].modelPolicyRoleKey, roleKey);
+    assert.equal(before.assignments[sessionID].leaseID, newLeaseID, "the current assignment is the replacement");
+    assert.notEqual(before.assignments[sessionID].leaseID, oldLeaseID);
+    assert.equal(before.assignments[sessionID].settledFailure, undefined,
+      "no sticky settled failure exists, so the assignment duplicate branch in /failure cannot answer");
+    assert.deepEqual(beforeRole.probation.leases[oldLeaseID], minted,
+      "the old id exists ONLY as an unsettled policy record: settlementBinding reaches it through policyLeaseBinding");
+    assert.equal(beforeRole.probation.leases[newLeaseID].settlement, null, "the replacement is live and unsettled");
+    assert.equal(beforeRole.probation.phase, "probation");
+    assert.deepEqual(before.circuits, {}, "no circuit is open before the report");
+    const decisionCount = decisionLines().length;
+
+    // The canonical gateway 502 in the bound-session (SDK) envelope. classifyRoutingFailure
+    // trusts only the broker's own binding: the record's target resolves through allTargets()
+    // to the local shadow, whose providerID matches the upstream named in the message.
+    const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+    const sdkCanonical = {
+      name: "AI_APICallError",
+      data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+    };
+    const sentAt = clock.now();
+    const failure = await rawRequest(broker.socketPath, "/failure", {
+      body: { sessionID, leaseID: oldLeaseID, targetID: shadowID, error: sdkCanonical },
+    });
+    const repliedAt = clock.now();
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.ok, true);
+    assert.equal(failure.body.kind, "overload", "the FIRST report against the unsettled record is a real overload settlement, not a replay");
+    assert.equal(typeof failure.body.circuitUntil, "number");
+    assert.ok(failure.body.circuitUntil - sentAt >= 14_000 && failure.body.circuitUntil - repliedAt <= 16_000,
+      `the reply names the 15s target hold on the daemon's clock, got until-sent=${failure.body.circuitUntil - sentAt}ms until-replied=${failure.body.circuitUntil - repliedAt}ms`);
+
+    const settled = readState();
+    const settledRole = roleOf(settled);
+    // Exactly one settlement, on the old record, with the native failure classification for a
+    // report that names no failureClass (the gateway and plugin never send one).
+    const settlement = settledRole.probation.leases[oldLeaseID].settlement;
+    assert.ok(settlement, "the historical record is settled by the first report");
+    assert.equal(settlement.outcome, "failure");
+    assert.equal(settlement.source, "failure");
+    assert.equal(settlement.failureClass, "unknown");
+    assert.equal(settlement.qualifying, false);
+    assert.ok(settlement.at >= sentAt && settlement.at <= repliedAt, `settlement.at ${settlement.at} is stamped on the daemon's clock`);
+    // ...and that settlement is the ONLY change to the whole role: successes, failures, phase,
+    // cursor and opportunity fields, the live replacement record, every other record.
+    assert.deepEqual(
+      { ...settledRole, probation: { ...settledRole.probation, leases: { ...settledRole.probation.leases, [oldLeaseID]: minted } } },
+      beforeRole,
+      "with the one settlement masked, the role record is byte-for-byte what it was");
+    assert.deepEqual(settled.modelPolicy.history, before.modelPolicy.history);
+    assert.equal(settledRole.probation.leases[newLeaseID].settlement, null, "the live replacement lease is not what got settled");
+    // Ordinary overload consequences, scoped to the record's own target: a 15s target circuit,
+    // no provider circuit, no health evidence.
+    assert.deepEqual(Object.keys(settled.circuits), [shadowID], "exactly the record's target gains a circuit");
+    assert.equal(settled.circuits[shadowID].kind, "overload");
+    assert.equal(settled.circuits[shadowID].until, failure.body.circuitUntil);
+    assert.equal(settled.circuits["provider:openai"], undefined);
+    assert.deepEqual(settled.health, before.health, "a transient gateway overload is not provider health evidence");
+    // The session's CURRENT lease and assignment are untouched: dropExactLease matched the old
+    // id against the live lease and left it; settledFailure is only stamped for a binding that IS
+    // the assignment, and a historical binding never is.
+    assert.deepEqual(settled.leases, before.leases, "the replacement lease survives the report on the old id");
+    assert.deepEqual(settled.assignments, before.assignments, "the replacement assignment is unchanged; no sticky settledFailure");
+    // One failure-reported line, naming the record's target and session.
+    const afterFirst = decisionLines();
+    assert.equal(afterFirst.length, decisionCount + 1, "exactly one decision line is appended");
+    const reported = JSON.parse(afterFirst.at(-1));
+    assert.equal(reported.policy, "failure-reported");
+    assert.equal(reported.sessionID, sessionID);
+    assert.equal(reported.targetID, shadowID);
+    assert.equal(reported.reasons[0], "overload");
+    assert.ok(String(reported.reasons.at(-1)).includes(canonical));
+
+    // Every later report for the old id -- plain, SDK-wrapped, or without a target id (the
+    // record supplies it) -- replays. The current lease still exists, so the assignment
+    // duplicate branch is skipped; settleCandidateOutcome answers replayed:true and the
+    // handler returns before any circuit, decision, lease or assignment effect.
+    for (const [label, body] of [
+      ["plain", { sessionID, leaseID: oldLeaseID, targetID: shadowID, error: { message: canonical } }],
+      ["sdk", { sessionID, leaseID: oldLeaseID, targetID: shadowID, error: sdkCanonical }],
+      ["sdk without target id", { sessionID, leaseID: oldLeaseID, error: sdkCanonical }],
+    ]) {
+      const replay = await rawRequest(broker.socketPath, "/failure", { body });
+      assert.equal(replay.status, 200, `${label}: ${JSON.stringify(replay.body)}`);
+      assert.deepEqual(replay.body, { ok: true, kind: "replayed" }, `${label}: a settled historical record only replays`);
+      const after = readState();
+      assert.deepEqual(after.modelPolicy, settled.modelPolicy, `${label}: the model policy is unchanged in full`);
+      assert.deepEqual(after.circuits, settled.circuits, `${label}: the 15s circuit is neither extended nor joined`);
+      assert.deepEqual(after.health, settled.health, `${label}: no health evidence`);
+      assert.deepEqual(after.leases, settled.leases, `${label}: the live replacement lease is untouched`);
+      assert.deepEqual(after.assignments, settled.assignments, `${label}: the assignment is untouched`);
+      assert.equal(decisionLines().length, decisionCount + 1, `${label}: decisions.jsonl does not grow`);
+    }
+  } finally {
+    if (broker) await stopBroker(broker.child);
+    await modelsServer.stop();
+  }
+}));
+
+test("gateway legacy targetless policy lease cannot borrow the caller target", async () => withTempHome(async (home) => {
+  const initial = await startLiveProbationCandidate(home);
+  let broker = null;
+  try {
+    const sessionID = "probation-live-candidate";
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    await stopBroker(initial.child);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const oldLeaseID = initial.firstLeaseID;
+    const record = state.modelPolicy.roles["openai:gpt-sol"].probation.leases[oldLeaseID];
+    record.targetID = null;
+    delete state.leases[sessionID];
+    writeFileSync(statePath, JSON.stringify(state));
+
+    broker = await startBroker(home, { OPENCODE_BROKER_CONFIG: initial.configPath },
+      [...DEFAULT_RESOLVABLE_MODELS, "openai/gpt-6-sol"]);
+    const legacy = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(legacy.modelPolicy.roles["openai:gpt-sol"].probation.leases[oldLeaseID].targetID, null,
+      "model-policy normalization preserves a legacy targetless lease record");
+
+    const replacement = await request(broker.socketPath, "/lease", {
+      sessionID, profile: "auto", tier: "worker", replace: true,
+      preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+    });
+    assert.notEqual(replacement.leaseID, oldLeaseID, "the current assignment is a replacement lease");
+    const before = await request(broker.socketPath, "/status");
+    const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+    const failure = await rawRequest(broker.socketPath, "/failure", {
+      body: {
+        sessionID,
+        leaseID: oldLeaseID,
+        targetID: initial.candidateID,
+        error: { message: canonical },
+      },
+    });
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.kind, "noop", "a targetless historical binding cannot trust caller attribution");
+    const after = await request(broker.socketPath, "/status");
+    assert.deepEqual(after.circuits, before.circuits, "the caller target opens no circuit");
+    assert.deepEqual(after.health, before.health, "the caller target records no health evidence");
+    assert.deepEqual(after.leases, before.leases, "the replacement lease is untouched");
+    assert.deepEqual(after.assignments, before.assignments, "the replacement assignment is untouched");
+  } finally {
+    if (broker) await stopBroker(broker.child);
+    else await stopBroker(initial.child);
+  }
+}));
+
+test("gateway assignment-only settlement overloads once and replays after reclaim", async () => withTempHome(async (home) => {
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const first = await startBroker(home);
+  let second = null;
+  try {
+    await request(first.socketPath, "/inventory", inventory({
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const sessionID = "ses-gateway-assignment-only";
+    const lease = await request(first.socketPath, "/lease", {
+      sessionID, profile: "auto", tier: "worker", replace: true,
+      preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+    });
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    await stopBroker(first.child);
+    const reclaimed = JSON.parse(readFileSync(statePath, "utf8"));
+    delete reclaimed.leases[sessionID];
+    writeFileSync(statePath, JSON.stringify(reclaimed));
+
+    second = await startBroker(home);
+    const before = await request(second.socketPath, "/status");
+    assert.equal(before.leases[sessionID], undefined, "the reclaimed lease is gone before replacement");
+    assert.equal(before.assignments[sessionID].leaseID, lease.leaseID, "the assignment retains the broker-minted lease id");
+    assert.equal(before.assignments[sessionID].targetID, lease.target.id, "the assignment retains the stored target");
+    const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+    const body = {
+      sessionID,
+      leaseID: lease.leaseID,
+      targetID: lease.target.id,
+      error: { name: "AI_APICallError", data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` } },
+    };
+    const sentAt = Date.now();
+    const failure = await rawRequest(second.socketPath, "/failure", { body });
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.kind, "overload");
+    assert.ok(failure.body.circuitUntil >= sentAt + 14_000 && failure.body.circuitUntil <= Date.now() + 16_000,
+      "the original assignment target gets the target-only 15s overload hold");
+    const settled = await request(second.socketPath, "/status");
+    assert.equal(settled.assignments[sessionID].settledFailure?.targetID, lease.target.id);
+    assert.deepEqual(settled.health, before.health, "a gateway overload has no provider health evidence");
+    const decisionsPath = join(home, ".local/share/opencode/model-routing/decisions.jsonl");
+    const stateAfterFirst = JSON.parse(readFileSync(statePath, "utf8"));
+    const decisionsAfterFirst = readFileSync(decisionsPath, "utf8");
+    const replay = await rawRequest(second.socketPath, "/failure", { body });
+    assert.deepEqual(replay, failure, "the duplicate returns the original settled reply");
+    assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")), stateAfterFirst,
+      "the duplicate changes no circuit, health, lease, assignment, or policy state");
+    assert.equal(readFileSync(decisionsPath, "utf8"), decisionsAfterFirst,
+      "the duplicate appends no decision");
+  } finally {
+    await stopBroker(first.child);
+    if (second) await stopBroker(second.child);
   }
 }));
 

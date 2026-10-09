@@ -68,6 +68,175 @@ test("the router's own guard errors never indict the provider", () => {
   assert.equal(classifyRoutingFailure({ message: "model not found: gpt-9", statusCode: 404 }), "model");
 });
 
+test("verified gateway upstream 5xx overloads only its matching target provider", () => {
+  for (const status of [500, 502, 503, 504]) {
+    const message = `gateway: no provider could serve the request: upstream openai HTTP ${status}`;
+    assert.equal(classifyRoutingFailure({ message }, { targetProviderID: "openai" }), "overload");
+    assert.equal(classifyRoutingFailure({
+      message: `Bad Gateway: ${JSON.stringify({ error: { message, type: "upstream_error" } })}`,
+    }, { targetProviderID: "openai" }), "overload");
+  }
+
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  assert.equal(classifyRoutingFailure({ message: canonical }), "noop");
+  assert.equal(classifyRoutingFailure({ message: canonical }, { targetProviderID: "anthropic" }), "noop");
+  assert.equal(classifyRoutingFailure({ message: canonical, targetProviderID: "openai" }), "noop");
+  const sdkCanonical = {
+    name: "AI_APICallError",
+    data: { message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}` },
+  };
+  assert.equal(classifyRoutingFailure(sdkCanonical, { targetProviderID: "anthropic" }), "noop",
+    "an SDK envelope cannot override the verified binding's provider");
+  assert.equal(classifyRoutingFailure(
+    { message: "gateway: no provider could serve the request: upstream openai:spoof HTTP 502" },
+    { targetProviderID: "openai:spoof" },
+  ), "noop", "provider tokens outside the conservative grammar fail closed");
+  for (const suffix of ["\n", "\r\n", "\r"]) {
+    assert.equal(classifyRoutingFailure({
+      message: `Bad Gateway: ${JSON.stringify({ error: { message: `${canonical}${suffix}` } })}`,
+    }, { targetProviderID: "openai" }), "noop", `SDK inner message ending ${JSON.stringify(suffix)} is not canonical`);
+  }
+  assert.equal(classifyRoutingFailure({
+    message: "gateway: no provider could serve the request: upstream OpenAI HTTP 502",
+  }, { targetProviderID: "openai" }), "noop");
+  assert.equal(classifyRoutingFailure({
+    message: "gateway: no provider could serve the request: upstream openai HTTP 5021",
+  }, { targetProviderID: "openai" }), "noop");
+  assert.equal(classifyRoutingFailure({
+    message: "gateway: no provider could serve the request: upstream openai HTTP 505",
+  }, { targetProviderID: "openai" }), "noop");
+  assert.equal(classifyRoutingFailure({
+    message: `${canonical}: chat body`,
+  }, { targetProviderID: "openai" }), "noop");
+  assert.equal(classifyRoutingFailure({
+    message: `Bad Gateway: ${JSON.stringify({ message: canonical })}`,
+  }, { targetProviderID: "openai" }), "noop");
+  assert.equal(classifyRoutingFailure({
+    message: `Bad Gateway: {\"error\":`,
+  }, { targetProviderID: "openai" }), "other");
+  assert.equal(classifyRoutingFailure({
+    message: `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })} trailing`,
+  }, { targetProviderID: "openai" }), "noop");
+  for (const status of [400, 401, 429]) {
+    assert.equal(classifyRoutingFailure({
+      message: `gateway: no provider could serve the request: upstream openai HTTP ${status}`,
+    }, { targetProviderID: "openai" }), "noop");
+  }
+
+  assert.equal(classifyRoutingFailure({ statusCode: 503, message: "Service Unavailable" }), "overload");
+  assert.equal(classifyRoutingFailure({ statusCode: 500, message: "Internal Server Error" }), "other");
+});
+
+test("gateway raw message accepts only the exact plain or complete SDK gateway form", () => {
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const context = { targetProviderID: "openai" };
+  const wrapped = `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}`;
+
+  for (const error of [
+    canonical,
+    { message: canonical },
+    { message: wrapped },
+    { name: "AI_APICallError", data: { message: wrapped } },
+  ]) {
+    assert.equal(classifyRoutingFailure(error, context), "overload", JSON.stringify(error));
+  }
+
+  for (const [label, message] of [
+    ["plain LF suffix", `${canonical}\n`],
+    ["plain CRLF suffix", `${canonical}\r\n`],
+    ["plain CR suffix", `${canonical}\r`],
+    ["leading space", ` ${canonical}`],
+    ["trailing space", `${canonical} `],
+    ["double space", canonical.replace("upstream openai", "upstream  openai")],
+    ["tab", canonical.replace("upstream openai", "upstream\topenai")],
+    ["NBSP", canonical.replace("upstream openai", "upstream\u00a0openai")],
+    ["long trailing padding", `${canonical}${" ".repeat(513)}`],
+    ["trailing junk", `${canonical} trailing junk`],
+    ["noncanonical wrapper prefix spacing", `Bad  Gateway: ${JSON.stringify({ error: { message: canonical } })}`],
+  ]) {
+    assert.equal(classifyRoutingFailure({ message }, context), "noop", label);
+  }
+
+  const innerWhitespace = `${canonical}\n`;
+  assert.equal(classifyRoutingFailure({
+    message: `Bad Gateway: {"error":{"message":${JSON.stringify(innerWhitespace)}}}`,
+  }, context), "noop", "quoted JSON inner whitespace is not canonical");
+  assert.equal(classifyRoutingFailure({
+    message: `${wrapped} trailing`,
+  }, context), "noop", "complete JSON rejects trailing non-whitespace");
+});
+
+test("gateway raw message only reads supported own string data properties", () => {
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const context = { targetProviderID: "openai" };
+  const wrapped = `Bad Gateway: ${JSON.stringify({ error: { message: canonical } })}`;
+  assert.equal(classifyRoutingFailure(new Error(canonical), context), "overload");
+  assert.equal(classifyRoutingFailure(wrapped, context), "overload");
+  assert.equal(classifyRoutingFailure({ message: `Bad Gateway:  ${JSON.stringify({ error: { message: canonical } })}` }, context), "overload", "JSON formatting whitespace is valid after the exact prefix");
+  const inherited = Object.assign(Object.create({ message: canonical }), { name: "Error" });
+  const inheritedData = { name: "Error", data: Object.assign(Object.create({ message: canonical }), { name: "Error" }) };
+  const directGetter = { name: "Error", get message() { return canonical; } };
+  const dataGetter = { name: "Error", get data() { return { message: canonical }; } };
+  for (const [label, error] of [
+    ["inherited message", inherited],
+    ["inherited SDK message", inheritedData],
+    ["message accessor", directGetter],
+    ["data accessor", dataGetter],
+    ["non-string direct message", { name: "Error", message: 502, data: { message: canonical } }],
+    ["empty direct message", { name: "Error", message: "", data: { message: canonical } }],
+    ["unsupported error envelope", { error: { message: canonical } }],
+    ["unsupported cause envelope", { cause: { message: canonical } }],
+  ]) {
+    assert.equal(classifyRoutingFailure(error, context), "noop", `${label} cannot establish exact raw evidence`);
+  }
+  for (const error of [null, undefined, 502, true, {}, { data: null }, { data: "not-an-object" }, { data: {} }, { data: { message: 502 } }]) {
+    assert.notEqual(classifyRoutingFailure(error, context), "overload", "unsupported raw shape fails closed");
+  }
+});
+
+test("gateway upstream 5xx ignores non-string SDK envelope messages", () => {
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const wrapped = (message) => ({
+    message: `Bad Gateway: ${JSON.stringify({ error: { message, note: canonical } })}`,
+  });
+
+  for (const message of [
+    null,
+    502,
+    [],
+    [canonical],
+    [[canonical]],
+    {},
+    { toString: "not-a-function", note: canonical },
+    { toString: null, valueOf: null, note: canonical },
+  ]) {
+    assert.equal(classifyRoutingFailure(wrapped(message), { targetProviderID: "openai" }), "noop");
+  }
+});
+
+test("gateway upstream 5xx needs a string provider in the broker-supplied context, nothing coerces", () => {
+  const canonical = "gateway: no provider could serve the request: upstream openai HTTP 502";
+  const error = { message: canonical };
+  assert.equal(classifyRoutingFailure(error, { targetProviderID: "openai" }), "overload", "control: the exact string matches");
+  // Only `internalContext.targetProviderID` as a genuine string counts. A coercible object,
+  // an array holding the right id, a bare string in place of the context object, or an
+  // absent/null field all fall back to the caller-side noop -- the guard is typeof, not ==.
+  for (const [label, context] of [
+    ["undefined", undefined],
+    ["null", null],
+    ["empty object", {}],
+    ["null provider", { targetProviderID: null }],
+    ["array provider", { targetProviderID: ["openai"] }],
+    ["coercible object", { targetProviderID: { toString: () => "openai" } }],
+    ["String wrapper", { targetProviderID: new String("openai") }],
+    ["bare string context", "openai"],
+    ["wrong key", { providerID: "openai" }],
+    ["empty string", { targetProviderID: "" }],
+  ]) {
+    assert.equal(classifyRoutingFailure(error, context), "noop", `${label} must not establish provider attribution`);
+  }
+});
+
 test("fast-mode-credits is recognised through the gateway wrapper and in direct upstream wording", () => {
   // The reason constant is exported so the broker and tests reference ONE name.
   assert.equal(FAST_MODE_CREDITS_REASON, "fast-mode-credits");

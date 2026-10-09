@@ -1864,8 +1864,11 @@ const serve = async () => {
         }
         const targetID = bindingTargetID(binding, body);
         const error = normalizeProviderError(body.error);
-        const kind = classifyRoutingFailure(error);
         const target = targetForID(targetID, allTargets(state));
+        // A legacy targetless binding must not borrow caller-supplied attribution.
+        const kind = classifyRoutingFailure(body.error, binding?.leaseID && binding.targetID && target?.id === binding.targetID
+          ? { targetProviderID: target.providerID }
+          : undefined);
         const policyEvent = settlePolicyLease(state, binding, {
           outcome: "failure",
           failureClass: body.failureClass,

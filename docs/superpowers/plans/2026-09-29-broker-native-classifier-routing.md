@@ -523,6 +523,25 @@ git commit -m "delegate classifier model selection to the broker"
 
 ### Task 6: Remove fleet pins and capability mirrors
 
+**Permission unblock (2026-09-29):** Holden switched the session to Manual permission
+mode and authorized one-time removal of exactly these two retired deployed symlinks if
+`devbox-sync --no-pull` leaves them dangling:
+
+- `/home/dev/.config/opencode/agent/fleet-classifier-local.md`
+- `/home/dev/.config/opencode/agent/fleet-classifier-haiku.md`
+
+Do not remove or rewrite any other deployed agent path.
+
+**Cleanup completed by the GOD root session (2026-09-29):** Both authorized
+symlinks above were removed and verified absent with both `test ! -L` and `test ! -e`.
+The Task 6 child must not attempt another unlink; continue with sync, GREEN verification,
+staging isolation, commit, and review.
+
+**Deployed guard config completed by the GOD root session (2026-09-29):** Removed only
+the `brokerAgents` key from `/home/dev/.config/opencode/classifier.json`, verified that
+the key is absent, and verified the file remains mode `0600`. The Task 6 child must not
+edit this guard control file; rerun deployed-state tests, sync, review, and commit.
+
 **Files:**
 - Modify: `/home/dev/devbox/config/opencode/agent/fleet-classifier.md`
 - Delete: `/home/dev/devbox/config/opencode/agent/fleet-classifier-local.md`
