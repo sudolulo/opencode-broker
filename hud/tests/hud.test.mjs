@@ -986,7 +986,9 @@ test("a plan-lapsed provider leaves the usage sidebar entirely while every other
       `a lapsed plan must appear nowhere -- no row, no note:\n${text}`);
     assert.match(text, /anthropic\s+wk 25%/, "a live provider still gets its row");
     assert.match(text, /openai\s+wk 10%/, "a quota-stopped provider is still a provider in use");
-    assert.match(text, /openai\s+\u26d4 circuit til \d\d:\d\d/,
+    // A usage stop reads "limit til <weekday> HH:MM": the day is what tells a weekly limit apart
+    // from one that lifts later today.
+    assert.match(text, /openai\s+\u26d4 limit til (?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d\d:\d\d/,
       "a non-lapsed circuit note is load-bearing and must survive the filter");
     assert.match(text, /google\s+\u26d4 probation/, "probation is not a lapse");
     assert.match(text, /zai\s+\u26d4 quarantined/,

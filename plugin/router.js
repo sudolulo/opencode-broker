@@ -39,6 +39,7 @@ import {
   routeTierForSession,
 } from "../lib/router-core.js";
 import { isAbortError, normalizeProviderError } from "../lib/provider-health.js";
+import { describeProviderLimit, wrapUpMessage } from "../lib/usage-limit.js";
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const LOCAL_CHILD_INACTIVITY_WATCHDOG_MS = 10 * 60 * 1000;
@@ -628,6 +629,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     }, HEARTBEAT_MS);
     timer.unref?.();
     heartbeats.set(sessionID, timer);
+    scheduleWrapUpCheck();
   };
 
   const route = async (session, preferredModel = null) => {
@@ -795,6 +797,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         explicit: resolved.explicit,
       };
       routes.set(session.id, routed);
+      // Served again (the resume, or the user nudging it first): no longer waiting.
+      unpark(session.id);
       // A replacement lease restarts the inactivity window unless a tool is still running.
       // A non-local replacement clears the prior watchdog before it can terminate the new route.
       rearmLocalChildInactivityWatchdog(session.id);
@@ -804,6 +808,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // safer than silently spending an API-key provider after broker failure.
       clearLocalChildInactivityWatchdog(session.id);
       routes.delete(session.id);
+      // Nothing in the lane can serve it: park it to resume when something can. Classifier
+      // lanes are excluded -- they serve a guard decision, not a task to pick back up.
+      if (!classifier && PARKABLE_REFUSALS.has(error?.code)) {
+        parkSession(session.id, { profile: resolved.profile, tier, agent: session.agent, reason: error.code });
+      }
       failLease(classifier ? owner : resolved, error);
     }
   };
@@ -865,6 +874,177 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     }, delay);
     if (typeof handle?.unref === "function") handle.unref();
   };
+  // --- Resume after an outage --------------------------------------------
+  // Failover covers a provider stopping a session while ANOTHER can take it. When none
+  // can -- every plan in the lane spent, or the lane otherwise empty -- the turn fails
+  // with nowhere to go, and the session used to sit there until someone noticed the
+  // provider was back and nudged it by hand, possibly days later for a weekly limit.
+  // Such a session is PARKED instead: once a minute the broker is asked (side-effect-free
+  // /preview, at the session's own context size) whether its lane would get a model now,
+  // and when it would, the session is re-engaged exactly like a failover.
+  const RESUME_TEXT = "[opencode-broker] A model is available again after the provider outage that stopped this session. Continue the task exactly where it stopped; do not restart completed work.";
+  const RESUME_POLL_MS = 60 * 1000;
+  // Longer than the longest plan window (a week), so a weekly limit still resumes.
+  const PARK_MAX_MS = 8 * 24 * 60 * 60 * 1000;
+  // Refusals that mean "nothing can serve this lane right now" -- and nothing else. A
+  // busy or preparing target already waits in place; anything else is not an outage.
+  const PARKABLE_REFUSALS = new Set(["usage-limit", "no-eligible-target"]);
+  const parked = new Map(); // sessionID -> { profile, tier, agent, since, reason, notBefore }
+  // ☠️ A RESUME THAT FAILS AGAIN BACKS OFF. /preview can say a lane is servable while its
+  // provider still refuses (a full window Anthropic has not locked), so the resumed turn
+  // fails and re-parks. Resumes within the last two hours space out 1, 2, 4 ... 30 minutes
+  // apart instead of spending a failed request every minute until the window resets.
+  const RESUME_BACKOFF_WINDOW_MS = 2 * 60 * 60 * 1000;
+  const RESUME_BACKOFF_MAX_MS = 30 * 60 * 1000;
+  const resumeHistory = new Map(); // sessionID -> [resumedAt, ...]
+  let resumeTimer = null;
+  const unpark = (sessionID) => {
+    if (!parked.delete(sessionID)) return;
+    if (!parked.size && resumeTimer) { cancelTimeout(resumeTimer); resumeTimer = null; }
+  };
+  // A self-rescheduling timeout on the injectable scheduler (tests drive it), running only
+  // while something is parked.
+  const scheduleResumePoll = () => {
+    if (resumeTimer || !parked.size) return;
+    resumeTimer = scheduleTimeout(async () => {
+      resumeTimer = null;
+      try { await pollParked(); } catch {}
+      scheduleResumePoll();
+    }, RESUME_POLL_MS);
+    if (typeof resumeTimer?.unref === "function") resumeTimer.unref();
+  };
+  const pollParked = async () => {
+    for (const [sessionID, entry] of [...parked]) {
+      if (Date.now() - entry.since > PARK_MAX_MS) {
+        report("warn", `${sessionID}: no model came back within ${Math.round(PARK_MAX_MS / 86_400_000)} days -- no longer waiting to resume`);
+        unpark(sessionID);
+        continue;
+      }
+      if (Date.now() < (entry.notBefore ?? 0)) continue;
+      let target = null;
+      try {
+        const contextTokens = await sessionContextTokens(sessionID);
+        const preview = await brokerRequest("/preview", {
+          profile: entry.profile,
+          tiers: [entry.tier],
+          ...(Number(contextTokens) > 0 ? { contextTokens } : {}),
+        });
+        target = preview?.preview?.[entry.tier] ?? null;
+      } catch { continue; } // broker down: try again next minute
+      if (!target?.model?.id) continue;
+      unpark(sessionID);
+      resumeHistory.set(sessionID, [...(resumeHistory.get(sessionID) ?? []), Date.now()]
+        .filter((at) => Date.now() - at < RESUME_BACKOFF_WINDOW_MS));
+      trimTracker(resumeHistory);
+      const model = `${target.model.providerID ?? ""}/${target.model.id}`.replace(/^\//, "");
+      report("info", `${sessionID}: ${model} is available again -- resuming the session parked since ${new Date(entry.since).toISOString()} (${entry.reason})`);
+      try {
+        client?.tui?.showToast?.({ body: { message: `Resuming a stopped session: ${model} is available again`, variant: "success", duration: 10000 }, query: { directory } })
+          ?.catch?.(() => {});
+      } catch {}
+      try {
+        await client.session.prompt({
+          path: { id: sessionID },
+          query: { directory },
+          body: {
+            ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+            parts: [{ type: "text", text: RESUME_TEXT, synthetic: true }],
+          },
+        });
+      } catch (error) {
+        // The prompt itself failing (the lane emptied again between preview and lease) parks it
+        // again through the lease path; anything else is reported and left to the user.
+        report("error", `${sessionID}: resume failed`, error);
+      }
+    }
+  };
+  const parkSession = (sessionID, { profile, tier, agent, reason }) => {
+    if (!sessionID || !tier) return;
+    const existing = parked.get(sessionID);
+    const recentResumes = (resumeHistory.get(sessionID) ?? []).filter((at) => Date.now() - at < RESUME_BACKOFF_WINDOW_MS).length;
+    const notBefore = recentResumes
+      ? Date.now() + Math.min(RESUME_BACKOFF_MAX_MS, RESUME_POLL_MS * 2 ** (recentResumes - 1))
+      : 0;
+    parked.set(sessionID, { profile, tier, agent, reason, since: existing?.since ?? Date.now(), notBefore });
+    trimTracker(parked);
+    if (!existing) report("info", `${sessionID}: parked -- no model can serve ${profile}/${tier} right now (${reason}); it resumes when one comes back`);
+    scheduleResumePoll();
+  };
+
+  // --- Wrap up before usage runs out ----------------------------------------
+  // Failover moves a session when one provider stops it; parking resumes it when one comes
+  // back. Neither helps the moment before: when every provider the lane can use is about to
+  // run out and no local model can take over, a working session is cut off mid-step with
+  // nothing written down. So while sessions are working, the broker is asked once a minute
+  // (/headroom, side-effect-free) whether their lane is nearly out, and each working session is
+  // told -- once per limit window -- to finish or checkpoint its step and write a handoff
+  // (a subagent returns what it has instead). The handoff is what the resumed session reads.
+  const WRAP_UP_POLL_MS = 60 * 1000;
+  const wrapUpSent = new Map(); // sessionID -> when it was told, for the current nearly-out episode
+  let wrapUpTimer = null;
+  const checkWrapUp = async () => {
+    const asked = new Map(); // one /headroom per lane and context size per pass
+    const told = [];
+    for (const sessionID of [...heartbeats.keys()]) {
+      const routed = routes.get(sessionID);
+      const session = sessions.get(sessionID);
+      if (!routed?.target || !routed.tier || isClassifierAgent(session?.agent)) continue;
+      let contextTokens = null;
+      try { contextTokens = await sessionContextTokens(sessionID); } catch {}
+      const key = `${routed.profile}|${routed.tier}|${Math.ceil((Number(contextTokens) || 0) / 10_000)}`;
+      if (!asked.has(key)) {
+        asked.set(key, brokerRequest("/headroom", {
+          profile: routed.profile, tier: routed.tier,
+          ...(Number(contextTokens) > 0 ? { contextTokens } : {}),
+        }).catch(() => null));
+      }
+      const headroom = await asked.get(key);
+      if (!headroom) continue;
+      // Once per episode: the mark clears when the lane has room again (a reset, a provider
+      // back). Not keyed on reset times -- providers report them with sub-second jitter
+      // (03:19:59.594, then 03:20:00.046 for the same reset), which would repeat the message.
+      if (!headroom.nearlyOut) { wrapUpSent.delete(sessionID); continue; }
+      if (wrapUpSent.has(sessionID)) continue;
+      wrapUpSent.set(sessionID, Date.now());
+      trimTracker(wrapUpSent);
+      try {
+        const response = await client.session.promptAsync({
+          path: { id: sessionID },
+          query: { directory },
+          body: {
+            ...(typeof session?.agent === "string" && session.agent ? { agent: session.agent } : {}),
+            parts: [{ type: "text", text: wrapUpMessage(headroom, { subagent: Boolean(session?.parentID) }), synthetic: true }],
+          },
+        });
+        if (response?.error) throw new Error(JSON.stringify(response.error));
+        told.push(sessionID);
+        report("warn", `${sessionID}: usage nearly out on ${routed.profile}/${routed.tier} -- asked it to wrap up${session?.parentID ? "" : " and write a handoff"}`);
+      } catch (error) {
+        wrapUpSent.delete(sessionID);
+        report("error", `${sessionID}: could not ask it to wrap up`, error);
+      }
+    }
+    if (told.length) {
+      try {
+        client?.tui?.showToast?.({ body: { message: `Usage nearly out: asked ${told.length} working session${told.length === 1 ? "" : "s"} to wrap up and write a handoff`, variant: "warning", duration: 15000 }, query: { directory } })
+          ?.catch?.(() => {});
+      } catch {}
+    }
+  };
+  // Runs only while some routed session is working (the heartbeat set), on the injectable
+  // scheduler so tests can drive it.
+  const scheduleWrapUpCheck = () => {
+    // Classifier lanes serve a guard decision, not a task: they never need a wrap-up.
+    const working = [...heartbeats.keys()].some((sessionID) => !isClassifierAgent(sessions.get(sessionID)?.agent));
+    if (wrapUpTimer || !working) return;
+    wrapUpTimer = scheduleTimeout(async () => {
+      wrapUpTimer = null;
+      try { await checkWrapUp(); } catch {}
+      scheduleWrapUpCheck();
+    }, WRAP_UP_POLL_MS);
+    if (typeof wrapUpTimer?.unref === "function") wrapUpTimer.unref();
+  };
+
   // Remember whom the session was displaced FROM and when that provider is due
   // back, so stickiness can be dropped at restore time instead of gluing the
   // session to its fallback provider forever.
@@ -1159,6 +1339,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (event?.type === "session.deleted") {
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
+        unpark(sessionID);
         displacedModels.delete(sessionID);
         try { removeFallbackMarker(sessionID); } catch {}
         await cleanupDeletedSession({
@@ -1244,6 +1425,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         successCandidates.delete(sessionID);
+        // The user stopped it on purpose: it must not come back on its own.
+        unpark(sessionID);
         return;
       }
       // ☠️ CHARGE THE FAILURE TO THE PROVIDER THAT ACTUALLY ANSWERED, OR TO NOBODY.
@@ -1277,8 +1460,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
-        const failedTarget = routes.get(sessionID)?.target;
-        const failedLeaseID = routes.get(sessionID)?.leaseID;
+        const failedRoute = routes.get(sessionID);
+        const failedTarget = failedRoute?.target;
+        const failedLeaseID = failedRoute?.leaseID;
         const targetID = failedTarget?.id;
         const failedOnLocal = failedTarget?.kind === "local" || modelIsLocalTarget(failedTarget?.model);
         const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
@@ -1303,6 +1487,33 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           ...(targetID ? { targetID } : {}),
           error,
         }); } catch {}
+        // A provider's own usage-limit error ("The usage limit has been reached") names no
+        // return time, and opencode shows it as-is. The broker's quota circuit knows when the
+        // limit lifts, so say it, with the day: a weekly limit can be days out.
+        if (failure?.kind === "quota" && typeof failedModel?.providerID === "string") {
+          // resetKnown: false means circuitUntil is only the broker's next probe, not a return date.
+          const until = failure.resetKnown === false ? NaN : Number(failure.circuitUntil);
+          const line = describeProviderLimit({
+            providerID: failedModel.providerID,
+            until: Number.isFinite(until) && until > Date.now() ? until : null,
+          });
+          report("warn", `${sessionID}: usage limit reached -- ${line}`);
+          try {
+            client?.tui?.showToast?.({ body: { message: `Usage limit reached: ${line}`, variant: "warning", duration: 15000 }, query: { directory } })
+              ?.catch?.(() => {});
+          } catch {}
+        }
+        // The gateway's usage-limit refusal (lib/usage-limit.js wording) is a noop to the broker --
+        // no provider is at fault -- so no failover follows it; the session would just stop. Park
+        // it like a refused lease, to resume when its lane can be served again.
+        if (!classifier && failedRoute?.tier && /usage limit reached -- /.test(String(error?.message ?? ""))) {
+          parkSession(sessionID, {
+            profile: failedRoute.profile,
+            tier: failedRoute.tier,
+            agent: sessions.get(sessionID)?.agent,
+            reason: "usage-limit",
+          });
+        }
         // A context-overflow error names the real request size. Record it so
         // the re-lease cannot land back on the too-small model.
         const overflow = /\((\d+)\s*tokens?\)\s*exceeds the (?:available )?context (?:size|length|window)/i

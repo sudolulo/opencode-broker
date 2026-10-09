@@ -320,6 +320,50 @@ test("fast-mode-credits classifier negatives keep today's behaviour", () => {
   }), "noop");
 });
 
+// A full window locks only when Anthropic says it is refusing (`locked_reason` on the
+// top-level entry). On 2026-10-09 100% with locked_reason null kept serving every request.
+// Kept identical to llm-auth-proxy's src/plan-usage.ts.
+test("anthropic plan usage locks a full window only when Anthropic reports it locked", async () => {
+  const config = { windows: [], planUsage: { type: "anthropic-oauth", authPath: authFixture() } };
+  const limits = [{ kind: "session", percent: 100, resets_at: "2026-10-09T03:20:00Z", is_active: true }];
+  for (const [label, fiveHour, expected] of [
+    ["full but not locked", { utilization: 100, locked_reason: null }, null],
+    ["full and locked", { utilization: 100, locked_reason: "session_limit" }, Date.parse("2026-10-09T03:20:00Z")],
+    ["no top-level entry falls back to the percentage", undefined, Date.parse("2026-10-09T03:20:00Z")],
+  ]) {
+    __resetPlanUsageCacheForTests();
+    const report = await fetchPlanUsage("anthropic", config, {
+      fetchImpl: async () => ({ ok: true, json: async () => ({ ...(fiveHour ? { five_hour: fiveHour } : {}), limits }) }),
+    });
+    assert.equal(report.windows[0].percent, 100, `${label}: the reading is still reported`);
+    assert.equal(report.lockedUntil, expected, label);
+  }
+});
+
+// Past a window's reset its percentage describes a window that no longer exists, so the
+// cached reading is refetched at once instead of serving out its TTL; a reading whose reset
+// was already past when it was taken does not force a refetch per request.
+test("a cached plan reading is refetched once one of its windows resets", async (t) => {
+  __resetPlanUsageCacheForTests();
+  const authPath = httpAuthFixture(t, { "provider-credential": { key: "test-secret" } });
+  const resetAt = 30_000;
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: true, json: async () => ({
+      windows: [{ id: "5h", percent: calls === 1 ? 100 : 3, resetsAt: new Date(resetAt).toISOString(), active: true, severity: null }],
+      lockedUntil: null,
+    }) };
+  };
+  const config = httpPlanConfig(authPath);
+  const before = await fetchPlanUsage("reset-provider", config, { fetchImpl, now: 1_000 });
+  const after = await fetchPlanUsage("reset-provider", config, { fetchImpl, now: 31_000 });
+  assert.equal(before.windows[0].percent, 100);
+  assert.equal(after.windows[0].percent, 3, "inside the 60 s TTL, but past the reset: refetched");
+  await fetchPlanUsage("reset-provider", config, { fetchImpl, now: 32_000 });
+  assert.equal(calls, 2, "the new reading's reset was already past when taken: no refetch loop");
+});
+
 test("anthropic plan usage normalizes to windows with the exact reset", async () => {
   __resetPlanUsageCacheForTests();
   const payload = {
@@ -469,6 +513,295 @@ test("a provider failure aborts the parked retry and re-engages on a new lease",
     assert.equal(result.promptMentionsReroute, true);
     assert.equal(result.markerPolicy, "provider-displaced");
     assert.equal(result.markerRestore, true, "the restore time is recorded");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// When NOTHING can take over -- every plan in the lane spent -- failover has nowhere to go and
+// the session used to sit stopped until a human noticed the provider was back. It is parked
+// instead, and resumed once the broker's /preview says its lane would get a model again.
+test("a session stopped because nothing could serve it resumes once its lane can be served again", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-resume-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    const brokerCalls = [];
+    let served = false; // the outage: nothing can serve the lane until this flips
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        const body = payload ? JSON.parse(payload) : {};
+        brokerCalls.push({ path: options.path, body });
+        const response = new EventEmitter();
+        response.setEncoding = () => {};
+        let reply = { ok: true };
+        response.statusCode = 200;
+        if (options.path === "/lease") {
+          if (served) {
+            reply = { target: { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } }, decision: { policy: "weighted-depletion", reasons: [] } };
+          } else {
+            response.statusCode = 400;
+            reply = { error: "usage limit reached -- openai weekly limit, back Wed Oct 14 03:38 UTC (in 4d 23h).", code: "usage-limit" };
+          }
+        } else if (options.path === "/preview") {
+          reply = { preview: served ? { [body.tiers[0]]: { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } } } : {} };
+        }
+        callback(response);
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.on = EventEmitter.prototype.on;
+      return req;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = [];
+    const client = {
+      provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) },
+      session: {
+        get: async (input) => ({ id: input?.path?.id, agent: "standard" }),
+        messages: async () => ({ data: [] }),
+        abort: async () => ({ data: true }),
+        prompt: async (input) => { prompts.push(input); return { data: true }; },
+      },
+    };
+    const timers = [];
+    const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn) => { timers.push(fn); return { unref() {} }; },
+      clearTimeout: () => {},
+    });
+    const refusedTurn = async (id) => {
+      await hooks.event({ event: { type: "session.created", properties: { info: { id, agent: "standard" } } } });
+      try { await hooks["chat.message"]({ sessionID: id, agent: "standard" }, { message: { model: {} } }); return null; }
+      catch (error) { return String(error.message); }
+    };
+    const refusal = await refusedTurn("ses-resume");
+    await refusedTurn("ses-aborted");
+    // The user stops one of them: it must stay stopped.
+    await hooks.event({ event: { type: "session.error", properties: { sessionID: "ses-aborted", error: { name: "MessageAbortedError", data: { message: "Aborted" } } } } });
+    await runTimers();                       // still out: nothing resumes
+    const promptedDuringOutage = prompts.length;
+    served = true;
+    await runTimers();                       // back: the parked session resumes
+    await runTimers();                       // and only once
+    console.log(JSON.stringify({
+      refusal,
+      promptedDuringOutage,
+      resumed: prompts.map((p) => p.path.id),
+      text: prompts[0]?.body?.parts?.[0]?.text ?? null,
+      synthetic: prompts[0]?.body?.parts?.[0]?.synthetic ?? null,
+      agent: prompts[0]?.body?.agent ?? null,
+      previewTier: brokerCalls.find((call) => call.path === "/preview")?.body?.tiers ?? null,
+    }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.match(String(result.refusal), /usage limit reached/, "the turn still fails, with the explicit reason");
+    assert.equal(result.promptedDuringOutage, 0, "nothing is resumed while the lane cannot be served");
+    assert.deepEqual(result.resumed, ["ses-resume"], "resumed exactly once, and the aborted session not at all");
+    assert.match(String(result.text), /available again/);
+    assert.equal(result.synthetic, true);
+    assert.equal(result.agent, "standard", "resumed in its own agent");
+    assert.equal(Array.isArray(result.previewTier) && result.previewTier.length, 1, "asks about its own tier");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The gateway path: the lease succeeds, the provider then refuses for usage at the gateway, and
+// the broker calls that 502 a noop -- so no failover follows. The session parks on the
+// gateway's usage-limit wording, resumes when served, and a resume that fails the same way
+// waits out a backoff instead of spending a failed request every minute.
+test("a gateway usage-limit stop parks the session, and a failed resume backs off", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-resume-gw-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        const body = payload ? JSON.parse(payload) : {};
+        const response = new EventEmitter();
+        response.setEncoding = () => {};
+        response.statusCode = 200;
+        const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+        const reply = options.path === "/lease" ? { target, decision: { policy: "weighted-depletion", reasons: [] } }
+          : options.path === "/failure" ? { ok: true, kind: "noop" }
+          : options.path === "/preview" ? { preview: { [body.tiers[0]]: target } }
+          : { ok: true };
+        callback(response);
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.on = EventEmitter.prototype.on;
+      return req;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = [];
+    const client = {
+      provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) },
+      session: {
+        get: async () => ({ id: "ses-gw", agent: "standard" }),
+        messages: async () => ({ data: [] }),
+        abort: async () => ({ data: true }),
+        prompt: async (input) => { prompts.push(input); return { data: true }; },
+      },
+    };
+    const timers = [];
+    const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn) => { timers.push(fn); return { unref() {} }; },
+      clearTimeout: () => {},
+    });
+    const gatewayUsageStop = async () => {
+      await hooks["chat.message"]({ sessionID: "ses-gw", agent: "standard" }, { message: { model: {} } });
+      await hooks.event({ event: { type: "session.error", properties: { sessionID: "ses-gw", error: {
+        name: "AI_APICallError",
+        data: { message: "Bad Gateway: usage limit reached -- openai weekly limit, back Wed Oct 14 03:38 UTC (in 4d 23h). (gateway: no provider could serve the request)", statusCode: 502 },
+      } } } });
+    };
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-gw", agent: "standard" } } } });
+    await gatewayUsageStop();
+    await runTimers();                          // served: resumes
+    const afterFirst = prompts.length;
+    await gatewayUsageStop();                   // the resumed turn hits the same limit
+    await runTimers();                          // inside the backoff: must not resume yet
+    console.log(JSON.stringify({ afterFirst, afterSecond: prompts.length }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.equal(result.afterFirst, 1, "the gateway usage stop parks, and it resumes when served");
+    assert.equal(result.afterSecond, 1, "a resume that failed the same way waits out its backoff");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Usage nearly out with nothing to take over: every working session is told once to wrap up --
+// a main session writes a handoff, a subagent returns what it has -- and nothing is said while
+// the lane still has room.
+test("working sessions are told once to wrap up when their lane is nearly out", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-wrapup-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    let nearlyOut = false;
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        const response = new EventEmitter();
+        response.setEncoding = () => {};
+        response.statusCode = 200;
+        const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+        const reply = options.path === "/lease" ? { target, leaseID: "L", decision: { policy: "weighted-depletion", reasons: [] } }
+          : options.path === "/headroom" ? { nearlyOut, threshold: 97, localFits: false, providers: [
+              { providerID: "openai", held: false, percent: 98, window: "wk", resetsAt: Date.now() + 3_600_000, room: false }] }
+          : { ok: true };
+        callback(response);
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.on = EventEmitter.prototype.on;
+      return req;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = [];
+    const infos = { "ses-main": { id: "ses-main", agent: "standard" }, "ses-child": { id: "ses-child", agent: "scout", parentID: "ses-main" } };
+    const client = {
+      provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) },
+      session: {
+        get: async (input) => ({ data: infos[input?.path?.id] }),
+        messages: async () => ({ data: [] }),
+        abort: async () => ({ data: true }),
+        prompt: async () => ({ data: true }),
+        promptAsync: async (input) => { prompts.push(input); return { data: true }; },
+      },
+      tui: { showToast: async () => ({}) },
+    };
+    const timers = [];
+    const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn) => { timers.push(fn); return { unref() {} }; },
+      clearTimeout: () => {},
+    });
+    for (const id of ["ses-main", "ses-child"]) {
+      await hooks.event({ event: { type: "session.created", properties: { info: infos[id] } } });
+      await hooks["chat.message"]({ sessionID: id, agent: infos[id].agent }, { message: { model: {} } });
+      await hooks.event({ event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } } });
+    }
+    await runTimers();                 // room left: nothing said
+    const whileRoom = prompts.length;
+    nearlyOut = true;
+    await runTimers();                 // nearly out: each working session told
+    await runTimers();                 // and only once for this window
+    console.log(JSON.stringify({
+      whileRoom,
+      told: prompts.map((p) => p.path.id).sort(),
+      main: prompts.find((p) => p.path.id === "ses-main")?.body?.parts?.[0]?.text ?? null,
+      child: prompts.find((p) => p.path.id === "ses-child")?.body?.parts?.[0]?.text ?? null,
+      agent: prompts.find((p) => p.path.id === "ses-child")?.body?.agent ?? null,
+    }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.equal(result.whileRoom, 0, "nothing is said while the lane has room");
+    assert.deepEqual(result.told, ["ses-child", "ses-main"], "each working session is told exactly once");
+    assert.match(result.main, /openai weekly window at 98%/);
+    assert.match(result.main, /write a handoff/);
+    assert.match(result.child, /return what you have to your parent/);
+    assert.equal(result.agent, "scout", "told in its own agent");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -655,6 +988,11 @@ const canonicalUsage = () => ({
   ],
   lockedUntil: null,
 });
+// The broker stamps every reading with when it was taken (fetchedAt); compare the rest.
+const reading = (report) => {
+  const { fetchedAt, ...rest } = report ?? {};
+  return rest;
+};
 
 const httpAuthFixture = (t, auth) => {
   const dir = mkdtempSync(join(tmpdir(), "plan-usage-http-"));
@@ -688,7 +1026,8 @@ test("HTTP plan usage resolves an exact authRef and sends only x-api-key", async
       return { ok: true, json: async () => canonicalUsage() };
     },
   });
-  assert.deepEqual(report, canonicalUsage());
+  assert.deepEqual(reading(report), canonicalUsage());
+  assert.equal(typeof report.fetchedAt, "number");
   assert.equal(request.url, "https://usage.example.invalid/v1/plan-usage");
   assert.equal(request.options.headers["x-api-key"], "expected-secret");
   assert.equal(Object.hasOwn(request.options.headers, "authorization"), false);
@@ -764,7 +1103,7 @@ test("HTTP plan usage accepts canonical multi-window JSON and returns a normaliz
   const report = await fetchPlanUsage("example-provider", httpPlanConfig(authPath), {
     fetchImpl: async () => ({ ok: true, json: async () => payload }),
   });
-  assert.deepEqual(report, canonicalUsage());
+  assert.deepEqual(reading(report), canonicalUsage());
   assert.notStrictEqual(report, payload);
   assert.notStrictEqual(report.windows, payload.windows);
   assert.notStrictEqual(report.windows[0], payload.windows[0]);
@@ -880,8 +1219,9 @@ test("HTTP plan usage caches a successful fetch for its 60-second TTL", async (t
   const config = httpPlanConfig(authPath);
   const first = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 1_000 });
   const second = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 60_999 });
-  assert.deepEqual(first, canonicalUsage());
-  assert.deepEqual(second, canonicalUsage());
+  assert.deepEqual(reading(first), canonicalUsage());
+  assert.deepEqual(second, first, "the cached reading, fetchedAt and all");
+  assert.equal(first.fetchedAt, 1_000);
   assert.equal(calls, 1);
 });
 
@@ -900,12 +1240,13 @@ test("HTTP plan usage serves the last good report and backs off failed refreshes
   const stale = await fetchPlanUsage("example-provider", config, { fetchImpl, now: 61_000 });
   const backedOff = await fetchPlanUsage("example-provider", config, {
     fetchImpl: async () => { throw new Error("backoff must suppress refresh"); },
-    now: 660_999,
+    now: 180_999,
   });
-  assert.deepEqual(first, good);
-  assert.deepEqual(stale, good);
-  assert.deepEqual(backedOff, good);
-  assert.equal(calls, 2, "one success, one failed refresh, then no call during failure backoff");
+  assert.deepEqual(reading(first), good);
+  assert.deepEqual(stale, first, "the last good reading keeps serving");
+  assert.equal(stale.fetchedAt, 1_000, "and keeps its own fetchedAt, so it can be shown as old");
+  assert.deepEqual(backedOff, first);
+  assert.equal(calls, 2, "one success, one failed refresh, then no call during the 2-minute failure backoff");
 });
 
 test("fallback markers release stickiness for a primary rebalance", async () => {
@@ -1272,7 +1613,7 @@ test("HTTP plan usage reads a keyFile and the proxy's OpenAI window shape", asyn
     },
   });
   assert.equal(sent, "proxy-secret");
-  assert.deepEqual(report, {
+  assert.deepEqual(reading(report), {
     windows: [{ id: "wk", percent: 100, resetsAt: new Date(1791309426 * 1000).toISOString(), active: true, severity: null }],
     lockedUntil: 1791309426 * 1000,
     plan: "pro",

@@ -88,6 +88,7 @@ import {
   fetchPlanUsage,
   planUsageConfigured,
   freshPlanUsage, planUsageResetAt, planUsageSnapshot, seedPlanUsageCache } from "../lib/plan-usage.js";
+import { activeUsageLimits, laneHeadroom, usageLimitMessage } from "../lib/usage-limit.js";
 import { applyProviderCheck, checkProvider, LAPSED_HOLD_MS, PLAN_LAPSED_REASON,
   planUsageResult, PROVIDER_CHECK_INTERVAL_MS, providerCheckConfigured } from "../lib/provider-check.js";
 import {
@@ -96,6 +97,7 @@ import {
   normalizeProviderError,
   operatorQuarantineProvider,
   providerEligible,
+  isProviderOriginated,
   recordFailureEvidence,
   rearmQuarantinedProvider,
 } from "../lib/provider-health.js";
@@ -189,7 +191,18 @@ const recordDecision = (state, decision) => {
   logDecision(decision);
 };
 const LEASE_TTL_MS = 2 * 60 * 60 * 1000;
-const ASSIGNMENT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+// ☆ How long an IDLE session keeps its pin, counted from its last activity (see
+// assignmentLastActive), not from when the model was picked. A pin buys two things: no
+// re-read at full price, which the provider prompt cache (5 min to 1 h) has already lost
+// after a few hours either way, and model continuity within a working stretch, which a
+// lunch break should keep and the next day need not. It was 14 days until 2026-10-09,
+// when ~500 sessions/day filled the cap and pins were evicted by count at ~22 h anyway.
+const ASSIGNMENT_TTL_MS = 4 * 60 * 60 * 1000;
+// A pin's own `updatedAt` moves only on a fresh SELECTION; a session that keeps reusing
+// its pin moves `activeAt` instead (stampPinActivity, as each lease ends), so a long busy session
+// is not treated as idle the moment its lease is released.
+const assignmentLastActive = (assignment) =>
+  Math.max(Number(assignment?.updatedAt) || 0, Number(assignment?.activeAt) || 0);
 // ☠️ A COUNT CAP, because the TTL alone is not a bound on anything that matters.
 // writeState() serialises the WHOLE state and rename-writes it on EVERY request --
 // /lease, /touch, /release, all of them -- so the size of this map is a per-request
@@ -198,11 +211,10 @@ const ASSIGNMENT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 // 2,958 assignments and a 405 KB state file, and /status p50 at 23.0 ms. Pruning to
 // the most recent 152 took the same call to 3.3 ms. The TTL says "old"; this says
 // "too many", and they are different questions.
-// ☆ 512 is generous on purpose. An assignment is ONLY a targetID fallback for
-// /failure, /complete and /forget when the lease has already gone, and all three
-// follow the session's own activity within minutes -- so what matters is how many
-// sessions could plausibly be mid-flight, not how many have ever run. 48 hours of
-// heavy use measured 152.
+// ☆ 512 is generous on purpose: with the 4 h idle TTL, what the map holds is the
+// sessions active in the last few hours, not every session of the last two weeks.
+// Measured 2026-10-09: the per-request write is 1.8 ms p50 at 512 (124 KB) and 4.9 ms
+// at 2048, so the cap is not something to raise to quiet the eviction warning.
 const MAX_ASSIGNMENTS = 512;
 const RATE_LIMIT_MS = 5 * 60 * 1000;
 // A brief provider overload (529/503) is transient: fence the target for a few
@@ -572,10 +584,19 @@ const bindingTargetID = (binding, body) => {
   return body.targetID || null;
 };
 
+// A lease ending is the session's last activity on its pin: the idle TTL starts here.
+// Stamped only when a lease ends -- while one is live the pin cannot expire anyway, and
+// stamping on every request would turn a read-only replay into a state change.
+const stampPinActivity = (state, sessionID, at) => {
+  const assignment = state.assignments[sessionID];
+  if (assignment && at > (Number(assignment.activeAt) || 0)) assignment.activeAt = at;
+};
+
 const dropExactLease = (state, sessionID, leaseID) => {
   if (state.leases[sessionID]?.leaseID === leaseID ||
     (leaseID === undefined && state.leases[sessionID]?.leaseID === undefined)) {
     delete state.leases[sessionID];
+    stampPinActivity(state, sessionID, Date.now());
   }
 };
 
@@ -602,6 +623,7 @@ const sweep = (state, now = Date.now()) => {
     if (!lease?.touchedAt || now - lease.touchedAt > LEASE_TTL_MS || !isProfile(lease?.profile) || !ROUTE_TIER_NAMES.includes(lease?.tier)) {
       settlePolicyLease(state, lease, { outcome: "abandoned", source: "expiry", now });
       delete state.leases[sessionID];
+      stampPinActivity(state, sessionID, Number(lease?.touchedAt) || 0);
     }
   }
   // A LIVE LEASE IS NEVER EVICTED -- by age here, or by the cap below. `updatedAt` moves only
@@ -611,7 +633,7 @@ const sweep = (state, now = Date.now()) => {
   // costing it its pinned model on its next selection. The lease loop above has already dropped
   // the expired leases, so what remains in state.leases is alive right now.
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
-    if (!state.leases[sessionID] && (!assignment?.updatedAt || now - assignment.updatedAt > ASSIGNMENT_TTL_MS)) {
+    if (!state.leases[sessionID] && now - assignmentLastActive(assignment) > ASSIGNMENT_TTL_MS) {
       removePolicyLeaseBinding(state, assignment);
       delete state.assignments[sessionID];
     }
@@ -620,7 +642,7 @@ const sweep = (state, now = Date.now()) => {
   // questions and ordering by age alone answered the wrong one.
   const assignmentIDs = Object.keys(state.assignments);
   if (assignmentIDs.length > MAX_ASSIGNMENTS) {
-    const oldestFirst = (a, b) => (state.assignments[a]?.updatedAt ?? 0) - (state.assignments[b]?.updatedAt ?? 0);
+    const oldestFirst = (a, b) => assignmentLastActive(state.assignments[a]) - assignmentLastActive(state.assignments[b]);
     // A LIVE LEASE IS NEVER EVICTED. The lease loop above has already dropped the expired
     // ones, so anything still in state.leases is a session that is mid-flight right now, and
     // its assignment is the pin its NEXT lease reads. `updatedAt` moves only on a fresh
@@ -727,6 +749,7 @@ const reclaimIdleLeases = (state, targets, requestingSessionID, now = Date.now()
       if (lease?.targetID !== targetID && modelSlotKey(targetForID(lease?.targetID, every)) !== key) continue;
       if (now - (lease.touchedAt ?? 0) <= RECLAIM_IDLE_MS) continue;
       delete state.leases[sessionID];
+      stampPinActivity(state, sessionID, Number(lease.touchedAt) || 0);
       reclaimed.push(`${sessionID} on ${lease.targetID}`);
     }
   }
@@ -852,7 +875,9 @@ const prepareTarget = (target, { sessionID } = {}) => {
 // rather than a fourth one invented at the call site -- an unclassified refusal is
 // honest, an over-specific taxonomy is a contract nobody can rely on. The auth-store
 // refusal above is the one such path today.
-const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target"]);
+// `usage-limit` is `no-eligible-target` with the cause known: every cloud provider in the lane is
+// held out by a plan window or quota stop, and the message names each one and when it returns.
+const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target", "usage-limit"]);
 // ☠️ `refusalCode`, NOT `code`. This handler's catch sees EVERY error, and node puts
 // its own `code` on system errors (ENOENT from a state write, EPIPE from a socket) --
 // forwarding that field would publish "ENOENT" as a routing refusal code, outside the
@@ -1404,6 +1429,25 @@ const acquire = async (state, request, {
     const noResolvableTarget = droppedResolvableLaneModelIDs.length > 0 &&
       !targetEligibleIDsFor(profile, tier, admittedTargets)
         .some((targetID) => targetForID(targetID, admittedTargets));
+    // ☠️ SAY "USAGE LIMIT" WHEN THAT IS WHY. With every cloud provider in the lane held out by a
+    // plan window or quota stop, the refusal used to read "all lightweight routing targets are
+    // busy or unavailable" -- 44 times in one log -- and the user had to go and find out that
+    // their plans were spent and until when. Named per provider, with the day each returns.
+    const laneCloudProviders = [...new Set(targetEligibleIDsFor(profile, tier, allTargets(state))
+      .map((targetID) => targetForID(targetID, allTargets(state)))
+      .filter((target) => target && target.kind !== "local")
+      .map((target) => target.providerID))];
+    // ☆ ONLY WHEN USAGE IS THE WHOLE STORY. If any cloud provider in the lane is out for another
+    // reason (busy at its concurrency cap, quarantined), waiting for the plan dates is the wrong
+    // advice -- that one may be back in seconds -- so the refusal keeps its generic wording.
+    const laneUsageLimits = localOnly ? [] : activeUsageLimits(state.circuits, laneCloudProviders, cachedPlanUsage, nowMs);
+    const usageLimits = laneCloudProviders.length > 0 && laneUsageLimits.length === laneCloudProviders.length
+      ? laneUsageLimits : [];
+    const usageLimitReason = () => `${usageLimitMessage(usageLimits, nowMs)}. ` +
+      `No other provider in ${tier} can take it` +
+      (Number(contextTokens) > 0
+        ? `, and no local model fits this session (${Math.round(Number(contextTokens) / 1000)}k tokens).`
+        : ", and no local model can serve it.");
     const reason = prepared
       ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
       : busy.length
@@ -1412,7 +1456,9 @@ const acquire = async (state, request, {
           ? `the calling OpenCode process cannot resolve any eligible model and must be restarted to load current provider config; dropped models: ${[...new Set(droppedResolvableLaneModelIDs)].slice(0, 5).join(", ")}`
         : localOnly
           ? "no eligible local model is currently deployed, free, or within its context window"
-          : "all lightweight routing targets are busy or unavailable";
+          : usageLimits.length
+            ? usageLimitReason()
+            : "all lightweight routing targets are busy or unavailable";
     // ☆ Both prepare wordings share ONE code. "preparing it now" and "still preparing
     // it" differ only in what a human reading a log wants to know (did this call start
     // the swap, or was it already running); to a client both mean the same thing --
@@ -1422,7 +1468,8 @@ const acquire = async (state, request, {
       ? "target-preparing"
       : busy.length ? "target-busy"
         : noResolvableTarget ? "no-resolvable-target"
-        : localOnly ? "no-eligible-local-target" : "no-eligible-target";
+        : localOnly ? "no-eligible-local-target"
+        : usageLimits.length ? "usage-limit" : "no-eligible-target";
     const subject = prepared ? absent[0] : busy.length === 1 ? busy[0] : wanted.length === 1 ? wanted[0] : null;
     // ☠️ A preparing target is NOT a refusal, and filing it as one makes the decision log
     // lie about the router. A refusal is terminal -- nothing is eligible, and the caller
@@ -1894,6 +1941,8 @@ const serve = async () => {
           state.budgets = learnCapacityFromFailure(state.budgets, target.providerID, kind);
         }
         let circuitUntil = null;
+        // Set only for a quota stop: whether circuitUntil is the real reset (see below).
+        let resetKnown = null;
         // Extra reasons the per-kind branches may add to the failure-reported
         // trail (e.g. the fast-mode fence names each circuited sibling). An
         // ordinary failure's reasons stay exactly [kind, error.message].
@@ -1948,6 +1997,9 @@ const serve = async () => {
             const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
             circuitUntil = planUsageResetAt(report);
           }
+          // Whether `until` is when the limit actually lifts or only when the broker next
+          // probes: a usage-limit message must never present a re-probe time as the return day.
+          resetKnown = Boolean(circuitUntil);
           // A lapsed plan has no reset coming: hold it until the background provider
           // check sees the renewal (lib/provider-check.js), not for a fixed re-probe.
           const lapsed = isPlanLapsed(error);
@@ -1956,6 +2008,7 @@ const serve = async () => {
             kind,
             ...(lapsed ? { reason: PLAN_LAPSED_REASON } : {}),
             until: circuitUntil,
+            resetKnown,
             updatedAt: Date.now(),
           };
         } else if (target && kind === "auth") {
@@ -2060,21 +2113,37 @@ const serve = async () => {
         } else if (target) {
           circuitUntil = Date.now() + RATE_LIMIT_MS;
           state.circuits[targetID] = { kind, until: circuitUntil, updatedAt: Date.now() };
-          state.health = recordFailureEvidence(state.health, target.providerID, {
-            targetID: target.id,
-            modelID: target.modelID,
-            sessionID: body.sessionID,
-            reasonCode: kind,
-            error,
-            at: Date.now(),
-          });
+          // Evidence only for a failure the PROVIDER produced (see isProviderOriginated): an
+          // unrecognised local error fences this target and goes no further.
+          if (isProviderOriginated(body.error)) {
+            const wasQuarantined = state.health?.providers?.[target.providerID]?.state === "quarantined";
+            state.health = recordFailureEvidence(state.health, target.providerID, {
+              targetID: target.id,
+              modelID: target.modelID,
+              sessionID: body.sessionID,
+              reasonCode: kind,
+              error,
+              at: Date.now(),
+            });
+            // Never silent: an automatic quarantine takes a whole provider out of routing until
+            // someone re-arms it, and on 2026-10-09 one sat unnoticed for half an hour while
+            // every large smart session was refused.
+            if (!wasQuarantined && state.health?.providers?.[target.providerID]?.state === "quarantined") {
+              notifyBurn({
+                title: `${target.providerID} quarantined`,
+                body: `Automatic, after: ${String(error.message).slice(0, 160)}. If the provider is fine, run: opencode-broker rearm provider:${target.providerID}`,
+              });
+            }
+          } else {
+            extraReasons.push("not-provider-originated");
+          }
         }
         logDecision({
           at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
           policy: "failure-reported",
           reasons: [kind, ...extraReasons, error.message].filter(Boolean),
         });
-        return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}) });
+        return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}), ...(resetKnown !== null ? { resetKnown } : {}) });
       }
       if (request.url === "/complete") {
         const binding = settlementBinding(state, body);
@@ -2117,7 +2186,7 @@ const serve = async () => {
         });
         // The lease goes (its slot is free again); the assignment stays. It is the session's
         // pin, so the next turn after an idle returns to the same model instead of being
-        // re-rolled. It ages out on ASSIGNMENT_TTL_MS like any other.
+        // re-rolled. Its idle TTL (ASSIGNMENT_TTL_MS) starts now, as the turn ends.
         // ONE-SHOT SESSIONS ARE THE EXCEPTION: their id is minted per request and never
         // recurs, so there is no next turn to return and nothing that can read the pin back.
         // The assignment goes with the lease rather than waiting out the TTL in the cap.
@@ -2259,6 +2328,26 @@ const serve = async () => {
           .map((targetIDs, index) => ({ targetIDs: [...targetIDs], afterMs: CONFIG.profileFallbackAfterMs?.[profile]?.[index] ?? 0 }))
           .filter((rung) => rung.afterMs > 0);
         return reply(response, 200, { preview, delayedProfileFallbacks });
+      }
+      if (request.url === "/headroom") {
+        // Side-effect-free, like /preview: is this lane about to run out of usage with nothing to
+        // take over? The router asks for each working session, and when it is, tells the session
+        // to wrap up and write a handoff before it is cut off (lib/usage-limit.js laneHeadroom).
+        const profile = isProfile(body.profile) ? body.profile : "auto";
+        const tier = ROUTE_TIER_NAMES.includes(body.tier) ? body.tier : "smart";
+        const rawContext = Number(body.contextTokens);
+        const contextTokens = Number.isFinite(rawContext) && rawContext >= 0 ? Math.floor(rawContext) : null;
+        const targets = allTargets(state);
+        const lane = targetEligibleIDsFor(profile, tier, targets).map((targetID) => targetForID(targetID, targets)).filter(Boolean);
+        const nowMs = Date.now();
+        // A local model in the lane that fits the session can carry on when the cloud runs out.
+        const localFits = lane.some((target) => target.kind === "local" &&
+          localContextEligible(targetContext(target, state.inventory?.modelContexts), contextTokens,
+            targetContextHeadroom(target), targetOutputReserve(target, state.inventory?.modelOutputs)) &&
+          ![state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((value) =>
+            value && (value.until === null || Number(value.until) > nowMs)));
+        const providerIDs = [...new Set(lane.filter((target) => target.kind !== "local").map((target) => target.providerID))];
+        return reply(response, 200, laneHeadroom({ providerIDs, circuits: state.circuits, planFor: cachedPlanUsage, localFits, now: nowMs }));
       }
       if (request.url === "/decisions") {
         let lines = [];
@@ -2450,6 +2539,17 @@ const serve = async () => {
   };
   runProviderChecks().catch(() => {});
   setInterval(() => { runProviderChecks().catch(() => {}); }, PROVIDER_CHECK_INTERVAL_MS).unref();
+  // Plan usage refreshes on a timer too, not only as a side effect of requests: a quiet
+  // broker otherwise kept serving the last reading for as long as nothing called it, and every
+  // HUD showed that number as current. Fetched outside the queue (warming the cache), applied
+  // inside it, where refreshPlanUsage finds the warm reading and only applies it.
+  const refreshPlanUsageTick = async () => {
+    await Promise.all(Object.entries(PROVIDER_BUDGETS)
+      .filter(([, providerConfig]) => planUsageConfigured(providerConfig))
+      .map(([providerID, providerConfig]) => fetchPlanUsage(providerID, providerConfig).catch(() => null)));
+    serial = serial.then(() => refreshPlanUsage(state)).catch(() => {});
+  };
+  setInterval(() => { refreshPlanUsageTick().catch(() => {}); }, 30_000).unref();
   process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
   for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);
   for (const signal of ["SIGINT", "SIGTERM"]) {

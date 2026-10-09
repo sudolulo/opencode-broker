@@ -45,6 +45,7 @@ import {
   writeSessionProfile,
 } from "../lib/routing.js";
 import { PLAN_LAPSED_REASON } from "../lib/provider-check.js";
+import { formatReturnShort } from "../lib/usage-limit.js";
 import { detectGuard } from "./guard.js";
 
 // ---- swap-back: put the resting models back when the last session leaves -----------------
@@ -859,6 +860,14 @@ export default {
     // Stale numbers are worse than none: after 2 minutes without a successful
     // poll the badge hides instead of lying.
     const budgetUtil = new Map();
+    // providerID -> when the PROVIDER's reading was taken (the broker's `plan.fetchedAt`), as
+    // opposed to budgetAt, which is only when this HUD last reached the broker. A broker that
+    // answers every poll can still be serving a held-over reading; this is what tells them apart.
+    const readingAt = new Map();
+    // A reading older than this is shown with its age and never as a bare current number.
+    // The chain is llm-auth-proxy's 60 s cache, the broker's 30 s refresh and 60 s cache, and
+    // this HUD's 10 s poll, so a healthy reading is at most ~2.5 min old.
+    const READING_STALE_MS = 3 * 60_000;
     const laneNotes = new Map();
     let budgetAt = 0;
     // When /status started failing, or null while it answers. Two misses in a row (the poll
@@ -881,6 +890,7 @@ export default {
           .filter(([key, circuit]) => key.startsWith("provider:") && circuit?.reason === PLAN_LAPSED_REASON)
           .map(([key]) => key.slice("provider:".length)));
         budgetUtil.clear();
+        readingAt.clear();
         for (const [providerID, report] of Object.entries(status?.budgets ?? {})) {
           if (lapsedProviders.has(providerID)) continue;
           // A provider that reports its own plan usage is EXACT: those numbers
@@ -893,7 +903,11 @@ export default {
               id: String(w.id ?? "?"),
               pct: Math.round(Number(w.percent)),
               estimate: false,
+              resetsAt: Date.parse(w.resetsAt ?? "") || null,
             }));
+          // A plan reading without fetchedAt predates the broker stamping it: age unknown, so
+          // it is treated as stale rather than trusted.
+          if (planWindows.length) readingAt.set(providerID, Number(report.plan.fetchedAt) || 0);
           const windows = planWindows.length ? planWindows : (Array.isArray(report?.windows) ? report.windows : [])
             .filter((w) => Number(w?.capacity) > 0)
             .map((w) => ({
@@ -919,12 +933,18 @@ export default {
         }
         for (const [key, circuit] of Object.entries(status?.circuits ?? {})) {
           const until = Number(circuit?.until);
-          const when = Number.isFinite(until) && until > Date.now()
-            ? new Date(until).toTimeString().slice(0, 5) : null;
+          // With the weekday: a weekly limit's "til 03:38" alone read as later today.
+          const when = Number.isFinite(until) && until > Date.now() ? formatReturnShort(until) : null;
           if (key.startsWith("provider:")) {
             const providerID = key.slice("provider:".length);
             if (lapsedProviders.has(providerID)) continue;
-            if (!laneNotes.has(providerID)) laneNotes.set(providerID, when ? `circuit til ${when}` : "circuit");
+            // A usage stop says "limit"; one whose end is only the broker's next probe (no reset
+            // reported) says "recheck", never "til" -- that time is not when usage returns.
+            const usage = circuit?.kind === "plan-window" || circuit?.kind === "quota";
+            const note = !when ? (usage ? "limit" : "circuit")
+              : usage && circuit?.resetKnown === false ? `limit, recheck ${when}`
+                : `${usage ? "limit" : "circuit"} til ${when}`;
+            if (!laneNotes.has(providerID)) laneNotes.set(providerID, note);
           } else if (!laneNotes.has(key)) {
             laneNotes.set(key, when ? `benched til ${when}` : "benched");
           }
@@ -942,10 +962,33 @@ export default {
       }
       finally { budgetPolling = false; }
     };
+    // Every HUD polls on the SAME wall-clock boundaries (:00, :10, :20 ...), not on a 30 s
+    // interval from whenever its window opened: they all read the one broker reading, so
+    // aligned polls show every window the same numbers at the same moment. Unaligned, two
+    // windows side by side could disagree for half a minute.
+    const BUDGET_POLL_MS = 10_000;
+    let budgetTimer = null;
+    let budgetDisposed = false;
+    const scheduleBudgetPoll = () => {
+      if (budgetDisposed) return;
+      budgetTimer = setTimeout(() => { void pollBudgets(); scheduleBudgetPoll(); },
+        BUDGET_POLL_MS - (Date.now() % BUDGET_POLL_MS) + 50);
+      if (typeof budgetTimer?.unref === "function") budgetTimer.unref();
+    };
     void pollBudgets();
-    const budgetTimer = setInterval(pollBudgets, 30_000);
-    if (typeof budgetTimer?.unref === "function") budgetTimer.unref();
-    api.lifecycle?.onDispose?.(() => clearInterval(budgetTimer));
+    scheduleBudgetPoll();
+    api.lifecycle?.onDispose?.(() => { budgetDisposed = true; clearTimeout(budgetTimer); });
+    // How old a provider's numbers are by their OWN account: the plan reading's fetch time,
+    // or, for estimate-only providers (no reading), this HUD's last successful poll.
+    const readingAge = (providerID) => Date.now() - (readingAt.has(providerID) ? readingAt.get(providerID) : budgetAt);
+    const readingStale = (providerID) => readingAge(providerID) > READING_STALE_MS;
+    // A window past its reset no longer has the percentage it was read at.
+    // A nearly-full window also says when it resets, with the weekday ("wk 100%! (Wed 03:38)"):
+    // that is the moment the number stops being trivia. Below 85% it would only cost width.
+    const windowCell = (w) => (w.resetsAt && w.resetsAt <= Date.now())
+      ? `${windowLabel(w.id)} reset`
+      : `${windowLabel(w.id)} ${w.estimate ? "~" : ""}${w.pct}%${w.pct >= 85 ? "!" : ""}` +
+        (w.pct >= 85 && w.resetsAt ? ` (${formatReturnShort(w.resetsAt)})` : "");
 
     const PROVIDER_SHORT = { openai: "oai", anthropic: "ant", "alibaba-token-plan": "qwen" };
     const WINDOW_SHORT = { week: "wk", month: "mo" };
@@ -960,7 +1003,11 @@ export default {
       return typeof modelID === "string" && modelID.toLowerCase().includes(scope.toLowerCase());
     };
     const pctOf = (providerID, modelID) => {
-      const windows = (budgetUtil.get(providerID) ?? []).filter((w) => windowAppliesTo(w.id, modelID));
+      // The badge has no room to say "old", so an old reading is not shown there at all, and
+      // a window past its reset no longer speaks for the provider.
+      if (readingStale(providerID)) return "";
+      const windows = (budgetUtil.get(providerID) ?? [])
+        .filter((w) => windowAppliesTo(w.id, modelID) && !(w.resetsAt && w.resetsAt <= Date.now()));
       const binding = windows.reduce((top, w) => (w.pct > (top?.pct ?? -1) ? w : top), null);
       if (!binding) return "";
       return `${PROVIDER_SHORT[providerID] ?? providerID.slice(0, 4)} ${binding.estimate ? "~" : ""}${binding.pct}% ${windowLabel(binding.id)}${binding.pct >= 85 ? "!" : ""}`;
@@ -1041,8 +1088,11 @@ export default {
       const rows = [...budgetUtil.entries()].sort(([a], [b]) => a.localeCompare(b))
         .map(([providerID, windows]) => {
           const name = (PROVIDER_LONG[providerID] ?? providerID).padEnd(10);
-          const cells = windows.map((w) => `${windowLabel(w.id)} ${w.estimate ? "~" : ""}${w.pct}%${w.pct >= 85 ? "!" : ""}`).join(" \u00b7 ");
-          return ` ${name} ${cells}`;
+          const cells = windows.map(windowCell).join(" \u00b7 ");
+          // Numbers older than READING_STALE_MS say how old they are, per provider: one
+          // provider's usage API failing must not pass its last reading off as current.
+          const age = readingStale(providerID) ? ` (${Math.max(1, Math.round(readingAge(providerID) / 60_000))}m old)` : "";
+          return ` ${name} ${cells}${age}`;
         });
       // The broker answered and every provider it budgets is filtered out (all plans lapsed).
       // Saying nothing would leave the "Usage" heading standing over an empty block, which

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   isAbortError,
+  isProviderOriginated,
   markProbationSuccessHealthy,
   normalizeHealth,
   normalizeProviderError,
@@ -11,6 +12,25 @@ import {
   recordFailureEvidence,
   rearmQuarantinedProvider,
 } from "../lib/provider-health.js";
+
+// Only a failure the provider produced may count toward a quarantine. Every past false
+// quarantine was a status-less error raised on our side that the classifier did not know.
+test("only provider-originated failures can count as quarantine evidence", () => {
+  // From the provider: an HTTP status, or a transport failure on the way to or from it.
+  assert.equal(isProviderOriginated({ name: "APIError", statusCode: 500, message: "Internal server error" }), true);
+  assert.equal(isProviderOriginated({ name: "APIError", data: { message: "x" }, status: 400 }), true);
+  assert.equal(isProviderOriginated({ message: '{"type":"api_error","message":"gateway: Anthropic upstream stream failed"}' }), true);
+  assert.equal(isProviderOriginated({ message: "socket hang up" }), true);
+  assert.equal(isProviderOriginated({ message: "read ECONNRESET" }), true);
+  assert.equal(isProviderOriginated({ message: "The operation timed out." }), true);
+  // Ours: each of these benched a healthy provider before it had its own rule.
+  assert.equal(isProviderOriginated({ message: "Failed to execute statement" }), false);
+  assert.equal(isProviderOriginated({ name: "SQLiteError", message: "database is locked" }), false);
+  assert.equal(isProviderOriginated({ message: "routed model mismatch" }), false);
+  assert.equal(isProviderOriginated({ name: "ProviderModelNotFoundError", message: "Model not found: openai/gpt-6-luna" }), false);
+  // And the next one nobody has seen yet.
+  assert.equal(isProviderOriginated({ name: "TypeError", message: "Cannot read properties of undefined (reading 'parts')" }), false);
+});
 
 const baseFailure = (overrides = {}) => ({
   targetID: "anthropic-worker",

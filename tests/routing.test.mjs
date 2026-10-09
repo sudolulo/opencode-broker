@@ -1927,6 +1927,11 @@ test("malformed-request and caller-close failures never indict a provider", () =
   // HTTP 499 is our own abort observed server-side; isAbortError cannot see it wrapped.
   assert.equal(R.classifyRoutingFailure({ message: "classifier request failed (HTTP 499): {}" }), "noop");
   assert.equal(R.classifyRoutingFailure({ message: "client closed request" }), "noop");
+  // opencode's own SQLite refusing a write (a VACUUM holding the database) is not the
+  // provider's fault: it quarantined anthropic on 2026-10-09.
+  assert.equal(R.classifyRoutingFailure({ message: "Failed to execute statement" }), "noop");
+  assert.equal(R.classifyRoutingFailure({ name: "SQLiteError", message: "database is locked" }), "noop");
+  assert.equal(R.classifyRoutingFailure({ code: "SQLITE_BUSY", message: "database is locked" }), "noop");
 
   // Context overflow is checked BEFORE payload and must keep its own kind: it steers the
   // re-lease to a roomier window, which "payload" deliberately does not do.

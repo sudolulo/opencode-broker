@@ -4149,7 +4149,7 @@ test("the assignment cap never evicts a session that still holds a live lease", 
 // costs the session its pinned model on its next selection.
 test("the assignment TTL evicts by age only when no live lease holds the session", async () => withTempHome(async (home) => {
   const now = Date.now();
-  const aged = now - 15 * 24 * 3_600_000; // past ASSIGNMENT_TTL_MS (14 days) either way
+  const aged = now - 15 * 24 * 3_600_000; // past ASSIGNMENT_TTL_MS (4 h idle) either way
   const statePath = seedState(home, {
     assignments: {
       ses_ttl_live: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: aged },
@@ -4167,6 +4167,41 @@ test("the assignment TTL evicts by age only when no live lease holds the session
       "an assignment whose session still holds a live lease is never evicted, by age or by cap");
     assert.ok(!after.assignments["ses_ttl_idle"],
       "and the TTL still removes an aged assignment that no lease holds");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
+// The idle TTL counts from the session's last ACTIVITY, not from when its model was picked:
+// `updatedAt` moves only on a fresh selection, so a session busy on one pin all day would
+// otherwise lose it at the first idle after four hours -- a mid-task model change.
+test("the assignment TTL counts idle time from the session's last activity", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const picked = now - 10 * 3_600_000; // selected long before the 4 h idle TTL
+  const statePath = seedState(home, {
+    assignments: {
+      // Busy until 30 min ago (its last lease released then): kept.
+      ses_busy: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: picked, activeAt: now - 30 * 60_000 },
+      // Its lease, last touched 2.5 h ago, expires in this sweep (2 h lease TTL): the touch
+      // becomes the pin's activity, which is inside the idle TTL, so the pin stays.
+      ses_leased: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: picked },
+      // Quiet for five hours: past the idle TTL, gone.
+      ses_quiet: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: picked, activeAt: now - 5 * 3_600_000 },
+      // Never used since its selection ten hours ago: gone.
+      ses_stale: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: picked },
+    },
+    leases: { ses_leased: { targetID: "gpt-luna", touchedAt: now - 150 * 60_000, profile: "auto", tier: "worker" } },
+  });
+
+  const { child } = await startBroker(home);
+  try {
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.ok(after.assignments["ses_busy"], "recent activity keeps a pin whose selection is old");
+    assert.ok(!after.leases["ses_leased"], "the stale lease expired");
+    assert.equal(after.assignments["ses_leased"]?.activeAt, now - 150 * 60_000,
+      "and its last touch was carried into the pin, which keeps it");
+    assert.ok(!after.assignments["ses_quiet"], "a pin idle past the TTL is removed");
+    assert.ok(!after.assignments["ses_stale"], "a pin with no activity since an old selection is removed");
   } finally {
     await stopBroker(child);
   }

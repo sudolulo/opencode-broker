@@ -429,3 +429,48 @@ test("a local model that is not loaded at all is still a refusal, not a wait", a
     assert.equal(refused.body.code, "no-eligible-local-target");
   });
 });
+
+// ☠️ A usage limit must SAY so. With every cloud provider in the lane held out by a quota stop,
+// the refusal used to be NO_TARGET, and the user had to go and find out their plan was spent and
+// until when. It now names the provider and the day it returns, under its own code.
+test("usage-limit names the spent provider and the day it returns", async () => {
+  await withBroker({ resident: () => [], auth: { openai: { type: "oauth" } } }, async ({ socketPath }) => {
+    const lease = await post(socketPath, "/lease", {
+      sessionID: "ses_usage_holder", profile: "auto", tier: "worker", contextTokens: 200000,
+    });
+    assert.equal(lease.statusCode, 200, JSON.stringify(lease.body));
+    const resetAt = new Date(Date.now() + 5 * 24 * 3_600_000).toISOString();
+    const failure = await post(socketPath, "/failure", {
+      sessionID: "ses_usage_holder", leaseID: lease.body.leaseID, targetID: lease.body.target?.id ?? "cloud-a",
+      error: { statusCode: 429, message: "The usage limit has been reached", resetAt },
+    });
+    assert.equal(failure.body.kind, "quota", JSON.stringify(failure.body));
+    assert.equal(failure.body.resetKnown, true, "the reply says circuitUntil is the real reset");
+
+    // 200k tokens: the local rung (64k) cannot take it either.
+    const refused = await post(socketPath, "/lease", {
+      sessionID: "ses_usage_next", profile: "auto", tier: "worker", contextTokens: 200000,
+    });
+    assert.equal(refused.body.code, "usage-limit", JSON.stringify(refused.body));
+    assert.match(refused.body.error, /^usage limit reached -- openai usage limit, back \w{3} \w{3} \d{1,2} \d{2}:\d{2} UTC \(in 5d 0h\)\. /);
+    assert.match(refused.body.error, /no local model fits this session \(200k tokens\)\.$/);
+  });
+});
+
+// /headroom: the lane is nearly out when its cloud providers have no room and no local model
+// fits the session; a session small enough for the local rung keeps going.
+test("headroom reports a lane nearly out only when nothing local fits", async () => {
+  await withBroker({ resident: () => [], auth: { openai: { type: "oauth" } } }, async ({ socketPath }) => {
+    const lease = await post(socketPath, "/lease", { sessionID: "ses_head", profile: "auto", tier: "worker", contextTokens: 200000 });
+    await post(socketPath, "/failure", {
+      sessionID: "ses_head", leaseID: lease.body.leaseID, targetID: lease.body.target?.id ?? "cloud-a",
+      error: { statusCode: 429, message: "The usage limit has been reached", resetAt: new Date(Date.now() + 3_600_000).toISOString() },
+    });
+    const big = await post(socketPath, "/headroom", { profile: "auto", tier: "worker", contextTokens: 200000 });
+    assert.equal(big.body.nearlyOut, true, JSON.stringify(big.body));
+    assert.deepEqual(big.body.providers.map((p) => [p.providerID, p.held]), [["openai", true]]);
+    const small = await post(socketPath, "/headroom", { profile: "auto", tier: "worker", contextTokens: 100 });
+    assert.equal(small.body.localFits, true);
+    assert.equal(small.body.nearlyOut, false, "the local rung can carry a small session");
+  });
+});

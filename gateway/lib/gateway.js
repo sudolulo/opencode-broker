@@ -27,6 +27,7 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { usageLimitMessage } from "../../lib/usage-limit.js";
 
 // Constant-time comparison of a presented credential with its expected wire value. Hashing first
 // gives both sides the same length, which timingSafeEqual requires for bearer and x-api-key auth.
@@ -103,6 +104,40 @@ const upstreamSignal = (body) => {
     if (signal.matches(message)) return signal.phrase;
   }
   return null;
+};
+// ☠️ A USAGE LIMIT MUST SAY SO. An upstream 429 that is the account's plan being spent reached
+// the user as "gateway: no provider could serve the request: upstream openai HTTP 429" -- true,
+// and useless: which limit, and when is it back? Recognised here from the status, the
+// `anthropic-ratelimit-unified-*` headers and the error's type/message, and only FACTS leave
+// (that it is a usage limit, which window, the reset time) -- never upstream wording, same rule
+// as UPSTREAM_SIGNALS above. Fast-mode credits are their own 429 and are excluded first.
+const UNIFIED_CLAIMS = { five_hour: "5-hour limit", seven_day: "weekly limit", seven_day_opus: "weekly Opus limit", seven_day_sonnet: "weekly Sonnet limit" };
+export const upstreamUsageLimit = (status, body, headers, now = Date.now()) => {
+  if (status !== 429) return null;
+  const header = (name) => {
+    try { return headers?.get?.(name) ?? null; } catch { return null; }
+  };
+  let parsed = null;
+  if (typeof body === "string" && body.length > 0 && body.length <= 16384) {
+    try { parsed = JSON.parse(body); } catch { parsed = null; }
+  }
+  const message = String(parsed?.error?.message ?? "");
+  const type = String(parsed?.error?.type ?? parsed?.error?.code ?? "");
+  if (UPSTREAM_SIGNALS.some((signal) => signal.matches(message))) return null;
+  const rejected = header("anthropic-ratelimit-unified-status") === "rejected";
+  if (!rejected && !/usage[_ ]limit|would exceed your account.{0,8}rate limit|limit has been reached/i.test(`${type} ${message}`)) {
+    return null;
+  }
+  const epochSeconds = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 1e9 ? n * 1000 : null;
+  };
+  const inSeconds = Number(parsed?.error?.resets_in_seconds ?? header("retry-after"));
+  const until = epochSeconds(header("anthropic-ratelimit-unified-reset")) ??
+    epochSeconds(parsed?.error?.resets_at) ??
+    (Number.isFinite(inSeconds) && inSeconds > 0 ? now + inSeconds * 1000 : null);
+  const claim = header("anthropic-ratelimit-unified-representative-claim");
+  return { limit: UNIFIED_CLAIMS[claim] ?? null, until };
 };
 // The shape a forwarded session fingerprint may take. Anything else is dropped at the
 // forward site, never an error: the hints steer cache and diagnostics, they are not
@@ -1093,9 +1128,15 @@ export const createGatewayHandler = ({
       ? requestHeaders.sessionKind : null;
     let lastError = null;
     let lastForwardError = null;
+    // Every provider that answered with a usage limit during this request, so the final reply
+    // can name them all (a retry may walk across several spent plans).
+    const usageLimited = [];
     const rememberForwardError = (error) => {
       lastForwardError = error;
       lastError = error;
+      if (error?.usageLimit && !usageLimited.some((entry) => entry.providerID === error.usageLimit.providerID)) {
+        usageLimited.push(error.usageLimit);
+      }
     };
     let acquiredLease = false;
     let lastLeased = null;
@@ -1386,7 +1427,8 @@ export const createGatewayHandler = ({
         // broker there.
         const raw = await response.text().catch(() => "");
         const text = raw.slice(0, 400);
-        const signal = api === CHAT ? null : upstreamSignal(raw);
+        const usageLimit = upstreamUsageLimit(response.status, raw, response.headers, now());
+        const signal = api === CHAT ? null : (upstreamSignal(raw) ?? (usageLimit ? "usage limit reached" : null));
         const suffix = signal ? `: ${signal}` : "";
         const safeMessage = api === MESSAGES
           ? `Anthropic upstream HTTP ${response.status}${suffix}`
@@ -1395,13 +1437,19 @@ export const createGatewayHandler = ({
             : text || `upstream HTTP ${response.status}`;
         clearTimeout(stallTimer);
         await settle(leased, "/failure", {
-          error: { statusCode: response.status, message: safeMessage },
+          error: {
+            statusCode: response.status,
+            message: safeMessage,
+            // The reset the provider reported, so the broker's quota circuit ends when the limit does.
+            ...(usageLimit?.until ? { resetAt: new Date(usageLimit.until).toISOString() } : {}),
+          },
         });
         const error = new Error(api === MESSAGES
           ? safeMessage
           : api === RESPONSES
             ? `upstream ${leased.providerID} HTTP ${response.status}${suffix}`
             : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
+        if (usageLimit) error.usageLimit = { providerID: leased.providerID, ...usageLimit };
         rememberForwardError(error);
         excludeLane(leased.providerID);
         continue;
@@ -1559,9 +1607,18 @@ export const createGatewayHandler = ({
     // clear after a CRASH, which a live process must not be manufacturing.
     // Releasing an already-released session is a no-op delete.
     if (acquiredLease && lastLeased) await settle(lastLeased, "/release");
+    // A usage limit LEADS the message: it is the one failure the user must act on (wait, or
+    // switch), and the day it lifts is the answer they need. The gateway phrase stays in it,
+    // because callers and the broker's classifier key on it to know no provider was at fault.
+    // Still a 502, not a 429: a 429 tells clients to retry, and a weekly limit is days away.
+    const usageLead = lastError?.code === "usage-limit"
+      ? String(lastError.message)
+      : usageLimited.length ? `${usageLimitMessage(usageLimited, now())}.` : null;
     return {
       status: 502,
-      payload: { error: { message: `gateway: no provider could serve the request: ${String(lastError?.message ?? lastError)}`, type: "upstream_error" } },
+      payload: { error: { message: usageLead
+        ? `${usageLead} (gateway: no provider could serve the request)`
+        : `gateway: no provider could serve the request: ${String(lastError?.message ?? lastError)}`, type: "upstream_error" } },
     };
   };
 
