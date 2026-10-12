@@ -524,6 +524,45 @@ const isAbort = (error) => error?.name === "AbortError"
   || error?.name === "TimeoutError"
   || /abort/i.test(String(error?.message ?? ""));
 
+// ── per-request failure log ─────────────────────────────────────────────────
+// One JSON line on stderr (journald) per request that ends non-2xx or is abandoned by its client,
+// and one per upstream attempt that failed before a later attempt succeeded. Before this, a caller
+// that got "no provider could serve the request" had the only copy of the cause.
+// ☠️ NOTHING FROM THE REQUEST BODY GOES IN HERE -- no messages, no input, no prompt. The only
+// free text is `detail`/`error`, which is the UPSTREAM's error message or the gateway's own reply,
+// and it passes through logDetail(): control characters stripped (one record must stay one line,
+// and an escape sequence must not reach a terminal reading the journal), bearer tokens and
+// sk- keys redacted defensively in case an upstream echoes a credential, then capped.
+const LOG_DETAIL_CHARS = 300;
+const logDetail = (value) => String(value ?? "")
+  .replace(/[\u0000-\u001f\u007f]+/g, " ")
+  .replace(/\bBearer\s+[^\s"',;]+/gi, "Bearer [redacted]")
+  .replace(/(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]+/g, "sk-[redacted]")
+  .trim()
+  .slice(0, LOG_DETAIL_CHARS);
+
+// The message inside an upstream's error body when it is the usual JSON envelope, else the raw text.
+const upstreamDetail = (raw) => {
+  try {
+    const parsed = JSON.parse(raw);
+    const message = parsed?.error?.message ?? (typeof parsed?.error === "string" ? parsed.error : parsed?.message);
+    if (typeof message === "string" && message) return message;
+  } catch { /* not JSON: the raw text is the detail */ }
+  return raw;
+};
+
+// What a forward that threw (no HTTP status) looked like: our stall watchdog, our timeout, or
+// the network. A client's own disconnect is never recorded as an attempt outcome.
+const thrownOutcome = (error) => {
+  if (!isAbort(error)) return "network";
+  return /stalled/i.test(String(error?.message ?? "")) ? "stalled" : "timeout";
+};
+const thrownDetail = (error) => {
+  const cause = error?.cause;
+  const why = cause ? ` (${[cause.code, cause.message].filter(Boolean).join(": ")})` : "";
+  return `${String(error?.message ?? error)}${why}`;
+};
+
 // ── SSE ──────────────────────────────────────────────────────────────────────
 
 const SSE_HEADERS = {
@@ -801,6 +840,9 @@ export const createGatewayHandler = ({
   // Injected so no test can spawn a real model-swap. On 2026-09-07 a test run in the llamacpp
   // repo fired a real swap and pulled a model out from under a live session.
   runModelSwap = spawnModelSwap,
+  // Where the per-request failure log goes: one JSON string per call, no newline. Injected only
+  // so tests can read it; production writes stderr, which systemd hands to journald.
+  logLine = (line) => { process.stderr.write(`${line}\n`); },
 }) => {
   const allowedProviders = Object.keys(config.providers);
 
@@ -1058,6 +1100,7 @@ export const createGatewayHandler = ({
     requestHeaders = {},
     probeAssignment = null,
     boundLease = null,
+    trace = null,
   ) => {
     const streaming = Boolean(sink);
     const wantedJson = Boolean(requestBody?.response_format?.type?.startsWith?.("json"));
@@ -1094,6 +1137,7 @@ export const createGatewayHandler = ({
         requestHeaders,
         probeAssignment,
         boundLease,
+        trace,
       );
     } finally {
       callers.delete(sessionID);
@@ -1118,7 +1162,13 @@ export const createGatewayHandler = ({
     requestHeaders,
     probeAssignment = null,
     boundLease = null,
+    trace = null,
   ) => {
+    // One entry per upstream attempt that failed, for the failure log (see handle's wrapper).
+    // Recording only: nothing here reads it back, so routing cannot depend on it.
+    const noteAttempt = (leased, outcome, detail) => {
+      trace?.attempts.push({ provider: leased.providerID, model: leased.modelID, outcome, detail: logDetail(detail) });
+    };
     // The session hints are validated once per request; whether they go out at all is
     // decided per provider, per attempt, at the forward site (forwardHeaders).
     const forwardSessionID = typeof requestHeaders.sessionID === "string"
@@ -1201,6 +1251,7 @@ export const createGatewayHandler = ({
       if (!providerConfig?.baseUrl) {
         await settle(leased, "/release");
         lastError = new Error(`no forward config for ${leased.providerID}`);
+        noteAttempt(leased, "no_forward_config", lastError.message);
         continue;
       }
       // A stale local credential is OUR problem, not the provider's: indicting
@@ -1218,6 +1269,7 @@ export const createGatewayHandler = ({
         // routing bug rather than an expired token. Name the lane and the reason.
         console.error(`opencode-gateway: ${leased.providerID} credential did not resolve -- released the lease and skipped the lane for this request: ${String(error?.message ?? error)}`);
         lastError = new Error(`${leased.providerID} credential did not resolve: ${String(error?.message ?? error)}`);
+        noteAttempt(leased, "credential", lastError.message);
         continue;
       }
       // A provider slower than the CLIENT's own patience helps nobody: time
@@ -1411,6 +1463,7 @@ export const createGatewayHandler = ({
         } else {
           await settle(leased, "/failure", { error: { message: String(error?.message ?? error) } });
         }
+        noteAttempt(leased, thrownOutcome(error), thrownDetail(error));
         excludeLane(leased.providerID);
         rememberForwardError(error);
         continue;
@@ -1450,6 +1503,7 @@ export const createGatewayHandler = ({
             ? `upstream ${leased.providerID} HTTP ${response.status}${suffix}`
             : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
         if (usageLimit) error.usageLimit = { providerID: leased.providerID, ...usageLimit };
+        noteAttempt(leased, usageLimit ? "usage_limit" : `http_${response.status}`, upstreamDetail(raw) || `HTTP ${response.status}`);
         rememberForwardError(error);
         excludeLane(leased.providerID);
         continue;
@@ -1499,6 +1553,7 @@ export const createGatewayHandler = ({
           } else {
             await settle(leased, "/failure", { error: { message: String(error?.message ?? error).slice(0, 400) } });
           }
+          noteAttempt(leased, isAbort(error) ? thrownOutcome(error) : "stream_error", thrownDetail(error));
           excludeLane(leased.providerID);
           rememberForwardError(error);
           continue;
@@ -1552,6 +1607,7 @@ export const createGatewayHandler = ({
           payload = JSON.parse(rawBody);
         } catch {
           await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
+          noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
           rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
           excludeLane(leased.providerID);
           continue;
@@ -1571,6 +1627,7 @@ export const createGatewayHandler = ({
       let payload;
       try { payload = await response.json(); } catch {
         await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
+        noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
         rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
         excludeLane(leased.providerID);
         continue;
@@ -1661,7 +1718,7 @@ export const createGatewayHandler = ({
     return false;
   };
 
-  const handle = async (request, response) => {
+  const handle = async (request, response, trace) => {
     const url = (request.url ?? "/").split("?")[0];
     // ── tenant control ─────────────────────────────────────────────────────────────────────
     // ☠️ DISPATCHED BEFORE THE GATEWAY-KEY GATE, AND BEFORE EVERY ROUTE. A sibling surface
@@ -1755,6 +1812,9 @@ export const createGatewayHandler = ({
       response.end(JSON.stringify({ error: { message: "only POST /v1/chat/completions, POST /v1/responses, POST /v1/messages, POST /v1/embeddings and GET /v1/models" } }));
       return;
     }
+    // ☆ From here on the request is an authorized model request, and only those are logged:
+    // a 401 to an unauthenticated prober must not be a way to fill the journal.
+    trace.route = url;
     const declaredBytes = Number(request.headers["content-length"]);
     if (api === EMBEDDINGS && Number.isFinite(declaredBytes) && declaredBytes > MAX_EMBEDDINGS_BODY_BYTES) {
       return respondJson(response, 413, { error: { message: "gateway: embeddings request body exceeds 1048576 bytes", type: "invalid_request_error" } });
@@ -1776,6 +1836,13 @@ export const createGatewayHandler = ({
       return;
     }
     const requestedModel = String(parsed?.model ?? "");
+    trace.label = requestedModel.slice(0, 100);
+    trace.streaming = parsed?.stream === true;
+    {
+      const route = modelRoute(config, requestedModel);
+      trace.profile = route?.profile ?? config.profile ?? null;
+      trace.tier = route?.tier ?? config.tier ?? null;
+    }
     if (api === EMBEDDINGS) {
       if (!modelRoute(config, requestedModel)) {
         return respondJson(response, 400, { error: { message: "gateway: embeddings require a mapped model", type: "invalid_request_error", param: "model" } });
@@ -1876,6 +1943,9 @@ export const createGatewayHandler = ({
         wireModelID: requestedModel,
         external: true,
       };
+      // Rides the session's own lease, so no gateway profile or tier was consulted.
+      trace.profile = null;
+      trace.tier = null;
     }
     const streaming = parsed.stream === true;
     // Anything that is not an explicit `stream: true` keeps the buffered
@@ -1954,10 +2024,14 @@ export const createGatewayHandler = ({
           ? request.headers["x-opencode-session-id"][0] : request.headers["x-opencode-session-id"],
         sessionKind: Array.isArray(request.headers["x-opencode-session-kind"])
           ? request.headers["x-opencode-session-kind"][0] : request.headers["x-opencode-session-kind"],
-      }, probeAssignment, boundLease);
+      }, probeAssignment, boundLease, trace);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
     }
+    // The status the gateway DECIDED, which is not always the one on the wire: a held-open
+    // request has already committed a 200 head before its 502 body.
+    trace.status = result.status;
+    if (result.status < 200 || result.status >= 300) trace.error = result.payload?.error?.message ?? null;
     // A streaming request that never got a frame out still owes the client an
     // ordinary JSON error, which is exactly what an OpenAI client expects when
     // a stream fails to start.
@@ -1975,13 +2049,63 @@ export const createGatewayHandler = ({
   // The bin fires this handler with `void` -- any rejection out of it is an
   // unhandledRejection, which is fatal in this node. A torn body read (client
   // gone mid-upload) or any future slip must end as a response, not a crash.
+  //
+  // The failure log is written here, after handle() has fully returned, so a record always carries
+  // every attempt the request made -- including one whose client walked away mid-way.
+  // ☆ Date.now(), not the injected `now`: tests drive that clock to steer waits, and the log must
+  // not add reads to it.
+  const writeFailureLog = (trace, response) => {
+    if (!trace.route) return; // never got past the key gate and route check
+    const status = trace.status ?? (response.headersSent ? response.statusCode : null);
+    const failed = status === null || status < 200 || status >= 300;
+    if (!trace.aborted && !failed && !trace.attempts.length) return; // a clean success: not logged
+    const record = (event, attempts) => JSON.stringify({
+      source: "opencode-broker-gateway",
+      ts: new Date().toISOString(),
+      event,
+      route: trace.route,
+      label: trace.label,
+      profile: trace.profile,
+      tier: trace.tier,
+      caller: trace.caller,
+      status,
+      attempts,
+      duration_ms: Date.now() - trace.started,
+      streaming: trace.streaming,
+      ...(trace.error ? { error: logDetail(trace.error) } : {}),
+    });
+    if (trace.aborted) logLine(record("client_aborted", trace.attempts));
+    else if (failed) logLine(record("request_failed", trace.attempts));
+    // Recovered: one line per lane that failed first, so a flapping lane is visible even though
+    // every caller got its answer.
+    else for (const attempt of trace.attempts) logLine(record("attempt_failed", [attempt]));
+  };
+
   return async (request, response) => {
-    try { await handle(request, response); } catch {
+    const trace = {
+      started: Date.now(),
+      route: null,
+      label: null,
+      profile: null,
+      tier: null,
+      caller: callerAddress(request),
+      streaming: false,
+      status: null,
+      error: null,
+      attempts: [],
+      aborted: false,
+    };
+    // Same test as the abort wiring in handle(): 'close' before our own end() is a hang-up.
+    response.on("close", () => { if (!response.writableEnded) trace.aborted = true; });
+    try { await handle(request, response, trace); } catch (error) {
+      trace.error = String(error?.message ?? error);
       try {
         if (response.headersSent) { response.end(); return; }
         response.writeHead(500, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: { message: "gateway internal error" } }));
       } catch { /* socket already gone */ }
+    } finally {
+      writeFailureLog(trace, response);
     }
   };
 };

@@ -612,6 +612,33 @@ backpressure, and reports input, output, cache-read, and cache-write usage.
   to `prepareWaitMs` (default 3 minutes). An unmapped one fails at once rather
   than holding a client that did not ask for that model. A model whose slots
   are all busy (`target-busy`) is waited out for every request.
+- **Failures are logged, successes are not.** Every authorized model request
+  that ends with a non-2xx status, or whose client disconnects, writes one JSON
+  line to stderr (journald under systemd); so does every upstream attempt that
+  failed before a later attempt succeeded. Clean successes write nothing. There
+  is no switch: the cost is one line per failure.
+
+  ```json
+  {"source":"opencode-broker-gateway","ts":"2026-10-12T14:41:33.643Z","event":"request_failed","route":"/v1/chat/completions","label":"smart","profile":"auto","tier":"smart","caller":"127.0.0.1","status":502,"attempts":[{"provider":"openai","model":"gpt-6-sol","outcome":"http_500","detail":"failed"},{"provider":"openai","model":"gpt-6-sol","outcome":"http_500","detail":"failed"}],"duration_ms":1,"streaming":false,"error":"gateway: no provider could serve the request: upstream openai HTTP 500: failed"}
+  ```
+
+  `event` is `request_failed` (non-2xx), `client_aborted` (the client hung up
+  first; `status` is what the gateway had decided, or the head already sent),
+  or `attempt_failed` (one line per failed lane of a request that then
+  succeeded, each with that one attempt). `status` is the status the gateway
+  decided, which for a `holdOpenMs` request can differ from the 200 already on
+  the wire. `caller` is the socket's remote address; `profile`/`tier` are null
+  for a session-bound request. An attempt's `outcome` is `http_<status>`,
+  `usage_limit`, `timeout`, `stalled` (streaming watchdog), `network`,
+  `stream_error`, `bad_json`, `credential` or `no_forward_config`. `detail` is
+  the upstream's error message (the `error.message` of a JSON body, else the
+  raw text) and `error` the gateway's own reply message. Both have control
+  characters stripped, `Bearer ...` and `sk-...` tokens replaced with
+  `[redacted]`, and are capped at 300 characters. Request and response bodies,
+  prompt text, headers and keys are never written. A failure before the
+  gateway key is checked (a 401) is not logged, so an unauthenticated prober
+  cannot fill the journal. Read them with
+  `journalctl --user -u opencode-gateway.service -o cat | grep '"event":'`.
 
 ### GPU tenant control
 
