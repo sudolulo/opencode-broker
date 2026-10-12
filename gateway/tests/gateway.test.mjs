@@ -3411,3 +3411,72 @@ test("a session-bound lease on a speed alias serves its base model, and nothing 
       `[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "${model}")`);
   }
 });
+
+// 2026-10-12: the routing retirement turned strictModelNames on, and every OpenCode turn on a
+// cloud model failed "Bad Request" for the next ten minutes. OpenCode puts the leased model's
+// real id (`claude-opus-5-5`, `gpt-6.1-sol`, ...) on the wire, never a gateway label, so the
+// allowlist refused all of them. A session-bound request is gated by /lease/verify instead --
+// exactly the leased model, nothing else -- which is tighter than any name list.
+test("strict model names do not refuse a session-bound request; its lease decides", async () => {
+  const scenario = async ({ held, model, session = true }) => {
+    const calls = [];
+    const forwards = [];
+    const handler = createGatewayHandler({
+      config: {
+        tier: "worker",
+        profile: "auto",
+        strictModelNames: true,
+        routedModelId: "auto",
+        providers: { anthropic: { baseUrl: "http://anthropic.example/v1" } },
+        modelProfiles: { smart: { profile: "auto", tier: "smart" } },
+      },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (path, body) => {
+        calls.push({ path, body });
+        if (path === "/lease/verify") {
+          return held
+            ? { held: true, leaseID: "lease-1", target: { id: "claude-opus-5-5", model: { providerID: "anthropic", id: "claude-opus-5-5" } } }
+            : { held: false };
+        }
+        if (path === "/lease") throw new Error("must not lease");
+        return { ok: true };
+      },
+      fetchImpl: async (url, init) => {
+        forwards.push({ url, body: JSON.parse(init.body) });
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "pong" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) };
+      },
+    });
+    let status;
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer gw-secret",
+          "Content-Type": "application/json",
+          ...(session ? { "x-opencode-session-id": "ses_abc", "x-opencode-lease-id": "lease-1" } : {}),
+        },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }] }),
+      });
+      status = response.status;
+      await response.arrayBuffer();
+    });
+    return { status, calls, forwards };
+  };
+
+  const ok = await scenario({ held: true, model: "claude-opus-5-5" });
+  assert.equal(ok.status, 200, "an OpenCode turn on its leased model is served under strict mode");
+  assert.equal(ok.forwards.length, 1);
+  assert.equal(ok.forwards[0].body.model, "claude-opus-5-5");
+
+  for (const refused of [
+    await scenario({ held: false, model: "claude-opus-5-5" }),
+    await scenario({ held: true, model: "claude-haiku-4-5" }),
+  ]) {
+    assert.equal(refused.status, 409, "the lease still refuses anything it did not grant");
+    assert.equal(refused.forwards.length, 0);
+  }
+
+  const anonymous = await scenario({ held: true, model: "claude-opus-5-5", session: false });
+  assert.equal(anonymous.status, 400, "without a session the allowlist still applies");
+  assert.equal(anonymous.calls.length, 0);
+});

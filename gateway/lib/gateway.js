@@ -2299,7 +2299,12 @@ export const createGatewayHandler = ({
         return respondJson(response, 400, { error: { message: "gateway: embeddings input has more than 2048 items", type: "invalid_request_error", param: "input" } });
       }
     }
-    if (config.strictModelNames && !advertisedModelIDs(config).includes(requestedModel)) {
+    // ☠️ NOT FOR A SESSION-BOUND REQUEST. OpenCode sends its leased model's real id
+    // (`claude-opus-5-5`), never a gateway label, and /lease/verify below admits exactly that id
+    // and nothing else -- a tighter gate than this list. Applying the list to it refused every
+    // OpenCode cloud turn the moment strict mode went on (2026-10-12, "Bad Request").
+    const sessionBound = request.headers["x-opencode-session-id"] !== undefined && !hasProbeMarker;
+    if (config.strictModelNames && !sessionBound && !advertisedModelIDs(config).includes(requestedModel)) {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         error: {
