@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { hideSubscriptionCosts } from "../lib/subscription-costs.js";
 
 const STATE = join(homedir(), ".local/share/opencode/model-default.json");
 
@@ -30,6 +31,7 @@ export const ModelDefault = async () => {
     config: async (input) => {
       config = input;
       applySelectedModel(config);
+      await hideSubscriptionCosts(config);
     },
     event: async ({ event }) => {
       // A long-lived TUI server does not reload config between home-screen prompts.
