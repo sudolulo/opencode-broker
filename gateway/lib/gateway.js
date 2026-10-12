@@ -661,6 +661,47 @@ const estimateUsage = (requestBody, outputChars) => ({
   estimated: true,
 });
 
+// A vision model tokenizes an image into a bounded number of patches, NOT into its base64
+// length: a 1280x720 Frigate JPEG is ~99,000 base64 characters (~24,700 by chars/4) and
+// llama.cpp measured 222-277 real prompt tokens for it on qwen3.8-27b. Counting images as text
+// put two snapshots past a 32768-token lane cap, so the request was never forwarded at all.
+// 1500 per image leaves headroom for larger images and other vision encoders.
+export const IMAGE_TOKEN_ESTIMATE = 1500;
+
+// Chat `image_url` parts and Responses `input_image` parts. A remote http(s) URL counts the same
+// allowance as inline data: the model sees the same image either way.
+const isImagePart = (part) => part && typeof part === "object"
+  && (part.type === "image_url" || part.type === "input_image");
+
+// Replaces image parts in a COPY of a content array; the forwarded body is never touched.
+const stripImages = (content, counter) => (Array.isArray(content)
+  ? content.map((part) => {
+    if (!isImagePart(part)) return part;
+    counter.images += 1;
+    return { type: part.type };
+  })
+  : content);
+
+// chars/4 is the usual serviceable estimate for OpenAI-shaped payloads, with each image part
+// counted at IMAGE_TOKEN_ESTIMATE instead of its serialized length.
+const estimateContextTokens = (requestBody) => {
+  const counter = { images: 0 };
+  const body = requestBody ?? {};
+  const withoutImages = {
+    ...body,
+    ...(Array.isArray(body.messages) ? { messages: body.messages.map((message) => (message && typeof message === "object"
+      ? { ...message, content: stripImages(message.content, counter) }
+      : message)) } : {}),
+    ...(Array.isArray(body.input) ? { input: body.input.map((item) => {
+      if (isImagePart(item)) { counter.images += 1; return { type: item.type }; }
+      return item && typeof item === "object" && Array.isArray(item.content)
+        ? { ...item, content: stripImages(item.content, counter) }
+        : item;
+    }) } : {}),
+  };
+  return Math.ceil(JSON.stringify(withoutImages).length / 4) + counter.images * IMAGE_TOKEN_ESTIMATE;
+};
+
 const embeddingInputItems = (input) => Array.isArray(input) && !input.every((entry) => Number.isInteger(entry)) ? input : [input];
 const embeddingInputTokens = (input) => embeddingInputItems(input).reduce((max, item) => Math.max(max,
   typeof item === "string" ? Math.ceil(item.length / 4) : Array.isArray(item) ? item.length : 0), 0);
@@ -1066,11 +1107,11 @@ export const createGatewayHandler = ({
     probeAssignment = null,
   ) => {
     // Local targets are strict: an unknown context size never fits them, so a
-    // lease without contextTokens can never land local. chars/4 is the usual
-    // serviceable estimate for OpenAI-shaped payloads.
+    // lease without contextTokens can never land local. See estimateContextTokens
+    // for why images are not counted by their base64 length.
     const contextTokens = api === EMBEDDINGS
       ? embeddingInputTokens(requestBody?.input)
-      : Math.ceil(JSON.stringify(requestBody ?? {}).length / 4);
+      : estimateContextTokens(requestBody);
     // A prompt can FIT a local model's context window and still be hopeless on
     // its hardware: a 26k-token prefill pinned the single llama.cpp slot for
     // many minutes and starved every other consumer (measured live). Providers
@@ -1082,17 +1123,27 @@ export const createGatewayHandler = ({
     // (declared context x localContextHeadroom) underneath either number.
     const override = Number(route?.maxContextTokens);
     const routeCap = Number.isFinite(override) && override > 0 ? override : null;
-    const forwardableProviders = allowedProviders.filter((id) => {
-      if (!providerServes(config.providers[id] ?? {}, api)) return false;
+    const capOf = (id) => {
       const cap = routeCap ?? Number(config.providers[id]?.maxContextTokens);
-      return !(Number.isFinite(cap) && cap > 0 && contextTokens > cap);
+      return Number.isFinite(cap) && cap > 0 ? cap : null;
+    };
+    const servingProviders = allowedProviders.filter((id) => providerServes(config.providers[id] ?? {}, api));
+    const forwardableProviders = servingProviders.filter((id) => {
+      const cap = capOf(id);
+      return !(cap !== null && contextTokens > cap);
     });
     const providers = forwardableProviders.filter((id) => !excludeProviders.includes(id));
     if (!providers.length) {
-      const apiUnsupported = !allowedProviders.some((id) => providerServes(config.providers[id] ?? {}, api));
+      const apiUnsupported = !servingProviders.length;
+      // Every lane that serves this API was dropped by its context cap alone: say THAT, with the
+      // numbers. "excluded" here sent an operator hunting for a failure that never happened.
+      // Several lanes may carry different caps; the largest is the one the request missed by least.
+      const overCap = !apiUnsupported && !forwardableProviders.length;
       const error = new Error(apiUnsupported
         ? `no configured lane serves /v1${api.path} (set ${api.name}Api: true on one that does)`
-        : "every forwardable provider was excluded this attempt");
+        : overCap
+          ? `request estimated at ${contextTokens} tokens exceeds the context cap ${Math.max(...servingProviders.map(capOf))} for every lane that serves it`
+          : "every forwardable provider was excluded this attempt");
       if (forwardableProviders.length && forwardableProviders.every((id) => excludeProviders.includes(id))) {
         error.code = LOCAL_FORWARDABLE_EXHAUSTION;
       }

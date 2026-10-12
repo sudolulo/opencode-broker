@@ -552,6 +552,14 @@ offered only to providers with `responsesApi: true` and `messagesApi: true`, res
 configured provider can serve the requested API, the gateway returns a capability-specific `502`
 without contacting the broker or an upstream.
 
+A chat or Responses request's context size is estimated as `ceil(chars / 4)` of its JSON body, with
+every image part (chat `image_url`, Responses `input_image`, inline base64 or a remote URL) counted
+as a flat 1,500 tokens instead of its encoded length. A 1280x720 JPEG is ~99,000 base64 characters
+but measured 222-277 real prompt tokens on qwen3.8-27b. A lane whose `maxContextTokens` (or the
+mapped name's override) is below the estimate is not offered the request; when that drops every
+lane that serves the API, the `502` says `request estimated at N tokens exceeds the context cap M
+for every lane that serves it`, M being the largest cap among those lanes.
+
 `POST /v1/embeddings` is buffered-only and is offered only to providers with
 `embeddingsApi: true`. It requires a mapped model and leases with `api: "embeddings"`, so it can
 use only a target marked `embedding: true`; those targets cannot serve chat, Responses, or Messages.
