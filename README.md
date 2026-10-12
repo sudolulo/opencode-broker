@@ -535,7 +535,7 @@ group or world permission bits, and sends its value only as `x-api-key`. This ke
 and provider OAuth state out of OpenCode's auth store. Provider keys are never logged. Per provider
 you can also set `headers`,
   `bodyExtras`, `dropBodyKeys` (for a lane that rejects a parameter the client
-sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"`, `chatApi`, `messagesApi`, `responsesApi`,
+sends), `streamIdleMs`, `streamUsage: false`, `jsonMode: "instruct"`, `assembleFromStream: true` (see below), `chatApi`, `messagesApi`, `responsesApi`,
   `embeddingsApi: true` (required for `/v1/embeddings`), `forwardSessionHints: true` (forward the request's `x-opencode-session-id` and
 `x-opencode-session-kind` to this lane: llm-auth-proxy uses the kind to pick its
 prompt-cache TTL, subagent 5m otherwise 1h, and the id to link request fingerprints
@@ -598,6 +598,26 @@ backpressure, and reports input, output, cache-read, and cache-write usage.
   error frame and is reported to the broker, but a second model's tokens are
   never spliced onto the first one's sentence. The stream watchdog measures
   silence, not total duration, so long generations are not cut off.
+- **A buffered request can be cancelled on a llama.cpp router lane
+  (`assembleFromStream: true`).** llama.cpp in router mode (measured on build
+  b11552) does not stop a NON-streaming generation when its HTTP client hangs
+  up; it stops a streaming one within about 0.2 s. So when the gateway's
+  `timeoutMs` fired, or a caller gave up, the gateway closed its connection and
+  the model kept generating to `max_tokens` -- one such orphan held a 27b slot
+  for 12 minutes, and a retry could add a second. On a provider with
+  `"assembleFromStream": true` the gateway forwards a non-streaming chat
+  request upstream with `stream: true` and `stream_options.include_usage`
+  (merged into any the client sent), reads the stream to `[DONE]`, and returns
+  the `chat.completion` the buffered upstream would have: content,
+  `reasoning_content`, tool calls assembled by index, `finish_reason`,
+  `logprobs`, usage, and any other field at its first non-null value. Timing
+  is the buffered path's (`timeoutMs` plus the client's abort, no stall
+  watchdog), and nothing reaches the client until the body is whole, so
+  failover, `holdOpenMs`, JSON unwrapping and accounting are unchanged. A
+  stream with an error frame, unparseable data or no `[DONE]` is a failed
+  attempt (`stream_error`) and fails over. Off by default; it never applies to
+  streaming requests, `n > 1`, `/v1/responses`, `/v1/messages` or
+  `/v1/embeddings`.
 - **Usage accounting is not the client's option.** The gateway asks every
   upstream for streamed usage and strips the extra frame for clients that did
   not ask. When an upstream sends none it estimates, and says so; it never

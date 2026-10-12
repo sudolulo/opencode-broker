@@ -821,6 +821,135 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
   return { relayed: true, usage, outputChars, error: null, sawDone: true };
 };
 
+// TRAP: WHY A BUFFERED ASK CAN GO UPSTREAM AS A STREAM (`assembleFromStream: true`). llama.cpp in
+// router mode (measured on build b11552, 2026-10-12) does NOT cancel a non-streaming generation
+// when its HTTP client hangs up; it cancels a streaming one within ~0.2 s. So the gateway's own
+// timeoutMs and a caller's disconnect both aborted the fetch and left the model generating to
+// max_tokens -- one orphan held a 27b slot for 12 minutes. A lane that opts in is asked to stream,
+// and this reads that stream to its end and builds the chat.completion the buffered upstream
+// would have returned, so aborting the fetch actually stops the generation. Nothing reaches the
+// client until it is whole, so failover and every consumer downstream are unchanged.
+// Returns { payload } or { error }; an abort while reading surfaces as the error itself, so the
+// caller can tell our impatience (or the client's) from a broken stream.
+const assembleChatCompletion = async (stream) => {
+  const decoder = new TextDecoder();
+  const top = new Map(); // first non-null value per unknown top-level key
+  const choices = new Map(); // by index
+  let usage;
+  let sawUsageKey = false;
+  let sawDone = false;
+  let buffer = "";
+  const keepFirst = (map, key, value) => {
+    if (!map.has(key) || (map.get(key) === null && value !== null)) map.set(key, value ?? null);
+  };
+  const choiceAt = (index) => {
+    if (!choices.has(index)) {
+      choices.set(index, { fields: new Map(), role: null, content: null, reasoning: null, toolCalls: new Map(), finishReason: null, logprobs: undefined });
+    }
+    return choices.get(index);
+  };
+  const absorb = (event) => {
+    for (const [key, value] of Object.entries(event)) {
+      if (key === "choices" || key === "object") continue;
+      if (key === "usage") {
+        sawUsageKey = true;
+        if (value && typeof value === "object") usage = value; // the final usage chunk wins
+        continue;
+      }
+      keepFirst(top, key, value);
+    }
+    for (const part of Array.isArray(event.choices) ? event.choices : []) {
+      const choice = choiceAt(Number(part?.index) || 0);
+      for (const [key, value] of Object.entries(part ?? {})) {
+        if (key === "index" || key === "delta") continue;
+        if (key === "finish_reason") { if (value != null) choice.finishReason = value; continue; }
+        if (key === "logprobs") {
+          // Streamed logprobs arrive a token's worth per chunk; buffered, as one list per field.
+          if (value && typeof value === "object") {
+            const merged = choice.logprobs ?? {};
+            for (const [field, entries] of Object.entries(value)) {
+              merged[field] = Array.isArray(entries) ? [...(Array.isArray(merged[field]) ? merged[field] : []), ...entries] : entries;
+            }
+            choice.logprobs = merged;
+          } else if (choice.logprobs === undefined) choice.logprobs = null;
+          continue;
+        }
+        keepFirst(choice.fields, key, value);
+      }
+      const delta = part?.delta ?? {};
+      if (typeof delta.role === "string" && !choice.role) choice.role = delta.role;
+      if (typeof delta.content === "string") choice.content = (choice.content ?? "") + delta.content;
+      if (typeof delta.reasoning_content === "string") choice.reasoning = (choice.reasoning ?? "") + delta.reasoning_content;
+      for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+        const at = Number(call?.index) || 0;
+        const entry = choice.toolCalls.get(at) ?? { id: null, name: null, arguments: "" };
+        if (!entry.id && call?.id) entry.id = call.id;
+        // The name is sent once, on the call's first delta; only the arguments are streamed.
+        if (!entry.name && call?.function?.name) entry.name = call.function.name;
+        if (typeof call?.function?.arguments === "string") entry.arguments += call.function.arguments;
+        choice.toolCalls.set(at, entry);
+      }
+    }
+  };
+  // Returns an Error for a frame that ends this attempt, else null.
+  const onFrame = (text) => {
+    const data = sseData(text);
+    if (!data) return null; // comment / heartbeat
+    if (data.trim() === "[DONE]") { sawDone = true; return null; }
+    let event;
+    try { event = JSON.parse(data); } catch {
+      return new Error("upstream stream carried unparseable data");
+    }
+    if (!event || typeof event !== "object") return new Error("upstream stream carried unparseable data");
+    if (event.error) return new Error(String(event.error?.message ?? JSON.stringify(event.error)).slice(0, 400));
+    absorb(event);
+    return null;
+  };
+  try {
+    // Leaving this loop early (return) cancels the body, which closes the upstream connection:
+    // a lane that sent garbage is not left generating either.
+    for await (const piece of stream) {
+      buffer += typeof piece === "string" ? piece : decoder.decode(piece, { stream: true });
+      let match;
+      while (!sawDone && (match = SSE_FRAME_END.exec(buffer))) {
+        const text = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        const failure = onFrame(text);
+        if (failure) return { error: failure };
+      }
+      if (sawDone) break;
+    }
+    if (!sawDone && buffer.trim()) {
+      const failure = onFrame(buffer.replace(/[\r\n]+$/, ""));
+      if (failure) return { error: failure };
+    }
+  } catch (error) {
+    return { error };
+  }
+  if (!sawDone) return { error: new Error("upstream stream ended without [DONE]") };
+  const payload = {};
+  for (const [key, value] of top) payload[key] = value;
+  payload.object = "chat.completion";
+  payload.choices = [...choices.keys()].sort((a, b) => a - b).map((index) => {
+    const choice = choices.get(index);
+    const toolCalls = [...choice.toolCalls.keys()].sort((a, b) => a - b).map((at) => {
+      const call = choice.toolCalls.get(at);
+      return { id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } };
+    });
+    // OpenAI's buffered shape: content is null for a pure tool-call turn, a string otherwise.
+    const message = { role: choice.role ?? "assistant", content: choice.content ?? (toolCalls.length ? null : "") };
+    if (choice.reasoning !== null) message.reasoning_content = choice.reasoning;
+    if (toolCalls.length) message.tool_calls = toolCalls;
+    const assembled = { index, message, finish_reason: choice.finishReason };
+    for (const [key, value] of choice.fields) assembled[key] = value;
+    if (choice.logprobs !== undefined) assembled.logprobs = choice.logprobs;
+    return assembled;
+  });
+  if (usage) payload.usage = usage;
+  else if (sawUsageKey) payload.usage = null;
+  return { payload };
+};
+
 export const createGatewayHandler = ({
   config,
   brokerRequest,
@@ -1316,6 +1445,11 @@ export const createGatewayHandler = ({
         stallTimer = setTimeout(() => stallAbort.abort(new DOMException("upstream stalled", "TimeoutError")), ms);
         stallTimer.unref?.();
       };
+      // Chat only, and never for n > 1 (one assembled choice per index is all this builds, and
+      // a multi-choice ask is rare enough to stay on the path it has always had). Embeddings,
+      // Responses and Messages keep their buffered upstream request.
+      const assembling = !streaming && api === CHAT && providerConfig.assembleFromStream === true
+        && !(Number(requestBody?.n) > 1);
       let response;
       let instructedJson = false;
       try {
@@ -1394,6 +1528,17 @@ export const createGatewayHandler = ({
           if (api === CHAT && providerConfig.streamUsage !== false) {
             forwardBody.stream_options = { ...(forwardBody.stream_options ?? {}), include_usage: true };
           }
+        }
+        // A buffered client ask on an `assembleFromStream` lane goes upstream as a stream, so an
+        // abort can cancel the generation (see assembleChatCompletion). include_usage is what keeps
+        // the assembled body's `usage` measured; the client's own stream_options are merged, not
+        // replaced.
+        if (assembling) {
+          forwardBody = {
+            ...forwardBody,
+            stream: true,
+            stream_options: { ...(forwardBody.stream_options ?? {}), include_usage: true },
+          };
         }
         if (api === CHAT && providerConfig.jsonMode === "instruct" && forwardBody.response_format) {
           const wantedJson = forwardBody.response_format?.type?.startsWith("json");
@@ -1625,12 +1770,36 @@ export const createGatewayHandler = ({
       // A 200 with an unparseable body IS a provider fault -- and an uncaught
       // throw here would escape completions() as an unhandledRejection.
       let payload;
-      try { payload = await response.json(); } catch {
-        await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
-        noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
-        rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
-        excludeLane(leased.providerID);
-        continue;
+      // The assembled body is read under the same signal as the buffered one (timeoutMs plus
+      // the client's abort), so the deadline is unchanged; an abort mid-read closes the upstream
+      // connection, which is the whole point. A lane that ignored `stream: true` and answered
+      // with one JSON body falls through to the ordinary buffered read below.
+      if (assembling && !String(response.headers?.get?.("content-type") ?? "").includes("application/json")) {
+        const outcome = await assembleChatCompletion(response.body ?? []);
+        if (outcome.error) {
+          // Nothing has reached the client: same sorting as a streamed attempt that failed with
+          // a clean wire -- our impatience or the client's releases, a broken stream indicts.
+          const error = outcome.error;
+          if (isAbort(error) || clientAbort?.aborted) {
+            await settle(leased, "/release");
+            if (clientAbort?.aborted) { lastError = new Error("client disconnected"); break; }
+          } else {
+            await settle(leased, "/failure", { error: { message: String(error?.message ?? error).slice(0, 400) } });
+          }
+          noteAttempt(leased, isAbort(error) ? thrownOutcome(error) : "stream_error", thrownDetail(error));
+          excludeLane(leased.providerID);
+          rememberForwardError(error);
+          continue;
+        }
+        payload = outcome.payload;
+      } else {
+        try { payload = await response.json(); } catch {
+          await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
+          noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
+          rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
+          excludeLane(leased.providerID);
+          continue;
+        }
       }
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
       // schema in some builds; instruct-mode models fence despite orders).
