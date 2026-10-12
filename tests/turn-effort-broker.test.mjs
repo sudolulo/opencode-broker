@@ -108,7 +108,7 @@ const lease = (socketPath, tier, sessionID, extra = {}) => post(socketPath, "/le
   ...extra,
 });
 
-test("turn effort is off by default without changing tier variants", async () => {
+test("absent turn effort leaves tier variants unchanged and writes no rows", async () => {
   const broker = await startBroker();
   try {
     for (const [tier, expected] of Object.entries({ smart: "high", build: "high", worker: "medium", deep: "xhigh" })) {
@@ -120,6 +120,37 @@ test("turn effort is off by default without changing tier variants", async () =>
       assert.deepEqual(withFields.target.model, before.target.model, `${tier} must remain byte-identical when mode is off`);
       assert.equal("turnEffort" in withFields, false);
     }
+    assert.equal(statSync(join(routingPath(broker.home), "turn-effort.jsonl"), { throwIfNoEntry: false }), undefined);
+  } finally {
+    await stopBroker(broker);
+  }
+});
+
+test("off mode leaves tier variants unchanged with valid turn fields", async () => {
+  const broker = await startBroker({ mode: "off", policy: "tier", models: ["openai/smart-model"] });
+  try {
+    for (const tier of ["smart", "build", "worker", "deep"]) {
+      const baseline = await lease(broker.socketPath, tier, `ses-off-baseline-${tier}`);
+      const withFields = await lease(broker.socketPath, tier, `ses-off-fields-${tier}`, {
+        turnClass: { class: "hard", reason: "explicit", resolvedFrom: "hard" }, engineEffortUpdates: true,
+      });
+      assert.equal(withFields.target.model.variant, baseline.target.model.variant, `${tier} must remain unchanged in off mode`);
+    }
+    assert.equal(statSync(join(routingPath(broker.home), "turn-effort.jsonl"), { throwIfNoEntry: false }), undefined);
+  } finally {
+    await stopBroker(broker);
+  }
+});
+
+test("shadow mode writes a turn effort row", async () => {
+  const broker = await startBroker({ mode: "shadow", policy: "tier", models: ["openai/smart-model"] });
+  try {
+    await lease(broker.socketPath, "smart", "ses-shadow", {
+      turnClass: { class: "hard", reason: "explicit" }, engineEffortUpdates: true,
+    });
+    const rows = readFileSync(join(routingPath(broker.home), "turn-effort.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].mode, "shadow");
   } finally {
     await stopBroker(broker);
   }
@@ -142,6 +173,16 @@ test("turn effort enforces eligible leases, logs bounded rows, rotates, and pres
     const fields = ["at", "sessionID", "leaseID", "tier", "targetID", "providerID", "modelID", "mode", "class", "reason", "resolvedFrom", "engineEffortUpdates", "eligible", "base", "policies", "applied", "clamped"];
     assert.deepEqual(Object.keys(rows[0]).sort(), fields.sort());
     assert.ok(Object.values(rows[0]).every((value) => typeof value !== "string" || value.length <= 200));
+
+    const invalid = await lease(broker.socketPath, "smart", "ses-invalid-class", {
+      turnClass: { class: "x".repeat(5000), reason: "<script>", resolvedFrom: { a: 1 } }, engineEffortUpdates: true,
+    });
+    assert.equal(invalid.target.model.variant, "high");
+    const invalidRow = readFileSync(turnLog, "utf8").trim().split("\n").map(JSON.parse).at(-1);
+    assert.equal(invalidRow.class, "invalid");
+    assert.equal(invalidRow.reason, "invalid");
+    assert.equal(invalidRow.resolvedFrom, "invalid");
+    assert.ok(Object.values(invalidRow).every((value) => typeof value !== "string" || value.length < 200));
 
     writeFileSync(turnLog, "x".repeat(8 * 1024 * 1024 + 1));
     await lease(broker.socketPath, "smart", "ses-rotated", {

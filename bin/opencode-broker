@@ -65,7 +65,7 @@ import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
 import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js";
-import { resolveTurnEffort } from "../lib/turn-effort.js";
+import { resolveTurnEffort, TURN_CLASSES, TURN_REASONS } from "../lib/turn-effort.js";
 import { TURN_EFFORT_CONFIG, TURN_EFFORT_CONFIG_ERROR } from "../lib/turn-effort-config.js";
 import { notifyArgv } from "../lib/notify.js";
 import { CONFIG_FINGERPRINT, DEPRECATIONS, envSetting, ROUTE_TIER_NAMES } from "../lib/config.js";
@@ -163,6 +163,15 @@ const logUsage = (record) => {
 };
 const TURN_EFFORT_LOG = join(routingStateDir(), "turn-effort.jsonl");
 const TURN_EFFORT_LOG_MAX = 8 * 1024 * 1024;
+const logTurnClass = (value) => value === undefined
+  ? null
+  : (TURN_CLASSES.includes(value) ? value : "invalid");
+const logTurnReason = (value) => value === undefined
+  ? null
+  : (TURN_REASONS.has(value) ? value : "invalid");
+const logResolvedFrom = (value) => value === undefined
+  ? null
+  : (["normal", "hard"].includes(value) ? value : "invalid");
 const logTurnEffort = (record) => {
   try {
     ensureRoutingStateDir();
@@ -1877,25 +1886,27 @@ const serve = async () => {
         const appliedTarget = effort.applied !== effort.base && target
           ? { ...target, model: { ...target.model, variant: effort.applied } }
           : target;
-        logTurnEffort({
-          at: Date.now(),
-          sessionID: typeof body.sessionID === "string" ? body.sessionID : null,
-          leaseID: lease.leaseID,
-          tier: body.tier ?? null,
-          targetID: lease.target?.id ?? null,
-          providerID: lease.target?.providerID ?? null,
-          modelID: lease.target?.modelID ?? null,
-          mode: TURN_EFFORT_CONFIG.mode,
-          class: body.turnClass?.class ?? null,
-          reason: body.turnClass?.reason ?? null,
-          resolvedFrom: body.turnClass?.resolvedFrom ?? null,
-          engineEffortUpdates: body.engineEffortUpdates === true,
-          eligible: effort.eligible,
-          base: effort.base,
-          policies: effort.policies,
-          applied: effort.applied,
-          clamped: effort.clamped,
-        });
+        if (TURN_EFFORT_CONFIG.mode !== "off") {
+          logTurnEffort({
+            at: Date.now(),
+            sessionID: typeof body.sessionID === "string" ? body.sessionID : null,
+            leaseID: lease.leaseID,
+            tier: body.tier ?? null,
+            targetID: lease.target?.id ?? null,
+            providerID: lease.target?.providerID ?? null,
+            modelID: lease.target?.modelID ?? null,
+            mode: TURN_EFFORT_CONFIG.mode,
+            class: logTurnClass(body.turnClass?.class),
+            reason: logTurnReason(body.turnClass?.reason),
+            resolvedFrom: logResolvedFrom(body.turnClass?.resolvedFrom),
+            engineEffortUpdates: body.engineEffortUpdates === true,
+            eligible: effort.eligible,
+            base: effort.base,
+            policies: effort.policies,
+            applied: effort.applied,
+            clamped: effort.clamped,
+          });
+        }
         return reply(response, 200, {
           leaseID: lease.leaseID,
           target: appliedTarget,
