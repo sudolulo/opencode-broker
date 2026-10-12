@@ -441,10 +441,24 @@ export const readGatewayKeyFile = (keyPath) => {
   return key;
 };
 
+// ☠️ `assembleFromStream` says "this lane streams, so ask it to even when the client did not";
+// `bufferStreamingUpstream` says "this lane cannot stream, so never ask it to". A lane carrying
+// both is a config that contradicts itself, and whichever one silently won would be wrong for
+// half its traffic. Refused at load and again at handler construction (tests and embedders pass
+// config without loading a file).
+const validateProviderFlags = (providers) => {
+  for (const [name, provider] of Object.entries(providers ?? {})) {
+    if (provider?.bufferStreamingUpstream === true && provider?.assembleFromStream === true) {
+      throw new Error(`providers["${name}"] sets both bufferStreamingUpstream and assembleFromStream: a lane either cannot stream (buffer) or should always stream (assemble), not both`);
+    }
+  }
+};
+
 export const loadGatewayConfig = (path = DEFAULT_GATEWAY_CONFIG) => {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   const providers = raw.providers && typeof raw.providers === "object" ? raw.providers : {};
   if (!Object.keys(providers).length) throw new Error("gateway config has no providers");
+  validateProviderFlags(providers);
   const modelProfiles = {};
   for (const [name, entry] of Object.entries(raw.modelProfiles && typeof raw.modelProfiles === "object" ? raw.modelProfiles : {})) {
     // Ceiling: this rejects only a MALFORMED entry (no profile, or a non-string
@@ -875,6 +889,112 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
   return { relayed: true, usage, outputChars, error: null, sawDone: true };
 };
 
+// TRAP: WHY A STREAMED ASK CAN GO UPSTREAM BUFFERED (`bufferStreamingUpstream: true`). The mirror
+// image of `assembleFromStream` below. Some lanes refuse to stream at all: the fleet auth proxy's
+// Anthropic chat route answers `stream: true` with a 400 ("stream must be false") and its
+// Responses route rejects any `stream` key, both on purpose. Home Assistant's Assist always
+// streams, so every Assist request that fell back to that lane failed (measured 2026-10-12). A
+// lane that opts in is asked for one buffered body; this reads it WHOLE and only then writes the
+// stream the client asked for, so a failed or abandoned attempt has written nothing and failover
+// is exactly the buffered path's. The cost, named: the client sees no token until the last one.
+// Returns relayStream's outcome shape. A failed read (our timeout, the client's abort) surfaces as
+// the error itself, so the caller can tell impatience from a broken body.
+const relayBufferedReply = async ({ response, sink, keepUsageFrames, api }) => {
+  const failed = (error) => ({ relayed: false, usage: null, outputChars: 0, sawDone: false, error });
+  let raw;
+  try { raw = await response.text(); } catch (error) { return failed(error); }
+  let payload;
+  try { payload = JSON.parse(raw); } catch {
+    return failed(new Error("upstream returned 200 with an unparseable JSON body"));
+  }
+  if (!payload || typeof payload !== "object") return failed(new Error("upstream returned 200 with an unparseable JSON body"));
+  const usage = payload.usage && typeof payload.usage === "object" ? readUsage(payload.usage) : null;
+  const frames = api === RESPONSES ? bufferedResponseEvents(payload) : bufferedChatFrames(payload, keepUsageFrames);
+  for (const frame of frames.text) await sink.write(frame);
+  return { relayed: true, usage, outputChars: frames.outputChars, error: null, sawDone: true };
+};
+
+// One chat.completion as the chunk sequence an OpenAI stream would have carried: per choice a
+// role/content delta (reasoning_content riding with it when present), one tool_calls delta holding
+// every call whole, and the finish_reason chunk; then the usage chunk if the client asked for it,
+// then [DONE]. Every top-level field but choices/usage/object rides on every chunk, so a client
+// that keeps the first value of each gets the buffered body back.
+const bufferedChatFrames = (payload, keepUsageFrames) => {
+  const head = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (key !== "choices" && key !== "usage" && key !== "object") head[key] = value;
+  }
+  head.object = "chat.completion.chunk";
+  const chunks = [];
+  let outputChars = 0;
+  (Array.isArray(payload.choices) ? payload.choices : []).forEach((choice, position) => {
+    const index = Number.isInteger(choice?.index) ? choice.index : position;
+    const message = choice?.message ?? {};
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    const content = typeof message.content === "string" ? message.content : (toolCalls.length ? null : "");
+    outputChars += content?.length ?? 0;
+    const delta = { role: message.role ?? "assistant", content };
+    if (typeof message.reasoning_content === "string") delta.reasoning_content = message.reasoning_content;
+    chunks.push({ ...head, choices: [{ index, delta, finish_reason: null, ...(choice?.logprobs !== undefined ? { logprobs: choice.logprobs } : {}) }] });
+    if (toolCalls.length) {
+      chunks.push({ ...head, choices: [{ index, delta: { tool_calls: toolCalls.map((call, at) => {
+        outputChars += String(call?.function?.arguments ?? "").length;
+        return { index: at, id: call?.id, type: call?.type ?? "function", function: { name: call?.function?.name, arguments: call?.function?.arguments ?? "" } };
+      }) }, finish_reason: null }] });
+    }
+    chunks.push({ ...head, choices: [{ index, delta: {}, finish_reason: choice?.finish_reason ?? "stop" }] });
+  });
+  if (keepUsageFrames && payload.usage && typeof payload.usage === "object") chunks.push({ ...head, choices: [], usage: payload.usage });
+  return { text: [...chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`), DONE_FRAME], outputChars };
+};
+
+// One Responses object as the typed event sequence its stream would have carried: created, then
+// per output item added -> (text part added/delta/done, or arguments delta/done) -> done, then the
+// terminal event carrying the buffered response whole. Item kinds without deltas (reasoning, ...)
+// get only added/done, both carrying the item. Responses streams have no [DONE].
+const bufferedResponseEvents = (payload) => {
+  const events = [];
+  let outputChars = 0;
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  events.push({ type: "response.created", response: { ...payload, status: "in_progress", output: [], usage: null } });
+  output.forEach((item, outputIndex) => {
+    const itemId = item?.id;
+    if (item?.type === "message") {
+      const parts = Array.isArray(item.content) ? item.content : [];
+      events.push({ type: "response.output_item.added", output_index: outputIndex, item: { ...item, status: "in_progress", content: [] } });
+      parts.forEach((part, contentIndex) => {
+        const at = { item_id: itemId, output_index: outputIndex, content_index: contentIndex };
+        if (part?.type === "output_text" && typeof part.text === "string") {
+          outputChars += part.text.length;
+          events.push({ type: "response.content_part.added", ...at, part: { ...part, text: "" } });
+          events.push({ type: "response.output_text.delta", ...at, delta: part.text });
+          events.push({ type: "response.output_text.done", ...at, text: part.text });
+        } else {
+          events.push({ type: "response.content_part.added", ...at, part });
+        }
+        events.push({ type: "response.content_part.done", ...at, part });
+      });
+    } else if (item?.type === "function_call") {
+      const args = typeof item.arguments === "string" ? item.arguments : "";
+      outputChars += args.length;
+      events.push({ type: "response.output_item.added", output_index: outputIndex, item: { ...item, status: "in_progress", arguments: "" } });
+      events.push({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: outputIndex, delta: args });
+      events.push({ type: "response.function_call_arguments.done", item_id: itemId, output_index: outputIndex, arguments: args });
+    } else {
+      events.push({ type: "response.output_item.added", output_index: outputIndex, item });
+    }
+    events.push({ type: "response.output_item.done", output_index: outputIndex, item });
+  });
+  const terminal = payload.status === "incomplete" ? "response.incomplete"
+    : payload.status === "failed" ? "response.failed"
+      : "response.completed";
+  events.push({ type: terminal, response: payload });
+  return {
+    text: events.map((event, sequence) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number: sequence })}\n\n`),
+    outputChars,
+  };
+};
+
 // TRAP: WHY A BUFFERED ASK CAN GO UPSTREAM AS A STREAM (`assembleFromStream: true`). llama.cpp in
 // router mode (measured on build b11552, 2026-10-12) does NOT cancel a non-streaming generation
 // when its HTTP client hangs up; it cancels a streaming one within ~0.2 s. So the gateway's own
@@ -1102,6 +1222,7 @@ export const createGatewayHandler = ({
   // so tests can read it; production writes stderr, which systemd hands to journald.
   logLine = (line) => { process.stderr.write(`${line}\n`); },
 }) => {
+  validateProviderFlags(config.providers);
   const allowedProviders = Object.keys(config.providers);
 
   // WHO ASKED, per gateway session: the client's address and the model name it sent. Every
@@ -1574,7 +1695,15 @@ export const createGatewayHandler = ({
       // window guards the wait for the FIRST frame (where failover still
       // works), and every frame that arrives resets it, so only actual silence
       // kills. What it measures is silence, never total duration.
-      const stallAbort = streaming ? new AbortController() : null;
+      // A streamed client ask on a `bufferStreamingUpstream` lane goes upstream BUFFERED (see
+      // relayBufferedReply), so it wears the buffered path's clock -- timeoutMs as a total deadline
+      // plus the client's abort -- and never the stall watchdog: a buffered upstream sends nothing
+      // until it is done, which the watchdog would read as a stall. Messages keeps its native
+      // stream; the flag covers the two OpenAI-shaped routes.
+      const bufferingStream = streaming && providerConfig.bufferStreamingUpstream === true
+        && (api === CHAT || api === RESPONSES);
+      const upstreamStreaming = streaming && !bufferingStream;
+      const stallAbort = upstreamStreaming ? new AbortController() : null;
       let stallTimer = null;
       const touch = (ms) => {
         clearTimeout(stallTimer);
@@ -1593,14 +1722,14 @@ export const createGatewayHandler = ({
       let response;
       let instructedJson = false;
       try {
-        const abort = streaming
+        const abort = upstreamStreaming
           ? (AbortSignal.any
             ? AbortSignal.any([stallAbort.signal, ...(clientAbort ? [clientAbort] : [])])
             : stallAbort.signal)
           : (AbortSignal.any
             ? AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(clientAbort ? [clientAbort] : [])])
             : AbortSignal.timeout(timeoutMs));
-        if (streaming) touch(idleMs);
+        if (upstreamStreaming) touch(idleMs);
         // Providers without OpenAI's json_object mode (Anthropic's compat
         // endpoint accepts only strict closed schemas) get the instruct
         // bridge: strip response_format, demand raw JSON in an appended
@@ -1646,7 +1775,14 @@ export const createGatewayHandler = ({
             forwardBody.response_format = { type: "json_object" };
           }
         }
-        if (streaming) {
+        if (bufferingStream) {
+          // Both keys go, not `stream: false`: the proxy's Responses route rejects any `stream`
+          // key, and its chat route rejects `stream_options` as an unknown field. The client's
+          // include_usage ask is honoured downstream from the buffered body's usage.
+          delete forwardBody.stream;
+          delete forwardBody.stream_options;
+        }
+        if (upstreamStreaming) {
           // ☠️ HOW USAGE SURVIVES STREAMING. A buffered response hands us
           // `usage` for free; a stream only carries it when include_usage is
           // set, so the gateway sets it ON EVERY streamed request whether the
@@ -1814,7 +1950,12 @@ export const createGatewayHandler = ({
           // ☆ Dressing a buffered body as a stream is a chat-only courtesy: a
           // responses stream is a sequence of typed events a client parses by
           // type, and inventing them risks a shape the client rejects halfway.
-          outcome = contentType.includes("application/json")
+          // A buffered upstream reply: read whole under the buffered signal, THEN written as the
+          // stream. Until it is whole `relayed` stays false, so everything below sorts it exactly
+          // like a streamed attempt that failed with the wire clean.
+          outcome = bufferingStream
+            ? await relayBufferedReply({ response, sink, keepUsageFrames, api })
+            : contentType.includes("application/json")
             ? (api === CHAT
               ? await relayBufferedAsStream({ response, sink, keepUsageFrames })
               : { relayed: false, usage: null, outputChars: 0, sawDone: false,

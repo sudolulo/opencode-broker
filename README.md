@@ -609,6 +609,24 @@ backpressure, and reports input, output, cache-read, and cache-write usage.
   error frame and is reported to the broker, but a second model's tokens are
   never spliced onto the first one's sentence. The stream watchdog measures
   silence, not total duration, so long generations are not cut off.
+- **A lane that cannot stream is asked for a buffered reply
+  (`bufferStreamingUpstream: true`).** The fleet auth proxy refuses streaming on
+  purpose: its Anthropic chat route rejects `stream` unless it is false, and its
+  Anthropic Responses route rejects a `stream` key at all. A caller that streams
+  -- Home Assistant Assist does -- therefore failed with `llm-auth-proxy: stream
+  must be false` every time its profile fell back to that lane. On a provider
+  with `"bufferStreamingUpstream": true` a streaming chat or `/v1/responses` ask
+  goes upstream buffered, with `stream` and `stream_options` removed, and the
+  finished reply is written to the client as the equivalent SSE stream: chat
+  sends role and content deltas (with `reasoning_content`), one `tool_calls`
+  delta, the `finish_reason` chunk, a usage chunk only when the client asked for
+  `stream_options.include_usage`, then `[DONE]`; `/v1/responses` sends typed
+  events from `response.created` through `response.completed`, `.incomplete` or
+  `.failed`. The client sees no tokens until the reply is whole, which is what
+  keeps failover, lease settle and release, usage reporting and the failure log
+  identical to the buffered path; `timeoutMs` is the deadline and no stall
+  watchdog applies. This is the mirror image of `assembleFromStream`, so a lane
+  that sets both is refused when the config loads.
 - **A buffered request can be cancelled on a llama.cpp router lane
   (`assembleFromStream: true`).** llama.cpp in router mode (measured on build
   b11552) does not stop a NON-streaming generation when its HTTP client hangs
