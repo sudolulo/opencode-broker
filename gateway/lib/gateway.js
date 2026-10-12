@@ -872,21 +872,12 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
     return { relayed: false, usage: null, outputChars: 0, sawDone: false,
       error: new Error("upstream returned 200 with an unparseable JSON body") };
   }
-  const created = Number(payload?.created) || Math.floor(Date.now() / 1000);
-  const head = { id: String(payload?.id ?? `chatcmpl-gw-${created}`), object: "chat.completion.chunk", created, model: String(payload?.model ?? "") };
-  let outputChars = 0;
-  const frames = [];
-  (Array.isArray(payload?.choices) ? payload.choices : []).forEach((choice, index) => {
-    const content = typeof choice?.message?.content === "string" ? choice.message.content : "";
-    outputChars += content.length;
-    frames.push({ ...head, choices: [{ index, delta: { role: choice?.message?.role ?? "assistant", content }, finish_reason: null }] });
-    frames.push({ ...head, choices: [{ index, delta: {}, finish_reason: choice?.finish_reason ?? "stop" }] });
-  });
   const usage = payload?.usage && typeof payload.usage === "object" ? readUsage(payload.usage) : null;
-  if (usage && keepUsageFrames) frames.push({ ...head, choices: [], usage: payload.usage });
-  for (const frame of frames) await sink.write(`data: ${JSON.stringify(frame)}\n\n`);
-  await sink.write(DONE_FRAME);
-  return { relayed: true, usage, outputChars, error: null, sawDone: true };
+  // Keep this dialect-recovery path byte-for-byte aligned with a deliberately buffered upstream
+  // reply: tool calls and reasoning are part of the stream contract too.
+  const frames = bufferedChatFrames(payload && typeof payload === "object" ? payload : {}, keepUsageFrames);
+  for (const frame of frames.text) await sink.write(frame);
+  return { relayed: true, usage, outputChars: frames.outputChars, error: null, sawDone: true };
 };
 
 // TRAP: WHY A STREAMED ASK CAN GO UPSTREAM BUFFERED (`bufferStreamingUpstream: true`). The mirror

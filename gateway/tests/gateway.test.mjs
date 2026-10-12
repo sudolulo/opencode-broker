@@ -913,6 +913,62 @@ test("a lane that ignores stream: true is dressed as a stream instead of breakin
   assert.ok(brokerCalls.some((call) => call.route === "/complete"), "a working lane is not indicted for a dialect gap");
 });
 
+test("a buffered chat reply on the older streaming path preserves tool calls, reasoning, and requested usage", async () => {
+  const completion = {
+    id: "c-tool", created: 1760000000, model: "m",
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant", content: "I will check.", reasoning_content: "Need the weather tool.",
+        tool_calls: [{ id: "call_weather", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Paris\"}" } }],
+      },
+      finish_reason: "tool_calls",
+    }],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+  };
+  const upstream = await startUpstream(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(completion));
+  });
+  const brokerCalls = [];
+  const handler = streamingHandler({
+    providers: { llamacpp: { baseUrl: upstream.base } },
+    brokerCalls,
+    leases: [
+      { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b-coder" } } },
+      { target: { model: { providerID: "llamacpp", id: "qwen3.5-9b-coder" } } },
+    ],
+  });
+  const readEvents = (text) => text.trim().split(/\r?\n\r?\n/).map((frame) => {
+    const data = frame.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim();
+    return data === "[DONE]" ? data : JSON.parse(data);
+  });
+  try {
+    await withServer(handler, async (base) => {
+      const withoutUsage = readEvents(await drain(await askStream(base)));
+      assert.equal(withoutUsage.at(-1), "[DONE]", "the older path still terminates the stream");
+      assert.ok(!withoutUsage.some((frame) => frame !== "[DONE]" && frame.usage), "usage stays absent without include_usage");
+      const toolChunk = withoutUsage.find((frame) => frame !== "[DONE]" && frame.choices[0]?.delta.tool_calls);
+      assert.ok(toolChunk, "the client receives a tool_calls delta");
+      assert.deepEqual(toolChunk.choices[0].delta.tool_calls, [{
+        index: 0, id: "call_weather", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Paris\"}" },
+      }]);
+      const firstDelta = withoutUsage.find((frame) => frame !== "[DONE]" && frame.choices[0]?.delta.role);
+      assert.deepEqual(firstDelta.choices[0].delta, {
+        role: "assistant", content: "I will check.", reasoning_content: "Need the weather tool.",
+      });
+      assert.equal(withoutUsage.find((frame) => frame !== "[DONE]" && frame.choices[0]?.finish_reason)?.choices[0].finish_reason, "tool_calls");
+
+      const withUsage = readEvents(await drain(await askStream(base, { stream_options: { include_usage: true } })));
+      assert.deepEqual(withUsage.at(-2).usage, completion.usage, "include_usage adds the buffered usage frame before [DONE]");
+      assert.equal(withUsage.at(-1), "[DONE]");
+    });
+  } finally {
+    await upstream.close();
+  }
+});
+
 test("a client that disconnects mid-stream releases the lease and indicts nobody", async () => {
   let clientGotFirst;
   const relayed = new Promise((resolve) => { clientGotFirst = resolve; });

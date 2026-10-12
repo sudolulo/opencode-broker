@@ -200,6 +200,10 @@ All notable changes to this project are documented here. The format is based on
   and two of them quarantined a healthy anthropic. It is now classified `noop`, like the router's
   other self-inflicted errors.
 
+### Fixed
+
+- **A streamed client no longer loses tool calls when a lane ignores `stream: true`.** When a lane answered a streaming ask with a single buffered chat document, the gateway dressed it as a stream by hand and emitted only a content delta and a `finish_reason` delta, silently dropping every `tool_calls` entry and any `reasoning_content`: a tool-using caller on such a lane received a content-only answer and no tool call at all. That path now builds its frames with the same helper as `bufferStreamingUpstream`, so indexed tool calls (id, type, function name and the full arguments string), reasoning, `finish_reason` and a usage frame when the client asked for `include_usage` all survive. Its outcome classification, usage accounting and failure logging are unchanged.
+
 ## [1.24.0] — 2026-09-30
 
 ### Added

@@ -626,7 +626,10 @@ backpressure, and reports input, output, cache-read, and cache-write usage.
   keeps failover, lease settle and release, usage reporting and the failure log
   identical to the buffered path; `timeoutMs` is the deadline and no stall
   watchdog applies. This is the mirror image of `assembleFromStream`, so a lane
-  that sets both is refused when the config loads.
+  that sets both is refused when the config loads. A lane that was asked to
+  stream but answered with one buffered chat document instead is dressed as a
+  stream through the same framing, so a streamed client keeps its tool calls and
+  reasoning there too; it used to receive content and a `finish_reason` only.
 - **A buffered request can be cancelled on a llama.cpp router lane
   (`assembleFromStream: true`).** llama.cpp in router mode (measured on build
   b11552) does not stop a NON-streaming generation when its HTTP client hangs
