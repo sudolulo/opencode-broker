@@ -65,6 +65,8 @@ import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
 import { createSlotWatch, parseLlamaMetrics } from "../lib/slot-watch.js";
 import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js";
+import { resolveTurnEffort } from "../lib/turn-effort.js";
+import { TURN_EFFORT_CONFIG, TURN_EFFORT_CONFIG_ERROR } from "../lib/turn-effort-config.js";
 import { notifyArgv } from "../lib/notify.js";
 import { CONFIG_FINGERPRINT, DEPRECATIONS, envSetting, ROUTE_TIER_NAMES } from "../lib/config.js";
 import {
@@ -158,6 +160,19 @@ const logUsage = (record) => {
     if (statSync(USAGE_LOG, { throwIfNoEntry: false })?.size > USAGE_LOG_MAX) renameSync(USAGE_LOG, `${USAGE_LOG}.1`);
     appendFileSync(USAGE_LOG, JSON.stringify(record) + "\n");
   } catch {}
+};
+const TURN_EFFORT_LOG = join(routingStateDir(), "turn-effort.jsonl");
+const TURN_EFFORT_LOG_MAX = 8 * 1024 * 1024;
+const logTurnEffort = (record) => {
+  try {
+    ensureRoutingStateDir();
+    if (statSync(TURN_EFFORT_LOG, { throwIfNoEntry: false })?.size > TURN_EFFORT_LOG_MAX) {
+      renameSync(TURN_EFFORT_LOG, `${TURN_EFFORT_LOG}.1`);
+    }
+    appendFileSync(TURN_EFFORT_LOG, JSON.stringify(record) + "\n");
+  } catch (error) {
+    console.error(`[opencode-broker] could not write turn effort log: ${error?.message ?? error}`);
+  }
 };
 // ☠️ A WAIT IS LOGGED ONCE A MINUTE PER SESSION, NOT ONCE PER POLL. A caller that waits out a
 // busy or absent local model re-leases every few seconds, and each refusal was a decision line:
@@ -440,6 +455,7 @@ const publicTarget = (target, tier, modelVariants) => target && {
 
 const publicState = (state, resolverProcesses = null) => ({
   ...state,
+  turnEffortConfigError: TURN_EFFORT_CONFIG_ERROR,
   ...(resolverProcesses ? { resolverProcesses: resolverProcesses.status() } : {}),
   circuits: Object.fromEntries(Object.entries(state.circuits).map(([key, circuit]) => [key, {
     ...circuit,
@@ -1846,9 +1862,43 @@ const serve = async () => {
           blockedGeneration = false,
           registration: decisionRegistration = registration,
         } = state.lastDecision ?? {};
+        const target = publicTarget(lease.target, body.tier, state.inventory?.modelVariants);
+        const modelKey = `${lease.target?.providerID}/${lease.target?.modelID}`;
+        const effort = resolveTurnEffort({
+          baseVariant: target?.model?.variant,
+          advertised: state.inventory?.modelVariants?.[modelKey] ?? [],
+          ceiling: lease.target?.effortCeiling,
+          turnClass: body.turnClass,
+          engineEffortUpdates: body.engineEffortUpdates === true,
+          modelKey,
+          sessionID: body.sessionID,
+          config: TURN_EFFORT_CONFIG,
+        });
+        const appliedTarget = effort.applied !== effort.base && target
+          ? { ...target, model: { ...target.model, variant: effort.applied } }
+          : target;
+        logTurnEffort({
+          at: Date.now(),
+          sessionID: typeof body.sessionID === "string" ? body.sessionID : null,
+          leaseID: lease.leaseID,
+          tier: body.tier ?? null,
+          targetID: lease.target?.id ?? null,
+          providerID: lease.target?.providerID ?? null,
+          modelID: lease.target?.modelID ?? null,
+          mode: TURN_EFFORT_CONFIG.mode,
+          class: body.turnClass?.class ?? null,
+          reason: body.turnClass?.reason ?? null,
+          resolvedFrom: body.turnClass?.resolvedFrom ?? null,
+          engineEffortUpdates: body.engineEffortUpdates === true,
+          eligible: effort.eligible,
+          base: effort.base,
+          policies: effort.policies,
+          applied: effort.applied,
+          clamped: effort.clamped,
+        });
         return reply(response, 200, {
           leaseID: lease.leaseID,
-          target: publicTarget(lease.target, body.tier, state.inventory?.modelVariants),
+          target: appliedTarget,
           existing: lease.existing,
           decision: {
             policy,
@@ -2248,7 +2298,7 @@ const serve = async () => {
           }
         }
         logUsage(usageRecord({
-          at: Date.now(), sessionID, providerID,
+          at: Date.now(), sessionID, leaseID: typeof body.leaseID === "string" ? body.leaseID : undefined, providerID,
           modelID,
           // rootSessionID is passed as-is; usageRecord drops it from the written line when
           // it equals the session itself (the root carries no new signal when it is its own
