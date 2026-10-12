@@ -83,6 +83,27 @@ const ask = (base, body = {}, init = {}) => fetch(`${base}/v1/chat/completions`,
   ...init,
 });
 
+const askResponses = (base, body = {}, init = {}) => fetch(`${base}/v1/responses`, {
+  method: "POST",
+  headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+  body: JSON.stringify({ model: "anything", input: "hi", ...body }),
+  ...init,
+});
+
+const askResponsesThrough = async (upstream, assembleFromStream, body = {}) => {
+  const brokerCalls = [];
+  const handler = gateway({
+    providers: { llamacpp: { baseUrl: upstream.base, responsesApi: true, ...(assembleFromStream ? { assembleFromStream: true } : {}) } },
+    leases: [{ ...LEASE_LOCAL }], brokerCalls,
+  });
+  let status; let payload;
+  await withServer(handler, async (base) => {
+    const response = await askResponses(base, body);
+    status = response.status; payload = await response.json();
+  });
+  return { status, payload, brokerCalls };
+};
+
 // One non-streaming request through a gateway whose llamacpp lane has the flag set as given.
 const askThrough = async (upstream, assembleFromStream, body = {}) => {
   const brokerCalls = [];
@@ -546,7 +567,7 @@ test("embeddings on a flagged lane are forwarded exactly as without the flag", a
   assert.deepEqual(forwarded[0].body, { model: "qwen3-embedding-0.6b", input: "hello" });
 });
 
-test("a /v1/responses request on a flagged lane stays a buffered upstream request", async () => {
+test("a buffered /v1/responses request on a flagged lane is forwarded as a stream", async () => {
   const forwarded = [];
   const handler = createGatewayHandler({
     config: { tier: "worker", profile: "auto", providers: { llamacpp: { baseUrl: "http://local.example/v1", responsesApi: true, assembleFromStream: true } } },
@@ -554,7 +575,9 @@ test("a /v1/responses request on a flagged lane stays a buffered upstream reques
     brokerRequest: async (path) => path === "/lease" ? { ...LEASE_LOCAL } : { ok: true },
     fetchImpl: async (url, options) => {
       forwarded.push({ url, body: JSON.parse(options.body) });
-      return { ok: true, status: 200, json: async () => ({ id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } }) };
+      const event = `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`;
+      return { ok: true, status: 200, headers: new Headers({ "content-type": "text/event-stream" }),
+        body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(event)); controller.close(); } }) };
     },
   });
   await withServer(handler, async (base) => {
@@ -564,8 +587,121 @@ test("a /v1/responses request on a flagged lane stays a buffered upstream reques
       body: JSON.stringify({ model: "anything", input: "hi" }),
     });
     assert.equal(response.status, 200);
-    await response.json();
+    assert.deepEqual(await response.json(), { id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } });
   });
-  assert.equal(forwarded[0].body.stream, undefined);
+  assert.equal(forwarded[0].body.stream, true);
   assert.equal(forwarded[0].body.stream_options, undefined);
+});
+
+const responseBody = (output, usage = { input_tokens: 11, output_tokens: 4 }) => ({
+  id: "resp_abc", object: "response", created_at: 1760000000, model: "qwen3.8-27b", status: "completed", output, usage,
+});
+const responseCompleted = (response) => ({ type: "response.completed", response });
+const responseScenarios = {
+  text: responseBody([{ id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] }]),
+  "reasoning plus text": responseBody([{ id: "rs_1", type: "reasoning", summary: [{ type: "summary_text", text: "Because." }] }, { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "42" }] }]),
+  "function call": responseBody([{ id: "fc_1", type: "function_call", call_id: "call_1", name: "weather", arguments: "{\"city\":\"Paris\"}", status: "completed" }]),
+};
+
+for (const [name, buffered] of Object.entries(responseScenarios)) {
+  test(`assembled Responses ${name} deep-equals the buffered reply and reports its usage`, async () => {
+    const upstream = await scriptedUpstream({ chunks: [responseCompleted(buffered)], buffered });
+    try {
+      const plain = await askResponsesThrough(upstream, false);
+      const assembled = await askResponsesThrough(upstream, true);
+      assert.equal(plain.status, 200); assert.equal(assembled.status, 200);
+      assert.deepEqual(assembled.payload, plain.payload);
+      assert.equal(upstream.seen[0].stream, undefined);
+      assert.equal(upstream.seen[1].stream, true);
+      assert.equal(upstream.seen[1].stream_options, undefined);
+      assert.deepEqual(assembled.brokerCalls.find((call) => call.route === "/usage")?.body.tokens, { input: 11, output: 4 });
+    } finally { await upstream.close(); }
+  });
+}
+
+test("Responses completion without response assembles text and function arguments from events", async () => {
+  const upstream = await scriptedUpstream({ chunks: [
+    { type: "response.created", response: { id: "resp_fallback", created_at: 1, model: "qwen", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "msg", type: "message", role: "assistant", content: [] } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "Hi" },
+    { type: "response.output_item.added", output_index: 1, item: { id: "fc", type: "function_call", call_id: "call", name: "weather", arguments: "" } },
+    { type: "response.function_call_arguments.delta", output_index: 1, delta: "{}" }, { type: "response.completed" },
+  ] });
+  try {
+    const result = await askResponsesThrough(upstream, true);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.payload.output, [
+      { id: "msg", type: "message", role: "assistant", content: [{ type: "output_text", text: "Hi" }] },
+      { id: "fc", type: "function_call", call_id: "call", name: "weather", arguments: "{}" },
+    ]);
+  } finally { await upstream.close(); }
+});
+
+for (const [name, chunks] of Object.entries({
+  "response.failed": [{ type: "response.failed", response: { error: { message: "no slot" } } }],
+  "error event": [{ type: "error", message: "no slot" }],
+  "missing completion": [{ type: "response.created", response: { id: "resp_1" } }],
+})) {
+  test(`Responses ${name} is stream_error and fails over before writing a response`, async () => {
+    const broken = await scriptedUpstream({ chunks, done: false });
+    const alive = await scriptedUpstream({ buffered: responseScenarios.text });
+    const brokerCalls = []; const logLines = [];
+    const handler = gateway({ providers: { llamacpp: { baseUrl: broken.base, responsesApi: true, assembleFromStream: true }, second: { baseUrl: alive.base, responsesApi: true } }, leases: [{ ...LEASE_LOCAL }, { ...LEASE_SECOND }], brokerCalls, logLines });
+    try {
+      await withServer(handler, async (base) => {
+        const response = await askResponses(base); assert.equal(response.status, 200); assert.deepEqual(await response.json(), responseScenarios.text);
+      });
+      assert.equal(broken.seen[0].stream, true); assert.equal(alive.seen[0].stream, undefined);
+      assert.ok(brokerCalls.some((call) => call.route === "/failure"));
+      assert.equal(JSON.parse(logLines.at(-1)).attempts[0].outcome, "stream_error");
+    } finally { await broken.close(); await alive.close(); }
+  });
+}
+
+test("a client disconnecting from buffered Responses closes the upstream streaming connection within 1 s", async () => {
+  const upstream = await scriptedUpstream({ chunks: [{ type: "response.created", response: { id: "resp_live" } }], hold: true });
+  const brokerCalls = [];
+  const handler = gateway({ providers: { llamacpp: { baseUrl: upstream.base, responsesApi: true, assembleFromStream: true, timeoutMs: 60_000 } }, leases: [{ ...LEASE_LOCAL }], brokerCalls });
+  try {
+    await withServer(handler, async (base) => {
+      const abort = new AbortController();
+      const pending = askResponses(base, {}, { signal: abort.signal }).catch(() => null);
+      await upstream.started;
+      const abortedAt = Date.now(); abort.abort(); await pending;
+      const closedAt = await Promise.race([upstream.closed, delay(1000).then(() => null)]);
+      assert.ok(closedAt && closedAt - abortedAt <= 1000, "upstream stream closes within 1 s");
+    });
+    assert.equal(upstream.seen[0].stream, true);
+    assert.ok(brokerCalls.some((call) => call.route === "/release"));
+    assert.ok(!brokerCalls.some((call) => call.route === "/failure"));
+  } finally { await upstream.close(); }
+});
+
+test("Responses timeout closes the upstream stream, releases it, and fails over", async () => {
+  const stuck = await scriptedUpstream({ chunks: [{ type: "response.created", response: { id: "resp_live" } }], hold: true });
+  const alive = await scriptedUpstream({ buffered: responseScenarios.text });
+  const brokerCalls = []; const logLines = [];
+  const handler = gateway({ providers: { llamacpp: { baseUrl: stuck.base, responsesApi: true, assembleFromStream: true, timeoutMs: 300 }, second: { baseUrl: alive.base, responsesApi: true } }, leases: [{ ...LEASE_LOCAL }, { ...LEASE_SECOND }], brokerCalls, logLines });
+  try {
+    await withServer(handler, async (base) => {
+      const response = await askResponses(base); assert.equal(response.status, 200); assert.deepEqual(await response.json(), responseScenarios.text);
+    });
+    assert.ok(await Promise.race([stuck.closed, delay(1000).then(() => null)]));
+    assert.equal(stuck.seen[0].stream, true);
+    assert.ok(brokerCalls.some((call) => call.route === "/release" && call.body.leaseID === "l1"));
+    assert.equal(JSON.parse(logLines.at(-1)).attempts[0].outcome, "timeout");
+  } finally { await stuck.close(); await alive.close(); }
+});
+
+test("a streaming Responses client request remains an unchanged SSE relay", async () => {
+  const upstream = await scriptedUpstream({ chunks: [responseCompleted(responseScenarios.text)] });
+  const handler = gateway({ providers: { llamacpp: { baseUrl: upstream.base, responsesApi: true, assembleFromStream: true } }, leases: [{ ...LEASE_LOCAL }] });
+  try {
+    await withServer(handler, async (base) => {
+      const response = await askResponses(base, { stream: true });
+      assert.match(response.headers.get("content-type"), /text\/event-stream/);
+      assert.match(await response.text(), /response\.completed/);
+    });
+    assert.equal(upstream.seen[0].stream, true);
+  } finally { await upstream.close(); }
 });

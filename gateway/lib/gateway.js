@@ -950,6 +950,81 @@ const assembleChatCompletion = async (stream) => {
   return { payload };
 };
 
+// Responses streams end in `response.completed`, whose `response` is the authoritative buffered
+// object. Some compatible servers omit it, so retain enough typed-event state to return their
+// output-item/delta equivalent. Unlike chat, Responses has no [DONE]: completion is mandatory.
+const assembleResponse = async (stream) => {
+  const decoder = new TextDecoder();
+  const output = new Map();
+  let created = null;
+  let completed = false;
+  let finalResponse = null;
+  let buffer = "";
+  const itemAt = (event) => {
+    const key = event?.output_index ?? event?.item?.id ?? event?.item_id;
+    if (!output.has(key)) output.set(key, { id: event?.item_id, type: "message", role: "assistant", content: [] });
+    return output.get(key);
+  };
+  const appendText = (item, index, delta, type = "output_text") => {
+    const content = item.content ?? (item.content = []);
+    const at = Number(index) || 0;
+    if (!content[at]) content[at] = { type, text: "" };
+    content[at].text = `${content[at].text ?? ""}${delta}`;
+  };
+  const absorb = (event) => {
+    if (event.type === "response.created" && event.response && typeof event.response === "object") created = event.response;
+    if (event.type === "response.output_item.added") output.set(event.output_index ?? event.item?.id, structuredClone(event.item));
+    if (event.type === "response.output_item.done") output.set(event.output_index ?? event.item?.id, structuredClone(event.item));
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") appendText(itemAt(event), event.content_index, event.delta);
+    if (event.type === "response.function_call_arguments.delta" && typeof event.delta === "string") {
+      const item = itemAt(event);
+      item.type = "function_call";
+      item.arguments = `${item.arguments ?? ""}${event.delta}`;
+    }
+    if (/^response\.reasoning_.*\.delta$/.test(event.type) && typeof event.delta === "string") {
+      const item = itemAt(event);
+      const summary = item.summary ?? (item.summary = []);
+      const at = Number(event.summary_index ?? event.content_index) || 0;
+      if (!summary[at]) summary[at] = { type: "summary_text", text: "" };
+      summary[at].text = `${summary[at].text ?? ""}${event.delta}`;
+    }
+    if (event.type === "response.completed") {
+      completed = true;
+      if (event.response && typeof event.response === "object") finalResponse = event.response;
+    }
+  };
+  const onFrame = (text) => {
+    const data = sseData(text);
+    if (!data) return null;
+    let event;
+    try { event = JSON.parse(data); } catch { return new Error("upstream responses stream carried unparseable data"); }
+    if (!event || typeof event !== "object") return new Error("upstream responses stream carried unparseable data");
+    const failure = event.error ?? (event.type === "response.failed" ? (event.response?.error ?? event) : null);
+    if (failure) return new Error(String(failure.message ?? JSON.stringify(failure)).slice(0, 400));
+    absorb(event);
+    return null;
+  };
+  try {
+    for await (const piece of stream) {
+      buffer += typeof piece === "string" ? piece : decoder.decode(piece, { stream: true });
+      let match;
+      while (!completed && (match = SSE_FRAME_END.exec(buffer))) {
+        const failure = onFrame(buffer.slice(0, match.index));
+        buffer = buffer.slice(match.index + match[0].length);
+        if (failure) return { error: failure };
+      }
+      if (completed) break;
+    }
+    if (!completed && buffer.trim()) {
+      const failure = onFrame(buffer.replace(/[\r\n]+$/, ""));
+      if (failure) return { error: failure };
+    }
+  } catch (error) { return { error }; }
+  if (!completed) return { error: new Error("upstream responses stream ended without response.completed") };
+  if (finalResponse) return { payload: finalResponse };
+  return { payload: { ...(created ?? {}), object: "response", output: [...output.values()] } };
+};
+
 export const createGatewayHandler = ({
   config,
   brokerRequest,
@@ -1445,11 +1520,12 @@ export const createGatewayHandler = ({
         stallTimer = setTimeout(() => stallAbort.abort(new DOMException("upstream stalled", "TimeoutError")), ms);
         stallTimer.unref?.();
       };
-      // Chat only, and never for n > 1 (one assembled choice per index is all this builds, and
-      // a multi-choice ask is rare enough to stay on the path it has always had). Embeddings,
-      // Responses and Messages keep their buffered upstream request.
-      const assembling = !streaming && api === CHAT && providerConfig.assembleFromStream === true
-        && !(Number(requestBody?.n) > 1);
+      // Chat never assembles n > 1. Responses can opt in only when the lane explicitly serves
+      // that API; Messages and embeddings retain their buffered upstream request.
+      const assembling = !streaming && providerConfig.assembleFromStream === true && (
+        (api === CHAT && !(Number(requestBody?.n) > 1))
+        || (api === RESPONSES && providerConfig.responsesApi === true)
+      );
       let response;
       let instructedJson = false;
       try {
@@ -1530,14 +1606,13 @@ export const createGatewayHandler = ({
           }
         }
         // A buffered client ask on an `assembleFromStream` lane goes upstream as a stream, so an
-        // abort can cancel the generation (see assembleChatCompletion). include_usage is what keeps
-        // the assembled body's `usage` measured; the client's own stream_options are merged, not
-        // replaced.
+        // abort can cancel the generation. Chat needs include_usage; Responses reports it on
+        // response.completed and strict servers need not accept chat's stream_options.
         if (assembling) {
           forwardBody = {
             ...forwardBody,
             stream: true,
-            stream_options: { ...(forwardBody.stream_options ?? {}), include_usage: true },
+            ...(api === CHAT ? { stream_options: { ...(forwardBody.stream_options ?? {}), include_usage: true } } : {}),
           };
         }
         if (api === CHAT && providerConfig.jsonMode === "instruct" && forwardBody.response_format) {
@@ -1775,7 +1850,9 @@ export const createGatewayHandler = ({
       // connection, which is the whole point. A lane that ignored `stream: true` and answered
       // with one JSON body falls through to the ordinary buffered read below.
       if (assembling && !String(response.headers?.get?.("content-type") ?? "").includes("application/json")) {
-        const outcome = await assembleChatCompletion(response.body ?? []);
+        const outcome = api === RESPONSES
+          ? await assembleResponse(response.body ?? [])
+          : await assembleChatCompletion(response.body ?? []);
         if (outcome.error) {
           // Nothing has reached the client: same sorting as a streamed attempt that failed with
           // a clean wire -- our impatience or the client's releases, a broken stream indicts.

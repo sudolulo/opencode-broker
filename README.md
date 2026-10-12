@@ -605,19 +605,22 @@ backpressure, and reports input, output, cache-read, and cache-write usage.
   `timeoutMs` fired, or a caller gave up, the gateway closed its connection and
   the model kept generating to `max_tokens` -- one such orphan held a 27b slot
   for 12 minutes, and a retry could add a second. On a provider with
-  `"assembleFromStream": true` the gateway forwards a non-streaming chat
-  request upstream with `stream: true` and `stream_options.include_usage`
-  (merged into any the client sent), reads the stream to `[DONE]`, and returns
-  the `chat.completion` the buffered upstream would have: content,
+   `"assembleFromStream": true` the gateway forwards a non-streaming chat or
+   `/v1/responses` request upstream with `stream: true`. Chat also receives
+   `stream_options.include_usage` (merged into any the client sent), reads the
+   stream to `[DONE]`, and returns the `chat.completion` the buffered upstream
+   would have: content,
   `reasoning_content`, tool calls assembled by index, `finish_reason`,
   `logprobs`, usage, and any other field at its first non-null value. Timing
   is the buffered path's (`timeoutMs` plus the client's abort, no stall
   watchdog), and nothing reaches the client until the body is whole, so
   failover, `holdOpenMs`, JSON unwrapping and accounting are unchanged. A
-  stream with an error frame, unparseable data or no `[DONE]` is a failed
-  attempt (`stream_error`) and fails over. Off by default; it never applies to
-  streaming requests, `n > 1`, `/v1/responses`, `/v1/messages` or
-  `/v1/embeddings`.
+   stream with an error frame, unparseable data or no terminal event is a failed
+   attempt (`stream_error`) and fails over. A Responses stream returns the full
+   `response` carried by `response.completed` (or assembles output items when a
+   compatible server omits it); `response.failed`, `error`, or no completion
+   also fails over. Off by default; it never applies to streaming requests,
+   chat `n > 1`, `/v1/messages` or `/v1/embeddings`.
 - **Usage accounting is not the client's option.** The gateway asks every
   upstream for streamed usage and strips the extra frame for clients that did
   not ask. When an upstream sends none it estimates, and says so; it never
