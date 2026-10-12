@@ -132,6 +132,106 @@ test("a text request over every lane's context cap says so, with both numbers", 
   });
 });
 
+// Anthropic-shaped /v1/messages: image parts are `{ type: "image", source: { ... } }`, inline
+// base64 or a remote URL, and may sit inside a tool_result's content.
+const base64Image = () => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "A".repeat(IMAGE_CHARS) } });
+const urlImage = () => ({ type: "image", source: { type: "url", url: "https://cam.example/x.jpg" } });
+
+const postMessages = (base, body) => fetch(`${base}/v1/messages`, {
+  method: "POST",
+  headers: { "x-api-key": "gw-secret", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ max_tokens: 64, ...body }),
+});
+
+const messagesHandler = (leases, forwarded) => createGatewayHandler({
+  config: cappedLane({ messagesApi: true }),
+  gatewayKey: "gw-secret",
+  brokerRequest: async (route, body) => {
+    if (route === "/lease") { leases.push(body); return { target: { model: { providerID: "llamacpp", id: "m" } } }; }
+    return { ok: true };
+  },
+  fetchImpl: async (url, options) => {
+    forwarded.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ type: "message", role: "assistant", content: [{ type: "text", text: "a car" }],
+      usage: { input_tokens: 600, output_tokens: 2 } }), { status: 200, headers: { "content-type": "application/json" } });
+  },
+});
+
+test("a /v1/messages request with two base64 images is forwarded on a 32768-token lane, images intact", async () => {
+  const leases = [];
+  const forwarded = [];
+  const messages = [{ role: "user", content: [
+    { type: "text", text: "Describe these camera frames." },
+    base64Image(),
+    base64Image(),
+  ] }];
+  await withServer(messagesHandler(leases, forwarded), async (base) => {
+    const response = await postMessages(base, { messages });
+    assert.equal(response.status, 200, await response.clone().text());
+  });
+  assert.equal(leases.length, 1);
+  assert.ok(leases[0].contextTokens <= 32768, `estimate ${leases[0].contextTokens} must fit the cap`);
+  assert.ok(leases[0].contextTokens >= 2 * 1500, "each image still counts its fixed allowance");
+  assert.deepEqual(forwarded[0].messages, messages, "the forwarded body keeps both images byte for byte");
+});
+
+test("a /v1/messages url-source image counts the same fixed allowance as a base64 one", async () => {
+  const leases = [];
+  await withServer(messagesHandler(leases, []), async (base) => {
+    for (const image of [urlImage(), base64Image()]) {
+      const response = await postMessages(base, { messages: [{ role: "user", content: [image] }] });
+      assert.equal(response.status, 200, await response.clone().text());
+    }
+  });
+  assert.equal(leases[0].contextTokens, leases[1].contextTokens);
+});
+
+test("a /v1/messages image inside a tool_result counts the fixed allowance, forwarded intact", async () => {
+  const leases = [];
+  const forwarded = [];
+  const messages = [
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "snapshot", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [base64Image(), base64Image()] }] },
+  ];
+  await withServer(messagesHandler(leases, forwarded), async (base) => {
+    const response = await postMessages(base, { messages });
+    assert.equal(response.status, 200, await response.clone().text());
+  });
+  assert.ok(leases[0].contextTokens <= 32768, `estimate ${leases[0].contextTokens} must fit the cap`);
+  assert.ok(leases[0].contextTokens >= 2 * 1500);
+  assert.deepEqual(forwarded[0].messages, messages);
+});
+
+test("a /v1/messages system given as content blocks has its images counted at the fixed allowance", async () => {
+  const leases = [];
+  const forwarded = [];
+  const system = [{ type: "text", text: "You describe camera frames." }, base64Image(), base64Image()];
+  await withServer(messagesHandler(leases, forwarded), async (base) => {
+    const response = await postMessages(base, { system, messages: [{ role: "user", content: "describe" }] });
+    assert.equal(response.status, 200, await response.clone().text());
+  });
+  assert.ok(leases[0].contextTokens <= 32768, `estimate ${leases[0].contextTokens} must fit the cap`);
+  assert.ok(leases[0].contextTokens >= 2 * 1500);
+  assert.deepEqual(forwarded[0].system, system);
+});
+
+test("an oversized /v1/messages text request still gets the cap error with both numbers", async () => {
+  const handler = createGatewayHandler({
+    config: cappedLane({ messagesApi: true }),
+    gatewayKey: "gw-secret",
+    brokerRequest: async () => { throw new Error("must not lease"); },
+    fetchImpl: async () => { throw new Error("must not forward"); },
+  });
+  const body = { max_tokens: 64, messages: [{ role: "user", content: "x".repeat(200_000) }] };
+  const estimate = Math.ceil(JSON.stringify(body).length / 4);
+  await withServer(handler, async (base) => {
+    const response = await postMessages(base, body);
+    assert.equal(response.status, 502);
+    const text = await response.text();
+    assert.match(text, new RegExp(`estimated at ${estimate} tokens exceeds the context cap 32768`));
+  });
+});
+
 test("a lane excluded after a failure still reports the exclusion, not a context cap", async () => {
   const home = mkdtempSync(join(tmpdir(), "gw-img-cred-"));
   const authPath = join(home, "auth.json");

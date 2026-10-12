@@ -668,17 +668,28 @@ const estimateUsage = (requestBody, outputChars) => ({
 // 1500 per image leaves headroom for larger images and other vision encoders.
 export const IMAGE_TOKEN_ESTIMATE = 1500;
 
-// Chat `image_url` parts and Responses `input_image` parts. A remote http(s) URL counts the same
-// allowance as inline data: the model sees the same image either way.
+// Chat `image_url` parts, Responses `input_image` parts and Messages (Anthropic) `image` parts,
+// whatever their `source` (base64, url, file). A remote http(s) URL counts the same allowance as
+// inline data: the model sees the same image either way.
+// Messages `document` (PDF) parts are deliberately NOT here; they stay counted as text. Their real
+// cost scales with page count (each page is extracted text plus a page image), which the gateway
+// cannot see without parsing the PDF, and chars/4 of the base64 already tends to UNDER-count a
+// text-heavy PDF. A flat per-document allowance would wave a 100-page PDF onto a small-cap lane.
 const isImagePart = (part) => part && typeof part === "object"
-  && (part.type === "image_url" || part.type === "input_image");
+  && (part.type === "image_url" || part.type === "input_image" || part.type === "image");
 
 // Replaces image parts in a COPY of a content array; the forwarded body is never touched.
+// A Messages `tool_result` carries its own content array, which may hold images (a tool
+// returning a camera snapshot), so it is walked one level down.
 const stripImages = (content, counter) => (Array.isArray(content)
   ? content.map((part) => {
-    if (!isImagePart(part)) return part;
-    counter.images += 1;
-    return { type: part.type };
+    if (isImagePart(part)) {
+      counter.images += 1;
+      return { type: part.type };
+    }
+    return part && typeof part === "object" && part.type === "tool_result" && Array.isArray(part.content)
+      ? { ...part, content: stripImages(part.content, counter) }
+      : part;
   })
   : content);
 
@@ -689,6 +700,8 @@ const estimateContextTokens = (requestBody) => {
   const body = requestBody ?? {};
   const withoutImages = {
     ...body,
+    // Messages' top-level `system` may be an array of content blocks rather than a string.
+    ...(Array.isArray(body.system) ? { system: stripImages(body.system, counter) } : {}),
     ...(Array.isArray(body.messages) ? { messages: body.messages.map((message) => (message && typeof message === "object"
       ? { ...message, content: stripImages(message.content, counter) }
       : message)) } : {}),

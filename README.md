@@ -552,9 +552,12 @@ offered only to providers with `responsesApi: true` and `messagesApi: true`, res
 configured provider can serve the requested API, the gateway returns a capability-specific `502`
 without contacting the broker or an upstream.
 
-A chat or Responses request's context size is estimated as `ceil(chars / 4)` of its JSON body, with
-every image part (chat `image_url`, Responses `input_image`, inline base64 or a remote URL) counted
-as a flat 1,500 tokens instead of its encoded length. A 1280x720 JPEG is ~99,000 base64 characters
+A chat, Responses or Messages request's context size is estimated as `ceil(chars / 4)` of its JSON
+body, with every image part (chat `image_url`, Responses `input_image`, Messages `image` with any
+`source`, including one inside a `tool_result` or a block-array `system`; inline base64 or a remote
+URL) counted as a flat 1,500 tokens instead of its encoded length. Messages `document` (PDF) parts
+stay counted as text: their real cost grows with page count, which the gateway cannot see, and
+chars/4 of the base64 already tends to under-count a text-heavy PDF. A 1280x720 JPEG is ~99,000 base64 characters
 but measured 222-277 real prompt tokens on qwen3.8-27b. A lane whose `maxContextTokens` (or the
 mapped name's override) is below the estimate is not offered the request; when that drops every
 lane that serves the API, the `502` says `request estimated at N tokens exceeds the context cap M
