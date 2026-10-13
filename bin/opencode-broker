@@ -60,6 +60,26 @@ import {
   targetIDsFor,
   modelRefForTier,
 } from "../lib/routing.js";
+import {
+  authorizedReserveIDs,
+  buildCanonicalHeads,
+  markManagedOutageScope,
+  policyReserveIDs,
+  snapshotOutageContext,
+  stagedCandidateHeads,
+} from "../lib/outage-policy.js";
+import { decodeOutages } from "../lib/model-outage-state.js";
+import { emptyOutages, reduceOutages } from "../lib/model-outages.js";
+import { createOutageService } from "../lib/model-outage-service.js";
+import {
+  currentReserveGrant,
+  loadOutageRuntime,
+  ordinaryHealthLease,
+  outageLeaseAssertion,
+  probeAdmissible,
+} from "../lib/model-outage-runtime.js";
+import { fetchStatusSnapshot } from "../lib/status-incidents.js";
+import { verifyHealthReport } from "../gateway/lib/proxy-health-context.js";
 import { isSpeedVariant } from "../lib/model-candidates.js";
 import { PROVIDER_BUDGETS } from "../lib/budgets.js";
 import { createBurnWatch } from "../lib/burn-watch.js";
@@ -77,8 +97,8 @@ import {
 } from "../lib/model-policy.js";
 import { createResolverGenerationManager } from "../lib/resolver-generations.js";
 import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
-import { resolvePolicyLane } from "../lib/policy-targets.js";
-import { createProbeBrokerState } from "../lib/model-probe.js";
+import { probationOnlyModelKeys, resolvePolicyLane } from "../lib/policy-targets.js";
+import { createProbeBrokerState, runOutageProbe } from "../lib/model-probe.js";
 import {
   accrueOpportunityTime,
   recordCandidateLease,
@@ -100,7 +120,7 @@ import {
   operatorQuarantineProvider,
   providerEligible,
   isProviderOriginated,
-  recordFailureEvidence,
+  recordFailureEvidenceAndNotify,
   rearmQuarantinedProvider,
 } from "../lib/provider-health.js";
 
@@ -298,7 +318,7 @@ const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }, source = "/i
     console.error(`[opencode-broker] ${source} dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
   }
 };
-const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy() });
+const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy(), outages: emptyOutages() });
 const readState = () => {
   let source;
   try {
@@ -361,6 +381,9 @@ const readState = () => {
       rebalances: value?.rebalances && typeof value.rebalances === "object" ? value.rebalances : {},
       lastDecision: value?.lastDecision && typeof value.lastDecision === "object" ? value.lastDecision : null,
       modelPolicy,
+      // Optional outage-episode state (lib/model-outage-state.js): whitelisted field by field,
+      // never passed through. Whatever does not decode restores as "can authorize nothing".
+       outages: decodeOutages(value?.outages, { policy: CONFIG.modelOutages }),
     };
   }
 };
@@ -378,7 +401,12 @@ const allTargets = (state) => ({
   })),
 });
 
-const writeState = (state) => {
+// `requireDurable` is the outage commit mode (lib/model-outage-worker.js commit contract: a
+// resolved commit means the bytes AND their directory entry are on stable storage). Ordinary
+// callers keep the default, where a post-rename directory fsync failure is a visible commit
+// with a warning. A strict caller gets that same warning and then the error, so a probe
+// reservation whose durability is uncertain is never followed by a gateway dispatch.
+const writeState = (state, { requireDurable = false } = {}) => {
   ensureRoutingStateDir();
   state.version = 5;
   state.health = normalizeHealth(state.health);
@@ -431,10 +459,12 @@ const writeState = (state) => {
   // that an already committed mutation failed and invite it to repeat the operation.
   if (committed) {
     let directoryDescriptor;
+    let durabilityError = null;
     try {
       directoryDescriptor = openSync(STATE_ROOT, "r");
       fsyncSync(directoryDescriptor);
     } catch (error) {
+      durabilityError = error;
       try {
         console.error(`[opencode-broker] broker state ${STATE_PATH} was committed but its directory entry could not be made durable: ${error?.message ?? error}`);
       } catch {}
@@ -447,6 +477,11 @@ const writeState = (state) => {
           } catch {}
         }
       }
+    }
+    // Visible but not durable. The strict caller must not treat this as committed; it also must
+    // not roll the visible file back (the in-memory image it carries is the conservative one).
+    if (durabilityError && requireDurable) {
+      throw new Error(`broker state directory fsync failed after rename (visible, not durable): ${durabilityError?.message ?? durabilityError}`);
     }
   }
 };
@@ -920,8 +955,17 @@ const refusal = (message, code, subject = null) => {
   return error;
 };
 
-const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null) => {
-  if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets).includes(target.id)) return false;
+// The outage context a staged probation candidate is judged in: the same snapshot inputs with
+// the candidate standing as its scope's head for this offer only (lib/outage-policy.js
+// stagedCandidateHeads). Returns the ordinary context unchanged when there is nothing to stage.
+const stagedOutageContext = (outageContext, candidate) => {
+  if (!outageContext || !candidate) return outageContext;
+  const heads = stagedCandidateHeads(outageContext.heads, candidate, outageContext.policy);
+  return heads === outageContext.heads ? outageContext : snapshotOutageContext({ ...outageContext, heads });
+};
+
+const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null, outageContext = null) => {
+  if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets, outageContext).includes(target.id)) return false;
   if (!cloudTargetAdmitted(target, state.inventory?.providers)) return false;
   if (target.kind === "local") {
     // The output reserve too, exactly as chooseTarget applies it. Without it this check sized
@@ -1018,6 +1062,16 @@ const acquire = async (state, request, {
     throw new Error("resolvableModels must be an array of at most 2048 non-empty provider/model strings");
   }
   const resolvableModels = hasResolvableModels ? new Set(request.resolvableModels) : null;
+  // Per-request exclusions (a caller retrying after a failure on a named target). They are one
+  // more upper fence on THIS selection only: refused when malformed rather than ignored, applied
+  // to the held, sticky and fresh paths alike, and stored nowhere, so no later lease inherits them.
+  const hasExcludeTargetIDs = request.excludeTargetIDs !== undefined;
+  if (hasExcludeTargetIDs && (!Array.isArray(request.excludeTargetIDs) || request.excludeTargetIDs.length > 64 ||
+    request.excludeTargetIDs.some((id) => typeof id !== "string" || !/^[a-z0-9][a-z0-9._:-]{0,180}$/.test(id)))) {
+    throw new Error("excludeTargetIDs must be an array of at most 64 target ids");
+  }
+  const excludedTargetIDs = hasExcludeTargetIDs ? [...new Set(request.excludeTargetIDs)] : [];
+  const excluded = new Set(excludedTargetIDs);
   const api = request.api === "embeddings" ? "embeddings" : null;
   const requestedTargets = targetEligibleIDsFor(profile, tier, allTargets(state))
     .map((targetID) => targetForID(targetID, allTargets(state))).filter(Boolean);
@@ -1029,7 +1083,12 @@ const acquire = async (state, request, {
   }
   request = { ...request, api, contextTokens, preferredModel, fallbackTargetID, releasePin, oneShot };
   sweep(state);
-  let targets = allTargets(state);
+  // The outage gate's working view: every target the reviewed role classification puts in a
+  // managed role carries its mark, so a catalog sibling with missing or mismatched family/speed
+  // fails closed at every automatic gate below. Nonsecret metadata, a no-op while the policy is off.
+  const outageEnabled = CONFIG.modelOutages?.enabled === true;
+  const gateView = (view) => (outageEnabled ? markManagedOutageScope(view, { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles }) : view);
+  let targets = gateView(allTargets(state));
   const requestedCloud = targetIDsFor(profile, tier, targets)
     .map((targetID) => targetForID(targetID, targets))
     .some((target) => target?.kind === "cloud");
@@ -1051,7 +1110,7 @@ const acquire = async (state, request, {
     }
     state.inventory = { ...revalidateAdmission(state.inventory, authTypes()), authRevision: revision, updatedAt: Date.now() };
     logDecision({ at: Date.now(), sessionID, policy: "auth-revalidated", reasons: ["auth revision rotated; admission recomputed from fresh auth types"] });
-    targets = allTargets(state);
+    targets = gateView(allTargets(state));
   }
   // `chooseTarget` is a pure policy helper and cannot see broker inventory. Filter
   // first so fresh leases cannot bypass the provider-auth admission gate.
@@ -1074,8 +1133,14 @@ const acquire = async (state, request, {
   // inherits only this one property from the session it belongs to.
   // ☠️ "keep only local", never "drop cloud" -- same reason as everywhere else.
   const localOnlyRequest = request.localOnly === true;
-  const admittedBeforeResolvableModels = Object.fromEntries(Object.entries(targets)
-    .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers))
+  // This is the complete cloud-admitted/resolver-visible view. It is deliberately
+  // constructed before request-local provider, locality, and API narrowing: those
+  // constraints choose from a lane, but must not redefine that lane's canonical head.
+  const cloudAdmittedTargets = Object.fromEntries(Object.entries(targets)
+    .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers)));
+  const completeAdmittedTargets = Object.fromEntries(Object.entries(cloudAdmittedTargets)
+    .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`)));
+  const admittedBeforeResolvableModels = Object.fromEntries(Object.entries(cloudAdmittedTargets)
     .filter(([, target]) => !localOnlyRequest || target.kind === "local")
     .filter(([, target]) => !providerAllowlist || providerAllowlist.has(target.providerID))
     .filter(([, target]) => (target.embedding === true) === (api === "embeddings")));
@@ -1083,6 +1148,34 @@ const acquire = async (state, request, {
   // spawn. A caller catalog may only narrow that admission, never add a target the host denied.
   let admittedTargets = Object.fromEntries(Object.entries(admittedBeforeResolvableModels)
     .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`)));
+  // Build heads before circuit, capacity, context, or policy filtering. An unavailable
+  // head must never cause its older sibling to become the ordinary route.
+  // ☆ Staged-policy admission is part of "admitted": a probation candidate the model policy
+  // has not promoted yet (lib/policy-targets.js probationOnlyModelKeys) is not a head
+  // candidate, so a probation-only newer release never displaces the reviewed pin as the
+  // scope's ordinary head. An introduced ACTIVE model is admitted and may become head by date.
+  const probationOnly = probationOnlyModelKeys(state.modelPolicy);
+  const admittedModelKeys = Object.values(completeAdmittedTargets)
+    .map((target) => `${target.providerID}/${target.modelID}`)
+    .filter((key) => !probationOnly.has(key));
+  const resolvableModelKeys = resolvableModels ? [...resolvableModels] : admittedModelKeys;
+  const canonicalHeads = outageEnabled ? buildCanonicalHeads({
+    policy: CONFIG.modelOutages,
+    targets: completeAdmittedTargets,
+    admittedModelKeys,
+    resolvableModelKeys,
+  }) : {};
+  // ONE grants snapshot for every reusable gate of this request (expanded lane, held lease,
+  // sticky pin, opportunity check). Its lane scope is the complete reviewed lane: substitution
+  // is assembled only for primaries this lane actually carries. chooseTarget snapshots again at
+  // its own `now` from the same policy/heads/outages inputs.
+  const outageContext = outageEnabled ? snapshotOutageContext({
+    policy: CONFIG.modelOutages,
+    heads: canonicalHeads,
+    outages: state.outages ?? null,
+    primaryIDs: targetIDsFor(profile, tier, completeAdmittedTargets),
+    now: Date.now(),
+  }) : null;
   const droppedResolvableLaneModelIDs = resolvableModels
     ? targetEligibleIDsFor(profile, tier, admittedBeforeResolvableModels)
       .map((targetID) => admittedBeforeResolvableModels[targetID])
@@ -1099,10 +1192,16 @@ const acquire = async (state, request, {
     if (Object.keys(exact).length !== 1) throw new Error("probe exact target is unavailable or ambiguous");
     admittedTargets = exact;
   }
-  const expandedPolicyIDs = targetEligibleIDsFor(profile, tier, admittedTargets);
+  // Model policy must see raw lane members before the ordinary outage gate: a probation
+  // candidate is not an ordinary head yet, but policy may offer it for a candidate-only trial.
+  // Include authorized reserve substitutions too, so role governance cannot be bypassed via
+  // the "not in the lane" exemption. Actual selection/reuse still applies the outage gate.
+  const laneReserveIDs = outageContext ? authorizedReserveIDs(outageContext).map((grant) => grant.targetID) : [];
+  const expandedPolicyIDs = [...new Set([...targetEligibleIDsFor(profile, tier, admittedTargets), ...laneReserveIDs])];
   const policyLaneArgs = {
     targetIDs: expandedPolicyIDs,
     targets: admittedTargets,
+    reserveTargetIDs: laneReserveIDs,
     registration,
     activeLeases: Object.entries(state.leases)
       .filter(([activeSessionID]) => activeSessionID !== sessionID)
@@ -1133,10 +1232,13 @@ const acquire = async (state, request, {
     const candidateKey = `${opportunityRole.providerID}/${opportunityRole.probationModelID}`;
     const opportunityTargetID = policyLane.candidateOpportunityTargetID;
     const opportunityTarget = opportunityTargetID ? policyLane.targets[opportunityTargetID] : null;
+    // The staged candidate is judged in its own OFFER context (stagedCandidateHeads): the
+    // ordinary heads are untouched, but the staged policy's trial is not vetoed by the gate.
+    const opportunityContext = stagedOutageContext(outageContext, opportunityTarget);
     const candidateCapableProductionOpportunity = Boolean(opportunityTarget &&
       opportunityTarget.providerID === opportunityRole.providerID &&
       opportunityTarget.modelID === opportunityRole.probationModelID &&
-      targetEligibleFor(opportunityTarget, request, state, undefined, policyLane.targets, sessionID));
+       targetEligibleFor(opportunityTarget, request, state, undefined, policyLane.targets, sessionID, opportunityContext));
     const eligibleCandidateRequest = candidateCapableProductionOpportunity &&
       policyLane.policyTargetID === opportunityTargetID && policyLane.targetIDs.includes(opportunityTargetID);
     const opportunity = accrueOpportunityTime(state.modelPolicy, {
@@ -1177,7 +1279,18 @@ const acquire = async (state, request, {
       const heldOutgrown = target?.kind !== "local" && Number(contextTokens) > 0 &&
         Number.isFinite(heldDeclared) && heldDeclared > 0 &&
         Number(contextTokens) > heldDeclared * CONTEXT_PRESSURE;
-      if (target && !heldOutgrown && targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, targets, sessionID)) {
+      // Revalidated against the same policy-vetted, gate-marked view selection uses, never the
+      // raw target map: a held reserve is kept exactly while its grant is authorized here and
+      // abandoned the moment it is not, and a per-request exclusion beats the held target too.
+      // A held RESERVE additionally needs the exact grant it was issued under (generation and
+      // credential instance) to still be current: an expired or rotated grant is reselected,
+      // never carried forward and never blindly re-activated here.
+      const heldReserve = outageEnabled && target && policyReserveIDs(CONFIG.modelOutages).has(target.id);
+      const heldAssertionCurrent = !heldReserve || Boolean(currentReserveGrant({
+        policy: CONFIG.modelOutages, outages: state.outages, targetID: target.id, assertion: existing.outage, now: Date.now(),
+      }));
+      if (target && !heldOutgrown && !excluded.has(target.id) && heldAssertionCurrent &&
+        targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, admittedTargets, sessionID, outageContext)) {
         ensureActive();
         state.leases[sessionID].touchedAt = Date.now();
         recordDecision(state, {
@@ -1195,7 +1308,7 @@ const acquire = async (state, request, {
           balancedTargetIDs: [target.id],
           providerUtilization: { [target.providerID]: effectiveUtilization(state.budgets, target.providerID) },
         });
-        return { target, existing: true, leaseID: existing.leaseID };
+        return { target, existing: true, leaseID: existing.leaseID, outage: heldReserve ? existing.outage : null };
       }
     }
     ensureActive();
@@ -1218,6 +1331,10 @@ const acquire = async (state, request, {
     modelContexts: state.inventory?.modelContexts ?? {},
     modelOutputs: state.inventory?.modelOutputs ?? {},
     budgets: state.budgets ?? {},
+    outagePolicy: CONFIG.modelOutages,
+    outages: state.outages ?? null,
+    canonicalHeads,
+    excludedTargetIDs,
     // Carried on `selection` so the context-pressure retry below inherits it through `...selection`.
     // Passing it only to the ordinary call would make a delayed rung unreachable for exactly the
     // oversized sessions that most need the roomier target.
@@ -1234,7 +1351,7 @@ const acquire = async (state, request, {
   // undefined, where every local target is ineligible by definition. The rung would then be
   // unreachable no matter how long the caller waited, and the refusal would read as
   // "no eligible target" rather than naming the rung.
-  const includesLocal = localOnlyRequest || targetEligibleIDsFor(profile, tier, admittedTargets)
+  const includesLocal = localOnlyRequest || targetEligibleIDsFor(profile, tier, admittedTargets, outageContext)
     .map((targetID) => targetForID(targetID, admittedTargets))
     .some((target) => target?.kind === "local");
   let availableModels;
@@ -1254,24 +1371,39 @@ const acquire = async (state, request, {
   // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
   ensureActive();
   reclaimIdleLeases(state, admittedTargets, sessionID);
+  let selectedCandidateChoice = null;
+  let candidateSelection = null;
   if (policyLane.policyTargetID) {
     const candidateTargets = Object.fromEntries(Object.entries(admittedTargets)
       .filter(([id]) => !expandedPolicyIDs.includes(id) || id === policyLane.policyTargetID));
-    const candidateChoice = chooseTarget({
+    // The candidate-only offer is the existing staged-policy path: for THIS call the staged
+    // candidate stands as its scope's head (stagedCandidateHeads), so the outage gate does not
+    // veto a reviewed trial. `selection.canonicalHeads` -- the ordinary call below -- is unchanged.
+    const offeredSelection = {
       ...selection,
+      canonicalHeads: outageEnabled
+        ? stagedCandidateHeads(canonicalHeads, candidateTargets[policyLane.policyTargetID], CONFIG.modelOutages)
+        : canonicalHeads,
       targets: candidateTargets,
+    };
+    const candidateChoice = chooseTarget({
+      ...offeredSelection,
       active: activeCounts(state, candidateTargets),
       localModels: availableModels,
     });
     if (candidateChoice?.target?.id === policyLane.policyTargetID) {
       admittedTargets = candidateTargets;
+      selectedCandidateChoice = candidateChoice;
+      candidateSelection = offeredSelection;
     } else {
       admittedTargets = Object.fromEntries(Object.entries(admittedTargets)
         .filter(([id]) => id !== policyLane.policyTargetID));
     }
     selection.targets = admittedTargets;
   }
-  const ordinaryChoice = chooseTarget({
+  // Do not discard a successful staged choice and reselect it under the incumbent's head.
+  // Only this selection (and its pressure retry) uses the offered heads; reuse/stickiness do not.
+  const ordinaryChoice = selectedCandidateChoice ?? chooseTarget({
     ...selection,
     active: activeCounts(state, admittedTargets),
     localModels: availableModels,
@@ -1295,7 +1427,7 @@ const acquire = async (state, request, {
     }));
     if (Object.keys(roomy).length < Object.keys(admittedTargets).length && Object.keys(roomy).length > 0) {
       const roomyChoice = chooseTarget({
-        ...selection,
+        ...(candidateSelection ?? selection),
         targets: roomy,
         active: activeCounts(state, roomy),
         localModels: availableModels,
@@ -1323,10 +1455,11 @@ const acquire = async (state, request, {
   const pinnedTarget = pin && pin.profile === profile && pin.tier === tier
     ? admittedTargets[pin.targetID] ?? null
     : null;
-  const preferredTarget = (preferredModel
+  // A per-request exclusion outranks stickiness: the caller said this target failed it.
+  const preferredTarget = [(preferredModel
     ? Object.values(admittedTargets).find((target) =>
       target.providerID === preferredModel.providerID && target.modelID === preferredModel.id)
-    : null) ?? pinnedTarget;
+    : null) ?? pinnedTarget].find((target) => target && !excluded.has(target.id)) ?? null;
   // Stickiness never holds a session on a model it has outgrown: when pressure
   // moved the selection to a roomier window, the sticky model only wins if it
   // is itself roomy enough.
@@ -1350,7 +1483,7 @@ const acquire = async (state, request, {
       candidate.family === preferredTarget.family &&
       (candidate.speed ?? "standard") === (preferredTarget.speed ?? "standard") &&
       String(candidate.releaseDate ?? "") > String(preferredTarget.releaseDate) &&
-      targetEligibleFor(candidate, request, state, availableModels, admittedTargets, sessionID));
+       targetEligibleFor(candidate, request, state, availableModels, admittedTargets, sessionID, outageContext));
   if (newerFamilySibling && choice?.decision) {
     choice.decision.reasons = [...(choice.decision.reasons ?? []), "family-upgrade-releases-stickiness"];
   }
@@ -1365,6 +1498,7 @@ const acquire = async (state, request, {
     availableModels,
     admittedTargets,
     sessionID,
+    outageContext,
   )) {
     choice = {
       target: preferredTarget,
@@ -1381,7 +1515,7 @@ const acquire = async (state, request, {
       },
     };
   }
-  const fallbackTarget = fallbackTargetID && ordinaryChoice?.decision?.policy === "strict-fallback" &&
+  const fallbackTarget = fallbackTargetID && !excluded.has(fallbackTargetID) && ordinaryChoice?.decision?.policy === "strict-fallback" &&
     ordinaryChoice.decision.eligibleTargetIDs?.includes(fallbackTargetID)
     ? admittedTargets[fallbackTargetID]
     : null;
@@ -1525,7 +1659,31 @@ const acquire = async (state, request, {
     choice.decision.reasons = [...(choice.decision.reasons ?? []), resolvableModelsReason];
   }
   ensureActive();
-  const leasedAt = Date.now();
+  // An ACTUAL reserve grant: the chosen target is a policy reserve, so it must match one of this
+  // request's authorized grants. That grant's credential instance and generation ride on the
+  // lease (the proxy enforces them), and only here -- never on a preview, inventory, selection
+  // snapshot or probe -- does the reserve's proof become active. A reserve with no matching
+  // grant (the grant lapsed between snapshot and choice) is refused rather than leased unbound.
+  let outageGrant = null;
+  let leasedAt = null;
+  if (outageEnabled && policyReserveIDs(CONFIG.modelOutages).has(choice.target.id)) {
+    const selectedGrant = (outageContext ? authorizedReserveIDs(outageContext) : [])
+      .find((grant) => grant.targetID === choice.target.id) ?? null;
+    leasedAt = Date.now();
+    const currentContext = snapshotOutageContext({
+      policy: CONFIG.modelOutages,
+      heads: canonicalHeads,
+      outages: state.outages ?? null,
+      primaryIDs: targetIDsFor(profile, tier, completeAdmittedTargets),
+      now: leasedAt,
+    });
+    outageGrant = authorizedReserveIDs(currentContext).find((grant) => grant.targetID === choice.target.id
+      && ['logicalID', 'primaryID', 'credentialInstance', 'generation', 'episodeID']
+        .every((key) => grant[key] === selectedGrant?.[key])) ?? null;
+    if (!outageGrant) throw new Error("outage reserve selected without a current grant");
+  }
+  const outageAssertion = outageGrant ? outageLeaseAssertion(outageGrant) : null;
+  leasedAt ??= Date.now();
   const leaseID = randomUUID();
   const candidateRole = modelPolicyRoleForTarget(state, choice.target);
   let policyLease = {};
@@ -1559,6 +1717,7 @@ const acquire = async (state, request, {
     profile,
     tier,
     ...policyLease,
+    ...(outageAssertion ? { outage: outageAssertion } : {}),
   };
   ensureActive();
   state.assignments[sessionID] = {
@@ -1569,6 +1728,7 @@ const acquire = async (state, request, {
     tier,
     updatedAt: leasedAt,
     ...policyLease,
+    ...(outageAssertion ? { outage: outageAssertion } : {}),
     // A fallback rung is a degraded route, never a home: it must yield to the lane's
     // primary the moment one is eligible (fallback-stickiness above owns that), so it
     // is recorded but never pinned.
@@ -1585,7 +1745,17 @@ const acquire = async (state, request, {
     contextTokens,
     ...choice.decision,
   });
-  return { target: choice.target, existing: false, leaseID };
+  // Activated only now, once the lease and assignment exist: persisted with them by the /lease
+  // handler's write. The reducer re-validates the grant at the grant's own time.
+  if (outageGrant) {
+    state.outages = reduceOutages(state.outages, {
+      type: "activate",
+      logicalID: outageGrant.logicalID,
+      targetID: outageGrant.targetID,
+      credentialInstance: outageGrant.credentialInstance,
+    }, { policy: CONFIG.modelOutages, now: leasedAt });
+  }
+  return { target: choice.target, existing: false, leaseID, outage: outageAssertion };
 };
 
 // ☠️ `close` IS NOT OPTIONAL. A request whose client hung up before this ran never emits `end`
@@ -1626,6 +1796,12 @@ const socketResponds = (socketPath) => new Promise((resolve) => {
 
 const serve = async () => {
   ensureRoutingStateDir();
+  // Enabled outage reserves need every runtime dependency BEFORE the socket exists: a missing
+  // or unsafe key, credential or gateway URL is a loud startup failure, never a silent
+  // fallback. Disabled reads none of them and starts no outage timer, worker or fetch.
+  const outageRuntime = CONFIG.modelOutages?.enabled === true
+    ? loadOutageRuntime({ stateDir: STATE_ROOT })
+    : null;
   const socketPath = brokerSocketPath();
   try {
     const stat = lstatSync(socketPath);
@@ -1676,7 +1852,10 @@ const serve = async () => {
     error.code = code;
     throw error;
   };
-  const handle = async (request, response) => {
+  // `preparsed` is set only for /probe/consume and /probe/release when an outage service exists:
+  // their body is read OUTSIDE the queue to see whether it is an outage-health assignment, and a
+  // consumed request stream cannot be parsed twice.
+  const handle = async (request, response, preparsed = undefined) => {
     try {
       if (request.url === "/model-policy/status") {
         if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
@@ -1790,7 +1969,7 @@ const serve = async () => {
         if (!CONFIG.reconcile.apply.enabled) {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
-        const body = await parseBody(request);
+        const body = preparsed ?? await parseBody(request);
         try {
           requireProbeFields(body, ["sessionID", "probeNonce"], "invalid-probe-consume", "probe consume request");
           return reply(response, 200, probeState.consumeAssignment(body));
@@ -1806,7 +1985,7 @@ const serve = async () => {
         if (!CONFIG.reconcile.apply.enabled) {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
-        const body = await parseBody(request);
+        const body = preparsed ?? await parseBody(request);
         const header = request.headers["x-opencode-resolver-token"];
         const resolverToken = Array.isArray(header) ? header[0] : header;
         try {
@@ -1911,6 +2090,10 @@ const serve = async () => {
           leaseID: lease.leaseID,
           target: appliedTarget,
           existing: lease.existing,
+          // The exact scope the proxy must enforce: null for a primary (its actual attested
+          // identity becomes the baseline), the grant's canonical instance for a reserve.
+          expectedCredentialInstance: lease.outage?.expectedCredentialInstance ?? null,
+          generation: lease.outage?.generation ?? null,
           decision: {
             policy,
             reasons,
@@ -1945,11 +2128,19 @@ const serve = async () => {
         const lease = state.leases[body.sessionID];
         const leaseMatches = lease && (body.leaseID === undefined || body.leaseID === lease.leaseID);
         const target = leaseMatches ? targetForID(lease.targetID, allTargets(state)) : null;
-        if (!target) return reply(response, 200, { held: false });
+        // A held reserve verifies only while its exact grant is current; a lapsed or rotated
+        // grant must not let the gateway keep forwarding on it.
+        const reserve = Boolean(target) && CONFIG.modelOutages?.enabled === true &&
+          policyReserveIDs(CONFIG.modelOutages).has(target.id);
+        if (!target || (reserve && !currentReserveGrant({
+          policy: CONFIG.modelOutages, outages: state.outages, targetID: target.id, assertion: lease.outage, now: Date.now(),
+        }))) return reply(response, 200, { held: false });
         return reply(response, 200, {
           held: true,
           leaseID: lease.leaseID,
           target: { id: target.id, kind: target.kind, model: { providerID: target.providerID, id: target.modelID } },
+          expectedCredentialInstance: reserve ? lease.outage.expectedCredentialInstance : null,
+          generation: reserve ? lease.outage.generation : null,
         });
       }
       if (request.url === "/failure") {
@@ -2177,24 +2368,15 @@ const serve = async () => {
           // Evidence only for a failure the PROVIDER produced (see isProviderOriginated): an
           // unrecognised local error fences this target and goes no further.
           if (isProviderOriginated(body.error)) {
-            const wasQuarantined = state.health?.providers?.[target.providerID]?.state === "quarantined";
-            state.health = recordFailureEvidence(state.health, target.providerID, {
+            // Evidence plus the existing quarantine-transition notice (lib/provider-health.js).
+            state.health = recordFailureEvidenceAndNotify(state.health, target.providerID, {
               targetID: target.id,
               modelID: target.modelID,
               sessionID: body.sessionID,
               reasonCode: kind,
               error,
               at: Date.now(),
-            });
-            // Never silent: an automatic quarantine takes a whole provider out of routing until
-            // someone re-arms it, and on 2026-10-09 one sat unnoticed for half an hour while
-            // every large smart session was refused.
-            if (!wasQuarantined && state.health?.providers?.[target.providerID]?.state === "quarantined") {
-              notifyBurn({
-                title: `${target.providerID} quarantined`,
-                body: `Automatic, after: ${String(error.message).slice(0, 160)}. If the provider is fine, run: opencode-broker rearm provider:${target.providerID}`,
-              });
-            }
+            }, notifyBurn);
           } else {
             extraReasons.push("not-provider-originated");
           }
@@ -2204,6 +2386,14 @@ const serve = async () => {
           policy: "failure-reported",
           reasons: [kind, ...extraReasons, error.message].filter(Boolean),
         });
+        // A genuine provider failure may be an outage: ask for both official feeds without
+        // waiting. requestPoll only schedules (single-flight, 60 s spacing); its transaction
+        // queues behind this handler, so nothing here awaits the worker. It records no outage
+        // evidence: only the verified /model-health path does.
+        if (outageService && target) {
+          outageService.worker.requestPoll("anthropic");
+          outageService.worker.requestPoll("openai");
+        }
         return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}), ...(resetKnown !== null ? { resetKnown } : {}) });
       }
       if (request.url === "/complete") {
@@ -2354,9 +2544,26 @@ const serve = async () => {
           (typeof body.contextTokens === "number" || typeof body.contextTokens === "string")
           ? Math.floor(rawPreviewContext)
           : null;
-        const targets = allTargets(state);
+        const previewOutagesEnabled = CONFIG.modelOutages?.enabled === true;
+        const targets = previewOutagesEnabled
+          ? markManagedOutageScope(allTargets(state), { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles })
+          : allTargets(state);
         const admitted = Object.fromEntries(Object.entries(targets)
           .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers)));
+        // Match /lease's default resolver snapshot: preview has no caller-local
+        // narrowing, so calculate heads from the complete admitted view once and
+        // reuse that exact outage snapshot for every requested tier. Staged probation-only
+        // candidates are not head candidates here either.
+        const previewProbationOnly = probationOnlyModelKeys(state.modelPolicy);
+        const previewModelKeys = Object.values(admitted)
+          .map((target) => `${target.providerID}/${target.modelID}`)
+          .filter((key) => !previewProbationOnly.has(key));
+        const previewHeads = previewOutagesEnabled ? buildCanonicalHeads({
+          policy: CONFIG.modelOutages,
+          targets: admitted,
+          admittedModelKeys: previewModelKeys,
+          resolvableModelKeys: previewModelKeys,
+        }) : {};
         let availableModels;
         try { availableModels = await localModels(); } catch { availableModels = new Set(); }
         const preview = {};
@@ -2374,6 +2581,9 @@ const serve = async () => {
             modelContexts: state.inventory?.modelContexts ?? {},
             modelOutputs: state.inventory?.modelOutputs ?? {},
             budgets: state.budgets ?? {},
+            outagePolicy: CONFIG.modelOutages,
+            outages: previewOutagesEnabled ? state.outages ?? null : null,
+            canonicalHeads: previewHeads,
             // A preview is a snapshot of NOW, and nobody has waited yet.
             waitedMs: 0,
           });
@@ -2503,6 +2713,8 @@ const serve = async () => {
   // Local profile leases may await the model inventory. Serialize mutations so two
   // simultaneous requests cannot both reserve the single local slot while awaiting it.
   let serial = Promise.resolve();
+  // Built once, after the serializer below exists; null whenever outage reserves are disabled.
+  let outageService = null;
   // ☠️ THE SERIAL CHAIN IS A SINGLE POINT OF PERMANENT FAILURE. Every request is queued
   // onto one promise, so a handler that never settles does not fail that ONE request --
   // it stops the broker answering anything, for good, while the process stays perfectly
@@ -2538,7 +2750,7 @@ const serve = async () => {
     queueStats.lastAlertAt = now;
     notifyBurn({ title, body, kind: "broker-stall" });
   };
-  const guarded = (request, response, enqueuedAt) => {
+  const guarded = (request, response, enqueuedAt, preparsed = undefined) => {
     queueStats.depth -= 1;
     const waitedMs = Date.now() - enqueuedAt;
     if (abandoned(request, response)) {
@@ -2569,14 +2781,162 @@ const serve = async () => {
       if (typeof timer?.unref === "function") timer.unref();
     });
     let running;
-    try { running = Promise.resolve(handle(request, response)); }
+    try { running = Promise.resolve(handle(request, response, preparsed)); }
     catch (error) { running = Promise.reject(error); }
     return Promise.race([running.catch(() => {}), finished]).finally(() => clearTimeout(timer));
   };
-  const server = createServer((request, response) => {
+  const enqueueRequest = (request, response, preparsed = undefined) => {
     const enqueuedAt = Date.now();
     queueStats.depth += 1;
-    serial = serial.then(() => guarded(request, response, enqueuedAt), () => guarded(request, response, enqueuedAt));
+    const run = () => guarded(request, response, enqueuedAt, preparsed);
+    serial = serial.then(run, run);
+  };
+
+  // ONE queue for every broker state mutation. The outage worker's transactions ride the same
+  // `serial` chain as the request handlers (its injected serialize), never a second queue: the
+  // returned promise propagates the transaction's own result or rejection to its caller, while
+  // the chain's tail swallows it so the next transaction still runs.
+  const enqueueTransaction = (transaction) => {
+    const result = serial.then(transaction);
+    serial = result.catch(() => {});
+    return result;
+  };
+  if (outageRuntime) {
+    const policy = CONFIG.modelOutages;
+    const { gatewayURL, gatewayKey, gatewayCredential, healthKey } = outageRuntime;
+    outageService = createOutageService({
+      policy,
+      // Static, config-validated targets only: discovered inventory can never invent a reserve.
+      targets: TARGETS,
+      key: healthKey,
+      gatewayCredential,
+      read: () => state.outages,
+      // Conservative on failure: the in-memory image keeps the ADVANCED state (counts, cooldown,
+      // occupancy) even when the strict write throws, so no later ordinary write can restore an
+      // older image and refund a probe. The worker sees the throw and dispatches nothing.
+      commit: async (next) => {
+        state.outages = next;
+        writeState(state, { requireDurable: true });
+      },
+      serialize: enqueueTransaction,
+      // Official feeds are fetched outside the queue by the worker, bounded by the fetcher.
+      fetchStatus: (providerID, { signal }) => fetchStatusSnapshot(providerID, { policy, signal }),
+      sendProbe: (assignment, { signal, waitForOutcome }) => runOutageProbe({
+        assignment, scope: assignment.expectedScopePolicy, gatewayURL, gatewayKey, signal, waitForOutcome,
+      }),
+      canProbe: (candidate) => probeAdmissible(candidate, {
+        policy,
+        targets: TARGETS,
+        circuits: state.circuits,
+        health: state.health,
+        providers: state.inventory?.providers ?? {},
+        active: activeCounts(state),
+        providerActive: activeProviderCounts(state),
+        probationOnly: probationOnlyModelKeys(state.modelPolicy),
+        // Same discovered windows and output caps ordinary routing fits leases against.
+        modelContexts: state.inventory?.modelContexts ?? {},
+        modelOutputs: state.inventory?.modelOutputs ?? {},
+        now: Date.now(),
+      }),
+      timers: globalThis,
+      lookupOrdinaryLease: (input) => ordinaryHealthLease({
+        input,
+        lease: typeof input?.sessionID === "string" && Object.hasOwn(state.leases, input.sessionID) ? state.leases[input.sessionID] : null,
+        targets: TARGETS,
+        policy,
+        outages: state.outages,
+        now: Date.now(),
+      }),
+      // The daemon routes every ordinary path itself, inside its queue; the service only ever
+      // sees the private health and outage-probe paths. Reaching this is a routing bug.
+      ordinaryRequest: async (path) => {
+        throw new Error(`ordinary path ${path} reached the outage service`);
+      },
+      verifyAttestation: (input, ticket) => verifyHealthReport(healthKey, input, ticket),
+    });
+  }
+  const OUTAGE_PRIVATE_PATHS = new Set(["/model-health/begin", "/model-health/outcome"]);
+  const OUTAGE_PROBE_PATHS = new Set(["/probe/consume", "/probe/release"]);
+  // ☠️ The private paths (and the pre-read of /probe/consume|release) run outside `guarded`, so
+  // they had no deadline at all: a client that announced a body and never sent it left parseBody
+  // pending for good, and server.close() then waited on that connection forever, so SIGTERM
+  // never exited and the socket was never unlinked. Each such request now carries the SAME
+  // deadline as an ordinary handler, measured from arrival, and is destroyed when it expires;
+  // shutdown destroys whatever is still tracked here before closing the server. Private stalls
+  // are a client's fault, not a wedged queue, so they are logged but deliberately NOT counted
+  // in queueStats (which drives `opencode-broker health`) and do not notify.
+  // OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS exists only so tests need not wait 30 s; it is read
+  // once, here, at startup.
+  const PRIVATE_REQUEST_DEADLINE_MS = Number(process.env.OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS) > 0
+    ? Number(process.env.OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS)
+    : HANDLER_DEADLINE_MS;
+  const privateRequests = new Map();
+  const destroyPrivate = (request, response) => {
+    response.destroy();
+    request.destroy();
+    request.socket?.destroy();
+  };
+  // Tracks one private request until its response finishes or its connection closes. The
+  // returned release() hands a pre-read ordinary request over to the queue's own deadline.
+  const trackPrivate = (request, response) => {
+    let release = null;
+    const timer = setTimeout(() => {
+      console.error(`[opencode-broker] private request deadline exceeded: ${request.url} did not finish within ${PRIVATE_REQUEST_DEADLINE_MS / 1000} s; connection destroyed`);
+      release();
+      destroyPrivate(request, response);
+    }, PRIVATE_REQUEST_DEADLINE_MS);
+    if (typeof timer?.unref === "function") timer.unref();
+    release = () => {
+      clearTimeout(timer);
+      privateRequests.delete(request);
+      response.off("finish", release);
+      response.off("close", release);
+    };
+    privateRequests.set(request, response);
+    response.once("finish", release);
+    response.once("close", release);
+    return release;
+  };
+  // Private outage paths run OUTSIDE the ordinary queue: /model-health/outcome awaits a worker
+  // transaction on that very queue, so wrapping the whole handler in it would deadlock.
+  const handleOutage = async (request, response, body) => {
+    try {
+      if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
+        return reply(response, 403, { error: "loopback control endpoint required", code: "loopback-control-required" });
+      }
+      if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
+      const parsed = body ?? await parseBody(request);
+      return reply(response, 200, await outageService.request(request.url, parsed));
+    } catch (error) {
+      if (abandoned(request, response)) {
+        response.destroy();
+        return;
+      }
+      return reply(response, 400, { error: String(error?.message ?? error), code: "outage-health-refused" });
+    }
+  };
+  const server = createServer((request, response) => {
+    if (outageService && OUTAGE_PRIVATE_PATHS.has(request.url)) {
+      trackPrivate(request, response);
+      handleOutage(request, response).catch(() => {});
+      return;
+    }
+    if (outageService && OUTAGE_PROBE_PATHS.has(request.url) && request.method === "POST") {
+      const release = trackPrivate(request, response);
+      // The purpose decides the owner, so the bounded body is read here, once.
+      parseBody(request).then((body) => {
+        if (body && typeof body === "object" && body.purpose === "outage-health") return handleOutage(request, response, body);
+        // From here the ordinary queue owns it, with its own deadline and abandon accounting.
+        release();
+        enqueueRequest(request, response, body);
+        return undefined;
+      }, (error) => {
+        if (abandoned(request, response)) { response.destroy(); return; }
+        reply(response, 400, { error: String(error?.message ?? error) });
+      }).catch(() => {});
+      return;
+    }
+    enqueueRequest(request, response);
   });
   const removeSocket = () => { try { unlinkSync(socketPath); } catch {} };
   server.on("close", removeSocket);
@@ -2611,11 +2971,24 @@ const serve = async () => {
     serial = serial.then(() => refreshPlanUsage(state)).catch(() => {});
   };
   setInterval(() => { refreshPlanUsageTick().catch(() => {}); }, 30_000).unref();
+  // Started only once the socket is listening, so its first transaction meets a live queue.
+  outageService?.worker.start();
   process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
   for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => {
-      server.close(() => process.exit(0));
+      const finish = (code) => {
+        // A stalled private request would hold server.close() open forever; drop them first.
+        for (const [request, response] of [...privateRequests]) destroyPrivate(request, response);
+        server.close(() => process.exit(code));
+      };
+      if (!outageService) return finish(0);
+      // Abort and drain outage fetches, probes and timers BEFORE the socket goes away. A close
+      // failure is reported and turns the exit status non-zero; it never blocks shutdown.
+      outageService.close().then(() => finish(0), (error) => {
+        console.error(`[opencode-broker] outage service shutdown failed: ${error?.message ?? error}`);
+        finish(1);
+      });
     });
   }
 };

@@ -21,13 +21,14 @@
 // this endpoint fronts paid quota. Provider keys are read from opencode's
 // auth store at request time and never logged.
 import { spawn } from "node:child_process";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { usageLimitMessage } from "../../lib/usage-limit.js";
+import { createGatewayHealth, createTerminalParser } from "./model-health.js";
 
 // Constant-time comparison of a presented credential with its expected wire value. Hashing first
 // gives both sides the same length, which timingSafeEqual requires for bearer and x-api-key auth.
@@ -49,6 +50,8 @@ const loopbackAddress = (value) => {
 // prefix or suffix. Plain string comparison, not a RegExp built from the client-supplied id. The
 // gateway takes no imports from the broker's lib/, hence the copy rather than a shared helper.
 const SPEED_ALIAS_SUFFIXES = ["-fast", "-standard"];
+// Required anthropic-beta for a Messages request with top-level speed "fast".
+const FAST_MODE_BETA = "fast-mode-2026-02-01";
 const leaseCoversWireModel = (leasedModelID, wireModelID) => {
   if (typeof leasedModelID !== "string") return false;
   if (leasedModelID === wireModelID) return true;
@@ -763,7 +766,7 @@ const validEmbeddingInput = (input) => typeof input === "string" || (Array.isArr
 // for: the usage tail we asked for ourselves, and error frames.
 //
 // `relayed` is the whole ballgame -- see THE FAILOVER BOUNDARY below.
-const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT }) => {
+const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, observe = null }) => {
   const decoder = new TextDecoder();
   let buffer = "";
   let relayed = false;
@@ -850,6 +853,7 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT })
   try {
     for await (const chunk of stream) {
       touch();
+      observe?.(chunk);
       buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
       let live = true;
       let match;
@@ -878,9 +882,15 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT })
 // dialect gap would punish every buffered request too -- so the body is dressed
 // as the stream it should have been. Usage comes straight off the payload, so
 // this path accounts exactly, not by estimate.
-const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
+const relayBufferedAsStream = async ({ response, sink, keepUsageFrames, observe = null }) => {
   let payload;
-  try { payload = await response.json(); } catch {
+  try {
+    if (observe) {
+      const raw = await response.text();
+      observe(raw);
+      payload = JSON.parse(raw);
+    } else payload = await response.json();
+  } catch {
     return { relayed: false, usage: null, outputChars: 0, sawDone: false,
       error: new Error("upstream returned 200 with an unparseable JSON body") };
   }
@@ -902,10 +912,10 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames }) => {
 // is exactly the buffered path's. The cost, named: the client sees no token until the last one.
 // Returns relayStream's outcome shape. A failed read (our timeout, the client's abort) surfaces as
 // the error itself, so the caller can tell impatience from a broken body.
-const relayBufferedReply = async ({ response, sink, keepUsageFrames, api }) => {
+const relayBufferedReply = async ({ response, sink, keepUsageFrames, api, observe = null }) => {
   const failed = (error) => ({ relayed: false, usage: null, outputChars: 0, sawDone: false, error });
   let raw;
-  try { raw = await response.text(); } catch (error) { return failed(error); }
+  try { raw = await response.text(); observe?.(raw); } catch (error) { return failed(error); }
   let payload;
   try { payload = JSON.parse(raw); } catch {
     return failed(new Error("upstream returned 200 with an unparseable JSON body"));
@@ -1217,6 +1227,9 @@ export const createGatewayHandler = ({
   // restarts -- and the token must never be in the compose env, in config, or in git.
   // Absent means the surface is closed, not open.
   tenantToken = null,
+  // Private health credentials are startup-injected only. They are never accepted from the
+  // public JSON body or front-door headers.
+  health = null,
   reservationsPath = DEFAULT_RESERVATIONS_PATH,
   // Injected so no test can spawn a real model-swap. On 2026-09-07 a test run in the llamacpp
   // repo fired a real swap and pulled a model out from under a live session.
@@ -1227,6 +1240,9 @@ export const createGatewayHandler = ({
 }) => {
   validateProviderFlags(config.providers);
   const allowedProviders = Object.keys(config.providers);
+  const healthReporter = health?.key instanceof Uint8Array && typeof health.gatewayCredential === "string"
+    ? createGatewayHealth({ key: health.key, gatewayCredential: health.gatewayCredential, brokerRequest, now, sleepImpl })
+    : null;
 
   // WHO ASKED, per gateway session: the client's address and the model name it sent. Every
   // gateway request is a fresh `gw-...` session, so without this the broker's decision and
@@ -1246,6 +1262,7 @@ export const createGatewayHandler = ({
     api = CHAT,
     waitedMs = 0,
     probeAssignment = null,
+    excludeTargetIDs = [],
   ) => {
     // Local targets are strict: an unknown context size never fits them, so a
     // lease without contextTokens can never land local. See estimateContextTokens
@@ -1313,6 +1330,7 @@ export const createGatewayHandler = ({
       // merely bursty cannot seize a scarce shared target the moment its own lane is busy.
       waitedMs,
       providers,
+      ...(excludeTargetIDs.length ? { excludeTargetIDs } : {}),
       ...(probeAssignment ? {
         preferredModel: {
           providerID: probeAssignment.preferredModel.providerID,
@@ -1334,7 +1352,9 @@ export const createGatewayHandler = ({
       leaseID: lease?.leaseID,
       providerID: model.providerID,
       modelID: model.id,
+      targetID: typeof lease?.target?.id === "string" ? lease.target.id : model.id,
       embedding: lease?.target?.embedding === true,
+      expectedCredentialInstance: typeof lease?.expectedCredentialInstance === "string" ? lease.expectedCredentialInstance : null,
     };
   };
 
@@ -1385,6 +1405,7 @@ export const createGatewayHandler = ({
     deadline,
     api = CHAT,
     probeAssignment = null,
+    excludeTargetIDs = [],
   ) => {
     const line = route?.profile ?? config.profile;
     const budget = waitFor(route);
@@ -1415,7 +1436,7 @@ export const createGatewayHandler = ({
           // and counting it would let a request that never queued walk onto a delayed rung.
           const waitedMs = waitStarted === null ? 0 : Math.max(0, now() - waitStarted);
           try {
-            return await leaseOnce(sessionID, requestBody, excluded, route, api, waitedMs, probeAssignment);
+            return await leaseOnce(sessionID, requestBody, excluded, route, api, waitedMs, probeAssignment, excludeTargetIDs);
           } catch (refusal) {
             // A swap is waited out only for a mapped name (the rule below); a busy slot is waited
             // out for everyone. The deadline is the request's own either way.
@@ -1538,10 +1559,15 @@ export const createGatewayHandler = ({
     } finally {
       callers.delete(sessionID);
       if (probeAssignment) {
-        await brokerRequest("/probe/release", {
+        const release = {
           sessionID: probeAssignment.sessionID,
           probeNonce: probeAssignment.probeNonce,
-        });
+          ...(probeAssignment.outageAssignment ? {
+            leaseID: probeAssignment.leaseID,
+            purpose: "outage-health",
+          } : {}),
+        };
+        try { await brokerRequest("/probe/release", release); } catch { /* probe expiry is the broker-side backstop */ }
       }
     }
   };
@@ -1587,6 +1613,7 @@ export const createGatewayHandler = ({
     let acquiredLease = false;
     let lastLeased = null;
     const excluded = [];
+    const excludedTargets = [];
     // ☠️ A PROFILE-MAPPED REQUEST MUST NOT EXCLUDE ITS OWN LANE. The exclusion
     // (0.2.2) exists because the gateway picks among the providers IT can
     // forward to for a TIER: dropping the one that just failed sends the retry
@@ -1603,12 +1630,21 @@ export const createGatewayHandler = ({
     // 3-minute ceiling into a 6-minute one.
     // A mapped name may shorten (or refuse) the wait; anything else gets the deployment default.
     const deadline = now() + waitFor(route);
+    // HEALTH IDENTITY IS PER INBOUND HTTP REQUEST, NOT PER SESSION OR ATTEMPT INDEX. The
+    // broker's outage reducer dedupes failures by attemptID and diagnoses only on failures from
+    // two distinct requestIDs. An index-only attemptID ("0") collided across every request on a
+    // held session and across every gw- request's first attempt, so only one failure was ever
+    // recorded and no outage could be diagnosed. completionsFor runs once per inbound HTTP
+    // request, so one server-generated UUID minted here names that request for every attempt
+    // (retries and scope reroutes included), and `${UUID}:${attempt}` names each actual attempt.
+    // Never derived from caller headers or session ids; minted only when health is enabled.
+    const healthRequestID = healthReporter ? randomUUID() : null;
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       // ☠️ A SESSION-BOUND REQUEST GETS EXACTLY ONE ATTEMPT, ON EXACTLY ITS MODEL. Choosing a
       // different target is the session's own router's job (it holds the pin and the transcript
       // context); a gateway retry onto another lane would answer a Claude turn from whatever the
       // worker tier had free, which is how every opencode prompt failed on 2026-10-01.
-      if (boundLease && attempt > 0) break;
+      if ((boundLease || probeAssignment?.purpose === "outage-health") && attempt > 0) break;
       let leased;
       try {
         leased = boundLease ?? await leaseWithPrepare(
@@ -1620,6 +1656,7 @@ export const createGatewayHandler = ({
           deadline,
           api,
           probeAssignment,
+          excludedTargets,
         );
       }
       catch (error) {
@@ -1727,6 +1764,7 @@ export const createGatewayHandler = ({
         || (api === RESPONSES && providerConfig.responsesApi === true)
       );
       let response;
+      let healthAttempt = null;
       let instructedJson = false;
       try {
         const abort = upstreamStreaming
@@ -1871,14 +1909,78 @@ export const createGatewayHandler = ({
         } else if (key) {
           forwardHeaders.Authorization = `Bearer ${key}`;
         }
+        // A FAST OUTAGE SCOPE IS ASKED FOR IN THE BODY, NOT THE MODEL ID. Anthropic's fast mode
+        // is the BASE model plus top-level speed "fast" plus the fast-mode beta; the assignment
+        // writer already put the base id in wireModelID. Only the trusted consumed outage
+        // assignment decides this -- never a caller header, never provider bodyExtras, and an
+        // ordinary request's body/speed is left exactly as sent. Done before serialization so the
+        // signed health context and bodySHA256 bind the final fast body. Fast is defined only for
+        // native Messages; anything else is refused rather than sent as a fake fast probe.
+        if (probeAssignment?.outageAssignment === true && leased.outageAssignment === true
+          && leased.expectedScopePolicy?.speed === "fast") {
+          if (api !== MESSAGES) {
+            lastError = new Error("fast outage scope requires native Messages");
+            break;
+          }
+          forwardBody = { ...forwardBody, speed: "fast" };
+          const betas = [];
+          for (const name of Object.keys(forwardHeaders)) {
+            if (name.toLowerCase() !== "anthropic-beta") continue;
+            for (const beta of String(forwardHeaders[name]).split(",")) {
+              const value = beta.trim();
+              if (value && !betas.includes(value)) betas.push(value);
+            }
+            delete forwardHeaders[name];
+          }
+          if (!betas.includes(FAST_MODE_BETA)) betas.push(FAST_MODE_BETA);
+          forwardHeaders["anthropic-beta"] = betas.join(",");
+        }
+        const outboundBody = JSON.stringify(forwardBody);
+        const purpose = probeAssignment?.purpose === "outage-health" ? "outage-health" : "real";
+        if (healthReporter) {
+          try {
+            healthAttempt = await healthReporter.begin({
+              leased,
+              requestID: healthRequestID,
+              attemptID: `${healthRequestID}:${attempt}`,
+              purpose,
+              bodyText: outboundBody,
+              api: api === MESSAGES ? "messages" : api === RESPONSES ? "responses" : "chat",
+            });
+          } catch (error) {
+            if (probeAssignment?.purpose === "outage-health") {
+              lastError = new Error("health control plane unavailable");
+              break;
+            }
+          }
+        }
+        const requiresVerifiedHealth = probeAssignment?.purpose === "outage-health" || leased.expectedCredentialInstance !== null;
+        if (requiresVerifiedHealth && !healthAttempt) {
+          lastError = new Error("health control plane unavailable");
+          break;
+        }
+        // Generated context is the sole health header source. Provider config is deployment
+        // input, not a private authority, so remove all health-prefixed values before install.
+        for (const name of Object.keys(forwardHeaders)) {
+          if (name.toLowerCase().startsWith("x-fleet-health-")) delete forwardHeaders[name];
+        }
+        if (healthAttempt) Object.assign(forwardHeaders, healthAttempt.headers);
         response = await fetchImpl(`${providerConfig.baseUrl.replace(/\/$/, "")}${api.path}`, {
           method: "POST",
           headers: forwardHeaders,
-          body: JSON.stringify(forwardBody),
+          body: outboundBody,
           signal: abort,
         });
+        // Keep this attempt local to the loop body while every terminal branch reports it.
+        response.healthAttempt = healthAttempt;
+        response.healthAttestation = healthAttempt ? healthReporter.captureResponse(healthAttempt, response.headers) : null;
+        if (healthAttempt) response.healthParser = createTerminalParser(healthAttempt.api);
       } catch (error) {
         clearTimeout(stallTimer);
+        if (healthAttempt) {
+          const parser = createTerminalParser(healthAttempt.api);
+          await healthReporter.finish(healthAttempt, { responseHeaders: new Headers(), terminal: parser.finish({ status: 0, contentType: "", cancelled: clientAbort?.aborted, networkError: true }), finishedAt: now() }).catch(() => null);
+        }
         // A timeout is OUR impatience or the client's abandonment, not proof
         // the provider is down -- reporting it as a failure quarantined a
         // healthy provider under burst (measured live). Release the lease,
@@ -1895,6 +1997,21 @@ export const createGatewayHandler = ({
         rememberForwardError(error);
         continue;
       }
+      // A proxy-authenticated scope refusal is distinct from any broker/control-plane 409.
+      // Only this exact attested upstream fact may replace an external lease; the plugin retains
+      // ownership of that original lease while the gateway settles the replacement it acquires.
+      let scopeMismatch = false;
+      if (response.status === 409 && response.healthAttestation) {
+        scopeMismatch = response.healthAttestation[11] === "proxy-scope" && response.healthAttestation[12] === null;
+      }
+      if (scopeMismatch && !probeAssignment && (boundLease?.external || leased.expectedCredentialInstance !== null)) {
+        const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+        await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
+        if (!boundLease?.external) await settle(leased, "/release");
+        if (!excludedTargets.includes(leased.targetID)) excludedTargets.push(leased.targetID);
+        boundLease = null;
+        continue;
+      }
       if (!response.ok) {
         // The body is already read whole; `text` is a 400-char slice of it for
         // the chat path (unchanged). `upstreamSignal` is a fixed gateway-owned
@@ -1906,6 +2023,11 @@ export const createGatewayHandler = ({
         // and only name the status; the suffix is how the signal reaches the
         // broker there.
         const raw = await response.text().catch(() => "");
+        if (response.healthAttempt) {
+          const parser = createTerminalParser(response.healthAttempt.api);
+          parser.push(raw);
+          await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
+        }
         const text = raw.slice(0, 400);
         const usageLimit = upstreamUsageLimit(response.status, raw, response.headers, now());
         const signal = api === CHAT ? null : (upstreamSignal(raw) ?? (usageLimit ? "usage limit reached" : null));
@@ -1961,18 +2083,23 @@ export const createGatewayHandler = ({
           // stream. Until it is whole `relayed` stays false, so everything below sorts it exactly
           // like a streamed attempt that failed with the wire clean.
           outcome = bufferingStream
-            ? await relayBufferedReply({ response, sink, keepUsageFrames, api })
+            ? await relayBufferedReply({ response, sink, keepUsageFrames, api, observe: (chunk) => response.healthParser?.push(chunk) })
             : contentType.includes("application/json")
             ? (api === CHAT
-              ? await relayBufferedAsStream({ response, sink, keepUsageFrames })
+              ? await relayBufferedAsStream({ response, sink, keepUsageFrames, observe: (chunk) => response.healthParser?.push(chunk) })
               : { relayed: false, usage: null, outputChars: 0, sawDone: false,
                 error: new Error(`upstream ${leased.providerID} answered a streamed ${api.path} request with one JSON body`) })
-            : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api });
+            : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api,
+              observe: (chunk) => response.healthParser?.push(chunk) });
         } finally {
           clearTimeout(stallTimer);
         }
         if (api === MESSAGES && outcome.relayed && !outcome.error && !outcome.sawDone) {
           outcome.error = new Error("Anthropic upstream stream ended before message_stop");
+        }
+        if (response.healthAttempt) {
+          const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+          await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType, cancelled: clientAbort?.aborted }), finishedAt: now() }).catch(() => null);
         }
         if (!outcome.relayed) {
           // Wire still clean. No usage is reported for a lane that produced no
@@ -2038,11 +2165,20 @@ export const createGatewayHandler = ({
           rawBody = await response.text();
           payload = JSON.parse(rawBody);
         } catch {
+          if (response.healthAttempt) {
+            const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+            await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? ""), cancelled: clientAbort?.aborted }), finishedAt: now() }).catch(() => null);
+          }
           await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
           noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
           rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
           excludeLane(leased.providerID);
           continue;
+        }
+        if (response.healthAttempt) {
+          const parser = createTerminalParser(response.healthAttempt.api);
+          parser.push(rawBody);
+          await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
         if (payload?.usage) await reportUsage(leased, readMessagesUsage(payload.usage));
         await settle(leased, "/complete");
@@ -2062,10 +2198,22 @@ export const createGatewayHandler = ({
       // connection, which is the whole point. A lane that ignored `stream: true` and answered
       // with one JSON body falls through to the ordinary buffered read below.
       if (assembling && !String(response.headers?.get?.("content-type") ?? "").includes("application/json")) {
-        const outcome = api === RESPONSES
-          ? await assembleResponse(response.body ?? [])
-          : await assembleChatCompletion(response.body ?? []);
+          const stream = response.healthParser ? {
+            async *[Symbol.asyncIterator]() {
+              for await (const chunk of response.body ?? []) {
+                response.healthParser.push(chunk);
+                yield chunk;
+              }
+            },
+          } : (response.body ?? []);
+          const outcome = api === RESPONSES
+            ? await assembleResponse(stream)
+            : await assembleChatCompletion(stream);
         if (outcome.error) {
+          if (response.healthAttempt) {
+            const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+            await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? ""), cancelled: clientAbort?.aborted }), finishedAt: now() }).catch(() => null);
+          }
           // Nothing has reached the client: same sorting as a streamed attempt that failed with
           // a clean wire -- our impatience or the client's releases, a broken stream indicts.
           const error = outcome.error;
@@ -2081,13 +2229,32 @@ export const createGatewayHandler = ({
           continue;
         }
         payload = outcome.payload;
+        if (response.healthAttempt) {
+          const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+          await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
+        }
       } else {
-        try { payload = await response.json(); } catch {
+        let rawBody;
+        try {
+          if (response.healthAttempt) {
+            rawBody = await response.text();
+            payload = JSON.parse(rawBody);
+          } else payload = await response.json();
+        } catch {
+          if (response.healthAttempt) {
+            const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+            await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? ""), cancelled: clientAbort?.aborted }), finishedAt: now() }).catch(() => null);
+          }
           await settle(leased, "/failure", { error: { message: "upstream returned 200 with an unparseable JSON body" } });
           noteAttempt(leased, "bad_json", "upstream returned 200 with an unparseable JSON body");
           rememberForwardError(new Error(`upstream ${leased.providerID} returned unparseable JSON`));
           excludeLane(leased.providerID);
           continue;
+        }
+        if (response.healthAttempt) {
+          const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
+          if (typeof rawBody === "string") parser.push(rawBody);
+          await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
       }
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
@@ -2366,13 +2533,17 @@ export const createGatewayHandler = ({
       }));
       return;
     }
+    const rawProbePurpose = request.headers["x-opencode-probe-purpose"];
+    const probePurpose = Array.isArray(rawProbePurpose) ? rawProbePurpose[0] : rawProbePurpose;
     let probeAssignment = null;
+    let boundLease = null;
     if (hasProbeMarker) {
       let consumed;
       try {
         consumed = await brokerRequest("/probe/consume", {
           sessionID: probeSessionID,
           probeNonce,
+          ...(probePurpose === "outage-health" ? { purpose: "outage-health" } : {}),
         });
       } catch {
         return respondJson(response, 403, { error: { message: "probe assignment rejected" } });
@@ -2382,6 +2553,22 @@ export const createGatewayHandler = ({
         || typeof consumed?.preferredModel?.modelID !== "string") {
         return respondJson(response, 403, { error: { message: "probe assignment binding mismatch" } });
       }
+      const consumedOutageAssignment = consumed.purpose === "outage-health";
+      const releaseConsumedProbe = async () => {
+        try {
+          await brokerRequest("/probe/release", {
+            sessionID: probeSessionID,
+            probeNonce,
+            ...(consumedOutageAssignment ? { leaseID: consumed.leaseID, purpose: "outage-health" } : {}),
+          });
+        } catch { /* probe expiry is the broker-side backstop */ }
+      };
+      // A caller's header asks the service for an isolated assignment; it cannot turn a
+      // consumed generic staged probe into one after the fact.
+      if (probePurpose === "outage-health" && !consumedOutageAssignment) {
+        await releaseConsumedProbe();
+        return respondJson(response, 403, { error: { message: "outage probe assignment purpose mismatch" } });
+      }
       probeAssignment = {
         sessionID: probeSessionID,
         probeNonce,
@@ -2389,7 +2576,42 @@ export const createGatewayHandler = ({
           providerID: consumed.preferredModel.providerID,
           modelID: consumed.preferredModel.modelID,
         },
+        purpose: consumedOutageAssignment ? "outage-health" : null,
       };
+      if (probeAssignment.purpose === "outage-health") {
+        if (typeof consumed.leaseID !== "string" || typeof consumed.expectedCredentialInstance !== "string"
+          || typeof consumed.modelID !== "string" || typeof consumed.wireModelID !== "string"
+          || typeof consumed.targetID !== "string" || typeof consumed.preferredModel?.providerID !== "string"
+          || typeof consumed.expectedScopePolicy !== "object" || consumed.expectedScopePolicy === null
+          || !config.providers[consumed.preferredModel.providerID]) {
+          await releaseConsumedProbe();
+          return respondJson(response, 403, { error: { message: "outage probe assignment binding mismatch" } });
+        }
+        const requiredApi = api === MESSAGES ? "messages" : api === RESPONSES ? "responses" : null;
+        const scope = consumed.expectedScopePolicy;
+        if (requiredApi === null || scope.providerID !== consumed.preferredModel.providerID
+          || scope.transport !== requiredApi || scope.probe?.api !== requiredApi) {
+          await releaseConsumedProbe();
+          return respondJson(response, 403, { error: { message: "outage probe assignment API scope mismatch" } });
+        }
+        probeAssignment = {
+          ...probeAssignment,
+          leaseID: consumed.leaseID,
+          outageAssignment: true,
+        };
+        boundLease = {
+          sessionID: probeSessionID,
+          leaseID: consumed.leaseID,
+          providerID: consumed.preferredModel.providerID,
+          modelID: consumed.modelID,
+          wireModelID: consumed.wireModelID,
+          targetID: consumed.targetID,
+          expectedCredentialInstance: consumed.expectedCredentialInstance,
+          expectedScopePolicy: consumed.expectedScopePolicy,
+          external: true,
+          outageAssignment: true,
+        };
+      }
     }
     // ☠️ AN OPENCODE SESSION HAS ALREADY BEEN ROUTED. Its router plugin leased a target in
     // chat.message and sent that exact model here, so leasing again from this gateway's default
@@ -2403,7 +2625,6 @@ export const createGatewayHandler = ({
     // upstream (2026-10-01: every -fast build lease was refused 409). leaseCoversWireModel() holds
     // the exact rule. The forward therefore sends the client's own id (wireModelID), while
     // modelID stays the lease's id so the lease identity is never rewritten.
-    let boundLease = null;
     const rawBoundSession = request.headers["x-opencode-session-id"];
     const boundSessionID = Array.isArray(rawBoundSession) ? rawBoundSession[0] : rawBoundSession;
     if (boundSessionID !== undefined && !hasProbeMarker) {
@@ -2437,7 +2658,9 @@ export const createGatewayHandler = ({
         leaseID: held.leaseID,
         providerID: model.providerID,
         modelID: model.id,
+        targetID: typeof held?.target?.id === "string" ? held.target.id : model.id,
         wireModelID: requestedModel,
+        expectedCredentialInstance: typeof held.expectedCredentialInstance === "string" ? held.expectedCredentialInstance : null,
         external: true,
       };
       // Rides the session's own lease, so no gateway profile or tier was consulted.

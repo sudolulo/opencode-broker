@@ -21,7 +21,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { DEFAULT_GATEWAY_CONFIG, createGatewayHandler, loadGatewayConfig, readGatewayKeyFile } from "../lib/gateway.js";
-import { brokerRequest } from "../../lib/client.js";
+import { brokerRequest, createHealthBrokerRequest, selectBrokerTransport } from "../../lib/client.js";
+import { readHealthKey } from "../../lib/model-health-key.js";
 
 const deprecations = [];
 const setting = (name, legacyName) => {
@@ -50,6 +51,17 @@ const keyPath = setting("OPENCODE_BROKER_GATEWAY_KEY_FILE", "OPENCODE_FLEET_GATE
 // file another account on the host can read -- a 0640 drop file is a deploy fault, and one
 // that stays invisible for as long as nobody abuses it.
 const gatewayKey = readGatewayKeyFile(keyPath);
+// Health is intentionally opt-in until the broker endpoints and proxy attestation are deployed.
+// Its MAC key is a distinct 32-byte secret read with the stricter health-key proof; its broker
+// capability credential is a separate front-door-style drop file, never JSON configuration.
+const healthKeyPath = process.env.OPENCODE_BROKER_HEALTH_KEY_FILE;
+const healthCredentialPath = process.env.OPENCODE_BROKER_HEALTH_GATEWAY_CREDENTIAL_FILE;
+if (Boolean(healthKeyPath) !== Boolean(healthCredentialPath)) {
+  throw new Error("opencode-broker-gateway: health key and health credential files must be configured together");
+}
+const health = healthKeyPath
+  ? { key: readHealthKey(healthKeyPath, { frontDoorKeys: [gatewayKey] }), gatewayCredential: readGatewayKeyFile(healthCredentialPath) }
+  : null;
 // The tenant surface's own credential, read ONCE here at startup. ☠️ A long-running service
 // never calls rbw: the vault may be locked when it restarts, and a gateway that cannot come
 // up is worse than one without a tenant surface. The token is generated and written to a
@@ -80,7 +92,9 @@ try {
     }
   }
 } catch { /* broker down: nothing to sweep */ }
-const handler = createGatewayHandler({ config, brokerRequest, gatewayKey, tenantToken });
+const healthRequest = createHealthBrokerRequest();
+const request = selectBrokerTransport({ brokerRequest, healthRequest });
+const handler = createGatewayHandler({ config, brokerRequest: request, gatewayKey, tenantToken, health });
 const port = Number(process.env.PORT) || 8790;
 const host = process.env.HOST || "127.0.0.1";
 createServer((request, response) => { void handler(request, response); }).listen(port, host, () => {

@@ -217,6 +217,16 @@ All notable changes to this project are documented here. The format is based on
 
 - **A streamed client no longer loses tool calls when a lane ignores `stream: true`.** When a lane answered a streaming ask with a single buffered chat document, the gateway dressed it as a stream by hand and emitted only a content delta and a `finish_reason` delta, silently dropping every `tool_calls` entry and any `reasoning_content`: a tool-using caller on such a lane received a content-only answer and no tool call at all. That path now builds its frames with the same helper as `bufferStreamingUpstream`, so indexed tool calls (id, type, function name and the full arguments string), reasoning, `finish_reason` and a usage frame when the client asked for `include_usage` all survive. Its outcome classification, usage accounting and failure logging are unchanged.
 
+## [1.25.0] — 2026-10-13
+
+### Added
+
+- Opt-in, model-specific outage reserves limited to explicit older-sibling mappings after health verifies the same credential, provider, authentication, transport, product, and speed scope. Bounded status polling, fixed episodes, and probe counters are durably reserved before gateway dispatch. Private proxy attestation, gateway terminal-health validation, native Messages and Responses proof, actual fast-speed proof, and isolated single-attempt probe assignments support verification.
+
+### Fixed
+
+- Ordinary selection, held sticky sessions, inventory, profiles, and overflow fences prevent old, alias, or future-head bypasses from leaking reserves. Idempotent health receipt application and durable-generation revalidation preserve exactly one capability per outage probe. Unique actual-request and attempt identities let repeated native calls diagnose faults without counting retries as requests. Reservation-directory fsync failure prevents a billable probe. Ordinary notification, settlement, and privacy behavior is preserved.
+
 ## [1.24.0] — 2026-09-30
 
 ### Added
