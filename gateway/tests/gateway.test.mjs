@@ -2550,6 +2550,38 @@ test("Anthropic Messages carries the fast-mode-credits signal without echoing pr
   assert.equal(failure.body.error.message, "Anthropic upstream HTTP 429: usage credits are required for fast mode");
 });
 
+test("Anthropic Messages carries the context-overflow signal so the client can compact", async () => {
+  const upstreamBody = JSON.stringify({
+    type: "error",
+    error: { type: "invalid_request_error", message: "prompt is too long: 1616821 tokens > 1000000 maximum" },
+  });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-opus-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, {
+      status: 400, headers: { "content-type": "application/json" },
+    }),
+  });
+  let clientBody;
+  await withServer(handler, async (base) => {
+    clientBody = await (await askMessages(base)).text();
+  });
+  assert.match(clientBody, /Anthropic upstream HTTP 400: prompt is too long/);
+  // Only the gateway's phrase leaves, never the upstream token counts.
+  assert.doesNotMatch(clientBody, /1616821/);
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.equal(failure.body.error.message, "Anthropic upstream HTTP 400: prompt is too long");
+});
+
 test("Anthropic Messages fast-mode-credits does not relay a session-bound /failure", async () => {
   // External leases are the opencode plugin's to settle: a double-report would
   // double-count usage and could drop a lease the session still holds. The
