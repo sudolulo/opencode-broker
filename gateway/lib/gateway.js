@@ -142,9 +142,12 @@ export const upstreamUsageLimit = (status, body, headers, now = Date.now()) => {
     return Number.isFinite(n) && n > 1e9 ? n * 1000 : null;
   };
   const inSeconds = Number(parsed?.error?.resets_in_seconds ?? header("retry-after"));
-  const until = epochSeconds(header("anthropic-ratelimit-unified-reset")) ??
+  const computedUntil = epochSeconds(header("anthropic-ratelimit-unified-reset")) ??
     epochSeconds(parsed?.error?.resets_at) ??
     (Number.isFinite(inSeconds) && inSeconds > 0 ? now + inSeconds * 1000 : null);
+  // Date throws outside its supported range. A reset is optional quota metadata,
+  // so discard unusable provider values while preserving the recognised 429 itself.
+  const until = Number.isFinite(computedUntil) && computedUntil <= 8.64e15 ? computedUntil : null;
   const claim = header("anthropic-ratelimit-unified-representative-claim");
   return { limit: UNIFIED_CLAIMS[claim] ?? null, until };
 };
@@ -2123,13 +2126,29 @@ export const createGatewayHandler = ({
     // switch), and the day it lifts is the answer they need. The gateway phrase stays in it,
     // because callers and the broker's classifier key on it to know no provider was at fault.
     // Still a 502, not a 429: a 429 tells clients to retry, and a weekly limit is days away.
-    const usageLead = lastError?.code === "usage-limit"
+    const boundUsage = boundLease?.external && lastError?.usageLimit?.providerID === boundLease.providerID
+      ? lastError.usageLimit : null;
+    const resetAt = Number(boundUsage?.until);
+    const hasReset = Number.isFinite(resetAt) && resetAt > now() && resetAt <= 8.64e15;
+    const providerID = typeof boundUsage?.providerID === "string" && /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(boundUsage.providerID)
+      ? boundUsage.providerID : null;
+    const window = ["5-hour limit", "weekly limit", "weekly Opus limit", "weekly Sonnet limit"].includes(boundUsage?.limit)
+      ? boundUsage.limit : null;
+    // A verified session owns its lease and will report this failure to the broker. Its one
+    // upstream attempt nevertheless needs a provider-attributable, quota-classified message:
+    // the ordinary gateway summary is gateway-owned and noop, even when it summarizes attempts
+    // the gateway already settled itself.
+    const boundUsageMessage = providerID
+      ? `upstream ${providerID} HTTP 429: usage limit reached${window || hasReset
+        ? ` (${[window, hasReset ? `resets at ${new Date(resetAt).toISOString()}` : null].filter(Boolean).join("; ")})` : ""}`
+      : null;
+    const usageLead = boundUsageMessage ?? (lastError?.code === "usage-limit"
       ? String(lastError.message)
-      : usageLimited.length ? `${usageLimitMessage(usageLimited, now())}.` : null;
+      : usageLimited.length ? `${usageLimitMessage(usageLimited, now())}.` : null);
     return {
       status: 502,
       payload: { error: { message: usageLead
-        ? `${usageLead} (gateway: no provider could serve the request)`
+        ? boundUsageMessage ?? `${usageLead} (gateway: no provider could serve the request)`
         : `gateway: no provider could serve the request: ${String(lastError?.message ?? lastError)}`, type: "upstream_error" } },
     };
   };
