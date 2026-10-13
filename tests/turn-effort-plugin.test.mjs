@@ -103,24 +103,33 @@ test("sends an explicit hard turn and the default engine capability with its lea
   });
 });
 
-test("records engine effort capability from chat.params and defaults absent input to false", async () => {
-  await withRouter(new Map([["root", { id: "root", agent: "standard" }]]), async ({ hooks, requests }) => {
-    const first = await message(hooks, "root", "first turn");
+test("keeps engine effort capability isolated per session and defaults unseen sessions to false", async () => {
+  await withRouter(new Map([
+    ["a", { id: "a", agent: "standard" }],
+    ["b", { id: "b", agent: "standard" }],
+    ["unseen", { id: "unseen", agent: "standard" }],
+  ]), async ({ hooks, requests }) => {
+    const firstA = await message(hooks, "a", "first turn");
+    const firstB = await message(hooks, "b", "first turn");
     await hooks["chat.params"]({
-      sessionID: "root",
+      sessionID: "a",
       model: { providerID: "openai", id: "gpt-5.6-luna" },
-      message: first.message,
+      message: firstA.message,
       effortUpdates: true,
     });
-    await message(hooks, "root", "second turn");
     await hooks["chat.params"]({
-      sessionID: "root",
+      sessionID: "b",
       model: { providerID: "openai", id: "gpt-5.6-luna" },
-      message: first.message,
+      message: firstB.message,
+      effortUpdates: false,
     });
-    await message(hooks, "root", "third turn");
+    await message(hooks, "a", "second turn");
+    await message(hooks, "b", "second turn");
+    await message(hooks, "unseen", "first turn");
     const leases = requests.filter((request) => request.path === "/lease");
-    assert.deepEqual(leases.map((lease) => lease.body.engineEffortUpdates), [false, true, false]);
+    assert.deepEqual(leases.map((lease) => [lease.body.sessionID, lease.body.engineEffortUpdates]), [
+      ["a", false], ["b", false], ["a", true], ["b", false], ["unseen", false],
+    ]);
   });
 });
 

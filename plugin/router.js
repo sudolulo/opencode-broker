@@ -128,7 +128,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const routes = new Map();
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
   const previousTurnClasses = new Map(); // sessionID -> last substantive normal or hard class
-  let engineEffortUpdates = false;
+  const engineEffortUpdates = new Map(); // sessionID -> whether this session's engine supports safe effort updates
   const sessions = new Map();
   const successCandidates = new Map();
   // The model that failed before the engine's own compaction can consume the failure.
@@ -749,7 +749,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             reason: turnEffort.reason,
             ...(turnEffort.resolvedFrom ? { resolvedFrom: turnEffort.resolvedFrom } : {}),
           },
-          engineEffortUpdates,
+          engineEffortUpdates: engineEffortUpdates.get(session.id) === true,
         } : {}),
       };
       // ☠️ A WAIT IS NOT A FAILURE. `target-busy` (every slot of a resident local model is
@@ -1310,9 +1310,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       output.headers["x-opencode-session-kind"] = session.parentID ? "subagent" : "primary";
     },
     "chat.params": async (input) => {
-      engineEffortUpdates = input?.effortUpdates === true;
       const sessionID = input?.sessionID;
       if (!sessionID) return;
+      engineEffortUpdates.set(sessionID, input.effortUpdates === true);
+      trimTracker(engineEffortUpdates);
       // ☠️ opencode's own small-model calls are not the conversation's turn. Title generation
       // runs on the configured `small_model`, fires chat.params with agent "title" and the
       // session's id, and never passes through chat.message -- so it has no route of its own,

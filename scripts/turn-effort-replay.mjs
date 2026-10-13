@@ -60,22 +60,29 @@ const replay = (path, state) => {
       ORDER BY message.session_id, message.time_created, message.id, part.time_created, part.id
     `).all();
     const seenSessions = new Set();
+    const messages = new Map();
     for (const row of rows) {
       seenSessions.add(row.session_id);
       const message = parseData(row.message_data, `message ${row.message_id}`);
       const part = parseData(row.part_data, `part ${row.part_id}`);
       if (message.role !== "user" || part.type !== "text" || part.synthetic === true || typeof part.text !== "string") continue;
-      const previous = state.previous.get(row.session_id);
+      const grouped = messages.get(row.message_id) ?? { sessionID: row.session_id, text: [] };
+      grouped.text.push(part.text);
+      messages.set(row.message_id, grouped);
+    }
+    for (const grouped of messages.values()) {
+      const text = grouped.text.join("\n");
+      const previous = state.previous.get(grouped.sessionID);
       const result = classifyTurn({
-        text: part.text,
+        text,
         isSubagent: false,
         riskFloor: null,
         riskRaisedTier: false,
         previous,
       });
-      state.previous.set(row.session_id, nextPrevious(previous, result));
+      state.previous.set(grouped.sessionID, nextPrevious(previous, result));
       state.counts[result.class] += 1;
-      if (state.samples[result.class].length < state.sampleLimit) state.samples[result.class].push(truncate(part.text));
+      if (state.samples[result.class].length < state.sampleLimit) state.samples[result.class].push(truncate(text));
     }
     state.sessionIDs = new Set([...state.sessionIDs, ...seenSessions]);
   } finally {
@@ -101,7 +108,7 @@ const main = () => {
   }
   const total = TURN_CLASSES.reduce((sum, turnClass) => sum + state.counts[turnClass], 0);
   console.log(`main sessions: ${state.sessionIDs.size}`);
-  console.log(`real user text parts: ${total}`);
+  console.log(`real user messages: ${total}`);
   for (const turnClass of TURN_CLASSES) {
     const percentage = total === 0 ? 0 : (state.counts[turnClass] / total) * 100;
     console.log(`${turnClass}: ${state.counts[turnClass]} (${percentage.toFixed(1)}%)`);

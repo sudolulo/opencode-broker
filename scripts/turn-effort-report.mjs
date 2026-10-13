@@ -52,10 +52,10 @@ const main = () => {
   const classes = Object.fromEntries(TURN_CLASSES.map((turnClass) => [turnClass, {
     turns: 0, matched: 0, unmatched: 0, output: 0,
   }]));
+  const unclassified = { turns: 0, matched: 0, unmatched: 0 };
   const tripwire = { changed: [], unchanged: [] };
   for (const turn of turns) {
-    if (!TURN_CLASSES.includes(turn.class)) continue;
-    const summary = classes[turn.class];
+    const summary = TURN_CLASSES.includes(turn.class) ? classes[turn.class] : unclassified;
     summary.turns += 1;
     const rows = typeof turn.leaseID === "string" ? usageByLease.get(turn.leaseID) : undefined;
     if (!rows?.length) {
@@ -63,6 +63,7 @@ const main = () => {
       continue;
     }
     summary.matched += 1;
+    if (!TURN_CLASSES.includes(turn.class)) continue;
     summary.output += rows.reduce((sum, row) => sum + number(row.output), 0);
     if (turn.eligible === true) {
       const first = [...rows].sort((left, right) => number(left.at) - number(right.at))[0];
@@ -77,6 +78,8 @@ const main = () => {
     const output = summary.matched ? String(summary.output / summary.matched) : "n/a";
     console.log(`${turnClass}: turns ${summary.turns}, matched ${summary.matched}, unmatched ${summary.unmatched}, mean output tokens ${output}`);
   }
+  // Title calls produce no usage rows and compaction leases are unclassified.
+  console.log(`unclassified: turns ${unclassified.turns}, matched ${unclassified.matched}, unmatched ${unclassified.unmatched}`);
   const changed = mean(tripwire.changed);
   const unchanged = mean(tripwire.unchanged);
   console.log(`cache tripwire changed applied: ${changed === null ? "n/a" : changed.toFixed(3)}; unchanged applied: ${unchanged === null ? "n/a" : unchanged.toFixed(3)}`);
