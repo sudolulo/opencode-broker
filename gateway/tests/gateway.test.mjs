@@ -3480,3 +3480,87 @@ test("strict model names do not refuse a session-bound request; its lease decide
   assert.equal(anonymous.status, 400, "without a session the allowlist still applies");
   assert.equal(anonymous.calls.length, 0);
 });
+
+test("strict model names observe unadvertised session-bound requests without lease ids", async () => {
+  const scenario = async ({ strict = true, requests }) => {
+    const logs = [];
+    const handler = createGatewayHandler({
+      config: {
+        tier: "worker",
+        profile: "auto",
+        strictModelNames: strict,
+        routedModelId: "auto",
+        providers: { anthropic: { baseUrl: "http://anthropic.example/v1" } },
+        modelProfiles: { smart: { profile: "auto", tier: "smart" } },
+      },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (path, body) => {
+        if (path === "/lease/verify") {
+          const modelID = body.sessionID === "ses_advertised" ? "auto" : "claude-opus-5-5";
+          return {
+            held: true,
+            leaseID: "lease-1",
+            target: { id: modelID, model: { providerID: "anthropic", id: modelID } },
+          };
+        }
+        if (path === "/lease") throw new Error("must not lease");
+        return { ok: true };
+      },
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: "pong" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      }),
+      logLine: (line) => { logs.push(JSON.parse(line)); },
+    });
+    const responses = [];
+    await withServer(handler, async (base) => {
+      for (const { model, sessionID, leaseID } of requests) {
+        const response = await fetch(`${base}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer gw-secret",
+            "Content-Type": "application/json",
+            ...(sessionID ? { "x-opencode-session-id": sessionID } : {}),
+            ...(leaseID ? { "x-opencode-lease-id": leaseID } : {}),
+          },
+          body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }] }),
+        });
+        responses.push({ status: response.status, payload: await response.json() });
+      }
+    });
+    return { logs, responses };
+  };
+
+  const unleased = await scenario({
+    requests: [
+      { model: "claude-opus-5-5", sessionID: "ses_unleased" },
+      { model: "claude-opus-5-5", sessionID: "ses_unleased" },
+      { model: "claude-opus-5-5", sessionID: "ses_with_lease", leaseID: "lease-1" },
+      { model: "auto", sessionID: "ses_advertised" },
+    ],
+  });
+  assert.deepEqual(unleased.responses.map(({ status }) => status), [200, 200, 200, 200],
+    "session-bound requests retain their existing successful behavior");
+  assert.deepEqual(unleased.logs.map(({ event, model, sessionID }) => ({ event, model, sessionID })), [{
+    event: "session_bound_without_lease",
+    model: "claude-opus-5-5",
+    sessionID: "ses_unleased",
+  }]);
+  assert.equal(unleased.logs[0].source, "opencode-broker-gateway");
+  assert.match(unleased.logs[0].ts, /^\d{4}-\d{2}-\d{2}T/);
+
+  const nonStrict = await scenario({
+    strict: false,
+    requests: [{ model: "claude-opus-5-5", sessionID: "ses_non_strict" }],
+  });
+  assert.equal(nonStrict.responses[0].status, 200);
+  assert.deepEqual(nonStrict.logs, []);
+
+  const anonymous = await scenario({
+    requests: [{ model: "claude-opus-5-5" }],
+  });
+  assert.equal(anonymous.responses[0].status, 400);
+  assert.equal(anonymous.responses[0].payload.error.code, "unknown_model");
+  assert.deepEqual(anonymous.logs.filter(({ event }) => event === "session_bound_without_lease"), []);
+});

@@ -87,6 +87,15 @@ const UPSTREAM_SIGNALS = [
       /\busage credits?.{0,80}fast[ -]?mode\b|\bfast[ -]?mode.{0,80}usage credits?\b/i.test(message),
     phrase: "usage credits are required for fast mode",
   },
+  // ☠️ CONTEXT OVERFLOW MUST REACH THE CLIENT AS ONE. Without it a session past the window got
+  // "Anthropic upstream HTTP 400" and OpenCode, unable to see an overflow, retried the same
+  // 1.6M-token prompt instead of compacting (2026-10-13), while the broker filed it as a provider
+  // failure. The phrase is the one OpenCode's isContextOverflow and the broker's
+  // classifyRoutingFailure ("context") both key on.
+  {
+    matches: (message) => /prompt is too long|context[._ -]?length[._ -]?exceeded|maximum context length/i.test(message),
+    phrase: "prompt is too long",
+  },
 ];
 
 // Reads the upstream error message out of the shared Anthropic/OpenAI JSON
@@ -1222,6 +1231,10 @@ export const createGatewayHandler = ({
   // document extractor and a chat UI all read as anonymous gateway traffic.
   const callers = new Map();
   const callerOf = (sessionID) => callers.get(sessionID);
+  // Strict-mode session exemptions without a lease header are evidence for a future hardening
+  // decision. Keep one entry per session, but never let observability state grow unbounded.
+  const sessionBoundWithoutLeaseLogged = new Set();
+  const MAX_SESSION_BOUND_WITHOUT_LEASE_LOGS = 500;
   const leaseOnce = async (
     sessionID,
     requestBody,
@@ -2304,7 +2317,25 @@ export const createGatewayHandler = ({
     // and nothing else -- a tighter gate than this list. Applying the list to it refused every
     // OpenCode cloud turn the moment strict mode went on (2026-10-12, "Bad Request").
     const sessionBound = request.headers["x-opencode-session-id"] !== undefined && !hasProbeMarker;
-    if (config.strictModelNames && !sessionBound && !advertisedModelIDs(config).includes(requestedModel)) {
+    const advertisedModels = advertisedModelIDs(config);
+    if (config.strictModelNames && sessionBound
+      && request.headers["x-opencode-lease-id"] === undefined
+      && !advertisedModels.includes(requestedModel)) {
+      const rawSessionID = request.headers["x-opencode-session-id"];
+      const sessionID = Array.isArray(rawSessionID) ? rawSessionID[0] : rawSessionID;
+      if (sessionBoundWithoutLeaseLogged.size < MAX_SESSION_BOUND_WITHOUT_LEASE_LOGS
+        && !sessionBoundWithoutLeaseLogged.has(sessionID)) {
+        sessionBoundWithoutLeaseLogged.add(sessionID);
+        logLine(JSON.stringify({
+          source: "opencode-broker-gateway",
+          ts: new Date(Date.now()).toISOString(),
+          event: "session_bound_without_lease",
+          model: requestedModel,
+          sessionID,
+        }));
+      }
+    }
+    if (config.strictModelNames && !sessionBound && !advertisedModels.includes(requestedModel)) {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         error: {
