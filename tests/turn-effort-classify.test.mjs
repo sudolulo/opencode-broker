@@ -29,6 +29,8 @@ const classifyCases = [
   ["recognizes a JavaScript stack trace", { text: "    at foo (/a/b.js:1:2)\n    at foo (/a/b.js:1:2)" }, "hard", "failure"],
   ["recognizes a Python stack trace", { text: '  File "x.py", line 3\n  File "x.py", line 3' }, "hard", "failure"],
   ["recognizes a long task", { text: "a ".repeat(501) }, "hard", "long-task"],
+  ["inherits normal for a long team report", { text: `[team report from "x" (sp-implementer, task none)]\n${"a".repeat(1500)}`, previous: "normal" }, "normal", "agent-notice", "normal"],
+  ["inherits hard for a team report", { text: `[team report from "x" (sp-implementer, task none)]\n${"a".repeat(1500)}`, previous: "hard" }, "hard", "agent-notice", "hard"],
   ["recognizes an unraised risk floor", { text: "hi", riskFloor: "smart" }, "hard", "risk-floor"],
   ["does not add effort when the risk floor raised the tier", { text: "hi", riskFloor: "smart", riskRaisedTier: true }, "normal", "default"],
   ...["all good?", "Status?", "what did we do so far", "did it work?"].map((text) => [
@@ -63,6 +65,46 @@ test("replaces the previous substantive class with normal", () => {
 
 test("keeps the previous substantive class for a go-ahead", () => {
   assert.equal(nextPrevious("hard", { class: "hard", reason: "go-ahead" }), "hard");
+});
+
+test("recognizes trimmed case-insensitive harness notice prefixes", () => {
+  for (const text of [
+    "  [PEER MESSAGE abc from \"s\" ...",
+    "\t[Scheduled Prompt task]",
+    "\n[background job completed]",
+  ]) {
+    const result = classifyTurn({ ...defaults, text, previous: "normal" });
+    assert.deepEqual(result, { class: "normal", reason: "agent-notice", resolvedFrom: "normal" });
+  }
+});
+
+test("does not classify a human message containing a harness notice prefix as a notice", () => {
+  const result = classifyTurn({
+    ...defaults,
+    text: "Please explain why [team report from another agent] did not arrive.",
+  });
+  assert.deepEqual(result, { class: "normal", reason: "default" });
+});
+
+test("keeps the previous substantive class for an agent notice", () => {
+  assert.equal(nextPrevious("hard", { class: "hard", reason: "agent-notice" }), "hard");
+});
+
+test("resumes hard after an agent notice followed by a go-ahead", () => {
+  let previous = "hard";
+  const notice = classifyTurn({ ...defaults, text: "[team notice from x] complete", previous });
+  previous = nextPrevious(previous, notice);
+  const resume = classifyTurn({ ...defaults, text: "continue", previous });
+  assert.deepEqual(resume, { class: "hard", reason: "go-ahead", resolvedFrom: "hard" });
+});
+
+test("keeps subagent briefs at their seat effort when they start with a harness prefix", () => {
+  const result = classifyTurn({
+    ...defaults,
+    isSubagent: true,
+    text: "[team report from x] do the task",
+  });
+  assert.deepEqual(result, { class: "normal", reason: "subagent-seat" });
 });
 
 test("resumes hard after a status question followed by a go-ahead", () => {

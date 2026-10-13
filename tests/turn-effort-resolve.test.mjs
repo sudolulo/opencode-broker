@@ -30,6 +30,17 @@ test("resolves tier and savings policies for a hard turn", () => {
   });
 });
 
+test("resolves agent notices like go-aheads when they inherit a hard class", () => {
+  const result = resolveTurnEffort({
+    ...baseInput,
+    turnClass: { class: "hard", reason: "agent-notice" },
+  });
+
+  assert.equal(result.eligible, true);
+  assert.equal(result.policies.tier, "xhigh");
+  assert.equal(result.applied, "xhigh");
+});
+
 test("lowers light turns without stepping below low", () => {
   const result = resolveTurnEffort({
     ...baseInput,

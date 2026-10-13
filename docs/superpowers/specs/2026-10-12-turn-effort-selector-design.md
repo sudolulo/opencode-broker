@@ -112,7 +112,12 @@ Normalisation: trim, lower-case, collapse whitespace, then strip trailing `.!?,`
 becomes `go`). Rules run in this order, and the first match wins:
 
 1. `isSubagent`: `normal` / `subagent-seat`.
-2. Go-ahead. The normalised text must FULLY match one of the following:
+2. Agent notice. A trimmed, case-insensitive text prefix of `[team report from `, `[team idle from `,
+   `[team notice from `, `[team message`, `[peer message `, `[scheduled prompt `, or `[background job `
+   is a harness-injected notice from another agent, not a human turn. It inherits `previous` like a
+   go-ahead, with reason `agent-notice`; this prevents 726 of 4,074 replayed messages (including 251
+   of 473 hard messages) from being raised merely to read a teammate report.
+3. Go-ahead. The normalised text must FULLY match one of the following:
    - one of `continue`, `go`, `go on`, `go ahead`, `yes`, `y`, `ok`, `okay`, `do it`, `you do it`,
      `approve`, `approved`, `push`, `try again`, `proceed`, `keep going`, `sounds good`;
    - a single option token: `^[a-z0-9]$`, `^option [a-z0-9]$`;
@@ -121,7 +126,7 @@ becomes `go`). Rules run in this order, and the first match wins:
 
    The result is the previous substantive class (`previous`; `normal` when unset), with reason
    `go-ahead` and `resolvedFrom` set to that class.
-3. Hard:
+4. Hard:
    - `riskFloor` set and NOT `riskRaisedTier` gives `risk-floor`. When the floor already raised the tier,
      that tier's default is the escalation, so the turn gets no extra step;
    - an explicit ask (substring): `ultra-think`, `ultrathink`, `think harder`, `think deeply`,
@@ -130,16 +135,16 @@ becomes `go`). Rules run in this order, and the first match wins:
      `doesn't work`, `same error`, `still broken`), or at least two stack-frame lines (a JavaScript
      frame `at <frame> (<path>:<n>:<n>)`, or a Python frame `File "...", line <n>`);
    - normalised text over 1,000 characters gives `long-task`.
-4. Light: normalised text of 200 characters or fewer that STARTS with a status pattern: `all good`,
+5. Light: normalised text of 200 characters or fewer that STARTS with a status pattern: `all good`,
    `status`, `what did we do`, `where are we`, `is it done`, `did it work`, `any update`, `check status`.
    A bare `check` is not light, because "check the migration for races" is real work.
-5. Otherwise `normal` / `default`.
+6. Otherwise `normal` / `default`.
 
 Carry-over: the plugin keeps `previous` per session (bounded, like its other per-session maps). It
 updates `previous` only on real, non-synthetic, non-compaction user turns, and only to `normal` or
-`hard`. `light` is never carried. So "all good?" followed by "continue" resumes the heavy level. A
-plugin or broker restart forgets `previous`, and the go-ahead chain after it then resolves to `normal`
-until the next substantive turn.
+`hard`. `light`, go-aheads, and agent notices are never carried. So "all good?" followed by "continue"
+resumes the heavy level. A plugin or broker restart forgets `previous`, and the go-ahead chain after it
+then resolves to `normal` until the next substantive turn.
 
 ### S2. Steps, policies and eligibility (broker)
 
