@@ -743,8 +743,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           : {}),
         ...(contextTokens !== null && contextTokens !== undefined ? { contextTokens } : {}),
         ...(resolvableModels ? { resolvableModels } : {}),
-        ...(turnEffort ? {
-          turnClass: { class: turnEffort.class, reason: turnEffort.reason },
+        ...(turnEffort && session.agent !== "compaction" ? {
+          turnClass: {
+            class: turnEffort.class,
+            reason: turnEffort.reason,
+            ...(turnEffort.resolvedFrom ? { resolvedFrom: turnEffort.resolvedFrom } : {}),
+          },
           engineEffortUpdates,
         } : {}),
       };
@@ -1222,19 +1226,19 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       let turnEffort = null;
       const isCompaction = agent === "compaction";
       if (!syntheticOnly && messageText && resolved.profile !== "manual") {
-        let riskRaisedTier = false;
-        if (!classifier && floor && session?.id) {
-          const baseTier = await routeTierForSession({
-            agent,
-            parentID: session.parentID,
-            sessionID,
-            routes,
-            sessions,
-            getSession,
-          });
-          riskRaisedTier = raiseTier(baseTier, floor) !== baseTier;
-        }
         try {
+          let riskRaisedTier = false;
+          if (!classifier && floor && session?.id) {
+            const baseTier = await routeTierForSession({
+              agent,
+              parentID: session.parentID,
+              sessionID,
+              routes,
+              sessions,
+              getSession,
+            });
+            riskRaisedTier = raiseTier(baseTier, floor) !== baseTier;
+          }
           turnEffort = classifyTurn({
             text: messageText,
             isSubagent: !session?.id || Boolean(session.parentID),
@@ -1242,8 +1246,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             riskRaisedTier,
             previous: previousTurnClasses.get(sessionID),
           });
-        } catch {
+        } catch (error) {
           // Classification must never block routing a user turn.
+          report("warn", "turn effort classification failed", error);
           turnEffort = { class: "normal", reason: "classifier-error" };
         }
         if (!isCompaction) {

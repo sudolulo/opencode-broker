@@ -30,6 +30,7 @@ const routing = await import("../lib/routing.js");
 const withRouter = async (sessions, run, { staleLease = false, profile = "local" } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "turn-effort-plugin-"));
   const requests = [];
+  const logs = [];
   let stale = staleLease;
   const brokerRequest = async (path, body) => {
     requests.push({ path, body });
@@ -53,12 +54,18 @@ const withRouter = async (sessions, run, { staleLease = false, profile = "local"
     session: {
       get: async ({ path }) => {
         const session = sessions.get(path.id);
+        if (Array.isArray(session)) {
+          const next = session.shift();
+          if (next instanceof Error) throw next;
+          return next;
+        }
         if (session instanceof Error) throw session;
         return session;
       },
       messages: async () => ({ data: [] }),
     },
   };
+  client.app.log = async (entry) => { logs.push(entry); };
   const hooks = await ModelRouter({ client, directory: home }, { brokerRequest });
   for (const [sessionID, session] of sessions) {
     if (session instanceof Error) continue;
@@ -66,7 +73,7 @@ const withRouter = async (sessions, run, { staleLease = false, profile = "local"
     else routing.removeSessionProfile(sessionID);
   }
   try {
-    await run({ hooks, requests, client });
+    await run({ hooks, requests, logs, client });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -150,8 +157,9 @@ test("carries the previous hard class through a light status question and go-ahe
     assert.deepEqual(leases.map((lease) => lease.body.turnClass), [
       { class: "hard", reason: "explicit" },
       { class: "light", reason: "status" },
-      { class: "hard", reason: "go-ahead" },
+      { class: "hard", reason: "go-ahead", resolvedFrom: "hard" },
     ]);
+    assert.equal(Object.hasOwn(leases[0].body.turnClass, "resolvedFrom"), false);
   });
 });
 
@@ -167,7 +175,7 @@ test("does not attach a class to synthetic-only prompts", async () => {
   });
 });
 
-test("bounds previous classes and ignores compaction turns", async () => {
+test("bounds previous classes and does not send a class for compaction turns", async () => {
   await withRouter(new Map(), async ({ hooks, requests }) => {
     const sessions = 2100;
     const sessionIDs = Array.from({ length: sessions }, (_, index) => `session-${index}`);
@@ -182,8 +190,8 @@ test("bounds previous classes and ignores compaction turns", async () => {
     const leases = requests.filter((request) => request.path === "/lease");
     const continued = leases.filter((lease) => lease.body.sessionID === "session-0").at(-1);
     const compacted = leases.filter((lease) => lease.body.sessionID === "compaction").at(-1);
-    assert.deepEqual(continued.body.turnClass, { class: "normal", reason: "go-ahead" });
-    assert.deepEqual(compacted.body.turnClass, { class: "normal", reason: "go-ahead" });
+    assert.deepEqual(continued.body.turnClass, { class: "normal", reason: "go-ahead", resolvedFrom: "normal" });
+    assert.equal(Object.hasOwn(compacted.body, "turnClass"), false);
   });
 });
 
@@ -211,6 +219,21 @@ test("routes with a classifier-error class when the classifier throws", async ()
   } finally {
     classifyFailure = false;
   }
+});
+
+test("routes and warns without prompt text when turn tier lookup throws", async () => {
+  const prompt = "what dosage of ibuprofen is safe for a child";
+  await withRouter(new Map([
+    ["child", { id: "child", parentID: "root", agent: "general" }],
+    ["root", [new Error("tier lookup unavailable"), { id: "root", agent: "standard" }]],
+  ]), async ({ hooks, requests, logs }) => {
+    await message(hooks, "child", prompt, "general");
+    const lease = requests.find((request) => request.path === "/lease");
+    assert.deepEqual(lease.body.turnClass, { class: "normal", reason: "classifier-error" });
+    const warning = logs.find((entry) => entry.body?.level === "warn");
+    assert.equal(warning.body.message, "turn effort classification failed");
+    assert.equal(JSON.stringify(warning).includes(prompt), false);
+  });
 });
 
 test("reports the current lease ID with usage", async () => {
