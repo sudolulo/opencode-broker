@@ -40,6 +40,7 @@ import {
 } from "../lib/router-core.js";
 import { isAbortError, normalizeProviderError } from "../lib/provider-health.js";
 import { describeProviderLimit, wrapUpMessage } from "../lib/usage-limit.js";
+import { classifyTurn, nextPrevious } from "../lib/turn-effort.js";
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const LOCAL_CHILD_INACTIVITY_WATCHDOG_MS = 10 * 60 * 1000;
@@ -126,6 +127,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   });
   const routes = new Map();
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
+  const previousTurnClasses = new Map(); // sessionID -> last substantive normal or hard class
+  let engineEffortUpdates = false;
   const sessions = new Map();
   const successCandidates = new Map();
   // The model that failed before the engine's own compaction can consume the failure.
@@ -632,7 +635,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     scheduleWrapUpCheck();
   };
 
-  const route = async (session, preferredModel = null) => {
+  const route = async (session, preferredModel = null, turnEffort = null) => {
     if (!session?.id) return null;
     const classifier = isClassifierAgent(session.agent);
     if (classifier) {
@@ -740,6 +743,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           : {}),
         ...(contextTokens !== null && contextTokens !== undefined ? { contextTokens } : {}),
         ...(resolvableModels ? { resolvableModels } : {}),
+        ...(turnEffort ? {
+          turnClass: { class: turnEffort.class, reason: turnEffort.reason },
+          engineEffortUpdates,
+        } : {}),
       };
       // ☠️ A WAIT IS NOT A FAILURE. `target-busy` (every slot of a resident local model is
       // taken) and `target-preparing` (the model is being swapped onto its card) both clear
@@ -1060,7 +1067,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     } catch {}
   };
 
-  const ensure = async (sessionID, agentHint, preferredModel = null) => {
+  const ensure = async (sessionID, agentHint, preferredModel = null, turnEffort = null) => {
     if (!sessionID) return;
     let session = sessions.get(sessionID);
     try {
@@ -1109,7 +1116,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         };
       }
     }
-    return route(session, preferredModel);
+    return route(session, preferredModel, turnEffort);
   };
 
   return {
@@ -1212,6 +1219,38 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const resolved = classifier
         ? { profile: "auto", explicit: false }
         : resolveProfile({ sessionID, parentID: session?.parentID, agent });
+      let turnEffort = null;
+      const isCompaction = agent === "compaction";
+      if (!syntheticOnly && messageText && resolved.profile !== "manual") {
+        let riskRaisedTier = false;
+        if (!classifier && floor && session?.id) {
+          const baseTier = await routeTierForSession({
+            agent,
+            parentID: session.parentID,
+            sessionID,
+            routes,
+            sessions,
+            getSession,
+          });
+          riskRaisedTier = raiseTier(baseTier, floor) !== baseTier;
+        }
+        try {
+          turnEffort = classifyTurn({
+            text: messageText,
+            isSubagent: !session?.id || Boolean(session.parentID),
+            riskFloor: floor,
+            riskRaisedTier,
+            previous: previousTurnClasses.get(sessionID),
+          });
+        } catch {
+          // Classification must never block routing a user turn.
+          turnEffort = { class: "normal", reason: "classifier-error" };
+        }
+        if (!isCompaction) {
+          previousTurnClasses.set(sessionID, nextPrevious(previousTurnClasses.get(sessionID), turnEffort));
+          trimTracker(previousTurnClasses);
+        }
+      }
       // ☠️ Ask what the profile can REACH, not what it is called. A profile granted
       // `profileCloudEgress` is still one of the restrictive four by name while holding
       // a cloud fallback rung, and skipping admission work on the name would leave that
@@ -1229,11 +1268,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       let routed;
       try {
-        routed = await ensure(sessionID, agent, preferredModel);
+        routed = await ensure(sessionID, agent, preferredModel, turnEffort);
       } catch (error) {
         if (!needsInventory || (!/provider inventory is stale/.test(String(error?.message ?? error)) && !isAuthRevisionRaceError(error))) throw error;
         await refreshInventory();
-        routed = await ensure(sessionID, agent, preferredModel);
+        routed = await ensure(sessionID, agent, preferredModel, turnEffort);
       }
       applyMessageModel(output?.message, routed, sessionID);
       // The forked engine reads this field and binds the turn to it. A pane still running
@@ -1266,6 +1305,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       output.headers["x-opencode-session-kind"] = session.parentID ? "subagent" : "primary";
     },
     "chat.params": async (input) => {
+      engineEffortUpdates = input?.effortUpdates === true;
       const sessionID = input?.sessionID;
       if (!sessionID) return;
       // ☠️ opencode's own small-model calls are not the conversation's turn. Title generation
