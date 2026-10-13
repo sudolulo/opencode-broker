@@ -40,8 +40,14 @@ const realRouter = await import(routerUrl);
 const routerHooks = {};
 const shim = (name) => (...args) => (routerHooks[name] ?? realRouter[name])(...args);
 const resetRouterHooks = () => { for (const key of Object.keys(routerHooks)) delete routerHooks[key]; };
+// The background-shell store the HUD imports from `CONFIG.hud.backgroundShells` at plugin init.
+// It is null (no store, no shells) unless a test points it at the fake below, so every other
+// test sees the same shell-less HUD it always did. CONFIG itself is frozen, so the mocked
+// namespace carries a copy whose hud.backgroundShells is a getter over this variable.
+let fakeBgStorePath = null;
 const mockedRouter = {
   ...realRouter,
+  CONFIG: { ...realRouter.CONFIG, hud: { ...realRouter.CONFIG.hud, get backgroundShells() { return fakeBgStorePath; } } },
   brokerRequest: shim("brokerRequest"),
   resolveProfile: shim("resolveProfile"),
   // ☠️ Stubbable because the real ones WRITE into ~/.local/share/opencode/model-routing. A test must not leave managed-switch records behind for the running TUI to read.
@@ -108,20 +114,144 @@ const recordingJsx = (type, props = {}) => {
 const recordingRuntime = { jsx: recordingJsx, jsxs: recordingJsx, Fragment: "fragment" };
 if (jsxUrl) mock.module(jsxUrl, nodeMajor >= 24 ? { exports: recordingRuntime } : { namedExports: recordingRuntime });
 
+// A stand-in for opencode-background-shells' lib/bg-store.js, written into the temporary HOME (and
+// removed with it). Its jobs are set per test through `setJobs`, on the very module instance the
+// HUD imported, since both import the same file URL.
+const FAKE_BG_STORE = join(HOME, "fake-bg-store.mjs");
+writeFileSync(FAKE_BG_STORE, [
+  "let jobs = {};",
+  "export const setJobs = (next) => { jobs = next; };",
+  "export const listJobs = (sessionID) => { const value = jobs[sessionID]; if (value instanceof Error) throw value; return value ?? []; };",
+  "export const readOutput = () => ({ text: '', truncated: false });",
+].join("\n") + "\n");
+const fakeBgStore = await import(new URL(`file://${FAKE_BG_STORE}`).href);
+
+// This fixture re-exports the actual producer after it was evaluated against a separate HOME.
+// The HUD imports the fixture later while the suite HOME is restored, proving it honours the
+// producer's exported directory rather than assuming the consumer's documented default.
+const REAL_BG_HOME = mkdtempSync(join(tmpdir(), "hud-real-bg-home-"));
+const suiteHome = process.env.HOME;
+const realBgStoreUrl = new URL("../../../opencode-background-shells/lib/bg-store.js", import.meta.url).href + "?hud-real-store";
+process.env.HOME = REAL_BG_HOME;
+const realBgStore = await import(realBgStoreUrl);
+process.env.HOME = suiteHome;
+after(() => { rmSync(REAL_BG_HOME, { recursive: true, force: true }); });
+const REAL_BG_STORE = join(HOME, "real-bg-store.mjs");
+writeFileSync(REAL_BG_STORE, `export * from ${JSON.stringify(realBgStoreUrl)};\n`);
+
 const tuiUrl = new URL("../tui.js", import.meta.url).href;
 const plugin = await import(tuiUrl);
 let harnessQueue = Promise.resolve();
 
-const settle = (ms = 5) => new Promise((resolve) => { setTimeout(resolve, ms); });
+// ---- the virtual clock -------------------------------------------------------------------------
+// The HUD schedules everything it does with the global timers: the budget poll is a recursively
+// re-armed setTimeout aligned to the wall clock (Date.now() % 10 s), the roster and the repaint are
+// setIntervals, the allocation debounce and the lease wait are setTimeouts. A harness that stubbed
+// only setInterval (the old one) left the REAL budget timer running unobserved, so a "poll" helper
+// that looked for a 30 s interval did nothing at all and every freshness test passed off the
+// construction-time poll. While a harness is open, this clock owns all four timer globals AND
+// Date.now, so a test drives the exact production schedule by advancing virtual time, and nothing
+// real is ever armed by the plugin.
+// The suite's own waits use the REAL timers, captured here before any harness can replace them.
+const REAL_TIMERS = {
+  setTimeout: globalThis.setTimeout,
+  clearTimeout: globalThis.clearTimeout,
+  setInterval: globalThis.setInterval,
+  clearInterval: globalThis.clearInterval,
+  setImmediate: globalThis.setImmediate,
+  dateNow: Date.now,
+};
+let activeClock = null;
+// One real macrotask turn drains every microtask chain a hooked (in-process) broker answer starts.
+const flushReal = async (turns = 3) => {
+  for (let i = 0; i < turns; i += 1) await new Promise((resolve) => { REAL_TIMERS.setImmediate(resolve); });
+};
+const createVirtualClock = (startAt) => {
+  let now = startAt;
+  let seq = 0;
+  const timers = new Map();
+  const idOf = (handle) => (typeof handle === "object" && handle !== null ? handle.id : handle);
+  const arm = (fn, ms, args, repeat) => {
+    seq += 1;
+    const delay = Math.max(repeat ? 1 : 0, Number(ms) || 0);
+    const handle = { id: seq, unref() { return handle; }, ref() { return handle; }, hasRef: () => false,
+      [Symbol.toPrimitive]: () => handle.id };
+    timers.set(seq, { id: seq, fn, args, due: now + delay, every: repeat ? delay : null, armedAt: now, delay });
+    return handle;
+  };
+  const clock = {
+    now: () => now,
+    // Every armed timer, in firing order: what a test inspects to see the real schedule.
+    pending: () => [...timers.values()].sort((a, b) => a.due - b.due || a.id - b.id)
+      .map(({ id, due, every, armedAt, delay }) => ({ id, due, every, armedAt, delay })),
+    // Run every timer that falls due up to now + ms, in due order, letting each one's async work
+    // settle before the next fires -- the way an idle TUI would live through that stretch.
+    advance: async (ms) => {
+      const target = now + ms;
+      for (;;) {
+        const next = clock.pending().find((timer) => timer.due <= target);
+        if (!next) break;
+        const timer = timers.get(next.id);
+        now = Math.max(now, timer.due);
+        if (timer.every) timer.due += timer.every; else timers.delete(timer.id);
+        timer.fn(...(timer.args ?? []));
+        await flushReal();
+      }
+      now = target;
+      await flushReal();
+    },
+    advanceTo: (at) => clock.advance(Math.max(0, at - now)),
+    // Run one armed timer's callback now, without moving time or its schedule, and wait for what
+    // it returned. A one-shot timer is consumed, as it would be by firing.
+    fire: async (id) => {
+      const timer = timers.get(id);
+      if (!timer) return undefined;
+      if (!timer.every) timers.delete(id);
+      return timer.fn(...(timer.args ?? []));
+    },
+    install: () => {
+      globalThis.setTimeout = (fn, ms, ...args) => arm(fn, ms, args, false);
+      globalThis.setInterval = (fn, ms, ...args) => arm(fn, ms, args, true);
+      globalThis.clearTimeout = (handle) => { timers.delete(idOf(handle)); };
+      globalThis.clearInterval = (handle) => { timers.delete(idOf(handle)); };
+      Date.now = () => now;
+      activeClock = clock;
+    },
+    uninstall: () => {
+      globalThis.setTimeout = REAL_TIMERS.setTimeout;
+      globalThis.clearTimeout = REAL_TIMERS.clearTimeout;
+      globalThis.setInterval = REAL_TIMERS.setInterval;
+      globalThis.clearInterval = REAL_TIMERS.clearInterval;
+      Date.now = REAL_TIMERS.dateNow;
+      timers.clear();
+      if (activeClock === clock) activeClock = null;
+    },
+  };
+  return clock;
+};
+
+const settle = (ms = 5) => new Promise((resolve) => { REAL_TIMERS.setTimeout(resolve, ms); });
 // The allocation path is fired by an event, debounced 25 ms and then fully async, so there is no
 // promise to await from out here. Poll for the outcome instead of guessing a sleep long enough.
+// Each real wait also moves the open harness's virtual clock by the same amount, so the plugin's
+// own debounce and lease-poll timers fall due while real I/O (the fake broker socket) proceeds.
 const waitFor = async (predicate, { timeoutMs = 4000 } = {}) => {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = REAL_TIMERS.dateNow() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() > deadline) throw new Error("timed out waiting for the condition under test");
+    if (REAL_TIMERS.dateNow() > deadline) throw new Error("timed out waiting for the condition under test");
     await settle(5);
+    if (activeClock) await activeClock.advance(5);
   }
 };
+// A promise a test resolves by hand: how an in-flight broker or session-list call is held open.
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
+// The text a recorded element would show: `content` is a getter over the live closure.
+const contentOf = (element) => String(element?.content ?? "");
 // The human half of a refusal, byte for byte as the broker writes it. Kept in the tests purely so
 // they read like the real thing: nothing under test looks at these words any more.
 const PREPARING_MESSAGE = "qwen3.8-27b-uncensored is not resident; preparing it now -- resend the prompt in a moment";
@@ -172,14 +302,20 @@ const LEASED_TARGET = {
   existing: false,
 };
 
-const withTuiHarness = async ({ questionState, questionError, permissionState, sessionRows = [], initialMode = "manual" } = {}) => {
+// Options beyond the original ones:
+//   listSessions  replaces api.client.session.list (return or reject a promise to hold it open)
+//   sessionModel  what api.state.session.get(id).model reports, i.e. the live chat-bar model
+//   startAt       the virtual clock's starting epoch ms (default: the real time at open)
+const withTuiHarness = async ({ questionState, questionError, permissionState, sessionRows = [], initialMode = "manual",
+  listSessions, sessionModel, startAt } = {}) => {
   let releaseHarness;
   const previousHarness = harnessQueue;
   harnessQueue = new Promise((resolve) => { releaseHarness = resolve; });
   await previousHarness;
+  const clock = createVirtualClock(startAt ?? REAL_TIMERS.dateNow());
+  clock.install();
   const handlers = new Map();
   const disposers = [];
-  const intervals = [];
   const pushes = [];
   const releases = [];
   const consumes = [];
@@ -192,14 +328,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
   const slotRegistrations = [];
   let layer = null;
   let dialog = null;
-  const originalSetInterval = global.setInterval;
-  const originalClearInterval = global.clearInterval;
   let cleaned = false;
-  global.setInterval = (fn, ms) => {
-    intervals.push({ fn, ms });
-    return { unref() {} };
-  };
-  global.clearInterval = () => {};
 
   const on = (name, handler) => {
     const list = handlers.get(name) ?? [];
@@ -217,10 +346,13 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
   };
 
   let currentMode = initialMode;
-  const api = {
+  // One TUI window's api. A second window (openWindow below) gets its own slots and route but
+  // shares the clock, the broker hooks and the event bus -- two opencode panes on one machine.
+  const buildApi = (slotSink, route = { name: "session", params: { sessionID: "ses-1" } }) => ({
     client: {
       session: {
-        list: async () => ({ data: sessionRows }),
+        // The second argument is the SDK's per-request options (where an AbortSignal travels).
+        list: (input, options) => (listSessions ? listSessions(input, options) : Promise.resolve({ data: sessionRows })),
       },
       v2: {
         session: {
@@ -261,10 +393,10 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       }
     },
     route: {
-      current: { name: "session", params: { sessionID: "ses-1" } },
+      current: route,
       navigate: (name, params) => { navigations.push({ name, params }); },
     },
-    slots: { register: (registration) => { slotRegistrations.push(registration); } },
+    slots: { register: (registration) => { slotSink.push(registration); } },
     state: {
       path: { directory: "/tmp/hud-test" },
       session: {
@@ -275,6 +407,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
         permission: () => permissionState ?? [],
         status: () => ({ type: "idle" }),
         messages: () => [{ role: "user", agent: "standard" }],
+        get: () => (sessionModel ? { model: sessionModel } : undefined),
       },
     },
     theme: {},
@@ -287,49 +420,79 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       },
       toast: (t) => { toasts.push(t); },
     },
+  });
+  // The elements a user actually sees, built by the same slot factories opencode calls. Each
+  // element's `content` getter re-reads the live closure, so one capture keeps reporting the screen.
+  const slotsOf = (sink, name) => {
+    const registration = sink.find((entry) => entry?.slots?.[name]);
+    assert.ok(registration, `the HUD registered no ${name} slot`);
+    return registration.slots[name];
   };
+  const viewsOf = (sink, api) => ({
+    sidebarTitle: () => slotsOf(sink, "sidebar_content")().children[0],
+    sidebarBody: () => slotsOf(sink, "sidebar_content")().children[1],
+    routeTitle: () => slotsOf(sink, "sidebar_content")().children[2],
+    routeBody: () => slotsOf(sink, "sidebar_content")().children[3],
+    strip: () => slotsOf(sink, "app_bottom")(),
+    badge: () => slotsOf(sink, "session_prompt_right")({ session_id: api.route.current?.params?.sessionID }),
+    homeBadge: () => slotsOf(sink, "home_prompt_right")(),
+  });
+  const api = buildApi(slotRegistrations);
 
+  // Dispose the plugin(s) the way opencode does, but leave the virtual clock installed, so a
+  // test can still see what is armed afterwards and resolve calls that were in flight.
+  let disposed = false;
+  const dispose = async () => {
+    if (disposed) return;
+    disposed = true;
+    for (const fn of [...disposers]) await fn();
+  };
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      await dispose();
+    } finally {
+      clock.uninstall();
+      releaseHarness();
+    }
+  };
   try {
     await plugin.default.tui(api);
-    const runAgentPoll = async () => {
-      const agentPoll = intervals.find((entry) => entry.ms === 2000);
-      if (agentPoll) await agentPoll.fn();
-    };
-    const runRefresh = async () => {
-      const refreshTimer = intervals.find((entry) => entry.ms === 1000);
-      if (refreshTimer) await refreshTimer.fn();
-    };
-    const key = () => handlers.get("key")?.[0];
-    const runBudgetPoll = async () => {
-      const budgetTimer = intervals.find((entry) => entry.ms === 30_000);
-      if (budgetTimer) await budgetTimer.fn();
-    };
-    // The sidebar BODY element, built by the same `sidebar_content` factory opencode calls. Its
-    // `content` getter re-reads the live closure, so one capture keeps reporting what a user sees.
-    const sidebarBody = () => {
-      const registration = slotRegistrations.find((entry) => entry?.slots?.sidebar_content);
-      assert.ok(registration, "the HUD registered no sidebar_content slot");
-      const box = registration.slots.sidebar_content();
-      return box.children[1];
-    };
-    const cleanup = async () => {
-      if (cleaned) return;
-      cleaned = true;
-      try {
-        for (const fn of [...disposers]) await fn();
-      } finally {
-        global.setInterval = originalSetInterval;
-        global.clearInterval = originalClearInterval;
-        releaseHarness();
+    // Fire every repeating timer of this period once, in place (no time passes), and wait for
+    // what each returned -- the roster poll is async and its result is what a test asserts on.
+    const runEvery = async (ms) => {
+      for (const timer of clock.pending().filter((entry) => entry.every === ms)) {
+        await clock.fire(timer.id);
       }
+      await flushReal();
     };
-    return { api, emit, key, runAgentPoll, runRefresh, runBudgetPoll, sidebarBody, pushes, releases,
+    const runAgentPoll = () => runEvery(2000);
+    const runRefresh = () => runEvery(1000);
+    const key = () => handlers.get("key")?.[0];
+    // THE REAL BUDGET SCHEDULE: move virtual time to the next 10 s wall-clock boundary plus the
+    // 50 ms the plugin arms past it. Whatever the plugin armed fires on the way, exactly as it
+    // would for an idle window; if it armed nothing there, nothing polls and the test says so.
+    const BUDGET_PERIOD_MS = 10_000;
+    const nextBudgetBoundary = () => clock.now() - (clock.now() % BUDGET_PERIOD_MS) + BUDGET_PERIOD_MS + 50;
+    const runBudgetPoll = () => clock.advanceTo(nextBudgetBoundary());
+    // Navigate the way opencode does: the route object is replaced, and nothing is emitted.
+    const navigate = (sessionID) => {
+      api.route.current = sessionID ? { name: "session", params: { sessionID } } : { name: "home" };
+    };
+    const openWindow = async (route) => {
+      const sink = [];
+      const windowApi = buildApi(sink, route);
+      await plugin.default.tui(windowApi);
+      return { api: windowApi, ...viewsOf(sink, windowApi) };
+    };
+    return { api, clock, emit, key, runAgentPoll, runRefresh, runBudgetPoll, nextBudgetBoundary, navigate,
+      openWindow, dispose, ...viewsOf(slotRegistrations, api), pushes, releases,
       consumes, switches, cycles, replies, toasts, navigations, switchedModels, cleanup,
       get layer() { return layer; },
       get dialog() { return dialog; } };
   } catch (error) {
-    global.setInterval = originalSetInterval;
-    global.clearInterval = originalClearInterval;
+    clock.uninstall();
     releaseHarness();
     throw error;
   }
@@ -1020,7 +1183,6 @@ test("the sidebar says so when every budgeted provider is lapsed, instead of ren
 });
 
 test("a failed poll marks an all-lapsed sidebar stale without hiding its empty state", async () => {
-  const originalNow = Date.now;
   requireJsxRuntime();
   withStatus({
     budgets: { "alibaba-token-plan": learnedWindow(50) },
@@ -1033,14 +1195,13 @@ test("a failed poll marks an all-lapsed sidebar stale without hiding its empty s
     await h.runBudgetPoll();
     assert.equal(body.content, " (no active providers)");
 
+    // Seven minutes of the real schedule, every poll of it failing.
     routerHooks.brokerRequest = async () => { throw new Error("broker unavailable"); };
-    Date.now = () => originalNow() + 7 * 60_000;
-    await h.runBudgetPoll();
+    await h.clock.advance(7 * 60_000);
 
     assert.match(body.content, /^ \(stale 7m\)$/m);
     assert.match(body.content, /^ \(no active providers\)$/m);
   } finally {
-    Date.now = originalNow;
     resetRouterHooks();
     await h.cleanup();
   }
@@ -1113,6 +1274,1365 @@ test("disposing a HUD that owns a swapped session still launches a detached rest
     await h.cleanup();
 
     assert.deepEqual(swapBackCalls, [{ kind: "detached", command: "true", args: ["default"] }]);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+// ---- freshness: nothing the HUD shows may be silently stale ---------------------------------
+// The HUD polls the broker on aligned 10 s boundaries (/status, then /preview) and the session
+// list every 2 s. Provider truth cannot be instantaneous -- the broker legitimately caches a plan
+// reading for minutes -- so the rule is not "always current" but "never passed off as current":
+// what could not be refreshed says so, and warnings are never muted to make it say so.
+const EPOCH = 1_800_000_000_000;
+const routeOf = (...models) => ({ preview: Object.fromEntries(
+  ["deep", "smart"].slice(0, models.length).map((tier, i) => [tier, { model: { id: models[i] } }])) });
+// A scripted broker: each field can be swapped mid-test, and every call is stamped with the
+// virtual time it arrived at.
+const scriptBroker = (initial = {}) => {
+  const broker = { status: { budgets: {}, health: { providers: {} }, circuits: {} }, preview: routeOf("model-a"),
+    statusError: null, previewError: null, calls: [], ...initial };
+  routerHooks.brokerRequest = async (path) => {
+    broker.calls.push({ path, at: Date.now() });
+    if (path === "/status") {
+      if (broker.statusError) throw broker.statusError;
+      return typeof broker.status === "function" ? broker.status() : broker.status;
+    }
+    if (path === "/preview") {
+      if (broker.previewError) throw broker.previewError;
+      return typeof broker.preview === "function" ? broker.preview() : broker.preview;
+    }
+    return {};
+  };
+  return broker;
+};
+const planReading = (percent, fetchedAt) => ({ plan: { fetchedAt, windows: [
+  { id: "week", percent, resetsAt: new Date(fetchedAt + 3 * 86_400_000).toISOString() },
+] } });
+
+test("two windows opened at different wall-clock times poll the broker on the same 10 s boundaries", async () => {
+  requireJsxRuntime();
+  const broker = scriptBroker();
+  // Window A opens 3.0 s past a boundary, window B 7.5 s past it.
+  const h = await withTuiHarness({ startAt: EPOCH + 3_000 });
+  try {
+    await h.clock.advance(4_500);
+    await h.openWindow({ name: "session", params: { sessionID: "ses-2" } });
+    // Each window armed exactly one budget timer, and both point at the same instant.
+    const budgetTimers = h.clock.pending().filter((timer) => timer.every === null);
+    assert.deepEqual(budgetTimers.map((timer) => timer.due - EPOCH), [10_050, 10_050]);
+
+    broker.calls.length = 0;
+    await h.clock.advanceTo(EPOCH + 30_100);
+    assert.deepEqual(broker.calls.filter((call) => call.path === "/status").map((call) => call.at - EPOCH),
+      [10_050, 10_050, 20_050, 20_050, 30_050, 30_050]);
+    // /preview rides on each /status answer: exactly one per window per boundary, no more.
+    assert.deepEqual(broker.calls.filter((call) => call.path === "/preview").map((call) => call.at - EPOCH),
+      [10_050, 10_050, 20_050, 20_050, 30_050, 30_050]);
+    assert.equal(broker.calls.length, 12, "nothing but /status and /preview is asked for");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("an idle window picks up new usage and routes on the shared schedule with no input", async () => {
+  requireJsxRuntime();
+  let percent = 25;
+  let model = "model-a";
+  scriptBroker({
+    status: () => ({ budgets: { anthropic: planReading(percent, Date.now()) }, health: { providers: {} }, circuits: {} }),
+    preview: () => routeOf(model),
+  });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+  try {
+    const body = h.sidebarBody();
+    const routes = h.routeBody();
+    const badge = h.badge();
+    await flushReal();
+    assert.match(contentOf(body), /anthropic\s+wk 25%/);
+    assert.match(contentOf(badge), /ant 25% wk/);
+    assert.match(contentOf(routes), /deep\s+model-a/);
+
+    percent = 40;
+    model = "model-b";
+    // No key, no event, no explicit poll: only time passes.
+    await h.clock.advance(10_000);
+    assert.match(contentOf(body), /anthropic\s+wk 40%/);
+    assert.match(contentOf(badge), /ant 40% wk/);
+    assert.match(contentOf(routes), /deep\s+model-b/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a healthy broker serving an old provider reading never shows it as current", async () => {
+  requireJsxRuntime();
+  // The broker answers every poll, but its plan reading was taken at open and never refreshed
+  // (a usage API that stopped answering behind a healthy broker).
+  const fetchedAt = EPOCH + 1_000;
+  scriptBroker({ status: () => ({ budgets: { anthropic: planReading(30, fetchedAt) }, health: { providers: {} }, circuits: {} }) });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+  try {
+    const body = h.sidebarBody();
+    const badge = h.badge();
+    await flushReal();
+    assert.match(contentOf(badge), /ant 30% wk/, "a fresh reading is shown");
+
+    await h.clock.advance(4 * 60_000);
+    assert.doesNotMatch(contentOf(badge), /ant/, "the badge has no room to say old, so it shows nothing");
+    assert.match(contentOf(body), /anthropic\s+wk 30% \(4m old\)/, "the sidebar keeps the number and says its age");
+    assert.doesNotMatch(contentOf(body), /\(stale/, "the broker itself is answering; only the reading is old");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a /status failure keeps every warning visible, marks the block stale at once, and recovers", async () => {
+  requireJsxRuntime();
+  const broker = scriptBroker({ status: () => ({
+    budgets: { anthropic: learnedWindow(25) },
+    health: { providers: { zai: { state: "quarantined" } } },
+    circuits: { "provider:openai": { kind: "quota", until: Date.now() + 3_600_000 } },
+  }) });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+  try {
+    const body = h.sidebarBody();
+    const routes = h.routeBody();
+    const badge = h.badge();
+    await flushReal();
+    assert.match(contentOf(badge), /ant 25% wk/);
+    assert.doesNotMatch(contentOf(body), /stale/);
+
+    broker.statusError = new Error("broker unavailable");
+    await h.runBudgetPoll();
+    const text = contentOf(body);
+    assert.match(text, /^ \(stale 9s\)$/m, `one failed poll is already stale, with its age:\n${text}`);
+    assert.match(text, /zai\s+\u26d4 quarantined/, "a health warning is never dropped by a failed poll");
+    assert.match(text, /openai\s+\u26d4 limit til/, "a circuit warning is never dropped by a failed poll");
+    assert.doesNotMatch(contentOf(badge), /ant 25%/, "the badge must not vouch for a number the broker did not confirm");
+    assert.match(contentOf(routes), /^ \(stale 9s\)$/m, "routes went unrefreshed too");
+    assert.match(contentOf(routes), /deep\s+model-a/, "and are still shown, as stale");
+
+    await h.clock.advance(7 * 60_000);
+    assert.match(contentOf(body), /^ \(stale 7m\)$/m);
+    assert.match(contentOf(body), /zai\s+\u26d4 quarantined/);
+    assert.match(contentOf(badge), /BROKER DOWN/, "the existing broker-down alarm still fires");
+
+    broker.statusError = null;
+    await h.runBudgetPoll();
+    assert.doesNotMatch(contentOf(body), /stale/);
+    assert.doesNotMatch(contentOf(routes), /stale/);
+    assert.match(contentOf(badge), /ant 25% wk/);
+    assert.doesNotMatch(contentOf(badge), /BROKER DOWN/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a /preview-only failure marks the routes stale, not the usage, and recovery clears it", async () => {
+  requireJsxRuntime();
+  const broker = scriptBroker({ status: { budgets: { anthropic: learnedWindow(25) }, health: { providers: {} }, circuits: {} } });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    const body = h.sidebarBody();
+    const routeTitle = h.routeTitle();
+    const routes = h.routeBody();
+    const strip = h.strip();
+    await flushReal();
+
+    broker.previewError = new Error("preview timed out");
+    await h.runBudgetPoll();
+    assert.doesNotMatch(contentOf(body), /stale/, "usage was refreshed; it is not stale");
+    assert.equal(contentOf(routeTitle), "\nRoute");
+    assert.match(contentOf(routes), /^ \(stale 9s\)$/m);
+    assert.match(contentOf(routes), /deep\s+model-a/);
+    // The home screen has no sidebar: the strip carries the route line there.
+    h.navigate(undefined);
+    assert.match(contentOf(strip), /Route: deep model-a .*\(stale 9s\)/);
+
+    broker.previewError = null;
+    broker.preview = routeOf("model-b");
+    await h.runBudgetPoll();
+    assert.doesNotMatch(contentOf(routes), /stale/);
+    assert.match(contentOf(routes), /deep\s+model-b/);
+    assert.doesNotMatch(contentOf(strip), /stale/);
+    assert.match(contentOf(strip), /Route: deep model-b/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a route preview that has never answered says unavailable instead of rendering nothing", async () => {
+  requireJsxRuntime();
+  scriptBroker({ previewError: new Error("preview timed out") });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    await flushReal();
+    assert.equal(contentOf(h.routeTitle()), "\nRoute");
+    assert.equal(contentOf(h.routeBody()), " (unavailable)");
+    h.navigate(undefined);
+    assert.equal(contentOf(h.strip()), " Route: unavailable");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+// ---- the roster belongs to the session on screen, and only to it -----------------------------
+const CHILD_A = { id: "child-a", parentID: "ses-a", agent: "scout", title: "Task of session A" };
+const CHILD_B = { id: "child-b", parentID: "ses-b", agent: "scout", title: "Task of session B" };
+// Every session.list call is held open until the test answers it, in whatever order it likes.
+// It records the AbortSignal it was given and IGNORES it: the shape of a request whose
+// cancellation does not take, so whatever bounds the wait cannot be the request ending.
+const heldSessionList = () => {
+  const calls = [];
+  const listSessions = (_input, options) => {
+    const call = deferred();
+    call.signal = options?.signal;
+    calls.push(call);
+    return call.promise;
+  };
+  return { calls, listSessions, answer: (index, rows) => calls[index].resolve({ data: rows }) };
+};
+
+test("navigating while a roster load is in flight loads the new session and drops the old answer", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    const firstPoll = h.runAgentPoll();
+    await flushReal();
+    assert.equal(list.calls.length, 1);
+
+    h.navigate("ses-b");
+    await h.runRefresh();
+    assert.equal(list.calls.length, 2, "the new session must not wait behind the old session's request");
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(list.calls.length, 2, "one request per session visit, never one per tick");
+
+    list.answer(1, [CHILD_A, CHILD_B]);
+    await flushReal();
+    assert.match(contentOf(strip), /Task of session B/);
+
+    // The old request lands last. Its rows are session A's children and must go nowhere.
+    list.answer(0, [CHILD_A, CHILD_B]);
+    await firstPoll;
+    await flushReal();
+    assert.match(contentOf(strip), /Task of session B/);
+    assert.doesNotMatch(contentOf(strip), /Task of session A/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("A -> B -> A: a late answer from the first visit to A cannot replace the current one", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await flushReal();
+    h.navigate("ses-b");
+    await h.runRefresh();
+    h.navigate("ses-a");
+    await h.runRefresh();
+    assert.equal(list.calls.length, 3, "returning to A is a new visit with a request of its own");
+
+    list.answer(2, [{ ...CHILD_A, title: "Fresh title" }]);
+    list.answer(1, [CHILD_B]);
+    await flushReal();
+    assert.match(contentOf(strip), /Fresh title/);
+
+    // Same session ID as the screen, but an older visit: still discarded.
+    list.answer(0, [{ ...CHILD_A, title: "Stale title" }]);
+    await flushReal();
+    assert.match(contentOf(strip), /Fresh title/);
+    assert.doesNotMatch(contentOf(strip), /Stale title|Task of session B/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("navigation clears the old roster and its selection before the next draw", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const h = await withTuiHarness({ sessionRows: [CHILD_A] });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Task of session A/);
+    await h.key()({ event: { name: "down" }, consume: () => h.consumes.push("down") });
+    assert.deepEqual(h.consumes, ["down"], "row 0 of session A is selected");
+
+    // No poll and no repaint tick yet: the very next draw is already for session B.
+    h.navigate("ses-b");
+    assert.doesNotMatch(contentOf(strip), /Task of session A/);
+    assert.doesNotMatch(contentOf(h.badge()), /\d+\/\d+/, "no tally of session A's children on B's badge");
+    await h.key()({ event: { name: "return" }, consume: () => h.consumes.push("return") });
+    assert.deepEqual(h.consumes, ["down"], "session A's selection does not survive into B");
+    assert.deepEqual(h.navigations, []);
+
+    h.navigate(undefined);
+    assert.doesNotMatch(contentOf(strip), /Task of session A/);
+    assert.match(contentOf(strip), /Route:/, "home shows its route line, not a session's roster");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a same-session roster picks up changed titles and tokens on the next poll", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  let row = { ...CHILD_A, tokens: { input: 100, output: 0 } };
+  const h = await withTuiHarness({ listSessions: async () => ({ data: [row] }) });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Task of session A/);
+    row = { ...CHILD_A, title: "Renamed task", tokens: { input: 2500, output: 0 } };
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Renamed task/);
+    assert.match(contentOf(strip), /2\.5k tokens/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a failed session list is marked unavailable instead of passing off a roster as current", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  let failing = false;
+  const h = await withTuiHarness({ listSessions: async () => {
+    if (failing) throw new Error("server unavailable");
+    return { data: [CHILD_A] };
+  } });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Task of session A/);
+
+    failing = true;
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /subagents: unavailable/);
+    assert.doesNotMatch(contentOf(strip), /Task of session A/, "a roster that could not be read is not shown as current");
+    assert.match(contentOf(h.badge()), /agents \?/);
+
+    failing = false;
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Task of session A/);
+    assert.doesNotMatch(contentOf(strip), /unavailable/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("disposal stops in-flight polls from mutating the HUD and arms nothing further", async () => {
+  requireJsxRuntime();
+  const status = deferred();
+  routerHooks.brokerRequest = async (path) => (path === "/status" ? status.promise : routeOf("model-a"));
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions, startAt: EPOCH + 1_000 });
+  try {
+    h.navigate("ses-a");
+    const body = h.sidebarBody();
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(contentOf(body), " (no broker data yet)");
+
+    await h.dispose();
+    assert.deepEqual(h.clock.pending(), [], "no timer of any kind survives disposal");
+
+    status.resolve({ budgets: { anthropic: learnedWindow(25) }, health: { providers: { zai: { state: "quarantined" } } }, circuits: {} });
+    list.answer(0, [CHILD_A]);
+    await flushReal();
+    assert.equal(contentOf(body), " (no broker data yet)", "a poll that lands after disposal changes nothing");
+    await h.clock.advance(60_000);
+    // Time still passes for the getters (the age fallback may say "unavailable" by now), but
+    // nothing the late answer carried is ever installed.
+    assert.doesNotMatch(contentOf(body), /anthropic|zai/, "a poll that lands after disposal changes nothing");
+    assert.doesNotMatch(contentOf(strip), /Task of session A/);
+    assert.deepEqual(h.clock.pending(), [], "and schedules nothing");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+// ---- bounded waits: a request that never ends must not freeze the HUD on old data ------------
+// The session list has a 5 s deadline; the broker's /status and /preview have an age fallback of
+// two 10 s polls plus 5 s slack. lib/client.js's own timeout is a SOCKET IDLE timeout, which a
+// broker dribbling bytes never trips, so these bounds are the HUD's own.
+const ROSTER_DEADLINE = 5_000;
+const FRESHNESS_FALLBACK = 25_000;
+const never = () => new Promise(() => {});
+const watchRejections = () => {
+  const seen = [];
+  const onRejection = (reason) => { seen.push(reason); };
+  process.on("unhandledRejection", onRejection);
+  return { seen, stop: () => { process.off("unhandledRejection", onRejection); } };
+};
+// A session list that honours its AbortSignal the way the v2 SDK does: with throwOnError off (the
+// default) an aborted fetch is RETURNED as `{ error }`, it does not reject.
+const abortableSessionList = () => {
+  const calls = [];
+  const listSessions = (_input, options) => {
+    const call = deferred();
+    call.signal = options?.signal;
+    options?.signal?.addEventListener?.("abort", () => {
+      call.resolve({ error: Object.assign(new Error("This operation was aborted"), { name: "AbortError" }) });
+    });
+    calls.push(call);
+    return call.promise;
+  };
+  return { calls, listSessions, answer: (index, rows) => calls[index].resolve({ data: rows }) };
+};
+
+test("a session list that hangs after a success goes unavailable at its deadline and its late answer is dropped", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const rejections = watchRejections();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await flushReal();
+    list.answer(0, [CHILD_A]);
+    await flushReal();
+    assert.match(contentOf(strip), /Task of session A/);
+
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(list.calls.length, 2);
+    await h.clock.advance(ROSTER_DEADLINE - 100);
+    assert.match(contentOf(strip), /Task of session A/, "inside the deadline the last answer stands");
+    await h.clock.advance(200);
+    assert.match(contentOf(strip), /subagents: unavailable \(session list not answering\)/);
+    assert.doesNotMatch(contentOf(strip), /Task of session A/, "rows nobody could confirm are not shown as current");
+    assert.match(contentOf(h.badge()), /agents \?/);
+    assert.equal(list.calls[1].signal?.aborted, true, "the hung request is cancelled through its signal");
+
+    // This one ignored the abort and is still out: ticks share it rather than stacking more.
+    await h.clock.advance(20_000);
+    assert.equal(list.calls.length, 2, "a request that will not end is not joined by another every tick");
+
+    list.answer(1, [{ ...CHILD_A, title: "Late title" }]);
+    await flushReal();
+    assert.doesNotMatch(contentOf(strip), /Late title/, "an answer past its deadline is not installed");
+    assert.match(contentOf(strip), /subagents: unavailable/);
+
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(list.calls.length, 3, "once it has ended, the next tick asks again");
+    list.answer(2, [{ ...CHILD_A, title: "Fresh title" }]);
+    await flushReal();
+    assert.match(contentOf(strip), /Fresh title/);
+    assert.doesNotMatch(contentOf(strip), /unavailable/);
+    assert.doesNotMatch(contentOf(h.badge()), /agents \?/);
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a session list that never answers from the start says unavailable at its deadline, not nothing", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(contentOf(strip), "");
+    await h.clock.advance(ROSTER_DEADLINE);
+    assert.match(contentOf(strip), /subagents: unavailable \(session list not answering\)/);
+    assert.match(contentOf(h.badge()), /agents \?/);
+    assert.equal(list.calls.length, 1);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the roster deadline aborts through the SDK signal, and a list that honours it recovers next tick", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = abortableSessionList();
+  const rejections = watchRejections();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await flushReal();
+    await h.clock.advance(ROSTER_DEADLINE);
+    assert.equal(list.calls[0].signal?.aborted, true);
+    assert.match(contentOf(strip), /subagents: unavailable/);
+    assert.equal(list.calls.length, 1);
+
+    // The abort ended the request, so the guard is free and the next tick asks again at once.
+    void h.runAgentPoll();
+    await flushReal();
+    assert.equal(list.calls.length, 2);
+    list.answer(1, [CHILD_A]);
+    await flushReal();
+    assert.match(contentOf(strip), /Task of session A/);
+    assert.doesNotMatch(contentOf(strip), /unavailable/);
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("navigation aborts the old visit's list, and disposal aborts the current one and arms nothing", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    void h.runAgentPoll();
+    await flushReal();
+    h.navigate("ses-b");
+    await h.runRefresh();
+    assert.equal(list.calls.length, 2);
+    assert.equal(list.calls[0].signal?.aborted, true, "session A's list is no longer anyone's business");
+    assert.equal(list.calls[1].signal?.aborted, false);
+
+    await h.dispose();
+    assert.equal(list.calls[1].signal?.aborted, true);
+    assert.deepEqual(h.clock.pending(), [], "no deadline timer survives disposal");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+// ---- F10: the roster dialog is held to the same rules as the strip ----------------------------
+const runF10 = (h) => h.layer.commands.find((command) => command.name === "hud.agents.list").run();
+const SHELL_JOB = { id: "job-1", description: "watch build", state: "running", started: new Date(EPOCH).toISOString() };
+const subagentToasts = (h) => h.toasts.filter((t) => t?.title === "subagents");
+
+test("F10 says the subagent list failed instead of 'Nothing running', and still offers the shells", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = FAKE_BG_STORE;
+  fakeBgStore.setJobs({ "ses-a": [SHELL_JOB] });
+  const h = await withTuiHarness({ listSessions: async () => { throw new Error("server unavailable"); } });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    assert.ok(!h.toasts.some((t) => /Nothing running/.test(String(t?.message))), "a failed list is not an empty one");
+    assert.ok(subagentToasts(h).some((t) => t.variant === "warning" && /subagent list failed/i.test(t.message)),
+      `the failure is said out loud: ${JSON.stringify(h.toasts)}`);
+    assert.ok(h.dialog, "the shells are still offered");
+    assert.deepEqual(h.dialog.options.map((option) => option.value), ["job-1"]);
+    assert.match(String(h.dialog.title), /subagents unavailable/i);
+  } finally {
+    fakeBgStorePath = null;
+    fakeBgStore.setJobs({});
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("F10 with no shells and a failed list reports the failure, not 'Nothing running'", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const h = await withTuiHarness({ listSessions: async () => { throw new Error("server unavailable"); } });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    assert.ok(!h.toasts.some((t) => /Nothing running/.test(String(t?.message))));
+    assert.ok(subagentToasts(h).some((t) => t.variant === "warning" && /subagent list failed/i.test(t.message)));
+    assert.equal(h.dialog, null);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("F10 on a list that hangs says so at the deadline and cancels the request", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    assert.equal(list.calls.length, 1);
+    assert.deepEqual(subagentToasts(h), []);
+    await h.clock.advance(ROSTER_DEADLINE);
+    assert.ok(subagentToasts(h).some((t) => t.variant === "warning" && /did not answer/.test(t.message)),
+      `a hung list is reported: ${JSON.stringify(h.toasts)}`);
+    assert.equal(list.calls[0].signal?.aborted, true);
+    assert.equal(h.dialog, null);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("A -> B -> A: an F10 answer from the first visit to A opens nothing", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    const f10Call = list.calls.length - 1;
+    h.navigate("ses-b");
+    await h.runRefresh();
+    h.navigate("ses-a");
+    await h.runRefresh();
+    list.answer(f10Call, [CHILD_A]);
+    await flushReal();
+    assert.equal(h.dialog, null, "the dialog belongs to a visit that has ended");
+    assert.deepEqual(subagentToasts(h), []);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("disposing while F10 waits opens nothing and leaves no timer", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    await h.dispose();
+    assert.deepEqual(h.clock.pending(), []);
+    assert.equal(list.calls[0].signal?.aborted, true);
+    list.answer(0, [CHILD_A]);
+    await flushReal();
+    assert.equal(h.dialog, null);
+    assert.deepEqual(subagentToasts(h), []);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("an F10 selection acts on its own visit only", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const h = await withTuiHarness({ listSessions: async () => ({ data: [CHILD_A] }) });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    await flushReal();
+    h.dialog.onSelect({ value: "child-a" });
+    assert.deepEqual(h.navigations, [{ name: "session", params: { sessionID: "child-a" } }], "same visit: it opens");
+
+    runF10(h);
+    await flushReal();
+    const select = h.dialog.onSelect;
+    h.navigate("ses-b");
+    await h.runRefresh();
+    select({ value: "child-a" });
+    assert.equal(h.navigations.length, 1, "a pick from session A's list does not act from session B");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("newer F10 owns the dialog when two same-visit answers resolve in reverse order", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    runF10(h);
+    runF10(h);
+    list.answer(1, [{ ...CHILD_A, title: "Latest picker" }]);
+    await flushReal();
+    const latest = h.dialog;
+    assert.equal(latest.options[0].title, "Latest picker");
+    list.answer(0, [{ ...CHILD_A, title: "Obsolete picker" }]);
+    await flushReal();
+    assert.equal(h.dialog, latest, "the older invocation cannot replace the newer dialog");
+    assert.deepEqual(subagentToasts(h), []);
+    assert.equal(list.calls[0].signal.aborted, true, "superseded work is cancelled");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+for (const outcome of ["empty", "failed"]) {
+  test(`a newer ${outcome} F10 supersedes an older successful answer`, async () => {
+    requireJsxRuntime();
+    scriptBroker();
+    const list = heldSessionList();
+    const h = await withTuiHarness({ listSessions: list.listSessions });
+    try {
+      h.navigate("ses-a");
+      runF10(h);
+      runF10(h);
+      if (outcome === "empty") list.answer(1, []);
+      else list.calls[1].reject(new Error("new list failed"));
+      await flushReal();
+      const notices = [...subagentToasts(h)];
+      assert.equal(notices.length, 1);
+      assert.match(notices[0].message, outcome === "empty" ? /Nothing running/ : /new list failed/);
+      list.answer(0, [CHILD_A]);
+      await flushReal();
+      assert.equal(h.dialog, null, "superseded rows must not open a picker after the latest result");
+      assert.deepEqual(subagentToasts(h), notices);
+    } finally {
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+  test(`an older ${outcome} F10 cannot toast over a newer successful picker`, async () => {
+    requireJsxRuntime();
+    scriptBroker();
+    const list = heldSessionList();
+    const h = await withTuiHarness({ listSessions: list.listSessions });
+    try {
+      h.navigate("ses-a");
+      runF10(h);
+      runF10(h);
+      list.answer(1, [CHILD_A]);
+      await flushReal();
+      if (outcome === "empty") list.answer(0, []);
+      else list.calls[0].reject(new Error("obsolete list failed"));
+      await flushReal();
+      assert.deepEqual(subagentToasts(h), [], "only the latest invocation may report its outcome");
+      assert.equal(h.dialog.options[0].value, "child-a");
+    } finally {
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+}
+
+for (const replacement of ["another visit", "newer invocation", "empty invocation", "disposed HUD"]) {
+  test(`retained F10 selection cannot affect a replacement after ${replacement}`, async () => {
+    requireJsxRuntime();
+    scriptBroker();
+    let rows = [CHILD_A, CHILD_B];
+    const h = await withTuiHarness({ listSessions: async () => ({ data: rows }) });
+    try {
+      h.navigate("ses-a");
+      runF10(h);
+      await flushReal();
+      const selectOld = h.dialog.onSelect;
+      if (replacement === "another visit") h.navigate("ses-b");
+      if (replacement === "empty invocation") rows = [];
+      if (replacement === "disposed HUD") {
+        await h.dispose();
+        h.api.ui.dialog.replace(() => ({ title: "Replacement dialog" }));
+      } else {
+        runF10(h);
+        await flushReal();
+      }
+      const current = h.dialog;
+      if (replacement === "empty invocation") assert.equal(current, null, "old rows are not left visible");
+      selectOld({ value: "child-a" });
+      assert.equal(h.dialog, current, "an obsolete selection must not clear another dialog");
+      assert.deepEqual(h.navigations, [], "an obsolete selection must not navigate");
+    } finally {
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+}
+
+test("repeated F10 with ignored aborts bounds requests and recovers after they settle", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  const list = heldSessionList();
+  const rejections = watchRejections();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    for (let i = 0; i < 20; i += 1) runF10(h);
+    await flushReal();
+    assert.equal(list.calls.length, 2, "at most a superseded request plus its replacement remain outstanding");
+    assert.ok(list.calls.every((call) => call.signal.aborted));
+    assert.equal(subagentToasts(h).length, 1, "only the latest invocation reports unavailable");
+    assert.match(subagentToasts(h)[0].message, /unavailable/i);
+    list.answer(1, [CHILD_A]);
+    list.answer(0, [CHILD_A]);
+    await flushReal();
+    assert.equal(h.dialog, null);
+    runF10(h);
+    list.answer(2, [CHILD_A]);
+    await flushReal();
+    assert.equal(h.dialog.options[0].value, "child-a");
+    await h.dispose();
+    assert.deepEqual(h.clock.pending(), []);
+    assert.deepEqual(rejections.seen, []);
+  } finally {
+    rejections.stop();
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("shell rows keep refreshing every two seconds while the subagent list ignores cancellation", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = FAKE_BG_STORE;
+  fakeBgStore.setJobs({ "ses-a": [SHELL_JOB] });
+  const list = heldSessionList();
+  const h = await withTuiHarness({ listSessions: list.listSessions });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    void h.runAgentPoll();
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /watch build/, "shells need not wait five seconds for a list timeout");
+    fakeBgStore.setJobs({ "ses-a": [{ ...SHELL_JOB, description: "renamed build" }] });
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /renamed build/);
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /subagents: unavailable/);
+    fakeBgStore.setJobs({ "ses-a": [{ ...SHELL_JOB, state: "done" }] });
+    await h.clock.advance(2_000);
+    assert.doesNotMatch(contentOf(strip), /renamed build|watch build/);
+    fakeBgStore.setJobs({ "ses-a": [{ ...SHELL_JOB, description: "next build" }] });
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /next build/);
+    assert.equal(list.calls.length, 1, "disk refresh does not stack session-list calls");
+    assert.equal(list.calls[0].signal.aborted, true);
+  } finally {
+    fakeBgStorePath = null;
+    fakeBgStore.setJobs({});
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("shell source failure is visible beside valid agents and recovers without losing other warnings", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = FAKE_BG_STORE;
+  fakeBgStore.setJobs({ "ses-a": new Error("unreadable store") });
+  let failedList = false;
+  const h = await withTuiHarness({ listSessions: async () => {
+    if (failedList) throw new Error("list failed");
+    return { data: [CHILD_A] };
+  } });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /shells: unavailable/i);
+    assert.match(contentOf(strip), /Task of session A/);
+    assert.match(contentOf(h.badge()), /shells \?/);
+    runF10(h);
+    await flushReal();
+    assert.equal(h.dialog.options[0].value, "child-a");
+    assert.ok(subagentToasts(h).some((toast) => /shells.*unavailable/i.test(toast.message)));
+    failedList = true;
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /subagents: unavailable/);
+    assert.match(contentOf(strip), /shells: unavailable/);
+    fakeBgStore.setJobs({ "ses-a": [SHELL_JOB] });
+    await h.clock.advance(2_000);
+    assert.match(contentOf(strip), /watch build/);
+    assert.doesNotMatch(contentOf(strip), /shells: unavailable/);
+    assert.match(contentOf(strip), /subagents: unavailable/);
+  } finally {
+    fakeBgStorePath = null;
+    fakeBgStore.setJobs({});
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a configured shell store that cannot load is unavailable rather than absent", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = join(HOME, "missing-configured-store.mjs");
+  const h = await withTuiHarness();
+  try {
+    await h.runAgentPoll();
+    assert.match(contentOf(h.strip()), /shells: unavailable/);
+    runF10(h);
+    await flushReal();
+    assert.ok(subagentToasts(h).some((toast) => /shells.*unavailable/i.test(toast.message)));
+    assert.ok(!subagentToasts(h).some((toast) => /Nothing running/.test(toast.message)));
+  } finally {
+    fakeBgStorePath = null;
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the Bun TUI treats an uninstalled optional shell plugin as absent, not a failed store", () => {
+  // Bun reports a missing module, whereas Node reports a missing package. Exercise the real
+  // host runtime rather than guessing an error shape; HOME/config remain the suite's fixtures.
+  const output = realChildProcess.execFileSync("bun", ["--eval", `
+    const plugin = (await import(${JSON.stringify(tuiUrl)})).default;
+    const disposers = [];
+    const toasts = [];
+    let layer;
+    await plugin.tui({
+      route: { current: { name: "session", params: { sessionID: "missing-store-test" } } },
+      client: { session: { list: async () => ({ data: [] }) } },
+      state: { path: { directory: ${JSON.stringify(HOME)} }, session: {} },
+      event: { on: () => () => {} },
+      lifecycle: { onDispose: (fn) => disposers.push(fn) },
+      keymap: { intercept() {}, registerLayer: (value) => { layer = value; } },
+      slots: { register() {} },
+      ui: { dialog: { clear() {} }, toast: (value) => toasts.push(value) },
+    });
+    layer.commands.find((command) => command.name === "hud.agents.list").run();
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const dispose of disposers) await dispose();
+    console.log(JSON.stringify(toasts.filter((toast) => toast.title === "subagents")));
+  `], { encoding: "utf8", timeout: 10_000 });
+  const toasts = JSON.parse(output);
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0].message, /Nothing running/);
+  assert.doesNotMatch(toasts[0].message, /unavailable|partial read/);
+});
+
+test("invalid shell records leave valid rows visible with a partial-read warning", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = FAKE_BG_STORE;
+  fakeBgStore.setJobs({ "ses-a": [null, SHELL_JOB, {}] });
+  const h = await withTuiHarness();
+  try {
+    h.navigate("ses-a");
+    await h.runAgentPoll();
+    assert.match(contentOf(h.strip()), /watch build/);
+    assert.match(contentOf(h.strip()), /shells: partial read/);
+    runF10(h);
+    await flushReal();
+    assert.deepEqual(h.dialog.options.map((option) => option.value), ["job-1"]);
+    assert.ok(subagentToasts(h).some((toast) => /shells: partial read/.test(toast.message)));
+  } finally {
+    fakeBgStorePath = null;
+    fakeBgStore.setJobs({});
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the real shell producer's skipped records stay visible as HUD partial reads and recover", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = REAL_BG_STORE;
+  const dir = realBgStore.DIR;
+  const owned = { id: "owned", sessionID: "ses-a", pid: process.pid, description: "Owned shell", started: new Date(EPOCH).toISOString() };
+  const other = { id: "other", sessionID: "ses-b", pid: process.pid, description: "Other session", started: new Date(EPOCH).toISOString() };
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "owned.json"), JSON.stringify(owned));
+  writeFileSync(join(dir, "other.json"), JSON.stringify(other));
+  writeFileSync(join(dir, "broken.json"), "{");
+  mkdirSync(join(dir, "unreadable.json"));
+  assert.deepEqual(realBgStore.listJobs("ses-a").map((job) => job.id), ["owned"],
+    "the real producer skips malformed and unreadable records while retaining the owned row");
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /Owned shell/);
+    assert.doesNotMatch(contentOf(strip), /Other session/);
+    assert.match(contentOf(strip), /shells: partial read/);
+
+    runF10(h);
+    await flushReal();
+    assert.deepEqual(h.dialog.options.map((option) => option.value), ["owned"]);
+    assert.ok(subagentToasts(h).some((toast) => /shells: partial read/.test(toast.message)));
+
+    rmSync(join(dir, "owned.json"));
+    await h.clock.advance(3_000);
+    assert.doesNotMatch(contentOf(strip), /Owned shell/);
+    assert.match(contentOf(strip), /shells: partial read/, "all producer-filtered records still diagnose the partial read");
+    runF10(h);
+    await flushReal();
+    assert.ok(subagentToasts(h).some((toast) => /shells: partial read/.test(toast.message)));
+
+    rmSync(join(dir, "broken.json"));
+    rmSync(join(dir, "unreadable.json"), { recursive: true });
+    writeFileSync(join(dir, "recovered.json"), JSON.stringify({ ...owned, id: "recovered", description: "Recovered shell" }));
+    await h.clock.advance(3_000);
+    assert.match(contentOf(strip), /Recovered shell/);
+    assert.doesNotMatch(contentOf(strip), /shells: partial read/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    fakeBgStorePath = null;
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the real shell producer's unreadable exit record warns in the HUD and recovers", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = REAL_BG_STORE;
+  const dir = realBgStore.DIR;
+  const job = { id: "exit-unreadable", sessionID: "ses-a", pid: process.pid, description: "Exit unreadable", started: new Date(EPOCH).toISOString() };
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${job.id}.json`), JSON.stringify(job));
+  mkdirSync(join(dir, `${job.id}.rc`));
+  assert.deepEqual(realBgStore.listJobs("ses-a"), [],
+    "the real producer skips a record when its exit file cannot be read");
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    assert.match(contentOf(strip), /shells: partial read/);
+
+    runF10(h);
+    await flushReal();
+    assert.ok(subagentToasts(h).some((toast) => /shells: partial read/.test(toast.message)));
+    assert.ok(!subagentToasts(h).some((toast) => /Nothing running/.test(toast.message)));
+
+    rmSync(join(dir, `${job.id}.rc`), { recursive: true });
+    writeFileSync(join(dir, `${job.id}.rc`), "0");
+    await h.clock.advance(3_000);
+    assert.doesNotMatch(contentOf(strip), /shells: partial read/);
+    runF10(h);
+    await flushReal();
+    assert.deepEqual(h.dialog.options.map((option) => option.value), [job.id]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    fakeBgStorePath = null;
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("the real shell producer's directory errors warn while a missing optional store stays quiet", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = REAL_BG_STORE;
+  const dir = realBgStore.DIR;
+  rmSync(dir, { recursive: true, force: true });
+  const h = await withTuiHarness();
+  try {
+    await h.runAgentPoll();
+    assert.doesNotMatch(contentOf(h.strip()), /shells: unavailable|shells: partial read/,
+      "ENOENT is an absent optional store, not an error");
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dirname(dir), { recursive: true });
+    writeFileSync(dir, "not a directory");
+    assert.deepEqual(realBgStore.listJobs("ses-a"), [], "the real producer hides its directory error as an empty list");
+    await h.clock.advance(3_000);
+    assert.match(contentOf(h.strip()), /shells: unavailable/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    fakeBgStorePath = null;
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+// Real files exercise directory, read and parse failures without platform-dependent chmod tests.
+const TASK_ROOT = join(HOME, ".local/share/opencode");
+for (const failure of ["invalid", "unreadable"]) {
+  test(`${failure} shell exit records are partial reads, not successful outcomes`, async () => {
+    requireJsxRuntime();
+    scriptBroker();
+    const dir = join(TASK_ROOT, "bg");
+    mkdirSync(dir, { recursive: true });
+    const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+    try {
+      writeFileSync(join(dir, "job.json"), JSON.stringify({ id: "job", sessionID: "ses-1", description: "Exit unknown", started: new Date(EPOCH).toISOString() }));
+      if (failure === "invalid") writeFileSync(join(dir, "job.rc"), "not an exit code");
+      else mkdirSync(join(dir, "job.rc"));
+      assert.match(contentOf(h.strip()), /shells: partial read/);
+      assert.doesNotMatch(contentOf(h.strip()), /Exit unknown.*(?:done|exit)/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+}
+for (const source of ["bg", "workflow-runs"]) {
+  test(`${source} directory failures are visible, missing optional stores remain quiet`, async () => {
+    requireJsxRuntime();
+    scriptBroker();
+    const path = join(TASK_ROOT, source);
+    mkdirSync(TASK_ROOT, { recursive: true });
+    const h = await withTuiHarness();
+    try {
+      assert.doesNotMatch(contentOf(h.strip()), /unavailable|partial read/);
+      writeFileSync(path, "not a directory");
+      await h.clock.advance(3_000);
+      assert.match(contentOf(h.strip()), source === "bg" ? /shells: unavailable/ : /workflows: unavailable/);
+      rmSync(path);
+      await h.clock.advance(3_000);
+      assert.doesNotMatch(contentOf(h.strip()), /unavailable|partial read/);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+
+  for (const failure of ["corrupt", "unreadable"]) {
+    test(`${source} ${failure} records preserve valid rows and recover across session changes`, async () => {
+      requireJsxRuntime();
+      scriptBroker();
+      const dir = join(TASK_ROOT, source);
+      mkdirSync(dir, { recursive: true });
+      const bad = join(dir, "bad.json");
+      const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+      const record = (id, sessionID) => source === "bg"
+        ? { id, sessionID, description: `Work for ${sessionID}`, started: new Date(EPOCH).toISOString() }
+        : { id, sessionID, name: `Work for ${sessionID}`, status: "running", phase: "review", agentsDone: 0, agentsStarted: 2 };
+      const put = (name, data) => {
+        writeFileSync(join(dir, `${name}.json`), JSON.stringify(data));
+        if (source === "bg") writeFileSync(join(dir, `${data.id}.rc`), "0");
+      };
+      try {
+        put("good-a", record("good-a", "ses-a"));
+        put("good-b", record("good-b", "ses-b"));
+        if (failure === "corrupt") writeFileSync(bad, "{");
+        else mkdirSync(bad);
+        h.navigate("ses-a");
+        const strip = h.strip();
+        assert.match(contentOf(strip), /Work for ses-a/);
+        assert.match(contentOf(strip), source === "bg" ? /shells: partial read/ : /workflows: partial read/);
+        h.navigate("ses-b");
+        assert.match(contentOf(strip), /Work for ses-b/);
+        assert.doesNotMatch(contentOf(strip), /Work for ses-a/);
+        assert.match(contentOf(strip), /partial read/);
+        rmSync(bad, { recursive: true });
+        put("bad", record("recovered", "ses-b"));
+        await h.clock.advance(3_000);
+        assert.doesNotMatch(contentOf(strip), /unavailable|partial read/);
+        assert.match(contentOf(strip), /Work for ses-b/);
+        h.navigate("ses-a");
+        assert.match(contentOf(strip), /Work for ses-a/);
+        assert.doesNotMatch(contentOf(strip), /Work for ses-b|partial read/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+        resetRouterHooks();
+        await h.cleanup();
+      }
+    });
+  }
+}
+
+// ---- the broker's answers are aged by when they were ASKED for --------------------------------
+const STATUS_25 = () => ({
+  budgets: { anthropic: learnedWindow(25) },
+  health: { providers: { zai: { state: "quarantined" } } },
+  circuits: {},
+});
+
+test("a /status that never answers turns 'no broker data yet' into unavailable at the fallback age", async () => {
+  requireJsxRuntime();
+  const calls = [];
+  routerHooks.brokerRequest = (path) => { calls.push(path); return never(); };
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    const body = h.sidebarBody();
+    const routeTitle = h.routeTitle();
+    const routes = h.routeBody();
+    await flushReal();
+    assert.equal(contentOf(body), " (no broker data yet)");
+    await h.clock.advance(FRESHNESS_FALLBACK - 1_000);
+    assert.equal(contentOf(body), " (no broker data yet)", "a first answer may still come inside two polls and slack");
+    await h.clock.advance(2_000);
+    assert.equal(contentOf(body), " (broker unavailable)");
+    assert.equal(contentOf(routeTitle), "\nRoute");
+    assert.equal(contentOf(routes), " (unavailable)");
+    h.navigate(undefined);
+    assert.equal(contentOf(h.strip()), " Route: unavailable");
+    assert.deepEqual(calls, ["/status"], "the hung request is not joined by more");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a /status that hangs after an answer goes stale at the fallback age, warnings kept and badge hidden", async () => {
+  requireJsxRuntime();
+  let hang = false;
+  const calls = [];
+  routerHooks.brokerRequest = async (path) => {
+    calls.push(path);
+    if (hang) return never();
+    return path === "/status" ? STATUS_25() : routeOf("model-a");
+  };
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+  try {
+    const body = h.sidebarBody();
+    const routes = h.routeBody();
+    const badge = h.badge();
+    await flushReal();
+    assert.match(contentOf(badge), /ant 25% wk/);
+
+    hang = true;
+    await h.clock.advance(FRESHNESS_FALLBACK - 2_000);
+    assert.doesNotMatch(contentOf(body), /stale/);
+    assert.match(contentOf(badge), /ant 25% wk/);
+    await h.clock.advance(3_000);
+    const text = contentOf(body);
+    assert.match(text, /^ \(stale 26s\)$/m, `an overdue answer is stale with no failure to report:\n${text}`);
+    assert.match(text, /zai\s+\u26d4 quarantined/, "a warning is kept, not dropped");
+    assert.doesNotMatch(contentOf(badge), /ant 25%/);
+    assert.match(contentOf(routes), /^ \(stale 26s\)$/m);
+    assert.match(contentOf(routes), /deep\s+model-a/);
+    assert.deepEqual(calls, ["/status", "/preview", "/status"], "one hung request, never another stacked on it");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("an answer that lands minutes after it was asked for is shown as that old, not as fresh", async () => {
+  requireJsxRuntime();
+  let held = null;
+  routerHooks.brokerRequest = async (path) => {
+    if (path !== "/status") return routeOf("model-a");
+    if (held) return held.promise;
+    return STATUS_25();
+  };
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+  try {
+    const body = h.sidebarBody();
+    const badge = h.badge();
+    await flushReal();
+    held = deferred();
+    await h.clock.advance(3 * 60_000);
+    assert.match(contentOf(body), /^ \(stale 3m\)$/m);
+
+    const late = held;
+    held = null;
+    late.resolve({ budgets: { anthropic: learnedWindow(40) }, health: { providers: {} }, circuits: {} });
+    await flushReal();
+    // Asked for at EPOCH + 10 050, answered at EPOCH + 181 000: its numbers are ~3 min old.
+    assert.match(contentOf(body), /anthropic\s+wk 40%/);
+    assert.match(contentOf(body), /^ \(stale 3m\)$/m, "a late answer is aged from when it was asked for");
+    assert.doesNotMatch(contentOf(badge), /ant 40%/);
+
+    await h.runBudgetPoll();
+    assert.doesNotMatch(contentOf(body), /stale/);
+    assert.match(contentOf(badge), /ant 25% wk/);
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a /preview that never answers says unavailable at the fallback age", async () => {
+  requireJsxRuntime();
+  routerHooks.brokerRequest = async (path) => (path === "/status" ? STATUS_25() : never());
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    const routes = h.routeBody();
+    await flushReal();
+    assert.equal(contentOf(routes), "");
+    await h.clock.advance(FRESHNESS_FALLBACK + 1_000);
+    assert.equal(contentOf(h.routeTitle()), "\nRoute");
+    assert.equal(contentOf(routes), " (unavailable)");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+for (const [label, fetchedAt] of [
+  ["missing", () => undefined],
+  ["zero", () => 0],
+  ["negative", () => -5],
+  ["not a number", () => "yesterday"],
+  ["infinite", () => Infinity],
+  ["in the future", () => Date.now() + 60_000],
+]) {
+  test(`a plan reading whose fetchedAt is ${label} has an unknown age, never a made-up one`, async () => {
+    requireJsxRuntime();
+    scriptBroker({ status: () => ({
+      budgets: { anthropic: { plan: { fetchedAt: fetchedAt(), windows: [{ id: "week", percent: 30 }] } } },
+      health: { providers: {} },
+      circuits: {},
+    }) });
+    const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
+    try {
+      const body = h.sidebarBody();
+      await flushReal();
+      assert.match(contentOf(body), /^ anthropic\s+wk 30% \(age unknown\)$/m, contentOf(body));
+      assert.doesNotMatch(contentOf(h.badge()), /ant/, "an unknown age is not vouched for on the badge");
+    } finally {
+      resetRouterHooks();
+      await h.cleanup();
+    }
+  });
+}
+
+test("a collapsed Usage heading still says the block is stale", async () => {
+  requireJsxRuntime();
+  const broker = scriptBroker({ status: STATUS_25 });
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    const title = h.sidebarTitle();
+    await flushReal();
+    h.layer.commands.find((command) => command.name === "hud.usage.toggle").run();
+    assert.equal(contentOf(title), "\nUsage \u25b8");
+    broker.statusError = new Error("broker unavailable");
+    await h.runBudgetPoll();
+    assert.equal(contentOf(title), "\nUsage \u25b8 (stale 9s)");
+  } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a collapsed Usage heading still says the broker is unavailable", async () => {
+  requireJsxRuntime();
+  routerHooks.brokerRequest = async () => { throw new Error("broker unavailable"); };
+  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
+  try {
+    const title = h.sidebarTitle();
+    await flushReal();
+    h.layer.commands.find((command) => command.name === "hud.usage.toggle").run();
+    assert.equal(contentOf(title), "\nUsage \u25b8 (unavailable)");
   } finally {
     resetRouterHooks();
     await h.cleanup();

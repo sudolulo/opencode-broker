@@ -19,7 +19,8 @@
 // The permission mode is published as one file per session so the server-side guard can
 // read it -- the two plugins are separate module instances with no other channel.
 import { execFile, spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -613,34 +614,94 @@ export default {
     // the path `hud.backgroundShells` names. Loaded defensively -- if the store fails to import,
     // the badge and the agent roster still have to render.
     let bg = null;
+    let bgLoadWarning = null;
     for (const specifier of [
       CONFIG.hud.backgroundShells ? pathToFileURL(CONFIG.hud.backgroundShells).href : null,
       "opencode-background-shells/lib/bg-store.js",
     ].filter(Boolean)) {
-      try { bg = await import(specifier); break; } catch {}
+      try { bg = await import(specifier); break; } catch (error) {
+        // Only an uninstalled OPTIONAL package is absence. A configured path or a broken
+        // installed package is a failed source, even when a fallback store can still load.
+        // Node and Bun use different missing-import messages. Check package presence along
+        // the runtime's resolution paths instead: a present package with a missing store file
+        // or dependency is broken, not an optional plugin that was never installed.
+        const notInstalled = specifier === "opencode-background-shells/lib/bg-store.js" &&
+          error?.code === "ERR_MODULE_NOT_FOUND" &&
+          createRequire(import.meta.url).resolve.paths("opencode-background-shells").every((directory) => {
+            try { statSync(join(directory, "opencode-background-shells")); return false; }
+            catch (error) { return error?.code === "ENOENT"; }
+          });
+        if (!notInstalled) bgLoadWarning = "shells: unavailable (job store could not load)";
+      }
     }
+
+    // DIR is a read-only contract; calling the producer's dir() would create the store.
+    const bgDir = typeof bg?.DIR === "string" && bg.DIR
+      ? bg.DIR : join(homedir(), ".local/share/opencode/bg");
+    // A producer may silently skip bad records. Diagnose the raw store independently,
+    // sharing the scan with Tasks without deriving source health from rendered UI text.
+    // Unreadable records cannot be attributed to a session, so the warning is generic.
+    const readStore = (directory, source, visit) => {
+      let names;
+      try { names = readdirSync(directory); } catch (error) {
+        return error?.code === "ENOENT" ? null : `${source}: unavailable (store read failed)`;
+      }
+      let failures = 0;
+      for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+        try {
+          const record = JSON.parse(readFileSync(join(directory, name), "utf8"));
+          if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("invalid task record");
+          visit(record);
+        } catch {
+          failures += 1;
+        }
+      }
+      return failures ? `${source}: partial read (${failures} unreadable or invalid record${failures === 1 ? "" : "s"})` : null;
+    };
+    const readShellExitCode = (job) => {
+      const rc = join(bgDir, job.id + ".rc");
+      return existsSync(rc) ? readFileSync(rc, "utf8").trim() : null;
+    };
 
     // Jobs are folded into the SAME list as subagents so one panel, one cursor and
     // one Enter key cover both -- which is how Claude shows agents and shells.
     const loadJobs = (sid, { includeFinished = false } = {}) => {
-      if (!bg || !sid) return [];
+      const result = { rows: [], warning: sid ? bgLoadWarning : null };
+      if (!bg || !sid) return result;
+      const storeWarning = readStore(bgDir, "shells", (job) => {
+        if (typeof job.id !== "string" || !job.id) throw new Error("invalid job ID");
+        readShellExitCode(job);
+      });
+      result.warning = [bgLoadWarning, storeWarning].filter(Boolean).join("; ") || null;
       try {
-        return bg.listJobs(sid)
+        const jobs = bg.listJobs(sid);
+        if (!Array.isArray(jobs)) throw new Error("invalid job list");
+        for (const j of jobs) {
+          if (!j || typeof j.id !== "string" || !j.id || typeof j.state !== "string" || !j.state) {
+            result.warning = [bgLoadWarning, storeWarning, "shells: partial read (invalid job records)"].filter(Boolean).join("; ");
+            continue;
+          }
           // Keep persisted output available in F10 without treating historical jobs
           // as live workflow rows for the next 24 hours.
-          .filter((j) => includeFinished || j.state === "running")
-          .map((j) => ({
-          kind: "shell",
-          id: j.id,
-          title: String(j.description || j.command || j.id),
-          agent: "shell",
-          status: j.state,
-          code: j.code,
-          session: j.session || null,
-          created: Date.parse(j.started || 0) || 0,
-          tokens: 0,
-        }));
-      } catch { return []; }
+          if (!includeFinished && j.state !== "running") continue;
+          result.rows.push({
+            kind: "shell",
+            id: j.id,
+            title: String(j.description || j.command || j.id),
+            agent: "shell",
+            status: j.state,
+            code: j.code,
+            session: j.session || null,
+            created: Date.parse(j.started || 0) || 0,
+            tokens: 0,
+          });
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          result.warning = [bgLoadWarning, storeWarning, "shells: unavailable (job store read failed)"].filter(Boolean).join("; ");
+        }
+      }
+      return result;
     };
 
     const isShell = (a) => a.kind === "shell";
@@ -691,7 +752,13 @@ export default {
       // Route preview (the new-session page has no sidebar). Inside a session this
       // returns "" -- but bottomStripText still appends the Tasks monitor below, so
       // the bar carries workflow runs and jobs even with no live child sessions.
-      if (!agents.length) return sessionID() ? "" : homeRouteText();
+      syncRoster();
+      // A list that failed is said out loud: an empty strip would read as "no subagents".
+      const notice = sessionID() ? [
+        rosterUnavailable ? ` subagents: unavailable (session list ${rosterUnavailable})` : "",
+        jobsWarning ? ` ${jobsWarning}` : "",
+      ].filter(Boolean).join("\n") : "";
+      if (!agents.length) return sessionID() ? notice : homeRouteText();
       const w = width();
       if (selected !== null) {
         if (selected < scrollTop) scrollTop = selected;
@@ -729,34 +796,127 @@ export default {
 
       return "\u2500".repeat(w).slice(0, w) + "\n" +
         "\u25cf main\n" +
-        rows.join("\n");
+        rows.join("\n") + (notice ? "\n" + notice : "");
     };
 
     let agents = [];
-    const loadAgents = async (parentID) => {
+    // ---- whose roster `agents` is -----------------------------------------------------------
+    // The roster belongs to the session ON SCREEN, and a session list takes time to answer, so
+    // every change of session starts a new VISIT: `rosterGen` goes up, the old rows go at once,
+    // and only an answer requested during the current visit may be installed. A bare sessionID
+    // check is not enough -- A -> B -> A returns to the same ID, and the request from the first
+    // visit to A can land after the one from the second.
+    let rosterSid;
+    let rosterGen = 0;
+    let rosterLoadedGen = -1;     // the visit whose answer `agents` holds
+    let rosterInFlight = null;    // { gen, promise }: at most one request per visit
+    // Why the latest list for this visit could not be used -- "failed" or "not answering" --
+    // or false. Said out loud, never guessed around.
+    let rosterUnavailable = false;
+    let rosterDisposed = false;
+    let jobsAt = null;
+    let jobsWarning = null;
+    // Every session-list request still out (the poll's and F10's), so a navigation or a dispose
+    // can cancel them and clear their deadline timers.
+    const rosterCalls = new Set();
+    // Synchronous, and called by everything that draws or reads the roster, so the first draw
+    // after a navigation is already the new session's -- not up to a second of the old one's.
+    const syncRoster = () => {
+      const sid = sessionID();
+      if (sid === rosterSid) return;
+      rosterSid = sid;
+      rosterGen += 1;
+      agents = [];
+      rosterUnavailable = false;
+      jobsAt = null;
+      jobsWarning = null;
+      selected = null;
+      scrollTop = 0;
+      // Every request still out belongs to a visit that just ended; its answer would be dropped.
+      for (const call of [...rosterCalls]) call.cancel();
+    };
+    // Disk-backed shells have their own freshness boundary. A hung session list must not
+    // postpone their reads (or keep showing a finished shell as running).
+    const refreshJobs = () => {
+      if (jobsAt !== null && Date.now() - jobsAt < 2000) return;
+      const jobs = loadJobs(rosterSid);
+      jobsAt = Date.now();
+      jobsWarning = jobs.warning;
+      agents = [...agents.filter((a) => !isShell(a)), ...jobs.rows];
+      if (selected !== null && selected >= agents.length) selected = agents.length ? agents.length - 1 : null;
+    };
+    // Throws when the session list does. WARNING: The v2 SDK does NOT throw on failure by default
+    // (throwOnError is off): a refused, failed or ABORTED request comes back as `{ error }`, so
+    // that is checked here rather than left to fall through as an "empty" roster.
+    const listChildren = async (parentID, signal) => {
       if (!parentID) return [];
-      try {
-        const res = await api.client.session.list({ query: { directory: api.state.path.directory } });
-        const rows = res?.data ?? res ?? [];
-        return rows
-          // Children of THIS session, minus the command classifier -- see isClassifierAgent.
-          .filter((row) => row?.parentID === parentID && !isClassifierAgent(String(row?.agent ?? "")))
-          .map((row) => ({
-            kind: "agent",
-            id: row.id,
-            title: String(row.title ?? row.id),
-            // status is undefined for a session the TUI has not loaded; that is not
-            // an error, it just means nothing is running in it.
-            status: api.state.session.status(row.id)?.type ?? "idle",
-            // Metrics are best-effort: the row carries them under a couple of
-            // spellings depending on version, and a missing one just drops that
-            // part of the right-hand column rather than breaking the row.
-            agent: String(row.agent ?? "agent"),
-            created: row.time?.created ?? row.timeCreated ?? row.time_created ?? 0,
-            tokens: (row.tokens?.input ?? row.tokens_input ?? 0) +
-                    (row.tokens?.output ?? row.tokens_output ?? 0),
-          }));
-      } catch { return []; }
+      // The second argument is the SDK's per-request options; they are spread into the fetch's
+      // RequestInit, which is how the signal reaches it.
+      const res = await api.client.session.list({ query: { directory: api.state.path.directory } }, { signal });
+      if (res?.error) throw new Error(String(res.error?.message ?? res.error));
+      const rows = res?.data ?? res ?? [];
+      if (!Array.isArray(rows)) throw new Error("the session list returned no rows");
+      return rows
+        // Children of THIS session, minus the command classifier -- see isClassifierAgent.
+        .filter((row) => row?.parentID === parentID && !isClassifierAgent(String(row?.agent ?? "")))
+        .map((row) => ({
+          kind: "agent",
+          id: row.id,
+          title: String(row.title ?? row.id),
+          // status is undefined for a session the TUI has not loaded; that is not
+          // an error, it just means nothing is running in it.
+          status: api.state.session.status(row.id)?.type ?? "idle",
+          // Metrics are best-effort: the row carries them under a couple of
+          // spellings depending on version, and a missing one just drops that
+          // part of the right-hand column rather than breaking the row.
+          agent: String(row.agent ?? "agent"),
+          created: row.time?.created ?? row.timeCreated ?? row.time_created ?? 0,
+          tokens: (row.tokens?.input ?? row.tokens_input ?? 0) +
+                  (row.tokens?.output ?? row.tokens_output ?? 0),
+        }));
+    };
+    // ---- a session list may not take forever ------------------------------------------------
+    // A request that never settles would otherwise leave the last rows on screen as current for
+    // ever (the poll) or leave F10 doing nothing (the dialog). So every list gets a deadline:
+    //   answer   settles with the rows, or rejects -- on failure, at the deadline (err.timedOut),
+    //            or when cancelled. Whatever awaits it is never left hanging.
+    //   settled  resolves when the UNDERLYING request ends, however late. The poll holds its
+    //            one-request guard until then, so a request whose cancellation does not take is
+    //            shared by later ticks rather than joined by a new one every 2 s.
+    //   cancel() aborts the request and rejects `answer`; the deadline timer goes with it.
+    // The deadline aborts through the SDK's per-request `signal` (v2 RequestOptions extend
+    // RequestInit and are spread into the fetch), so a hung request is torn down, not abandoned.
+    const ROSTER_DEADLINE_MS = 5_000;
+    const requestChildren = (parentID) => {
+      const controller = new AbortController();
+      let timer = null;
+      let rejectAnswer = () => {};
+      const request = listChildren(parentID, controller.signal);
+      const call = {
+        answer: new Promise((resolve, reject) => {
+          rejectAnswer = reject;
+          request.then(resolve, reject);
+        }),
+        settled: null,
+        cancel: () => {
+          clearTimeout(timer);
+          rosterCalls.delete(call);
+          rejectAnswer(new Error("cancelled"));
+          controller.abort();
+        },
+      };
+      timer = setTimeout(() => {
+        rosterCalls.delete(call);
+        rejectAnswer(Object.assign(new Error(`the session list did not answer within ${ROSTER_DEADLINE_MS / 1000} s`), { timedOut: true }));
+        controller.abort();
+      }, ROSTER_DEADLINE_MS);
+      if (typeof timer?.unref === "function") timer.unref();
+      call.settled = request.then(() => {}, () => {}).finally(() => {
+        clearTimeout(timer);
+        rosterCalls.delete(call);
+      });
+      rosterCalls.add(call);
+      return call;
     };
 
     // Enter on a shell row in the roster. DialogAlert is one scrollable body with no
@@ -799,6 +959,8 @@ export default {
       api.keymap.intercept("key", (ctx) => {
         const name = ctx?.event?.name;
         const plain = ctx?.event && !ctx.event.ctrl && !ctx.event.meta && !ctx.event.option;
+        // A row selected in the previous session must not be opened from this one.
+        syncRoster();
         const id = sessionID();
         let interactionOpen = Boolean(api.ui?.dialog?.open);
         if (id) {
@@ -857,28 +1019,57 @@ export default {
     };
     // Provider usage: the broker's budget ledger, polled lazily so the badge can
     // answer "how much of this provider's window have we burned" at a glance.
-    // Stale numbers are worse than none: after 2 minutes without a successful
-    // poll the badge hides instead of lying.
+    // Stale numbers are worse than none: the badge hides the moment a poll fails, or once the
+    // last answer is older than FRESHNESS_FALLBACK_MS, instead of lying.
     const budgetUtil = new Map();
     // providerID -> when the PROVIDER's reading was taken (the broker's `plan.fetchedAt`), as
     // opposed to budgetAt, which is only when this HUD last reached the broker. A broker that
     // answers every poll can still be serving a held-over reading; this is what tells them apart.
+    // null = the reading's age is UNKNOWN (no usable fetchedAt): shown as such, never as current.
     const readingAt = new Map();
     // A reading older than this is shown with its age and never as a bare current number.
     // The chain is llm-auth-proxy's 60 s cache, the broker's 30 s refresh and 60 s cache, and
     // this HUD's 10 s poll, so a healthy reading is at most ~2.5 min old.
     const READING_STALE_MS = 3 * 60_000;
     const laneNotes = new Map();
+    // When the /status request behind the numbers on screen was SENT -- not when it answered.
+    // An answer that took three minutes to arrive is three minutes old, and must not read as
+    // fresh just because it landed now.
     let budgetAt = 0;
-    // When /status started failing, or null while it answers. Two misses in a row (the poll
-    // runs every 30 s) turn the badge into BROKER DOWN -- see fallbackBadge.
+    // When /status started failing, or null while it answers. 30 s of misses (three 10 s polls)
+    // turn the badge into BROKER DOWN -- see fallbackBadge.
     let brokerFailingSince = null;
+    // The route preview is a SECOND request with its own fate, so it keeps its own freshness:
+    // when it last answered, and since when it has missed a refresh -- its own failure, or a
+    // /status failure that meant it was never asked. Without these a failed /preview left the
+    // last routes on screen indefinitely, looking exactly like current ones.
+    // Like budgetAt, previewAt is when the /preview that answered was SENT.
+    let previewAt = 0;
+    let previewFailingSince = null;
+    const notePreviewMissed = () => { if (previewFailingSince === null) previewFailingSince = Date.now(); };
+    // The failure flags above only move when a request ENDS. A request that never ends -- and
+    // lib/client.js's timeout is a socket IDLE timeout, which a broker dribbling bytes never
+    // trips -- would leave them unset and the last answer on screen as current for ever. So
+    // freshness is also judged by AGE alone: older than two polls plus slack is stale (or, with
+    // no answer yet, unavailable), whatever the flags say. Ages count from when this HUD started
+    // until a first answer exists, so a broker that is hung from the start is caught too.
+    // No second request is sent to find out: `budgetPolling` keeps one /status (and its
+    // /preview) out at a time, so a hung poll shows as stale instead of stacking new ones.
+    const BUDGET_POLL_MS = 10_000;
+    const FRESHNESS_FALLBACK_MS = 2 * BUDGET_POLL_MS + 5_000;
+    const budgetSince = Date.now();
+    const usageStale = () => brokerFailingSince !== null ||
+      Date.now() - (budgetAt || budgetSince) > FRESHNESS_FALLBACK_MS;
     let budgetPolling = false;
+    // Set on dispose. A poll already in flight must not write into a disposed HUD.
+    let budgetDisposed = false;
     const pollBudgets = async () => {
       if (budgetPolling) return;
       budgetPolling = true;
       try {
+        const askedAt = Date.now();
         const status = await brokerRequest("/status", {}, { timeout: 1500 });
+        if (budgetDisposed) return;
         brokerFailingSince = null;
         // A provider whose SUBSCRIPTION has lapsed is not a provider in use: /status keeps
         // reporting its budget for diagnostics, so without this the sidebar showed a
@@ -905,9 +1096,14 @@ export default {
               estimate: false,
               resetsAt: Date.parse(w.resetsAt ?? "") || null,
             }));
-          // A plan reading without fetchedAt predates the broker stamping it: age unknown, so
-          // it is treated as stale rather than trusted.
-          if (planWindows.length) readingAt.set(providerID, Number(report.plan.fetchedAt) || 0);
+          // A plan reading without a usable fetchedAt -- absent (it predates the broker stamping
+          // it), not a finite positive number, or in the FUTURE -- has an unknown age: treated as
+          // stale and labelled "age unknown", never turned into a made-up age (an epoch-0 stamp
+          // read as "30000000m old"; a future one read as current).
+          if (planWindows.length) {
+            const fetchedAt = typeof report.plan.fetchedAt === "number" ? report.plan.fetchedAt : Number.NaN;
+            readingAt.set(providerID, Number.isFinite(fetchedAt) && fetchedAt > 0 && fetchedAt <= Date.now() ? fetchedAt : null);
+          }
           const windows = planWindows.length ? planWindows : (Array.isArray(report?.windows) ? report.windows : [])
             .filter((w) => Number(w?.capacity) > 0)
             .map((w) => ({
@@ -917,7 +1113,7 @@ export default {
             }));
           if (windows.length) budgetUtil.set(providerID, windows);
         }
-        budgetAt = Date.now();
+        budgetAt = askedAt;
         // Lane health: a benched provider must be VISIBLE, not silently absent
         // from routing (openai sat quarantined for a day before anyone knew).
         laneNotes.clear();
@@ -949,26 +1145,39 @@ export default {
             laneNotes.set(key, when ? `benched til ${when}` : "benched");
           }
         }
+        let routes;
+        const previewAskedAt = Date.now();
         try {
-          const routes = await brokerRequest("/preview", { profile: "auto", tiers: ["deep", "smart", "build", "worker"] }, { timeout: 2500 });
-          routePreview.clear();
-          for (const [tier, target] of Object.entries(routes?.preview ?? {})) {
-            if (target?.model?.id) routePreview.set(tier, target.model.id + (target.model.variant ? " \u00b7 " + target.model.variant : ""));
-          }
-        } catch { /* preview is decoration; usage numbers stand alone */ }
+          routes = await brokerRequest("/preview", { profile: "auto", tiers: ["deep", "smart", "build", "worker"] }, { timeout: 2500 });
+        } catch {
+          // Usage numbers stand alone, so a failed preview does not fail the poll -- but the
+          // routes it would have refreshed are now stale, and the Route block says so.
+          if (!budgetDisposed) notePreviewMissed();
+          return;
+        }
+        if (budgetDisposed) return;
+        routePreview.clear();
+        for (const [tier, target] of Object.entries(routes?.preview ?? {})) {
+          if (target?.model?.id) routePreview.set(tier, target.model.id + (target.model.variant ? " \u00b7 " + target.model.variant : ""));
+        }
+        previewAt = previewAskedAt;
+        previewFailingSince = null;
       } catch {
-        // broker down: values age out, and the badge says so (fallbackBadge)
+        if (budgetDisposed) return;
+        // broker down: every value is kept -- health and circuit warnings above all -- and marked
+        // stale at once (sidebarText, routeText); the badge drops usage and, after 30 s, says
+        // BROKER DOWN (fallbackBadge). The preview was never asked, so it missed this refresh too.
         if (brokerFailingSince === null) brokerFailingSince = Date.now();
+        notePreviewMissed();
       }
       finally { budgetPolling = false; }
     };
-    // Every HUD polls on the SAME wall-clock boundaries (:00, :10, :20 ...), not on a 30 s
+    // Every HUD polls on the SAME wall-clock boundaries (:00, :10, :20 ...), not on a 10 s
     // interval from whenever its window opened: they all read the one broker reading, so
     // aligned polls show every window the same numbers at the same moment. Unaligned, two
-    // windows side by side could disagree for half a minute.
-    const BUDGET_POLL_MS = 10_000;
+    // windows side by side could disagree for up to a whole poll period.
+    // (BUDGET_POLL_MS is declared above, with the freshness fallback derived from it.)
     let budgetTimer = null;
-    let budgetDisposed = false;
     const scheduleBudgetPoll = () => {
       if (budgetDisposed) return;
       budgetTimer = setTimeout(() => { void pollBudgets(); scheduleBudgetPoll(); },
@@ -980,8 +1189,16 @@ export default {
     api.lifecycle?.onDispose?.(() => { budgetDisposed = true; clearTimeout(budgetTimer); });
     // How old a provider's numbers are by their OWN account: the plan reading's fetch time,
     // or, for estimate-only providers (no reading), this HUD's last successful poll.
-    const readingAge = (providerID) => Date.now() - (readingAt.has(providerID) ? readingAt.get(providerID) : budgetAt);
-    const readingStale = (providerID) => readingAge(providerID) > READING_STALE_MS;
+    // null when the reading's own stamp was unusable: its age is unknown, which counts as stale.
+    const readingAge = (providerID) => {
+      if (!readingAt.has(providerID)) return Date.now() - budgetAt;
+      const at = readingAt.get(providerID);
+      return at === null ? null : Date.now() - at;
+    };
+    const readingStale = (providerID) => {
+      const age = readingAge(providerID);
+      return age === null || age > READING_STALE_MS;
+    };
     // A window past its reset no longer has the percentage it was read at.
     // A nearly-full window also says when it resets, with the weekday ("wk 100%! (Wed 03:38)"):
     // that is the moment the number stops being trivia. Below 85% it would only cost width.
@@ -1034,7 +1251,9 @@ export default {
     };
     const sessionProvider = (id) => sessionModelRef(id)?.providerID;
     const usageBadge = (id) => {
-      if (Date.now() - budgetAt > 120_000) return "";
+      // The badge has no room to say "stale", so a number the broker did not confirm on its
+      // latest poll is not shown at all; the sidebar keeps it, marked stale.
+      if (usageStale()) return "";
       const ref = sessionModelRef(id);
       if (!ref?.providerID || !budgetUtil.has(ref.providerID)) return "";
       const text = pctOf(ref.providerID, ref.modelID);
@@ -1048,12 +1267,24 @@ export default {
     const routePreview = new Map();
     const routeEls = new Set();
     const ROUTE_TIERS_SHOWN = ["deep", "smart", "build", "worker"];
+    // "12s" under a minute, "7m" after: a stale marker has to read at a glance.
+    const ageText = (ms) => (ms < 60_000
+      ? `${Math.max(0, Math.round(ms / 1000))}s`
+      : `${Math.round(ms / 60_000)}m`);
+    // Stale on a missed refresh, or by age alone (see FRESHNESS_FALLBACK_MS) when the request
+    // behind the last answer -- or the very first one -- has simply not come back.
+    const routeStale = () => previewFailingSince !== null ||
+      Date.now() - (previewAt || budgetSince) > FRESHNESS_FALLBACK_MS;
+    const routeAge = () => ageText(Date.now() - previewAt);
+    // The heading stands whenever there is something to say, including "unavailable".
+    const routeHeadText = () => (routePreview.size || routeStale() ? "\nRoute" : "");
     const routeText = () => {
-      if (!routePreview.size) return "";
-      return ROUTE_TIERS_SHOWN
+      if (!routePreview.size) return routeStale() ? " (unavailable)" : "";
+      const rows = ROUTE_TIERS_SHOWN
         .filter((tier) => routePreview.has(tier))
-        .map((tier) => ` ${tier.padEnd(10)} ${routePreview.get(tier)}`)
-        .join("\n");
+        .map((tier) => ` ${tier.padEnd(10)} ${routePreview.get(tier)}`);
+      if (routeStale()) rows.unshift(` (stale ${routeAge()})`);
+      return rows.join("\n");
     };
     const PROVIDER_LONG = { "alibaba-token-plan": "token-plan" };
     // The home/new-session screen has no sidebar, so the Route preview ALSO
@@ -1062,11 +1293,12 @@ export default {
     const homeRouteEls = new Set();
     const shortModel = (label) => label.replace(/^claude-/, "");
     const homeRouteText = () => {
-      if (!routePreview.size) return "";
+      if (!routePreview.size) return routeStale() ? " Route: unavailable" : "";
       const cells = ROUTE_TIERS_SHOWN
         .filter((tier) => routePreview.has(tier))
         .map((tier) => `${tier} ${shortModel(routePreview.get(tier))}`);
-      return cells.length ? " Route: " + cells.join(" \u00b7 ") : "";
+      if (!cells.length) return "";
+      return " Route: " + cells.join(" \u00b7 ") + (routeStale() ? ` (stale ${routeAge()})` : "");
     };
     // opencode-guard's floor LEVEL (its `oc-auto` CLI): how much of the safety floor
     // runs. Read straight off the flag-file contract; shown so "will this ask
@@ -1081,25 +1313,38 @@ export default {
     };
     let usageCollapsed = false;
     const sidebarTitleEls = new Set();
-    const usageTitle = () => usageCollapsed ? "\nUsage \u25b8" : "\nUsage";
+    // Collapsed, the heading is all that shows, so it carries the block's stale/unavailable
+    // marker itself: hiding the body must not hide that the numbers behind it are old.
+    const usageTitle = () => {
+      if (!usageCollapsed) return "\nUsage";
+      const marker = !usageStale() ? ""
+        : !budgetAt ? " (unavailable)"
+          : ` (stale ${ageText(Date.now() - budgetAt)})`;
+      return "\nUsage \u25b8" + marker;
+    };
     const sidebarText = () => {
       if (usageCollapsed) return "";
-      if (!budgetUtil.size && !budgetAt) return " (no broker data yet)";
+      if (!budgetUtil.size && !budgetAt) return usageStale() ? " (broker unavailable)" : " (no broker data yet)";
       const rows = [...budgetUtil.entries()].sort(([a], [b]) => a.localeCompare(b))
         .map(([providerID, windows]) => {
           const name = (PROVIDER_LONG[providerID] ?? providerID).padEnd(10);
           const cells = windows.map(windowCell).join(" \u00b7 ");
           // Numbers older than READING_STALE_MS say how old they are, per provider: one
           // provider's usage API failing must not pass its last reading off as current.
-          const age = readingStale(providerID) ? ` (${Math.max(1, Math.round(readingAge(providerID) / 60_000))}m old)` : "";
+          const readAge = readingAge(providerID);
+          const age = !readingStale(providerID) ? ""
+            : readAge === null ? " (age unknown)"
+              : ` (${Math.max(1, Math.round(readAge / 60_000))}m old)`;
           return ` ${name} ${cells}${age}`;
         });
       // The broker answered and every provider it budgets is filtered out (all plans lapsed).
       // Saying nothing would leave the "Usage" heading standing over an empty block, which
       // reads as a broken HUD rather than as the true answer.
       if (!rows.length && !laneNotes.size) rows.push(" (no active providers)");
-      const age = Date.now() - budgetAt;
-      if (age > 120_000) rows.unshift(` (stale ${Math.round(age / 60_000)}m)`);
+      // Stale from the first failed poll, or once the last answer is overdue by age alone (a
+      // request that never ends fails nothing): every row below -- the lane warnings included,
+      // which are kept rather than dropped -- is the last broker answer.
+      if (usageStale()) rows.unshift(` (stale ${ageText(Date.now() - budgetAt)})`);
       if ([...budgetUtil.values()].some((windows) => windows.some((w) => w.pct > 100))) {
         rows.push(" ~ = estimated cap; >100% just means past the guess");
       }
@@ -1129,51 +1374,47 @@ export default {
     const tasksText = (currentSid) => {
       if (Date.now() - tasksCache.at < 3000 && tasksCache.sid === currentSid) return tasksCache.text;
       const rows = [];
-      try {
-        const bgDir = join(homedir(), ".local/share/opencode/bg");
-        for (const name of readdirSync(bgDir).filter((entry) => entry.endsWith(".json"))) {
-          let job;
-          try { job = JSON.parse(readFileSync(join(bgDir, name), "utf8")); } catch { continue; }
-          const startedAt = Date.parse(job.started ?? "") || 0;
-          let state = "gone";
-          try {
-            const rc = readFileSync(join(bgDir, job.id + ".rc"), "utf8").trim();
+      const shellWarning = readStore(bgDir, "shells", (job) => {
+        if (typeof job.id !== "string" || !job.id) throw new Error("invalid job ID");
+        const jobSid = job.sessionID ?? job.session;
+        // Another session's jobs are not this session's business. Unattributed older jobs
+        // are likewise not shown; neither do their exit files need to be read here.
+        if (!currentSid || jobSid !== currentSid) return;
+        const startedAt = Date.parse(job.started ?? "") || 0;
+        let state = "gone";
+        try {
+          const rc = readShellExitCode(job);
+          if (rc !== null) {
+            if (!/^-?\d+$/.test(rc)) throw new Error("invalid job exit code");
             state = Number(rc) === 0 ? "done" : `exit ${rc}`;
-          } catch {
-            if (pidAlive(job.pid)) state = "running";
-          }
-          const jobSid = job.sessionID ?? job.session;
-          // The strip belongs to the session that owns the work: another session's jobs
-          // are not this session's business. A job with no recorded session cannot be
-          // attributed to anyone, so it is not shown.
-          if (!currentSid || jobSid !== currentSid) continue;
-          // Running jobs of THIS session are already the interactive roster's job, and
-          // the roster lists only running ones. So the strip shows what the roster does
-          // not: this session's recently finished jobs.
-          if (state === "running") continue;
-          if (state !== "gone" && Date.now() - startedAt < TASK_DONE_LINGER_MS) {
-            rows.push(` ✓ ${String(job.description ?? job.id).slice(0, 30)} · ${state}`);
-          }
+          } else if (pidAlive(job.pid)) state = "running";
+        } catch (error) {
+          // No exit file yet is normal for a running job. Every other read/parse failure
+          // makes its outcome unknown, not "gone" (nor an invented successful completion).
+          if (error?.code !== "ENOENT") throw error;
+          if (pidAlive(job.pid)) state = "running";
         }
-      } catch {}
-      try {
-        const workflowDir = join(homedir(), ".local/share/opencode/workflow-runs");
-        for (const name of readdirSync(workflowDir).filter((entry) => entry.endsWith(".json"))) {
-          let run;
-          try { run = JSON.parse(readFileSync(join(workflowDir, name), "utf8")); } catch { continue; }
-          const label = String(run.name ?? "workflow").slice(0, 20);
-          // Workflow runs now carry the session that invoked them. Runs recorded before
-          // that field existed cannot be attributed and are not shown; they age out.
-          if (!currentSid || run.sessionID !== currentSid) continue;
-          if (run.status === "running") {
-            rows.push(` ⚑ ${label} · ${String(run.phase ?? "").slice(0, 26)} · ${run.agentsDone ?? 0}/${run.agentsStarted ?? 0} agents`);
-          } else if (run.status && Date.now() - (run.finishedAt ?? run.startedAt ?? 0) < TASK_DONE_LINGER_MS) {
-            rows.push(run.status === "done"
-              ? ` ✓ ${label} · ${taskAge(run.finishedAt ?? run.startedAt)} ago`
-              : ` ✗ ${label} · ${String(run.error ?? "failed").slice(0, 30)}`);
-          }
+        // Running jobs are already in the interactive roster; only recent outcomes go here.
+        if (state !== "running" && state !== "gone" && Date.now() - startedAt < TASK_DONE_LINGER_MS) {
+          rows.push(` \u2713 ${String(job.description ?? job.id).slice(0, 30)} \u00b7 ${state}`);
         }
-      } catch {}
+      });
+      if (shellWarning) rows.push(` ${shellWarning}`);
+      const workflowDir = join(homedir(), ".local/share/opencode/workflow-runs");
+      const workflowWarning = readStore(workflowDir, "workflows", (run) => {
+        if (typeof run.status !== "string" || !run.status) throw new Error("invalid workflow status");
+        const label = String(run.name ?? "workflow").slice(0, 20);
+        // Older runs without an owning session cannot be attributed and are not shown.
+        if (!currentSid || run.sessionID !== currentSid) return;
+        if (run.status === "running") {
+          rows.push(` \u2691 ${label} \u00b7 ${String(run.phase ?? "").slice(0, 26)} \u00b7 ${run.agentsDone ?? 0}/${run.agentsStarted ?? 0} agents`);
+        } else if (Date.now() - (run.finishedAt ?? run.startedAt ?? 0) < TASK_DONE_LINGER_MS) {
+          rows.push(run.status === "done"
+            ? ` \u2713 ${label} \u00b7 ${taskAge(run.finishedAt ?? run.startedAt)} ago`
+            : ` \u2717 ${label} \u00b7 ${String(run.error ?? "failed").slice(0, 30)}`);
+        }
+      });
+      if (workflowWarning) rows.push(` ${workflowWarning}`);
       tasksCache = { at: Date.now(), sid: currentSid, text: rows.length ? "\nTasks\n" + rows.join("\n") : "" };
       return tasksCache.text;
     };
@@ -1203,7 +1444,10 @@ export default {
       }
       const parts = (prefix + profileBadge(current) + fallbackBadge(current) + usageBadge(current))
         .replace(/^ \u00b7 /, "");
-      const suffix = agents.length ? (parts ? " \u00b7 " : "") + tallyShort(agents) : "";
+      syncRoster();
+      const tally = [agents.length ? tallyShort(agents) : "", rosterUnavailable ? "agents ?" : "", jobsWarning ? "shells ?" : ""]
+        .filter(Boolean).join(" \u00b7 ");
+      const suffix = tally ? (parts ? " \u00b7 " : "") + tally : "";
       return " " + parts + suffix + " ";
     };
     const indicator = (slot, id) => {
@@ -1223,6 +1467,11 @@ export default {
     // cross-session jobs) folded in below it. The sidebar no longer carries Tasks.
     const bottomStripText = () => panelText() + tasksText(sessionID());
     const refresh = () => {
+      // A navigation is noticed here at the latest (every second): the old roster is dropped
+      // before anything below draws, and the new visit's list is asked for straight away
+      // rather than on the next 2 s roster tick.
+      syncRoster();
+      if (rosterLoadedGen !== rosterGen) void pollAgents();
       const want = bottomStripText();
       for (const el of strip) {
         try { if (el.content !== want) el.content = want; } catch {}
@@ -1240,7 +1489,7 @@ export default {
         try { if (el.content !== heading) el.content = heading; } catch {}
       }
       const routes = routeText();
-      const routeHead = routePreview.size ? "\nRoute" : "";
+      const routeHead = routeHeadText();
       for (const el of routeEls) {
         try {
           const want = el.attributes === 1 ? routeHead : routes;
@@ -1254,22 +1503,45 @@ export default {
     };
     // The roster poll is slower than the label repaint: the label has to be honest
     // the instant the key is pressed, the roster only has to keep up with reality.
-    let polling = false;
-    const pollAgents = async () => {
-      if (polling) return;
-      polling = true;
-      try {
-        const sid = sessionID();
-        const next = [...(await loadAgents(sid)), ...loadJobs(sid)];
-        const changed = next.length !== agents.length ||
-          next.some((a, i) => a.id !== agents[i]?.id || a.status !== agents[i]?.status);
-        agents = next;
-        if (changed) refresh();
-      } finally { polling = false; }
+    // One request per visit at a time: a tick that finds this visit's request still out shares
+    // it rather than stacking another -- and "out" means until the underlying request has really
+    // ended, not merely until its deadline (see requestChildren). A request from an EARLIER visit
+    // never blocks this one: navigation cancels it and its answer is discarded.
+    const pollAgents = () => {
+      if (rosterDisposed) return Promise.resolve();
+      syncRoster();
+      refreshJobs();
+      const gen = rosterGen;
+      if (rosterInFlight?.gen === gen) return rosterInFlight.promise;
+      const sid = rosterSid;
+      const call = requestChildren(sid);
+      const promise = (async () => {
+        let children = [];
+        let failure = null;
+        try { children = await call.answer; } catch (error) { failure = error; }
+        // Late: the screen moved on (or the HUD was disposed) while this was out.
+        if (rosterDisposed || gen !== rosterGen) return;
+        // Installed and repainted on every answer, so a same-session change of title, tokens
+        // or status shows even when the IDs did not move. On a failure or a deadline the shells
+        // (read off disk, not from the session list) stay; the subagent rows go, and say why.
+        agents = [...children, ...agents.filter(isShell)];
+        rosterUnavailable = failure ? (failure.timedOut ? "not answering" : "failed") : false;
+        rosterLoadedGen = gen;
+        if (selected !== null && selected >= agents.length) selected = agents.length ? agents.length - 1 : null;
+        refresh();
+      })();
+      const entry = { gen, promise };
+      rosterInFlight = entry;
+      void call.settled.then(() => { if (rosterInFlight === entry) rosterInFlight = null; });
+      return promise;
     };
     const agentTimer = setInterval(pollAgents, 2000);
     if (typeof agentTimer?.unref === "function") agentTimer.unref();
-    api.lifecycle?.onDispose?.(() => clearInterval(agentTimer));
+    api.lifecycle?.onDispose?.(() => {
+      rosterDisposed = true;
+      clearInterval(agentTimer);
+      for (const call of [...rosterCalls]) call.cancel();
+    });
 
     const timer = setInterval(() => { reconcileQuestionModes(); refresh(); }, 1000);
     if (typeof timer?.unref === "function") timer.unref();
@@ -1309,8 +1581,8 @@ export default {
           while (sidebarTitleEls.size > 4) sidebarTitleEls.delete(sidebarTitleEls.values().next().value);
           const routeTitle = jsx("text", {
             attributes: 1,
-            get content() { return routePreview.size ? "\nRoute" : ""; },
-            get children() { return routePreview.size ? "\nRoute" : ""; },
+            get content() { return routeHeadText(); },
+            get children() { return routeHeadText(); },
           });
           const routeBody = jsx("text", {
             get content() { return routeText(); },
@@ -1733,15 +2005,53 @@ export default {
     // Open the roster. A picker rather than an inline arrow-through list: an inline
     // one needs keyboard focus handling, and DialogSelect is API we already know works.
     // `up` (session_parent) is opencode's own way back, so it is not reimplemented here.
+    let pickerGen = 0;
+    // Retain underlying requests until they actually settle, not merely until abort/deadline.
+    // One replacement may proceed while its superseded request is cancelling; if both ignore
+    // cancellation, further invocations report unavailable instead of accumulating requests.
+    const pickerCalls = new Set();
     const roster = async () => {
+      syncRoster();
+      if (rosterDisposed) return;
+      const invocation = ++pickerGen;
+      for (const call of pickerCalls) call.cancel();
+      // This explicit new invocation replaces any previous picker, even if it finds no rows.
+      // Do it now, never from an obsolete completion or selection callback.
+      api.ui.dialog.clear();
       const here = sessionID();
       if (!here) {
         api.ui?.toast?.({ variant: "warning", message: "Open a session first -- subagents belong to one." });
         return;
       }
+      // The visit this dialog belongs to. Everything below runs after an await, by which time the
+      // screen may be on another session -- or back on this one in a NEW visit (A -> B -> A),
+      // which a bare session-ID check would wave through.
+      const gen = rosterGen;
+      const stillOwned = () => {
+        syncRoster();
+        return !rosterDisposed && gen === rosterGen && invocation === pickerGen;
+      };
+      // A failed or hung list is NOT an empty one: "Nothing running" would be a guess.
+      let children = [];
+      let failure = null;
+      const call = pickerCalls.size < 2 ? requestChildren(here) : null;
+      if (call) {
+        pickerCalls.add(call);
+        void call.settled.then(() => pickerCalls.delete(call));
+      }
+      try {
+        children = await (call ? call.answer : Promise.reject(new Error("previous session list requests are still pending")));
+      } catch (error) { failure = error; }
+      if (!stillOwned()) return;
+      const subagentWarning = !failure ? null
+        : failure.timedOut ? `Subagents unavailable: ${failure.message}.`
+          : `Subagents unavailable: the subagent list failed (${String(failure?.message ?? failure)}).`;
       // The live panel intentionally hides completed shells; F10 remains the place
       // to inspect their retained output until the background store prunes it.
-      const entries = [...(await loadAgents(here)), ...loadJobs(here, { includeFinished: true })];
+      // Shells come off disk, not from the session list, so a failed list still offers them.
+      const jobs = loadJobs(here, { includeFinished: true });
+      const warning = [subagentWarning, jobs.warning].filter(Boolean).join(" ");
+      const entries = [...children, ...jobs.rows];
       const options = entries.map((a) => ({
         title: a.title,
         value: a.id,
@@ -1749,8 +2059,9 @@ export default {
           ? "shell \u00b7 " + a.status + (a.code === null || a.code === undefined ? "" : " (" + a.code + ")")
           : (a.status === "idle" ? "idle" : a.status),
       }));
+      if (warning) api.ui?.toast?.({ variant: "warning", title: "subagents", message: warning + (failure && jobs.rows.length ? " Showing shells only." : "") });
       if (!options.length) {
-        api.ui?.toast?.({ title: "subagents", message: "Nothing running under this session." });
+        if (!warning) api.ui?.toast?.({ title: "subagents", message: "Nothing running under this session." });
         return;
       }
       if (!jsx) {
@@ -1759,15 +2070,20 @@ export default {
       }
       api.ui.dialog.replace(() =>
         jsx(api.ui.DialogSelect, {
-          title: "Subagents and shells",
+          title: failure ? "Shells (subagents unavailable)" : jobs.warning ? "Subagents and shells (partial data)" : "Subagents and shells",
           placeholder: "Filter",
           options,
           onSelect: (option) => {
+            // Ownership is checked BEFORE clearing: a retained callback must not close the
+            // replacement dialog, even when that dialog belongs to this same session visit.
+            if (!stillOwned()) return;
+            const picked = entries.find((a) => a.id === option.value);
+            if (!picked) return;
+            pickerGen += 1;
             try {
               api.ui.dialog.clear();
-              const picked = entries.find((a) => a.id === option.value);
-              if (picked && isShell(picked)) { showJob(picked); return; }
-              api.route.navigate("session", { sessionID: option.value });
+              if (isShell(picked)) { showJob(picked); return; }
+              api.route.navigate("session", { sessionID: picked.id });
             } catch {}
           },
         }));
