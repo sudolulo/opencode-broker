@@ -50,6 +50,12 @@ const loopbackAddress = (value) => {
 // prefix or suffix. Plain string comparison, not a RegExp built from the client-supplied id. The
 // gateway takes no imports from the broker's lib/, hence the copy rather than a shared helper.
 const SPEED_ALIAS_SUFFIXES = ["-fast", "-standard"];
+const speedAliasBase = (modelID) => {
+  if (typeof modelID !== "string") return null;
+  const suffix = SPEED_ALIAS_SUFFIXES.find((candidate) => modelID.endsWith(candidate));
+  const base = suffix ? modelID.slice(0, -suffix.length) : "";
+  return base || null;
+};
 // Required anthropic-beta for a Messages request with top-level speed "fast".
 const FAST_MODE_BETA = "fast-mode-2026-02-01";
 const leaseCoversWireModel = (leasedModelID, wireModelID) => {
@@ -1347,11 +1353,15 @@ export const createGatewayHandler = ({
       if (typeof lease?.code === "string") refusal.code = lease.code;
       throw refusal;
     }
+    const wireModelID = speedAliasBase(model.id);
     return {
       sessionID,
       leaseID: lease?.leaseID,
       providerID: model.providerID,
       modelID: model.id,
+      // Gateway-owned aliases use the same wire-model forwarding path as a
+      // session-bound lease: retain the alias for lease identity, base for wire.
+      ...(wireModelID ? { wireModelID } : {}),
       targetID: typeof lease?.target?.id === "string" ? lease.target.id : model.id,
       embedding: lease?.target?.embedding === true,
       expectedCredentialInstance: typeof lease?.expectedCredentialInstance === "string" ? lease.expectedCredentialInstance : null,

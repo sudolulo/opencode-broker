@@ -219,17 +219,7 @@ const waitIsFresh = (decision) => {
   if (waitLogged.size > 2000) waitLogged.delete(waitLogged.keys().next().value);
   return false;
 };
-// The caller of the /lease being handled (handlers run one at a time), so every decision
-// made for that session records who asked for it. Set and cleared around acquire().
-let leaseCaller = null; // { sessionID, caller }
-let leaseRegistration = null;
 const recordDecision = (state, decision) => {
-  if (leaseCaller && decision?.sessionID === leaseCaller.sessionID && !decision.caller) {
-    decision = { ...decision, caller: leaseCaller.caller };
-  }
-  if (leaseRegistration && decision?.sessionID === leaseRegistration.sessionID && !decision.registration) {
-    decision = { ...decision, registration: leaseRegistration.registration };
-  }
   state.lastDecision = decision;
   if (waitIsFresh(decision)) return;
   logDecision(decision);
@@ -533,15 +523,17 @@ const publicState = (state, resolverProcesses = null) => ({
 // first request after a plan window closes cannot enter on stale usage; because every
 // handler shares the serial queue, later requests can still wait behind that /lease.
 // The module cache throttles the underlying provider request to once a minute.
-const refreshPlanUsage = (state) => Promise.all(Object.entries(PROVIDER_BUDGETS).map(async ([providerID, providerConfig]) => {
+const refreshPlanUsage = (state, apply = (mutation) => mutation()) => Promise.all(Object.entries(PROVIDER_BUDGETS).map(async ([providerID, providerConfig]) => {
   if (!planUsageConfigured(providerConfig)) return;
   try {
     const report = await fetchPlanUsage(providerID, providerConfig);
     if (!report) return;
-    applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
-    // The same reading also settles a failure-reported quota stop or a lapse.
-    applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
-    writeState(state);
+    await apply(() => {
+      applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
+      // The same reading also settles a failure-reported quota stop or a lapse.
+      applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
+      writeState(state);
+    });
   } catch {}
 }));
 
@@ -996,6 +988,7 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
 
 const acquire = async (state, request, {
   isAbandoned = () => false,
+  caller = null,
   registration = null,
   probeAssignment = null,
 } = {}) => {
@@ -1005,6 +998,12 @@ const acquire = async (state, request, {
     error.code = "request-abandoned";
     throw error;
   };
+  // Lease attribution stays request-local because an expired handler can resume after its successor.
+  const recordLeaseDecision = (decision) => recordDecision(state, {
+    ...decision,
+    ...(caller && !decision.caller ? { caller } : {}),
+    ...(!decision.registration ? { registration } : {}),
+  });
   ensureActive();
   const { sessionID, profile, tier = "worker", replace = false } = request;
   if (!validSessionID(sessionID)) throw new Error("invalid session id");
@@ -1101,7 +1100,7 @@ const acquire = async (state, request, {
     // so a dead credential still cannot ride stale admission.
     const revision = authRevision();
     if (!revision) {
-      recordDecision(state, {
+      recordLeaseDecision({
         at: Date.now(), sessionID, profile, tier, targetID: null,
         policy: "refused", reasons: ["no readable auth.json; cloud routing needs credentials"],
         eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
@@ -1293,7 +1292,7 @@ const acquire = async (state, request, {
         targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, admittedTargets, sessionID, outageContext)) {
         ensureActive();
         state.leases[sessionID].touchedAt = Date.now();
-        recordDecision(state, {
+        recordLeaseDecision({
           at: Date.now(),
           sessionID,
           targetID: target.id,
@@ -1638,7 +1637,7 @@ const acquire = async (state, request, {
     // router was doing its job and waiting out a GPU swap. The HTTP reply and the code
     // are unchanged -- a client still has to resend -- only the classification differs.
     const policy = prepared || busy.length ? "waiting" : "refused";
-    recordDecision(state, {
+    recordLeaseDecision({
       at: Date.now(), sessionID, profile, tier, targetID: null,
       // ☆ The same code on the DECISION, so /selection and decisions.jsonl are
       // machine-readable too -- that log is where refusals get read after the fact, and
@@ -1736,7 +1735,7 @@ const acquire = async (state, request, {
     // Recorded, never acted on during selection -- see the sweep's tiered eviction.
     ...(oneShot ? { oneShot: true } : {}),
   };
-  recordDecision(state, {
+  recordLeaseDecision({
     at: Date.now(),
     sessionID,
     targetID: choice.target.id,
@@ -1855,7 +1854,7 @@ const serve = async () => {
   // `preparsed` is set only for /probe/consume and /probe/release when an outage service exists:
   // their body is read OUTSIDE the queue to see whether it is an outage-health assignment, and a
   // consumed request stream cannot be parsed twice.
-  const handle = async (request, response, preparsed = undefined) => {
+  const handle = async (request, response, preparsed = undefined, run = { expired: false }) => {
     try {
       if (request.url === "/model-policy/status") {
         if (!isLoopbackControlAddress(request.socket?.remoteAddress)) {
@@ -1873,6 +1872,7 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = await parseBody(request);
+        if (run.expired) return;
         const result = compareAndSwapModelPolicy(state.modelPolicy, body);
         if (result.changed) {
           state.modelPolicy = normalizeModelPolicy(result.policy, {
@@ -1895,6 +1895,7 @@ const serve = async () => {
           return reply(response, 409, { error: "probe control socket must have exact mode 0600", code: "probe-control-socket-insecure" });
         }
         const body = await parseBody(request);
+        if (run.expired) return;
         try {
           return reply(response, 200, probeState.issueLaunch(body, { modelPolicy: state.modelPolicy }));
         } catch (error) {
@@ -1910,6 +1911,7 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = await parseBody(request);
+        if (run.expired) return;
         if (Object.hasOwn(body, "probeLaunchNonce")) {
           try {
             const fields = Object.keys(body).sort();
@@ -1949,6 +1951,7 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = await parseBody(request);
+        if (run.expired) return;
         const header = request.headers["x-opencode-resolver-token"];
         const resolverToken = Array.isArray(header) ? header[0] : header;
         try {
@@ -1970,6 +1973,7 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = preparsed ?? await parseBody(request);
+        if (run.expired) return;
         try {
           requireProbeFields(body, ["sessionID", "probeNonce"], "invalid-probe-consume", "probe consume request");
           return reply(response, 200, probeState.consumeAssignment(body));
@@ -1986,6 +1990,7 @@ const serve = async () => {
           return reply(response, 409, { error: "reconciliation apply is disabled", code: "reconcile-apply-disabled" });
         }
         const body = preparsed ?? await parseBody(request);
+        if (run.expired) return;
         const header = request.headers["x-opencode-resolver-token"];
         const resolverToken = Array.isArray(header) ? header[0] : header;
         try {
@@ -2002,6 +2007,7 @@ const serve = async () => {
       }
       if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
       const body = await parseBody(request);
+      if (run.expired) return;
       const probeAssignment = request.url === "/lease" && typeof body.sessionID === "string"
         ? probeState.assignmentForLease(body.sessionID)
         : null;
@@ -2013,7 +2019,11 @@ const serve = async () => {
         reason: null,
       } : resolverProcesses.authorize({ resolverToken: body.resolverToken });
       sweep(state);
-      const planRefresh = refreshPlanUsage(state);
+      const awaitPlanRefresh = request.url === "/lease" && body.localOnly !== true &&
+        profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto");
+      const planRefresh = refreshPlanUsage(state, awaitPlanRefresh
+        ? (mutation) => { if (!run.expired) mutation(); }
+        : (mutation) => enqueueTransaction(() => { if (!run.expired) mutation(); }));
       // The burn watch's all-sessions plan-rise signal was removed (see lib/burn-watch.js
       // for the fourteen-day numbers that retired it). The plan refresh still runs for the
       // budgets, HUD, and admission gate below -- only the burn-watch feed is gone.
@@ -2024,23 +2034,18 @@ const serve = async () => {
         // window to admit against, and a due refresh can take seconds (one provider's usage API
         // is allowed 20 s) -- time a latency-critical local caller, such as a command classifier
         // with a 25 s budget that fails closed, cannot spare. LAN-only leases go straight on.
-        if (body.localOnly !== true && profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto")) {
+        if (awaitPlanRefresh) {
           await planRefresh;
+          if (run.expired) return;
         }
         const caller = sanitizeCaller(body.caller);
-        leaseCaller = caller && typeof body.sessionID === "string" ? { sessionID: body.sessionID, caller } : null;
-        leaseRegistration = typeof body.sessionID === "string" ? { sessionID: body.sessionID, registration } : null;
-        let lease;
-        try {
-          lease = await acquire(state, body, {
-            isAbandoned: () => abandoned(request, response),
-            registration,
-            probeAssignment,
-          });
-        } finally {
-          leaseCaller = null;
-          leaseRegistration = null;
-        }
+        const lease = await acquire(state, body, {
+          isAbandoned: () => run.expired || abandoned(request, response),
+          caller,
+          registration,
+          probeAssignment,
+        });
+        if (run.expired) return;
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
@@ -2247,6 +2252,7 @@ const serve = async () => {
           circuitUntil = quotaRenewalAt(error);
           if (!circuitUntil && planUsageConfigured(PROVIDER_BUDGETS[target.providerID])) {
             const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
+            if (run.expired) return;
             circuitUntil = planUsageResetAt(report);
           }
           // Whether `until` is when the limit actually lifts or only when the broker next
@@ -2566,6 +2572,7 @@ const serve = async () => {
         }) : {};
         let availableModels;
         try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+        if (run.expired) return;
         const preview = {};
         for (const tier of tiers) {
           const choice = chooseTarget({
@@ -2695,6 +2702,7 @@ const serve = async () => {
       }
       return reply(response, 404, { error: "unknown broker endpoint" });
     } catch (error) {
+      if (run.expired) return;
       if (error?.code === "request-abandoned" || abandoned(request, response)) {
         response.destroy();
         return;
@@ -2736,7 +2744,10 @@ const serve = async () => {
   // one request per 30 s while callers filled it far faster: alive, idle in epoll, mute.
   // ☆ So a request whose client is already gone is dropped at the head of the queue for
   // free, and every deadline hit is logged and notified instead of answered in silence.
-  const HANDLER_DEADLINE_MS = 30_000;
+  // Test-only override lets daemon regression tests exercise the 30 s fence without waiting.
+  const HANDLER_DEADLINE_MS = Number(process.env.OPENCODE_BROKER_TEST_HANDLER_DEADLINE_MS) > 0
+    ? Number(process.env.OPENCODE_BROKER_TEST_HANDLER_DEADLINE_MS)
+    : 30_000;
   // IncomingMessage.destroyed becomes true after a normally completed request body on
   // Unix sockets, while its response and socket are still live. Treat it as abandonment
   // only when the body itself was cut short; completed requests are fenced by the actual
@@ -2762,9 +2773,11 @@ const serve = async () => {
       alertStall("opencode-broker queue backed up",
         `${request.url} waited ${Math.round(waitedMs / 1000)} s in the request queue (${queueStats.depth} still queued)`);
     }
+    const run = { expired: false };
     let timer = null;
     const finished = new Promise((resolve) => {
       timer = setTimeout(() => {
+        run.expired = true;
         queueStats.deadlineHits += 1;
         queueStats.lastDeadlineAt = Date.now();
         alertStall("opencode-broker handler deadline exceeded",
@@ -2781,7 +2794,7 @@ const serve = async () => {
       if (typeof timer?.unref === "function") timer.unref();
     });
     let running;
-    try { running = Promise.resolve(handle(request, response, preparsed)); }
+    try { running = Promise.resolve(handle(request, response, preparsed, run)); }
     catch (error) { running = Promise.reject(error); }
     return Promise.race([running.catch(() => {}), finished]).finally(() => clearTimeout(timer));
   };
