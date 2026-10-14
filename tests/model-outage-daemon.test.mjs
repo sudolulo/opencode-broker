@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHealthProtocol, sha256 } from '../gateway/lib/proxy-health-context.js';
-import { emptyOutages, reduceOutages } from '../lib/model-outages.js';
+import { emptyOutages, reduceOutages, reserveProbe } from '../lib/model-outages.js';
 import { operatorQuarantineProvider, rearmQuarantinedProvider, recordFailureEvidenceAndNotify } from '../lib/provider-health.js';
 import { makeBaseline, makeFailure, makePolicy, makeSnapshot, makeTargets } from './helpers/model-outages.mjs';
 
@@ -75,7 +75,7 @@ const brokerEnv = (extra) => {
   return Object.fromEntries(Object.entries({ ...env, ...extra }).filter(([, value]) => value !== undefined));
 };
 
-async function spawnDaemon({ enabled = true, outages = null, leases = undefined, inventory = undefined, statusMode = 'unavailable',
+async function spawnDaemon({ enabled = true, mode = 'active', ordinaryReserve = false, outages = null, leases = undefined, inventory = undefined, statusMode = 'unavailable',
   keys = true, envOverrides = {}, expectExit = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'outage-runtime-daemon-'));
   chmodSync(home, 0o700);
@@ -97,10 +97,10 @@ async function spawnDaemon({ enabled = true, outages = null, leases = undefined,
   const configPath = join(home, 'config.json');
   writeFileSync(configPath, JSON.stringify({
     targets: fixtureTargets,
-    tiers: { smart: ['claude-opus-5-5'], build: ['claude-opus-5-5', 'gpt-terra'], worker: ['gpt-terra'] },
+    tiers: { smart: ordinaryReserve ? ['claude-opus-5-5', 'claude-opus-5'] : ['claude-opus-5-5'], build: ['claude-opus-5-5', 'gpt-terra'], worker: ['gpt-terra'] },
     fallbacks: { smart: [['gpt-6-1-sol']] },
     burnWatch: { enabled: false }, slotWatch: { enabled: false },
-    ...(enabled ? { modelOutages: (({ primaryScope: _derived, ...rest }) => rest)(policy) } : {}),
+    ...(enabled ? { modelOutages: (({ primaryScope: _derived, ...rest }) => ({ ...rest, mode }))(policy) } : {}),
   }));
   writeFileSync(join(home, '.local/share/opencode/auth.json'), JSON.stringify({ anthropic: { type: 'oauth' }, openai: { type: 'oauth' } }));
   const statePath = join(stateDir, 'broker.json');
@@ -241,6 +241,39 @@ test('private begin/outcome run outside the ordinary queue and durably bind the 
     assert.ok(Date.now() - started < 4000, 'served within the 5 s status fetch bound');
     assert.ok(broker.trace().some((event) => event.kind === 'status'), 'the hung status poll really was in flight');
     assert.doesNotMatch(broker.stderr(), /fake-private-gateway-credential|fake-front-door-key/);
+  } finally { await broker.stop(); }
+});
+
+test('observe mode durably records an exact real-head baseline without reserve authority or status I/O', async () => {
+  // This fails if observe retains active startup polling, reserve selection, or private probe authority.
+  const at = Date.now();
+  const reservation = reserveProbe(outagesAt(at), { logicalID: LOGICAL, targetID: 'claude-opus-5', kind: 'reserve',
+    id: 'observe-seeded', nonce: 'A'.repeat(43), now: at - 100 }, { policy });
+  assert.ok(reservation, 'active fixture seeds a valid occupied reserve before mode transition');
+  const seeded = reservation.state;
+  const seededCount = seeded.scopes[LOGICAL].instances[CI_A].episode.probeCounts.reserve;
+  const broker = await spawnDaemon({ mode: 'observe', ordinaryReserve: true, statusMode: 'hang', outages: seeded, inventory: admittedInventory });
+  try {
+    const preview = await post(broker.socketPath, '/preview', { profile: 'auto', tiers: ['smart'] });
+    assert.equal(preview.status, 200, JSON.stringify(preview.body));
+    assert.equal(preview.body.preview.smart?.id, 'claude-opus-5-5');
+    const lease = await post(broker.socketPath, '/lease', { sessionID: 's-observe', profile: 'auto', tier: 'smart' });
+    assert.equal(lease.status, 200, JSON.stringify(lease.body));
+    assert.equal(lease.body.target.id, 'claude-opus-5-5');
+    assert.equal(lease.body.expectedCredentialInstance, null);
+    assert.deepEqual(broker.state().leases['s-observe'].outage, undefined, 'ordinary reserve membership does not create an outage assertion');
+    const request = { requestID: 'req-observe', attemptID: 'att-observe', bodySHA256: 'c'.repeat(64) };
+    const begin = await post(broker.socketPath, '/model-health/begin', { gatewayCredential: CREDENTIAL, sessionID: 's-observe',
+      leaseID: lease.body.leaseID, purpose: 'real', modelID: 'claude-opus-5-5', ...request });
+    assert.equal(begin.status, 200, JSON.stringify(begin.body));
+    const outcome = await post(broker.socketPath, '/model-health/outcome', signedOutcome({ begin: begin.body, sessionRequest: request, wireModelID: 'claude-opus-5-5' }));
+    assert.deepEqual(outcome.body, { ok: true, duplicate: false });
+    const scope = broker.state().outages.scopes[LOGICAL];
+    assert.equal(scope.instances[CI_A].baselineAt !== null, true);
+    assert.equal(broker.state().outages.history.at(-1)?.probeCounts.reserve, seededCount, 'real observation retains retired episode counts in history');
+    assert.equal((await post(broker.socketPath, '/probe/consume', { sessionID: 'gw-probe-restored', probeNonce: 'pbn_x', purpose: 'outage-health' })).status, 400);
+    await sleep(100);
+    assert.deepEqual(broker.trace(), [], 'observe starts no status fetches or probe traffic');
   } finally { await broker.stop(); }
 });
 

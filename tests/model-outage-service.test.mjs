@@ -173,6 +173,20 @@ test('a verified real baseline success is durably committed and acknowledged wit
   } finally { await service.close(); }
 });
 
+test('observe mode accepts a signed real head outcome but refuses outage probes and polls', async () => {
+  // This catches an observation policy accidentally retaining synthetic probe authority.
+  const f = fixture({ state: emptyOutages(), pollsAllowed: true });
+  f.opts.policy = { ...policy, mode: 'observe' };
+  const service = createOutageService(f.opts);
+  try {
+    const { report } = await realRound(f, service);
+    assert.deepEqual(await service.request('/model-health/outcome', report), { ok: true, duplicate: false });
+    assert.equal(f.state.scopes[logicalID].instances[CI].baselineAt, f.clock);
+    assert.deepEqual(f.polls, []);
+    await assert.rejects(service.request('/probe/consume', { purpose: 'outage-health' }), /active mode/);
+  } finally { await service.close(); }
+});
+
 test('a qualifying real primary fault returns before its nonblocking poll of only that provider finishes', async () => {
   const f = fixture({ pollsAllowed: true });
   let finishFetch;

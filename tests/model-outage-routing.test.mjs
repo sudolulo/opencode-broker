@@ -232,3 +232,15 @@ test('disabled outage policy is exactly equivalent for representative primary, f
     assert.deepEqual(disabled, baseline);
   }
 });
+
+test('observe policy is routing-equivalent to disabled even with an active historical grant', () => {
+  // This catches reserve substitution, head exclusion, or managed filtering leaking into observe.
+  const targets = makeTargets();
+  const active = makePolicy();
+  const observe = { ...active, mode: 'observe' };
+  const outages = activeOutage(active);
+  const common = { profile: 'auto', tier: 'build', targets, cursors: {}, health: {}, localModels: new Set(), now: 20_000 };
+  const disabled = chooseTarget(common);
+  const observing = chooseTarget({ ...common, outagePolicy: observe, outages, canonicalHeads: {} });
+  assert.deepEqual(observing, disabled);
+});

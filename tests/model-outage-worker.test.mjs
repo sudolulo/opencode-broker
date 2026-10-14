@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { decodeOutages } from '../lib/model-outage-state.js';
 import { createOutageWorker } from '../lib/model-outage-worker.js';
-import { emptyOutages, nextProbe, reduceOutages } from '../lib/model-outages.js';
+import { emptyOutages, nextProbe, outageGrants, reduceOutages, reserveProbe } from '../lib/model-outages.js';
 import { CI_A, makePolicy, makeBaseline, makeFailure, makeSnapshot } from './helpers/model-outages.mjs';
 
 const policy = makePolicy();
@@ -59,6 +59,40 @@ test('failed durable reservation means zero probe dispatch', async () => {
     await assert.rejects(worker.tick(), /disk full/);
     assert.equal(f.calls.length, 0);
   } finally { await worker.close(); }
+});
+
+test('observe mode commits authenticated evidence without scheduling polls, probes, or timers', async () => {
+  // Removing the active-mode fence would make this dispatch a reserve probe and alter traffic.
+  const f = fixture();
+  f.opts.policy = { ...policy, mode: 'observe' };
+  const worker = createOutageWorker(f.opts);
+  try {
+    worker.start();
+    await worker.tick();
+    worker.requestPoll('anthropic');
+    await worker.drain();
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.polls, []);
+    assert.equal(f.timers.size, 0);
+    await worker.observe(makeBaseline({ finishedAt: 3_000, startedAt: 2_900 }));
+    assert.equal(f.commits.length, 1);
+    assert.equal(f.state.scopes['anthropic/opus/standard'].instances[CI_A].baselineAt, 3_000);
+  } finally { await worker.close(); }
+});
+
+test('switching active history to observe retains counts and occupancy without grants', () => {
+  // This catches a mode transition resetting spent probe capacity or silently authorizing it.
+  const state = ready();
+  const active = reserveProbe(state, {
+    logicalID: 'anthropic/opus/standard', targetID: 'claude-opus-5', kind: 'reserve', id: 'reservation', nonce: 'n'.repeat(43), now: 3_000,
+  }, { policy });
+  assert.ok(active);
+  const observing = { ...policy, mode: 'observe' };
+  const retained = reduceOutages(active.state, { type: 'tick' }, { policy: observing, now: 3_001 });
+  assert.equal(retained.providers.anthropic.inflight.id, 'reservation');
+  assert.equal(retained.scopes['anthropic/opus/standard'].instances[CI_A].episode.probeCounts.reserve, 1);
+  assert.deepEqual(outageGrants(retained, observing, 3_001), []);
+  assert.equal(nextProbe(retained, observing, 3_001), null);
 });
 
 test('probe dispatch sees the durable reservation before network I/O', async () => {

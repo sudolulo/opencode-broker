@@ -221,6 +221,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Model outages can now observe before they route.** An enabled `modelOutages` policy accepts
+  `mode: "observe"`; it preserves ordinary routing and mapped ordinary memberships while
+  durably recording authenticated real head-health evidence. It does not issue reserve grants,
+  assertions, probes, status polls, or outage-worker timers. Omitting `mode` remains active for
+  compatibility; moving to active requires an explicit configuration change and restart,
+  retaining history and counters.
+
 - Opt-in, model-specific outage reserves limited to explicit older-sibling mappings after health verifies the same credential, provider, authentication, transport, product, and speed scope. Bounded status polling, fixed episodes, and probe counters are durably reserved before gateway dispatch. Private proxy attestation, gateway terminal-health validation, native Messages and Responses proof, actual fast-speed proof, and isolated single-attempt probe assignments support verification.
 
 ### Fixed

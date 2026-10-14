@@ -1,9 +1,12 @@
 # Model outages
 
 Model outage reserves are disabled by default. An operator must explicitly enable the
-`modelOutages` policy; absence or disablement preserves ordinary routing behavior. The
-policy maps a canonical newest head to older reserve models. Older mappings are eligible
-only during a verified, model-specific outage of that head, never as normal fallback.
+`modelOutages` policy; absence or disablement preserves ordinary routing behavior. An enabled
+policy defaults to `mode: "active"` for compatibility, or may use `mode: "observe"` for the
+first phase. Observe records authenticated real head-health evidence but leaves ordinary
+membership, primary/fallback order, held leases, stickiness, previews, overflow, and discovery
+exactly unchanged. In particular, a mapped reserve may remain in ordinary membership in observe
+mode. The policy maps a canonical newest head to older reserve models only in active mode.
 
 ## Authority and scope
 
@@ -18,7 +21,23 @@ from two distinct actual requests within 60 seconds, or a fresh applicable model
 status notice. A same-scope reserve must still pass verification before it is eligible.
 Status notices alone never authorize a reserve.
 
-## Bounded verification
+## Two-phase readiness and bounded verification
+
+Observe is the readiness phase, not an outage-routing phase. It issues no outage reserve grants
+or lease assertions, excludes no heads, dispatches no synthetic probes, makes no status polls,
+and starts no outage worker timer. It does retain authenticated real outcomes using the same
+strict durable commit and validation path as active mode. A real fast proof still requires both
+the request body `speed: "fast"` and terminal `usage.speed: "fast"`; a `-fast` alias alone is
+ordinary traffic and is not evidence. Missing traffic is genuinely missing, not a negative
+result. Historical baselines are scoped to their recorded lease and time: an old logical-scope
+baseline does not prove a current head after a head or configuration change.
+
+An explicit host configuration change plus restart transitions observe to active. The transition
+does not refund or reset retained episode history, counts, deadlines, occupancy, or suppression;
+there is no automatic activation. Before switching to active, the operator must remove every
+mapped reserve from ordinary tier, fallback, and profile memberships; active-policy validation
+rejects a configuration that still lists one. Active mode then enables the bounded verification
+behavior below.
 
 Status is polled every 60 seconds. Proof freshness is 120 seconds. Episodes have a fixed
 10-minute provisional lifetime and at most four probes (two reserve and two primary),
@@ -52,8 +71,8 @@ The gateway assigns one internal request ID per actual HTTP request. Upstream re
 
 ## Runtime contract and deployment boundary
 
-The following is the current required runtime interface and product contract when the
-feature is enabled; it does not claim implementation or live-environment verification:
+The following is the current required runtime interface and product contract in both enabled
+phases (`observe` and `active`); it does not claim implementation or live-environment verification:
 
 - `OPENCODE_BROKER_OUTAGE_GATEWAY_URL` must explicitly name the gateway origin. Do not
   infer a live port or network topology.
@@ -66,7 +85,7 @@ feature is enabled; it does not claim implementation or live-environment verific
   and refuses to start when only one of the pair is configured.
 
 The enabled guard precedes all new key reads, timers, and network activity. Enabled
-missing dependencies must fail startup clearly; disabled mode performs no feature I/O.
+missing dependencies must fail startup clearly in either phase; disabled mode performs no feature I/O.
 Keys are drop files, not JSON secrets; this guide neither creates nor reads them. The
 gateway environment pair must match the broker. The proxy uses the same private key path
 as `LLM_AUTH_PROXY_HEALTH_KEY_FILE`, only after separate deployment approval. No commands

@@ -38,8 +38,8 @@ function stream(api, model, speed) {
     + sse('response.completed', { type: 'response.completed', response: { id: 'r', object: 'response', status: 'completed', model, output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } });
 }
 
-export async function createOutageHarness({ primaryID, feed = 'empty' }) {
-  const targets = makeTargets(); const policy = makePolicy(); const primary = targets[primaryID]; assert.ok(primary, primaryID);
+export async function createOutageHarness({ primaryID, feed = 'empty', outageMode = 'active' }) {
+  const targets = makeTargets(); const policy = { ...makePolicy(), mode: outageMode }; const primary = targets[primaryID]; assert.ok(primary, primaryID);
   const logicalID = policy.primaryScope[primaryID], scope = policy.expectedScopePolicies[logicalID], api = scope.probe.api;
   targets.fallback = { id: 'fallback', providerID: 'fallback', modelID: 'fixture-fallback', kind: 'cloud', family: 'other', speed: 'standard' };
   // The id a target's requests carry on the wire: the documented base id of a -fast alias, else the exact model id.

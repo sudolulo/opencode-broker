@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { normalizeOutagePolicy, DISABLED_OUTAGES, scopeID, membershipIDs } from '../lib/outage-policy.js';
+import { normalizeOutagePolicy, DISABLED_OUTAGES, outageRoutingEnabled, scopeID, membershipIDs } from '../lib/outage-policy.js';
 import { matchModelRole } from '../lib/model-roles.js';
 import { makeTargets, makePolicy } from './helpers/model-outages.mjs';
 const env = () => ({ targets: makeTargets(), tiers: {}, profiles: {}, fallbacks: {},
@@ -32,6 +32,26 @@ test('disabled and absent policies return the frozen disabled constant', () => {
   for (const enabled of ['true', 1, undefined]) {
     assert.throws(() => normalizeOutagePolicy({ ...makePolicy(), enabled }, env()), /enabled/);
   }
+});
+
+test('observe mode keeps ordinary memberships while active mode rejects them', () => {
+  // This catches routing gates treating telemetry-enabled observe as active and excluding reserves.
+  const ordinary = { build: ['claude-opus-5'] };
+  const observing = makePolicy();
+  observing.mode = 'observe';
+  const policy = normalizeOutagePolicy(observing, { ...env(), tiers: ordinary });
+  assert.equal(policy.mode, 'observe');
+  assert.equal(outageRoutingEnabled(policy), false);
+  assert.doesNotThrow(() => normalizeOutagePolicy(observing, { ...env(), tiers: ordinary }));
+
+  const active = makePolicy();
+  active.mode = 'active';
+  assert.throws(() => normalizeOutagePolicy(active, { ...env(), tiers: ordinary }), /ordinary/);
+  for (const mode of ['disabled', '', null, 1]) {
+    const invalid = makePolicy(); invalid.mode = mode;
+    assert.throws(() => normalizeOutagePolicy(invalid, env()), /mode/);
+  }
+  assert.equal(normalizeOutagePolicy(makePolicy(), env()).mode, 'active');
 });
 
 test('enabled policy derives primaryScope and returns frozen exact route values', () => {

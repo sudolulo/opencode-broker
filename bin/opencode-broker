@@ -64,6 +64,7 @@ import {
   authorizedReserveIDs,
   buildCanonicalHeads,
   markManagedOutageScope,
+  outageRoutingEnabled,
   policyReserveIDs,
   snapshotOutageContext,
   stagedCandidateHeads,
@@ -1085,7 +1086,7 @@ const acquire = async (state, request, {
   // The outage gate's working view: every target the reviewed role classification puts in a
   // managed role carries its mark, so a catalog sibling with missing or mismatched family/speed
   // fails closed at every automatic gate below. Nonsecret metadata, a no-op while the policy is off.
-  const outageEnabled = CONFIG.modelOutages?.enabled === true;
+  const outageEnabled = outageRoutingEnabled(CONFIG.modelOutages);
   const gateView = (view) => (outageEnabled ? markManagedOutageScope(view, { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles }) : view);
   let targets = gateView(allTargets(state));
   const requestedCloud = targetIDsFor(profile, tier, targets)
@@ -2135,7 +2136,7 @@ const serve = async () => {
         const target = leaseMatches ? targetForID(lease.targetID, allTargets(state)) : null;
         // A held reserve verifies only while its exact grant is current; a lapsed or rotated
         // grant must not let the gateway keep forwarding on it.
-        const reserve = Boolean(target) && CONFIG.modelOutages?.enabled === true &&
+        const reserve = Boolean(target) && outageRoutingEnabled(CONFIG.modelOutages) &&
           policyReserveIDs(CONFIG.modelOutages).has(target.id);
         if (!target || (reserve && !currentReserveGrant({
           policy: CONFIG.modelOutages, outages: state.outages, targetID: target.id, assertion: lease.outage, now: Date.now(),
@@ -2396,7 +2397,7 @@ const serve = async () => {
         // waiting. requestPoll only schedules (single-flight, 60 s spacing); its transaction
         // queues behind this handler, so nothing here awaits the worker. It records no outage
         // evidence: only the verified /model-health path does.
-        if (outageService && target) {
+        if (outageService && outageRoutingEnabled(CONFIG.modelOutages) && target) {
           outageService.worker.requestPoll("anthropic");
           outageService.worker.requestPoll("openai");
         }
@@ -2550,7 +2551,7 @@ const serve = async () => {
           (typeof body.contextTokens === "number" || typeof body.contextTokens === "string")
           ? Math.floor(rawPreviewContext)
           : null;
-        const previewOutagesEnabled = CONFIG.modelOutages?.enabled === true;
+        const previewOutagesEnabled = outageRoutingEnabled(CONFIG.modelOutages);
         const targets = previewOutagesEnabled
           ? markManagedOutageScope(allTargets(state), { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles })
           : allTargets(state);

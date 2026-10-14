@@ -17,6 +17,23 @@ test('offline only: proxy and gateway golden vectors are byte identical', CASE, 
   assert.deepEqual(proxyProtocol(options).signRequest(tuple), gatewayProtocol(options).signRequest(tuple));
 });
 
+for (const [primaryID] of rows) test(`offline only: ${primaryID} observe records real health without synthetic outage authority`, CASE, async () => {
+  // This fails if observation still starts polls/probes, issues a grant, or changes ordinary choice.
+  const h = await createOutageHarness({ primaryID, outageMode: 'observe', feed: 'positive' });
+  try {
+    const baseline = await h.real();
+    assert.deepEqual({ status: baseline.status, targetID: baseline.targetID, grants: h.grant().length, probes: h.stats.probeReservations.length, snapshots: h.stats.snapshots.length },
+      { status: 200, targetID: primaryID, grants: 0, probes: 0, snapshots: 0 });
+    const current = h.state().scopes[h.logicalID].currentCredentialInstance;
+    assert.equal(h.state().scopes[h.logicalID].instances[current].baselineAt !== null, true);
+    h.setFailure(true);
+    await h.real({ sessionID: baseline.sessionID });
+    await h.tick();
+    assert.deepEqual({ grants: h.grant().length, probes: h.stats.probeReservations.length, snapshots: h.stats.snapshots.length },
+      { grants: 0, probes: 0, snapshots: 0 });
+  } finally { await h.close(); }
+});
+
 for (const [primaryID, , speed, reserves] of rows) test(`offline only: ${primaryID} full outage reserve lifecycle`, CASE, async () => {
   const h = await createOutageHarness({ primaryID });
   try {
@@ -36,8 +53,7 @@ for (const [primaryID, , speed, reserves] of rows) test(`offline only: ${primary
     const expired = h.state().scopes[h.logicalID].instances[grant.credentialInstance].episode; assert.deepEqual([expired.id, expired.deadline, expired.suppressed], [episode.id, episode.deadline, true]);
     // After expiry the head is ordinarily routable again: the gateway's own lease tries it, it
     // fails, the lane is excluded, and the ordinary fallback serves. Never an older sibling.
-    // (For the fast row the gateway forwards its gateway-owned lease's alias id, which no upstream
-    // knows, so that head attempt fails 404 rather than 503; the fallback leg is the same.)
+    // The gateway maps a speed-alias lease to its base wire model before the upstream attempt.
     const ordinaryStart = h.stats.upstream.length; const ordinary = await h.real({ external: false }); assert.equal(ordinary.status, 200);
     const attempts = h.stats.upstream.slice(ordinaryStart);
     assert.deepEqual(attempts.map(call => [call.providerID, call.status >= 400]), [[h.targets[primaryID].providerID, true], ['fallback', false]], 'head attempt failed, then the ordinary fallback served');
