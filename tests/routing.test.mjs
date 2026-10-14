@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -807,6 +807,51 @@ test("cached inventory errors are actionable", async () => withTempHome(async (h
   const invalid = join(home, "invalid.json");
   writeFileSync(invalid, "[]\n");
   await assert.rejects(routing.publishCachedSubscriptionInventory({ cachePath: invalid }), /opencode models --refresh/);
+}));
+
+// OpenCode deletes models.json when a read of it fails to parse and leaves it gone until its next
+// models.dev fetch; on 2026-10-13 that took every prompt down for five hours.
+test("cached inventory survives a deleted or corrupt OpenCode cache via the last-good copy", async () => withTempHome(async (home) => {
+  const routing = await freshRouting();
+  const authDir = join(home, ".local/share/opencode");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(join(authDir, "auth.json"), JSON.stringify({ anthropic: { type: "oauth" } }) + "\n");
+  const cachePath = join(home, "cache/opencode/models.json");
+  const lastGoodPath = join(home, "state/last-good-models.json");
+  mkdirSync(join(home, "cache/opencode"), { recursive: true });
+  const catalog = { anthropic: { id: "anthropic", models: {
+    "claude-fable-5": { id: "claude-fable-5", family: "claude-fable", release_date: "2026-08-20", tool_call: true },
+  } } };
+  writeFileSync(cachePath, JSON.stringify(catalog));
+  const old = new Date("2026-10-13T00:00:00Z");
+  utimesSync(cachePath, old, old);
+  const calls = [];
+  const publish = () => routing.publishCachedSubscriptionInventory({
+    cachePath, lastGoodPath,
+    listResolvableModels: () => new Set(["anthropic/claude-fable-5"]),
+    request: async (path, body) => { calls.push(body); return { changed: true }; },
+  });
+
+  const first = await publish();
+  assert.equal(first.recovered, null);
+  assert.deepEqual(JSON.parse(readFileSync(lastGoodPath, "utf8")), catalog, "a good read is snapshotted");
+  assert.equal(statSync(lastGoodPath).mtimeMs, old.getTime(), "the snapshot carries the live mtime");
+
+  rmSync(cachePath);
+  const missing = await publish();
+  assert.match(missing.recovered, /last-good copy from 2026-10-13T00:00:00.000Z and restored it in place/);
+  assert.deepEqual(calls[1].targets, calls[0].targets, "the fallback publishes the same inventory");
+  assert.deepEqual(JSON.parse(readFileSync(cachePath, "utf8")), catalog, "the live cache is restored");
+  assert.equal(statSync(cachePath).mtimeMs, old.getTime(), "the restore stays stale so OpenCode refetches");
+
+  writeFileSync(cachePath, "{\"truncated\":");
+  const corrupt = await publish();
+  assert.match(corrupt.recovered, /restored it in place/);
+  assert.deepEqual(JSON.parse(readFileSync(cachePath, "utf8")), catalog);
+
+  rmSync(cachePath);
+  rmSync(lastGoodPath);
+  await assert.rejects(publish(), /opencode models --refresh/, "with no last-good copy the error stays actionable");
 }));
 
 // CRITICAL: models.dev is a CATALOG, not a resolver. On 2026-09-22 it published gpt-6-luna,

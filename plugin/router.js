@@ -366,6 +366,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     inventoryTask = (async () => {
       try {
         const response = await publishCachedSubscriptionInventory();
+        if (response?.recovered) report("warn", response.recovered);
         if (response?.accepted === false) {
           report("warn", `inventory publication rejected: ${response.reason ?? "unknown reason"}`);
           return { changed: false };
