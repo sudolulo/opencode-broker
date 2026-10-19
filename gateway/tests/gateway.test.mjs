@@ -3596,3 +3596,51 @@ test("strict model names observe unadvertised session-bound requests without lea
   assert.equal(anonymous.responses[0].payload.error.code, "unknown_model");
   assert.deepEqual(anonymous.logs.filter(({ event }) => event === "session_bound_without_lease"), []);
 });
+
+test("rig session hints: a stable session id keeps the broker pin, and a tier applies only to cloud-tier names", async () => {
+  const leases = [];
+  const handler = createGatewayHandler({
+    config: {
+      tier: "worker", profile: "auto",
+      providers: { cloud: { baseUrl: "http://cloud.example/v1" }, llamacpp: { baseUrl: "http://local.example/v1" } },
+      modelProfiles: { smart: { profile: "auto", tier: "smart" }, "local-text": { profile: "private" } },
+    },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path, body) => {
+      if (path === "/lease") {
+        leases.push(body);
+        return { leaseID: `lease-${leases.length}`, target: { model: { providerID: "cloud", id: "model-a" } } };
+      }
+      return { ok: true };
+    },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { role: "assistant", content: "ok" } }], usage: { prompt_tokens: 3, completion_tokens: 1 } }) }),
+  });
+  const ask = (base, model, headers = {}) => fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json", ...headers },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+  });
+  await withServer(handler, async (base) => {
+    assert.equal((await ask(base, "smart", { "x-rig-session": "s-1234abcd", "x-rig-tier": "review" })).status, 200);
+    assert.equal((await ask(base, "smart", { "x-rig-session": "s-1234abcd", "x-rig-tier": "review" })).status, 200);
+    assert.equal((await ask(base, "local-text", { "x-rig-session": "s-1234abcd", "x-rig-tier": "deep" })).status, 200);
+    assert.equal((await ask(base, "smart", { "x-rig-session": "bad id!", "x-rig-tier": "review" })).status, 200);
+    assert.equal((await ask(base, "smart", { "x-rig-session": "s-1234abcd", "x-rig-tier": "admin" })).status, 200);
+    assert.equal((await ask(base, "smart")).status, 200);
+  });
+  const [first, second, local, malformed, badTier, plain] = leases;
+  assert.equal(first.sessionID, "rig-s-1234abcd");
+  assert.equal(second.sessionID, "rig-s-1234abcd", "the same session id on every request: the broker's pin holds the model");
+  assert.equal(first.oneShot, undefined, "a rig session is not one-shot");
+  assert.equal(first.tier, "review");
+  assert.equal(local.profile, "private");
+  assert.equal(local.tier, "worker", "a private name never takes the requested tier");
+  assert.match(malformed.sessionID, /^gw-/, "a malformed session id falls back to a one-shot session");
+  assert.equal(malformed.oneShot, true);
+  assert.equal(malformed.tier, "smart");
+  assert.equal(badTier.sessionID, "rig-s-1234abcd");
+  assert.equal(badTier.tier, "smart", "an unknown tier is ignored; the name's tier applies");
+  assert.match(plain.sessionID, /^gw-/, "callers without the hints are unchanged");
+  assert.equal(plain.oneShot, true);
+  assert.equal(plain.tier, "smart");
+});
