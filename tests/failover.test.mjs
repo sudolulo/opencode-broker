@@ -626,6 +626,123 @@ test("a session stopped because nothing could serve it resumes once its lane can
   }
 });
 
+// A strict-fallback lease binds the whole turn, so a long agent turn used to stay on the
+// emergency rung after its primaries came back (2026-10-19: smart on gpt-terra for 16+ minutes
+// after a 3-minute proxy outage). A root on a fallback leaves it at the next tool-call step
+// boundary once /preview says a primary would serve its lane; a subagent is never aborted.
+test("a root session on a fallback moves back to a primary at the next step boundary", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-restore-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    const terra = { id: "gpt-terra", model: { providerID: "openai", id: "gpt-5.6-terra" } };
+    const sol = { id: "gpt-sol", model: { providerID: "openai", id: "gpt-6.1-sol" } };
+    let primaryBack = false;
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        const body = payload ? JSON.parse(payload) : {};
+        const response = new EventEmitter();
+        response.setEncoding = () => {};
+        response.statusCode = 200;
+        let reply = { ok: true };
+        if (options.path === "/lease") {
+          reply = primaryBack
+            ? { leaseID: "l-" + body.sessionID + "-2", target: sol, decision: { policy: "weighted-depletion", reasons: [] } }
+            : { leaseID: "l-" + body.sessionID, target: terra, decision: { policy: "strict-fallback", reasons: ["only-eligible-target"] } };
+        } else if (options.path === "/preview") {
+          reply = { preview: { [body.tiers[0]]: primaryBack ? sol : { ...terra, fallback: true } } };
+        }
+        callback(response);
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.on = EventEmitter.prototype.on;
+      return req;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = [];
+    const aborts = [];
+    const infos = { "ses-root": { id: "ses-root", agent: "smart" }, "ses-child": { id: "ses-child", agent: "smart", parentID: "ses-root" } };
+    const client = {
+      provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) },
+      session: {
+        get: async (input) => ({ data: infos[input?.path?.id] }),
+        messages: async () => ({ data: [] }),
+        abort: async (input) => { aborts.push(input.path.id); return { data: true }; },
+        prompt: async (input) => { prompts.push(input); return { data: true }; },
+      },
+    };
+    const timers = [];
+    const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn) => { timers.push(fn); return { unref() {} }; },
+      clearTimeout: () => {},
+    });
+    const stepFinish = async (sessionID, reason, n) => {
+      await hooks.event({ event: { type: "message.part.updated", properties: { part: {
+        id: "prt-" + sessionID + n, messageID: "msg-" + sessionID, sessionID, type: "step-finish", reason,
+      } } } });
+      await tick();
+    };
+    for (const id of ["ses-root", "ses-child"]) {
+      await hooks.event({ event: { type: "session.created", properties: { info: infos[id] } } });
+      await hooks["chat.message"]({ sessionID: id, agent: "smart" }, { message: { model: {} } });
+    }
+    await runTimers();                         // primaries still down: preview answers a fallback
+    await stepFinish("ses-root", "tool-calls", 1);
+    const abortedWhileDown = aborts.length;
+    primaryBack = true;
+    await runTimers();                         // preview now answers a primary
+    await stepFinish("ses-root", "stop", 2);   // a turn that is ending is left alone
+    const abortedOnStop = aborts.length;
+    await stepFinish("ses-child", "tool-calls", 3);
+    await stepFinish("ses-root", "tool-calls", 4);
+    await runTimers();                         // the delayed re-engage
+    await stepFinish("ses-root", "tool-calls", 5);
+    await runTimers();
+    console.log(JSON.stringify({
+      abortedWhileDown,
+      abortedOnStop,
+      aborts,
+      prompted: prompts.map((p) => p.path.id),
+      text: prompts[0]?.body?.parts?.[0]?.text ?? null,
+      synthetic: prompts[0]?.body?.parts?.[0]?.synthetic ?? null,
+      agent: prompts[0]?.body?.agent ?? null,
+    }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.equal(result.abortedWhileDown, 0, "nothing moves while only a fallback can serve the lane");
+    assert.equal(result.abortedOnStop, 0, "a step that ends the turn is not aborted");
+    assert.deepEqual(result.aborts, ["ses-root"], "the root is aborted exactly once, the subagent never");
+    assert.deepEqual(result.prompted, ["ses-root"], "and re-engaged exactly once");
+    assert.match(String(result.text), /moved off its fallback/);
+    assert.equal(result.synthetic, true);
+    assert.equal(result.agent, "smart", "re-engaged in its own agent");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // The gateway path: the lease succeeds, the provider then refuses for usage at the gateway, and
 // the broker calls that 502 a noop -- so no failover follows. The session parks on the
 // gateway's usage-limit wording, resumes when served, and a resume that fails the same way

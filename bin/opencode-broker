@@ -2595,8 +2595,13 @@ const serve = async () => {
             // A preview is a snapshot of NOW, and nobody has waited yet.
             waitedMs: 0,
           });
+          // `fallback` marks an answer that is itself a fallback rung, so a session restoring
+          // home from a fallback can tell "a primary is back" from "another fallback".
           preview[tier] = choice
-            ? publicTarget(choice.target, tier, state.inventory?.modelVariants)
+            ? {
+              ...publicTarget(choice.target, tier, state.inventory?.modelVariants),
+              ...(choice.decision?.policy === "strict-fallback" ? { fallback: true } : {}),
+            }
             : null;
         }
         // ☆ Additive, and load-bearing for honesty: at waitedMs 0 a delayed rung is invisible to

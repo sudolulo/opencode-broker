@@ -789,7 +789,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (policy === "strict-fallback") {
         report("warn", `${resolved.profile}/${tier} FALLBACK: leased ${target.id} (${target.model.providerID}/${target.model.id}) because no primary ${tier} target was eligible (${(lease.decision.reasons ?? []).join(", ") || "circuits/quota/health"})`);
         try { writeFallbackMarker(session.id, { policy, targetID: target.id, reasons: lease.decision.reasons }); } catch {}
+        if (!classifier && !session.parentID) {
+          watchFallback(session.id, { profile: resolved.profile, tier, agent: session.agent, targetID: target.id });
+        }
       } else {
+        unwatchFallback(session.id);
         // A healthy lease clears fallback marks -- except a pending displacement
         // hold, which must survive until its provider's reset so the restore
         // path can release stickiness at the right moment.
@@ -980,6 +984,99 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     trimTracker(parked);
     if (!existing) report("info", `${sessionID}: parked -- no model can serve ${profile}/${tier} right now (${reason}); it resumes when one comes back`);
     scheduleResumePoll();
+  };
+
+  // --- Restore home after a fallback ---------------------------------------
+  // A strict-fallback lease (every primary of the lane was down) binds the WHOLE turn: opencode
+  // re-leases only on the next prompt, so a long agent turn stayed on the emergency rung long
+  // after its primaries came back. Measured 2026-10-19: a smart root fell to gpt-terra during a
+  // 3-minute llm-auth-proxy outage and was still on it 16 minutes after the proxy recovered.
+  // While a root works on a fallback, the broker is asked once a minute (/preview, side-effect
+  // free) whether its lane would get a primary now. When it would, the turn is aborted at the
+  // next step boundary -- a step-finish that continues with tool calls, so the step's tools have
+  // already returned and nothing in flight is lost -- and re-engaged, which re-leases it home.
+  // Roots only: aborting a subagent ends its parent's task call with the work unreturned.
+  const RESTORE_TEXT = "[opencode-broker] A primary model is available again; the session was moved off its fallback model. Continue the task exactly where it stopped; do not restart completed work.";
+  const RESTORE_POLL_MS = 60 * 1000;
+  // A primary that previews as servable but fails again sends the session back to the
+  // fallback; cap the round trips so a flapping provider cannot abort the turn every minute.
+  const RESTORE_WINDOW_MS = 30 * 60 * 1000;
+  const RESTORE_MAX_ATTEMPTS = 3;
+  const onFallback = new Map(); // sessionID -> { profile, tier, agent, targetID, ready }
+  const restoreHistory = new Map(); // sessionID -> [restoredAt, ...]
+  let restoreTimer = null;
+  const unwatchFallback = (sessionID) => {
+    if (!onFallback.delete(sessionID)) return;
+    if (!onFallback.size && restoreTimer) { cancelTimeout(restoreTimer); restoreTimer = null; }
+  };
+  const scheduleRestorePoll = () => {
+    if (restoreTimer || !onFallback.size) return;
+    restoreTimer = scheduleTimeout(async () => {
+      restoreTimer = null;
+      try { await pollFallbacks(); } catch {}
+      scheduleRestorePoll();
+    }, RESTORE_POLL_MS);
+    if (typeof restoreTimer?.unref === "function") restoreTimer.unref();
+  };
+  const watchFallback = (sessionID, { profile, tier, agent, targetID }) => {
+    if (!sessionID || !tier) return;
+    onFallback.set(sessionID, { profile, tier, agent, targetID, ready: false });
+    trimTracker(onFallback);
+    scheduleRestorePoll();
+  };
+  const pollFallbacks = async () => {
+    for (const [sessionID, entry] of [...onFallback]) {
+      if (entry.ready) continue;
+      let target = null;
+      try {
+        const contextTokens = await sessionContextTokens(sessionID);
+        const preview = await brokerRequest("/preview", {
+          profile: entry.profile,
+          tiers: [entry.tier],
+          ...(Number(contextTokens) > 0 ? { contextTokens } : {}),
+        });
+        target = preview?.preview?.[entry.tier] ?? null;
+      } catch { continue; } // broker down: try again next minute
+      // `fallback` is the broker saying its answer is itself a fallback rung; a broker too old
+      // to say so still never moves a session to the very target it is already on.
+      if (!target?.model?.id || target.fallback === true || target.id === entry.targetID) continue;
+      entry.ready = true;
+      const model = `${target.model.providerID ?? ""}/${target.model.id}`.replace(/^\//, "");
+      report("info", `${sessionID}: ${model} can serve ${entry.profile}/${entry.tier} again -- leaving fallback ${entry.targetID} at the next step boundary`);
+    }
+  };
+  const restoreAtStepBoundary = (sessionID, finishReason) => {
+    const entry = onFallback.get(sessionID);
+    // Any other finish ends the turn; the next prompt re-leases home on its own.
+    if (!entry?.ready || finishReason !== "tool-calls") return;
+    unwatchFallback(sessionID);
+    const now = Date.now();
+    const history = (restoreHistory.get(sessionID) ?? []).filter((at) => now - at < RESTORE_WINDOW_MS);
+    if (history.length >= RESTORE_MAX_ATTEMPTS) {
+      report("warn", `${sessionID}: not leaving fallback ${entry.targetID} -- ${history.length} restores in the last ${RESTORE_WINDOW_MS / 60000} min`);
+      return;
+    }
+    restoreHistory.set(sessionID, [...history, now]);
+    trimTracker(restoreHistory);
+    report("info", `${sessionID}: leaving fallback ${entry.targetID} -- aborting at the step boundary to re-lease on a primary`);
+    Promise.resolve().then(async () => {
+      try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
+      const handle = scheduleTimeout(async () => {
+        try {
+          await client.session.prompt({
+            path: { id: sessionID },
+            query: { directory },
+            body: {
+              ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+              parts: [{ type: "text", text: RESTORE_TEXT, synthetic: true }],
+            },
+          });
+        } catch (error) {
+          report("error", `${sessionID}: restore from fallback failed`, error);
+        }
+      }, REENGAGE_DELAY_MS);
+      if (typeof handle?.unref === "function") handle.unref();
+    }).catch(() => {});
   };
 
   // --- Wrap up before usage runs out ----------------------------------------
@@ -1386,6 +1483,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
         unpark(sessionID);
+        unwatchFallback(sessionID);
         displacedModels.delete(sessionID);
         try { removeFallbackMarker(sessionID); } catch {}
         await cleanupDeletedSession({
@@ -1473,6 +1571,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         successCandidates.delete(sessionID);
         // The user stopped it on purpose: it must not come back on its own.
         unpark(sessionID);
+        unwatchFallback(sessionID);
         return;
       }
       // ☠️ CHARGE THE FAILURE TO THE PROVIDER THAT ACTUALLY ANSWERED, OR TO NOBODY.
@@ -1604,6 +1703,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         // Reported for every session (manual and local profiles too — their spend burns
         // the same subscription windows the balancer is equalizing).
         const part = properties.part ?? properties.info ?? properties;
+        if (part?.type === "step-finish" && sessionID) restoreAtStepBoundary(sessionID, part.reason);
         if (part?.type === "step-finish" && typeof part.id === "string" &&
           part.tokens && typeof part.tokens === "object" && !reportedSteps.has(part.id)) {
           const model = messageModels.get(part.messageID);
@@ -1680,6 +1780,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
+        // The turn is over: the next prompt re-leases, and the fallback marker makes that
+        // lease drop its preference for the fallback model.
+        unwatchFallback(sessionID);
         const completed = successCandidates.get(sessionID) === true;
         try { await brokerRequest("/forget", {
           sessionID,
