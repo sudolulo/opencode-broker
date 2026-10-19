@@ -219,6 +219,12 @@ All notable changes to this project are documented here. The format is based on
 
 - **A streamed client no longer loses tool calls when a lane ignores `stream: true`.** When a lane answered a streaming ask with a single buffered chat document, the gateway dressed it as a stream by hand and emitted only a content delta and a `finish_reason` delta, silently dropping every `tool_calls` entry and any `reasoning_content`: a tool-using caller on such a lane received a content-only answer and no tool call at all. That path now builds its frames with the same helper as `bufferStreamingUpstream`, so indexed tool calls (id, type, function name and the full arguments string), reasoning, `finish_reason` and a usage frame when the client asked for `include_usage` all survive. Its outcome classification, usage accounting and failure logging are unchanged.
 
+## [1.25.1] — 2026-10-19
+
+### Fixed
+
+- Replace the HUD's global route forecasts with the viewed session's last assistant-turn provider/model and each subagent's own actual model. Remove the forecast from the home prompt; retain readable model suffixes in narrow rosters. Bound history hydration with per-visit ownership and a deadline, ignore summary messages, and preserve newer live metadata across empty, failed, and late responses.
+
 ## [1.25.0] — 2026-10-13
 
 ### Added

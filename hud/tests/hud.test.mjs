@@ -307,7 +307,7 @@ const LEASED_TARGET = {
 //   sessionModel  what api.state.session.get(id).model reports, i.e. the live chat-bar model
 //   startAt       the virtual clock's starting epoch ms (default: the real time at open)
 const withTuiHarness = async ({ questionState, questionError, permissionState, sessionRows = [], initialMode = "manual",
-  listSessions, sessionModel, startAt } = {}) => {
+  listSessions, sessionModel, messages, rendererWidth, sessionStatuses, startAt } = {}) => {
   let releaseHarness;
   const previousHarness = harnessQueue;
   harnessQueue = new Promise((resolve) => { releaseHarness = resolve; });
@@ -356,6 +356,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       },
       v2: {
         session: {
+          messages: (input, options) => (messages ? messages(input, options) : Promise.resolve({ data: [] })),
           switchAgent: async (input) => { switches.push(input); return { data: true }; },
           switchModel: async (input) => { switchedModels.push(input); return { data: true }; },
         },
@@ -396,6 +397,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       current: route,
       navigate: (name, params) => { navigations.push({ name, params }); },
     },
+    renderer: rendererWidth ? { width: rendererWidth } : undefined,
     slots: { register: (registration) => { slotSink.push(registration); } },
     state: {
       path: { directory: "/tmp/hud-test" },
@@ -405,7 +407,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
           return questionState ?? [];
         },
         permission: () => permissionState ?? [],
-        status: () => ({ type: "idle" }),
+        status: (id) => ({ type: sessionStatuses?.[id] ?? "idle" }),
         messages: () => [{ role: "user", agent: "standard" }],
         get: () => (sessionModel ? { model: sessionModel } : undefined),
       },
@@ -431,8 +433,8 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
   const viewsOf = (sink, api) => ({
     sidebarTitle: () => slotsOf(sink, "sidebar_content")().children[0],
     sidebarBody: () => slotsOf(sink, "sidebar_content")().children[1],
-    routeTitle: () => slotsOf(sink, "sidebar_content")().children[2],
-    routeBody: () => slotsOf(sink, "sidebar_content")().children[3],
+    lastAssistantTitle: () => slotsOf(sink, "sidebar_content")().children[2],
+    lastAssistantBody: () => slotsOf(sink, "sidebar_content")().children[3],
     strip: () => slotsOf(sink, "app_bottom")(),
     badge: () => slotsOf(sink, "session_prompt_right")({ session_id: api.route.current?.params?.sessionID }),
     homeBadge: () => slotsOf(sink, "home_prompt_right")(),
@@ -941,6 +943,198 @@ test("a real subagent still reaches the roster beside a classifier child", async
   }
 });
 
+test("the HUD shows actual assistant models without preview calls or static defaults", async () => {
+  requireJsxRuntime();
+  const messageCalls = [];
+  const h = await withTuiHarness({
+    sessionModel: "wrong-provider/wrong-static-default",
+    sessionRows: [{ id: "child-scout", parentID: "ses-1", agent: "scout", title: "Find the thing" }],
+    messages: async ({ sessionID, limit }) => {
+      messageCalls.push({ sessionID, limit });
+      const bySession = {
+        "ses-1": [{ info: { id: "main-message", sessionID, role: "assistant", providerID: "anthropic", modelID: "claude-actual", time: { created: 20 } } }],
+        "child-scout": [{ info: { id: "child-message", sessionID, role: "assistant", providerID: "openai", modelID: "gpt-child", time: { created: 10 } } }],
+      };
+      return { data: bySession[sessionID] ?? [] };
+    },
+  });
+  try {
+    const last = h.lastAssistantBody();
+    const strip = h.strip();
+    await h.runAgentPoll();
+    await flushReal();
+    assert.equal(contentOf(last), " anthropic/claude-actual");
+    assert.match(contentOf(strip), /scout.*openai\/gpt-child/);
+    assert.deepEqual(messageCalls.sort((a, b) => a.sessionID.localeCompare(b.sessionID)), [
+      { sessionID: "child-scout", limit: 20 }, { sessionID: "ses-1", limit: 20 },
+    ]);
+    assert.doesNotMatch(contentOf(h.homeBadge()), /Route|preview/);
+
+    await h.emit("message.updated", { info: {
+      id: "child-newer", sessionID: "child-scout", role: "assistant", providerID: "google", modelID: "gemini-live", time: { created: 30 },
+    } });
+    assert.match(contentOf(strip), /scout.*google\/gemini-live/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("assistant-model hydration is scoped to navigation and cannot overwrite newer live metadata", async () => {
+  requireJsxRuntime();
+  const requests = new Map();
+  const h = await withTuiHarness({ messages: ({ sessionID }) => {
+    const request = deferred();
+    requests.set(sessionID, request);
+    return request.promise;
+  } });
+  try {
+    h.navigate("ses-a");
+    const last = h.lastAssistantBody();
+    await h.runRefresh();
+    assert.equal(contentOf(last), " pending");
+
+    h.navigate("ses-b");
+    await h.runRefresh();
+    await h.emit("message.updated", { info: {
+      id: "b-live", sessionID: "ses-b", role: "assistant", providerID: "openai", modelID: "newer", time: { created: 20 },
+    } });
+    requests.get("ses-b").resolve({ data: [{ info: {
+      id: "b-old", sessionID: "ses-b", role: "assistant", providerID: "openai", modelID: "older", time: { created: 10 },
+    } }] });
+    requests.get("ses-a").resolve({ data: [{ info: {
+      id: "a-late", sessionID: "ses-a", role: "assistant", providerID: "anthropic", modelID: "stale", time: { created: 30 },
+    } }] });
+    await flushReal();
+    assert.equal(contentOf(last), " openai/newer");
+
+    h.navigate("ses-fail");
+    await h.runRefresh();
+    requests.get("ses-fail").reject(new Error("unavailable"));
+    await flushReal();
+    assert.equal(contentOf(last), " unavailable");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("completed empty, malformed, failed, and synchronous assistant hydration becomes stable unavailable metadata", async () => {
+  requireJsxRuntime();
+  const calls = new Map();
+  const h = await withTuiHarness({ messages: ({ sessionID }) => {
+    calls.set(sessionID, (calls.get(sessionID) ?? 0) + 1);
+    if (sessionID === "ses-error") return { error: new Error("SDK failure") };
+    if (sessionID === "ses-reject") return Promise.reject(new Error("transport failure"));
+    if (sessionID === "ses-throw") throw new Error("synchronous failure");
+    return { data: sessionID === "ses-user" ? [{ info: { role: "user" } }] : [] };
+  } });
+  try {
+    const last = h.lastAssistantBody();
+    for (const id of ["ses-empty", "ses-user", "ses-error", "ses-reject", "ses-throw"]) {
+      h.navigate(id);
+      await h.runRefresh();
+      await flushReal();
+      const expected = id === "ses-empty" || id === "ses-user" ? " awaiting assistant model" : " unavailable";
+      assert.equal(contentOf(last), expected, `${id} is a completed load, not pending`);
+      await h.runRefresh();
+      assert.equal(calls.get(id), 1, `${id} is hydrated once per visit`);
+    }
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("assistant hydration deadline releases an ignored request without repeat polling or disposal timers", async () => {
+  requireJsxRuntime();
+  let calls = 0;
+  const h = await withTuiHarness({ messages: () => { calls += 1; return never(); } });
+  try {
+    const last = h.lastAssistantBody();
+    await h.runRefresh();
+    assert.equal(contentOf(last), " pending");
+    await h.clock.advance(5_000);
+    assert.equal(contentOf(last), " unavailable");
+    await h.runRefresh();
+    assert.equal(calls, 1, "a timed-out visit is not fetched again");
+    await h.dispose();
+    assert.equal(h.clock.pending().filter((timer) => timer.delay === 5_000).length, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("an old A visit cannot overwrite or release the current A hydration", async () => {
+  requireJsxRuntime();
+  const requests = [];
+  const h = await withTuiHarness({ messages: ({ sessionID }) => {
+    const request = deferred();
+    requests.push({ sessionID, request });
+    return request.promise;
+  } });
+  try {
+    const last = h.lastAssistantBody();
+    await h.runRefresh(); // A1
+    h.navigate("ses-b");
+    await h.runRefresh();
+    h.navigate("ses-1");
+    await h.runRefresh(); // A2
+    const [a1, b, a2] = requests;
+    a1.request.resolve({ data: [{ info: { id: "a1", sessionID: "ses-1", role: "assistant", providerID: "old", modelID: "stale", time: { created: 99 } } }] });
+    await flushReal();
+    assert.equal(contentOf(last), " pending", "A1 cannot complete A2");
+    a2.request.resolve({ data: [{ info: { id: "a2", sessionID: "ses-1", role: "assistant", providerID: "new", modelID: "current", time: { created: 10 } } }] });
+    await flushReal();
+    assert.equal(contentOf(last), " new/current");
+    a1.request.reject(new Error("late A1 failure"));
+    b.request.resolve({ data: [] });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("assistant metadata ignores summaries and lets a live correction beat stale hydration", async () => {
+  requireJsxRuntime();
+  const request = deferred();
+  const h = await withTuiHarness({ messages: () => request.promise });
+  try {
+    const last = h.lastAssistantBody();
+    await h.runRefresh();
+    await h.emit("message.updated", { info: { id: "turn", sessionID: "ses-1", role: "assistant", providerID: "old", modelID: "initial", time: { created: 20 } } });
+    await h.emit("message.updated", { info: { id: "turn", sessionID: "ses-1", role: "assistant", providerID: "openai", modelID: "corrected", time: { created: 20 } } });
+    await h.emit("message.updated", { info: { id: "summary", sessionID: "ses-1", role: "assistant", summary: true, providerID: "bad", modelID: "compaction", time: { created: 99 } } });
+    request.resolve({ data: [
+      { info: { id: "turn", sessionID: "ses-1", role: "assistant", providerID: "old", modelID: "hydrated", time: { created: 20 } } },
+      { summary: true, info: { id: "summary-hydrated", sessionID: "ses-1", role: "assistant", providerID: "bad", modelID: "compaction", time: { created: 100 } } },
+    ] });
+    await flushReal();
+    assert.equal(contentOf(last), " openai/corrected");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("narrow roster retains agent status and provider/model suffix before task metrics", async () => {
+  requireJsxRuntime();
+  const h = await withTuiHarness({ rendererWidth: 60, sessionStatuses: { "child-wide": "running" }, sessionRows: [{
+    id: "child-wide", parentID: "ses-1", agent: "very-long-agent-name", status: "running",
+    title: "An exceptionally long task title that must yield to model identity", time: { created: 0 },
+  }], messages: ({ sessionID }) => ({ data: [{ info: {
+    id: "child-model", sessionID, role: "assistant", providerID: "very-long-provider-name", modelID: "meaningful-model-suffix", time: { created: 1 },
+  } }] }) });
+  try {
+    await h.runAgentPoll();
+    await flushReal();
+    const row = contentOf(h.strip()).split("\n").at(-1);
+    assert.ok(row.length <= 60);
+    assert.match(row, /very-long-age/);
+    assert.match(row, /running/);
+    assert.match(row, /ver[^/]*\//);
+    assert.match(row, /suffix/);
+    assert.doesNotMatch(row, /\d+[sm]\s+·|tok/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 // ---- the profile tables and the router's profile list must not drift -----------------------
 // ☠️ THREE LISTS, ONE TRUTH. The router owns which profiles exist; this plugin decides which are
 // OFFERED (F11), how each is LABELLED on screen, and which of them own the swap-back. Each
@@ -1327,41 +1521,34 @@ test("two windows opened at different wall-clock times poll the broker on the sa
     await h.clock.advanceTo(EPOCH + 30_100);
     assert.deepEqual(broker.calls.filter((call) => call.path === "/status").map((call) => call.at - EPOCH),
       [10_050, 10_050, 20_050, 20_050, 30_050, 30_050]);
-    // /preview rides on each /status answer: exactly one per window per boundary, no more.
-    assert.deepEqual(broker.calls.filter((call) => call.path === "/preview").map((call) => call.at - EPOCH),
-      [10_050, 10_050, 20_050, 20_050, 30_050, 30_050]);
-    assert.equal(broker.calls.length, 12, "nothing but /status and /preview is asked for");
+    assert.equal(broker.calls.some((call) => call.path === "/preview"), false, "the HUD never forecasts routes");
+    assert.equal(broker.calls.length, 6, "only /status is polled");
   } finally {
     resetRouterHooks();
     await h.cleanup();
   }
 });
 
-test("an idle window picks up new usage and routes on the shared schedule with no input", async () => {
+test("an idle window picks up new usage on the shared schedule with no input", async () => {
   requireJsxRuntime();
   let percent = 25;
-  let model = "model-a";
-  scriptBroker({
+  const broker = scriptBroker({
     status: () => ({ budgets: { anthropic: planReading(percent, Date.now()) }, health: { providers: {} }, circuits: {} }),
-    preview: () => routeOf(model),
   });
   const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
   try {
     const body = h.sidebarBody();
-    const routes = h.routeBody();
     const badge = h.badge();
     await flushReal();
     assert.match(contentOf(body), /anthropic\s+wk 25%/);
     assert.match(contentOf(badge), /ant 25% wk/);
-    assert.match(contentOf(routes), /deep\s+model-a/);
 
     percent = 40;
-    model = "model-b";
     // No key, no event, no explicit poll: only time passes.
     await h.clock.advance(10_000);
     assert.match(contentOf(body), /anthropic\s+wk 40%/);
     assert.match(contentOf(badge), /ant 40% wk/);
-    assert.match(contentOf(routes), /deep\s+model-b/);
+    assert.equal(broker.calls.some((call) => call.path === "/preview"), false);
   } finally {
     resetRouterHooks();
     await h.cleanup();
@@ -1401,7 +1588,6 @@ test("a /status failure keeps every warning visible, marks the block stale at on
   const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
   try {
     const body = h.sidebarBody();
-    const routes = h.routeBody();
     const badge = h.badge();
     await flushReal();
     assert.match(contentOf(badge), /ant 25% wk/);
@@ -1414,8 +1600,6 @@ test("a /status failure keeps every warning visible, marks the block stale at on
     assert.match(text, /zai\s+\u26d4 quarantined/, "a health warning is never dropped by a failed poll");
     assert.match(text, /openai\s+\u26d4 limit til/, "a circuit warning is never dropped by a failed poll");
     assert.doesNotMatch(contentOf(badge), /ant 25%/, "the badge must not vouch for a number the broker did not confirm");
-    assert.match(contentOf(routes), /^ \(stale 9s\)$/m, "routes went unrefreshed too");
-    assert.match(contentOf(routes), /deep\s+model-a/, "and are still shown, as stale");
 
     await h.clock.advance(7 * 60_000);
     assert.match(contentOf(body), /^ \(stale 7m\)$/m);
@@ -1425,7 +1609,6 @@ test("a /status failure keeps every warning visible, marks the block stale at on
     broker.statusError = null;
     await h.runBudgetPoll();
     assert.doesNotMatch(contentOf(body), /stale/);
-    assert.doesNotMatch(contentOf(routes), /stale/);
     assert.match(contentOf(badge), /ant 25% wk/);
     assert.doesNotMatch(contentOf(badge), /BROKER DOWN/);
   } finally {
@@ -1434,55 +1617,6 @@ test("a /status failure keeps every warning visible, marks the block stale at on
   }
 });
 
-test("a /preview-only failure marks the routes stale, not the usage, and recovery clears it", async () => {
-  requireJsxRuntime();
-  const broker = scriptBroker({ status: { budgets: { anthropic: learnedWindow(25) }, health: { providers: {} }, circuits: {} } });
-  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
-  try {
-    const body = h.sidebarBody();
-    const routeTitle = h.routeTitle();
-    const routes = h.routeBody();
-    const strip = h.strip();
-    await flushReal();
-
-    broker.previewError = new Error("preview timed out");
-    await h.runBudgetPoll();
-    assert.doesNotMatch(contentOf(body), /stale/, "usage was refreshed; it is not stale");
-    assert.equal(contentOf(routeTitle), "\nRoute");
-    assert.match(contentOf(routes), /^ \(stale 9s\)$/m);
-    assert.match(contentOf(routes), /deep\s+model-a/);
-    // The home screen has no sidebar: the strip carries the route line there.
-    h.navigate(undefined);
-    assert.match(contentOf(strip), /Route: deep model-a .*\(stale 9s\)/);
-
-    broker.previewError = null;
-    broker.preview = routeOf("model-b");
-    await h.runBudgetPoll();
-    assert.doesNotMatch(contentOf(routes), /stale/);
-    assert.match(contentOf(routes), /deep\s+model-b/);
-    assert.doesNotMatch(contentOf(strip), /stale/);
-    assert.match(contentOf(strip), /Route: deep model-b/);
-  } finally {
-    resetRouterHooks();
-    await h.cleanup();
-  }
-});
-
-test("a route preview that has never answered says unavailable instead of rendering nothing", async () => {
-  requireJsxRuntime();
-  scriptBroker({ previewError: new Error("preview timed out") });
-  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
-  try {
-    await flushReal();
-    assert.equal(contentOf(h.routeTitle()), "\nRoute");
-    assert.equal(contentOf(h.routeBody()), " (unavailable)");
-    h.navigate(undefined);
-    assert.equal(contentOf(h.strip()), " Route: unavailable");
-  } finally {
-    resetRouterHooks();
-    await h.cleanup();
-  }
-});
 
 // ---- the roster belongs to the session on screen, and only to it -----------------------------
 const CHILD_A = { id: "child-a", parentID: "ses-a", agent: "scout", title: "Task of session A" };
@@ -1590,7 +1724,7 @@ test("navigation clears the old roster and its selection before the next draw", 
 
     h.navigate(undefined);
     assert.doesNotMatch(contentOf(strip), /Task of session A/);
-    assert.match(contentOf(strip), /Route:/, "home shows its route line, not a session's roster");
+    assert.equal(contentOf(strip), "", "home shows no hypothetical route forecast");
   } finally {
     resetRouterHooks();
     await h.cleanup();
@@ -2472,18 +2606,14 @@ test("a /status that never answers turns 'no broker data yet' into unavailable a
   const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
   try {
     const body = h.sidebarBody();
-    const routeTitle = h.routeTitle();
-    const routes = h.routeBody();
     await flushReal();
     assert.equal(contentOf(body), " (no broker data yet)");
     await h.clock.advance(FRESHNESS_FALLBACK - 1_000);
     assert.equal(contentOf(body), " (no broker data yet)", "a first answer may still come inside two polls and slack");
     await h.clock.advance(2_000);
     assert.equal(contentOf(body), " (broker unavailable)");
-    assert.equal(contentOf(routeTitle), "\nRoute");
-    assert.equal(contentOf(routes), " (unavailable)");
     h.navigate(undefined);
-    assert.equal(contentOf(h.strip()), " Route: unavailable");
+    assert.equal(contentOf(h.strip()), "");
     assert.deepEqual(calls, ["/status"], "the hung request is not joined by more");
   } finally {
     resetRouterHooks();
@@ -2503,7 +2633,6 @@ test("a /status that hangs after an answer goes stale at the fallback age, warni
   const h = await withTuiHarness({ startAt: EPOCH + 1_000, sessionModel: "anthropic/claude-opus" });
   try {
     const body = h.sidebarBody();
-    const routes = h.routeBody();
     const badge = h.badge();
     await flushReal();
     assert.match(contentOf(badge), /ant 25% wk/);
@@ -2517,9 +2646,7 @@ test("a /status that hangs after an answer goes stale at the fallback age, warni
     assert.match(text, /^ \(stale 26s\)$/m, `an overdue answer is stale with no failure to report:\n${text}`);
     assert.match(text, /zai\s+\u26d4 quarantined/, "a warning is kept, not dropped");
     assert.doesNotMatch(contentOf(badge), /ant 25%/);
-    assert.match(contentOf(routes), /^ \(stale 26s\)$/m);
-    assert.match(contentOf(routes), /deep\s+model-a/);
-    assert.deepEqual(calls, ["/status", "/preview", "/status"], "one hung request, never another stacked on it");
+    assert.deepEqual(calls, ["/status", "/status"], "one hung request, never another stacked on it");
   } finally {
     resetRouterHooks();
     await h.cleanup();
@@ -2561,22 +2688,6 @@ test("an answer that lands minutes after it was asked for is shown as that old, 
   }
 });
 
-test("a /preview that never answers says unavailable at the fallback age", async () => {
-  requireJsxRuntime();
-  routerHooks.brokerRequest = async (path) => (path === "/status" ? STATUS_25() : never());
-  const h = await withTuiHarness({ startAt: EPOCH + 1_000 });
-  try {
-    const routes = h.routeBody();
-    await flushReal();
-    assert.equal(contentOf(routes), "");
-    await h.clock.advance(FRESHNESS_FALLBACK + 1_000);
-    assert.equal(contentOf(h.routeTitle()), "\nRoute");
-    assert.equal(contentOf(routes), " (unavailable)");
-  } finally {
-    resetRouterHooks();
-    await h.cleanup();
-  }
-});
 
 for (const [label, fetchedAt] of [
   ["missing", () => undefined],

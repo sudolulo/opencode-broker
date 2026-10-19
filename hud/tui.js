@@ -361,6 +361,90 @@ export default {
       return route?.name === "session" ? route?.params?.sessionID : undefined;
     };
 
+    // Static session models are routing defaults, not evidence of what an assistant used.
+    const assistantTurns = new Map();
+    const assistantLoads = new Map();
+    const assistantRelevant = new Map();
+    let assistantDisposed = false;
+    const assistantStamp = (info) => ({ created: Number(info?.time?.created ?? 0), id: String(info?.id ?? "") });
+    const newerAssistant = (next, prior) => !prior || !Number.isFinite(prior.created) || next.created > prior.created ||
+      (next.created === prior.created && next.id > prior.id);
+    const noteAssistant = (info, live = false) => {
+      const id = info?.sessionID;
+      if (!assistantRelevant.has(id) || info?.role !== "assistant" || info?.summary || !info?.providerID || !info?.modelID) return;
+      const next = { ...assistantStamp(info), model: `${info.providerID}/${info.modelID}`, state: "ready" };
+      const prior = assistantTurns.get(id);
+      if (newerAssistant(next, prior) || (live && next.created === prior?.created && next.id === prior?.id)) assistantTurns.set(id, next);
+    };
+    const hydrateAssistant = (id) => {
+      if (!id || !assistantRelevant.has(id) || assistantLoads.has(id) || assistantTurns.has(id)) return;
+      if (typeof api.client?.v2?.session?.messages !== "function") {
+        assistantTurns.set(id, { state: "unavailable" });
+        return;
+      }
+      const controller = new AbortController();
+      const visit = assistantRelevant.get(id);
+      const entry = { controller, visit, timer: null, finished: false, cancelled: false };
+      const owns = () => !assistantDisposed && !entry.cancelled && assistantRelevant.get(id) === visit && assistantLoads.get(id) === entry;
+      const finish = (state) => {
+        if (!owns() || entry.finished) return;
+        entry.finished = true;
+        clearTimeout(entry.timer);
+        if (assistantTurns.get(id)?.state === "pending") assistantTurns.set(id, { state });
+        assistantLoads.delete(id);
+      };
+      entry.timer = setTimeout(() => { controller.abort(); finish("unavailable"); }, 5_000);
+      const timer = entry.timer;
+      if (typeof timer?.unref === "function") timer.unref();
+      assistantLoads.set(id, entry);
+      assistantTurns.set(id, { state: "pending" });
+      const request = Promise.resolve()
+        .then(() => api.client.v2.session.messages({ sessionID: id, limit: 20 }, { signal: controller.signal }))
+        .then((res) => {
+          if (!owns()) return;
+          if (res?.error) { finish("unavailable"); return; }
+          const messages = Array.isArray(res?.data) ? res.data : [];
+          const latest = messages.reduce((top, message) => {
+            const info = message?.info;
+            if (info?.role !== "assistant" || message?.summary || info?.summary || !info?.providerID || !info?.modelID) return top;
+            return newerAssistant(assistantStamp(info), top ? assistantStamp(top) : null) ? info : top;
+          }, null);
+          if (latest) noteAssistant(latest);
+          else if (assistantTurns.get(id)?.state === "pending") assistantTurns.set(id, { state: "awaiting" });
+          finish("awaiting");
+        })
+        .catch(() => {
+          finish("unavailable");
+        })
+        .finally(() => { if (owns()) finish("unavailable"); });
+      entry.request = request;
+    };
+    const syncAssistantSessions = (ids) => {
+      const wanted = new Set(ids.filter(Boolean));
+      for (const id of assistantRelevant.keys()) {
+        if (wanted.has(id)) continue;
+        assistantRelevant.delete(id); assistantTurns.delete(id);
+        const load = assistantLoads.get(id); if (load) { load.cancelled = true; clearTimeout(load.timer); load.controller.abort(); assistantLoads.delete(id); }
+      }
+      for (const id of wanted) { if (!assistantRelevant.has(id)) assistantRelevant.set(id, Symbol(id)); hydrateAssistant(id); }
+    };
+    const assistantModel = (id) => {
+      const record = assistantTurns.get(id);
+      return record?.state === "ready" ? record.model : record?.state === "pending" ? "pending" : record?.state === "awaiting" ? "awaiting assistant model" : "unavailable";
+    };
+    const unsubscribeAssistantUpdates = api.event.on("message.updated", (event) => { noteAssistant(event?.properties?.info, true); refresh(); });
+    const unsubscribeAssistantDelete = api.event.on("session.deleted", (event) => {
+      const id = event?.properties?.info?.id ?? event?.properties?.sessionID;
+      if (!id) return;
+      assistantRelevant.delete(id); assistantTurns.delete(id);
+      const load = assistantLoads.get(id); if (load) { load.cancelled = true; clearTimeout(load.timer); load.controller.abort(); assistantLoads.delete(id); }
+    });
+    api.lifecycle?.onDispose?.(() => {
+      assistantDisposed = true; unsubscribeAssistantUpdates?.(); unsubscribeAssistantDelete?.();
+      for (const load of assistantLoads.values()) { load.cancelled = true; clearTimeout(load.timer); load.controller.abort(); }
+      assistantLoads.clear(); assistantTurns.clear(); assistantRelevant.clear();
+    });
+
     // Session/profile/agent changes allocate the sticky model before dispatch. The
     // step-start listener remains a reconciliation guard for resumed sessions and
     // emits the native model-switch state used by the chat bar. The marker prevents
@@ -748,17 +832,15 @@ export default {
     };
 
     const panelText = () => {
-      // No subagent/shell roster to show: on the HOME screen the strip carries the
-      // Route preview (the new-session page has no sidebar). Inside a session this
-      // returns "" -- but bottomStripText still appends the Tasks monitor below, so
-      // the bar carries workflow runs and jobs even with no live child sessions.
+      // BottomStripText appends the Tasks monitor below this roster, so tasks remain visible
+      // even when there are no live child sessions.
       syncRoster();
       // A list that failed is said out loud: an empty strip would read as "no subagents".
       const notice = sessionID() ? [
         rosterUnavailable ? ` subagents: unavailable (session list ${rosterUnavailable})` : "",
         jobsWarning ? ` ${jobsWarning}` : "",
       ].filter(Boolean).join("\n") : "";
-      if (!agents.length) return sessionID() ? notice : homeRouteText();
+      if (!agents.length) return notice;
       const w = width();
       if (selected !== null) {
         if (selected < scrollTop) scrollTop = selected;
@@ -780,12 +862,34 @@ export default {
         const state = isShell(a)
           ? (a.status === "running" ? "" : a.status + (a.code === null || a.code === undefined ? "" : " " + a.code))
           : (a.status === "idle" ? "" : a.status);
-        const right = [state, elapsed(a), isShell(a) ? "" : tokens(a)]
-          .filter(Boolean).join(" \u00b7 ") + "  ";
+        const head = cursor + glyph + " " + shortTitle(a.agent, NAME) + "  ";
+        const fitModel = (label, max) => {
+          if (label.length <= max) return label;
+          const slash = label.indexOf("/");
+          if (slash < 1 || max < 5) return shortTitle(label, max);
+          const provider = label.slice(0, slash);
+          const model = label.slice(slash + 1);
+          const modelRoom = Math.max(3, max - Math.min(provider.length, Math.max(2, Math.floor(max / 3))) - 2);
+          return shortTitle(provider, max - modelRoom - 1) + "/" + (model.length <= modelRoom ? model : "…" + model.slice(-(modelRoom - 1)));
+        };
+        // Reserve the state, its separator, and a readable task column before fitting the model.
+        // Otherwise the final row slice eats the model suffix we deliberately retained.
+        let right;
+        if (isShell(a)) {
+          right = [state, elapsed(a)].filter(Boolean).join(" \u00b7 ") + "  ";
+        } else {
+          const model = fitModel(assistantModel(a.id), Math.max(8, w - head.length - state.length - (state ? 13 : 10)));
+          const optional = [elapsed(a), tokens(a)].filter(Boolean);
+          right = [state, model].filter(Boolean).join(" \u00b7 ");
+          for (const metric of optional) {
+            const candidate = [right, metric].filter(Boolean).join(" \u00b7 ");
+            if (head.length + candidate.length + 10 <= w) right = candidate;
+          }
+          right += "  ";
+        }
         // Size the task column to whatever is left, so a row can never exceed the
         // terminal and wrap -- a wrapped row breaks the panel's alignment and makes
         // the whole thing look like spilled output again.
-        const head = cursor + glyph + " " + shortTitle(a.agent, NAME) + "  ";
         const room = Math.max(8, w - head.length - right.length - 1);
         const left = head + shortTitle(a.title, room);
         const gap = Math.max(1, w - left.length - right.length);
@@ -832,6 +936,7 @@ export default {
       jobsWarning = null;
       selected = null;
       scrollTop = 0;
+      syncAssistantSessions(sid ? [sid] : []);
       // Every request still out belongs to a visit that just ended; its answer would be dropped.
       for (const call of [...rosterCalls]) call.cancel();
     };
@@ -1039,22 +1144,14 @@ export default {
     // When /status started failing, or null while it answers. 30 s of misses (three 10 s polls)
     // turn the badge into BROKER DOWN -- see fallbackBadge.
     let brokerFailingSince = null;
-    // The route preview is a SECOND request with its own fate, so it keeps its own freshness:
-    // when it last answered, and since when it has missed a refresh -- its own failure, or a
-    // /status failure that meant it was never asked. Without these a failed /preview left the
-    // last routes on screen indefinitely, looking exactly like current ones.
-    // Like budgetAt, previewAt is when the /preview that answered was SENT.
-    let previewAt = 0;
-    let previewFailingSince = null;
-    const notePreviewMissed = () => { if (previewFailingSince === null) previewFailingSince = Date.now(); };
     // The failure flags above only move when a request ENDS. A request that never ends -- and
     // lib/client.js's timeout is a socket IDLE timeout, which a broker dribbling bytes never
     // trips -- would leave them unset and the last answer on screen as current for ever. So
     // freshness is also judged by AGE alone: older than two polls plus slack is stale (or, with
     // no answer yet, unavailable), whatever the flags say. Ages count from when this HUD started
     // until a first answer exists, so a broker that is hung from the start is caught too.
-    // No second request is sent to find out: `budgetPolling` keeps one /status (and its
-    // /preview) out at a time, so a hung poll shows as stale instead of stacking new ones.
+    // No second request is sent to find out: `budgetPolling` keeps one /status out at a time,
+    // so a hung poll shows as stale instead of stacking new ones.
     const BUDGET_POLL_MS = 10_000;
     const FRESHNESS_FALLBACK_MS = 2 * BUDGET_POLL_MS + 5_000;
     const budgetSince = Date.now();
@@ -1145,30 +1242,11 @@ export default {
             laneNotes.set(key, when ? `benched til ${when}` : "benched");
           }
         }
-        let routes;
-        const previewAskedAt = Date.now();
-        try {
-          routes = await brokerRequest("/preview", { profile: "auto", tiers: ["deep", "smart", "build", "worker"] }, { timeout: 2500 });
-        } catch {
-          // Usage numbers stand alone, so a failed preview does not fail the poll -- but the
-          // routes it would have refreshed are now stale, and the Route block says so.
-          if (!budgetDisposed) notePreviewMissed();
-          return;
-        }
-        if (budgetDisposed) return;
-        routePreview.clear();
-        for (const [tier, target] of Object.entries(routes?.preview ?? {})) {
-          if (target?.model?.id) routePreview.set(tier, target.model.id + (target.model.variant ? " \u00b7 " + target.model.variant : ""));
-        }
-        previewAt = previewAskedAt;
-        previewFailingSince = null;
       } catch {
         if (budgetDisposed) return;
         // broker down: every value is kept -- health and circuit warnings above all -- and marked
-        // stale at once (sidebarText, routeText); the badge drops usage and, after 30 s, says
-        // BROKER DOWN (fallbackBadge). The preview was never asked, so it missed this refresh too.
+        // stale at once; the badge drops usage and, after 30 s, says BROKER DOWN.
         if (brokerFailingSince === null) brokerFailingSince = Date.now();
-        notePreviewMissed();
       }
       finally { budgetPolling = false; }
     };
@@ -1264,42 +1342,15 @@ export default {
     // are operator ESTIMATES, and the header says so. Over 100% therefore means
     // "past the estimate", not "provider blocked": circuits handle real limits.
     const sidebarEls = new Set();
-    const routePreview = new Map();
-    const routeEls = new Set();
-    const ROUTE_TIERS_SHOWN = ["deep", "smart", "build", "worker"];
     // "12s" under a minute, "7m" after: a stale marker has to read at a glance.
     const ageText = (ms) => (ms < 60_000
       ? `${Math.max(0, Math.round(ms / 1000))}s`
       : `${Math.round(ms / 60_000)}m`);
-    // Stale on a missed refresh, or by age alone (see FRESHNESS_FALLBACK_MS) when the request
-    // behind the last answer -- or the very first one -- has simply not come back.
-    const routeStale = () => previewFailingSince !== null ||
-      Date.now() - (previewAt || budgetSince) > FRESHNESS_FALLBACK_MS;
-    const routeAge = () => ageText(Date.now() - previewAt);
-    // The heading stands whenever there is something to say, including "unavailable".
-    const routeHeadText = () => (routePreview.size || routeStale() ? "\nRoute" : "");
-    const routeText = () => {
-      if (!routePreview.size) return routeStale() ? " (unavailable)" : "";
-      const rows = ROUTE_TIERS_SHOWN
-        .filter((tier) => routePreview.has(tier))
-        .map((tier) => ` ${tier.padEnd(10)} ${routePreview.get(tier)}`);
-      if (routeStale()) rows.unshift(` (stale ${routeAge()})`);
-      return rows.join("\n");
-    };
     const PROVIDER_LONG = { "alibaba-token-plan": "token-plan" };
-    // The home/new-session screen has no sidebar, so the Route preview ALSO
-    // renders there (home_bottom) as one compact line -- that is the moment a
-    // user is tabbing agents and needs to see the real destinations.
-    const homeRouteEls = new Set();
-    const shortModel = (label) => label.replace(/^claude-/, "");
-    const homeRouteText = () => {
-      if (!routePreview.size) return routeStale() ? " Route: unavailable" : "";
-      const cells = ROUTE_TIERS_SHOWN
-        .filter((tier) => routePreview.has(tier))
-        .map((tier) => `${tier} ${shortModel(routePreview.get(tier))}`);
-      if (!cells.length) return "";
-      return " Route: " + cells.join(" \u00b7 ") + (routeStale() ? ` (stale ${routeAge()})` : "");
-    };
+    const assistantTitleText = () => sessionID() ? "\nLast assistant turn" : "";
+    const assistantText = () => sessionID() ? " " + assistantModel(sessionID()) : "";
+    const assistantTitleEls = new Set();
+    const assistantEls = new Set();
     // opencode-guard's floor LEVEL (its `oc-auto` CLI): how much of the safety floor
     // runs. Read straight off the flag-file contract; shown so "will this ask
     // me?" never requires remembering two invisible states.
@@ -1488,17 +1539,13 @@ export default {
       for (const el of sidebarTitleEls) {
         try { if (el.content !== heading) el.content = heading; } catch {}
       }
-      const routes = routeText();
-      const routeHead = routeHeadText();
-      for (const el of routeEls) {
-        try {
-          const want = el.attributes === 1 ? routeHead : routes;
-          if (el.content !== want) el.content = want;
-        } catch {}
+      const assistantTitle = assistantTitleText();
+      for (const el of assistantTitleEls) {
+        try { if (el.content !== assistantTitle) el.content = assistantTitle; } catch {}
       }
-      const homeRoute = homeRouteText();
-      for (const el of homeRouteEls) {
-        try { if (el.content !== homeRoute) el.content = homeRoute; } catch {}
+      const assistant = assistantText();
+      for (const el of assistantEls) {
+        try { if (el.content !== assistant) el.content = assistant; } catch {}
       }
     };
     // The roster poll is slower than the label repaint: the label has to be honest
@@ -1524,6 +1571,7 @@ export default {
         // Installed and repainted on every answer, so a same-session change of title, tokens
         // or status shows even when the IDs did not move. On a failure or a deadline the shells
         // (read off disk, not from the session list) stay; the subagent rows go, and say why.
+        syncAssistantSessions(rosterSid ? [rosterSid, ...children.map((child) => child.id)] : []);
         agents = [...children, ...agents.filter(isShell)];
         rosterUnavailable = failure ? (failure.timedOut ? "not answering" : "failed") : false;
         rosterLoadedGen = gen;
@@ -1579,19 +1627,20 @@ export default {
           sidebarEls.add(body);
           while (sidebarEls.size > 4) sidebarEls.delete(sidebarEls.values().next().value);
           while (sidebarTitleEls.size > 4) sidebarTitleEls.delete(sidebarTitleEls.values().next().value);
-          const routeTitle = jsx("text", {
+          const assistantTitle = jsx("text", {
             attributes: 1,
-            get content() { return routeHeadText(); },
-            get children() { return routeHeadText(); },
+            get content() { return assistantTitleText(); },
+            get children() { return assistantTitleText(); },
           });
-          const routeBody = jsx("text", {
-            get content() { return routeText(); },
-            get children() { return routeText(); },
+          const assistant = jsx("text", {
+            get content() { return assistantText(); },
+            get children() { return assistantText(); },
           });
-          routeEls.add(routeTitle); routeEls.add(routeBody);
-          while (routeEls.size > 8) routeEls.delete(routeEls.values().next().value);
+          assistantTitleEls.add(assistantTitle); assistantEls.add(assistant);
+          while (assistantTitleEls.size > 4) assistantTitleEls.delete(assistantTitleEls.values().next().value);
+          while (assistantEls.size > 4) assistantEls.delete(assistantEls.values().next().value);
           try {
-            return jsx("box", { children: [title, body, routeTitle, routeBody] });
+            return jsx("box", { children: [title, body, assistantTitle, assistant] });
           } catch {
             return body;
           }
