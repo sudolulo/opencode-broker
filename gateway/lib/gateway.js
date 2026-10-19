@@ -105,6 +105,14 @@ const UPSTREAM_SIGNALS = [
     matches: (message) => /prompt is too long|context[._ -]?length[._ -]?exceeded|maximum context length/i.test(message),
     phrase: "prompt is too long",
   },
+  // ☠️ A DEAD PROXY SOCKET IS THE PROVIDER, NOT THE MODEL. llm-auth-proxy answers 502 with these
+  // exact texts when it never reached the provider; without the phrase the broker saw only
+  // "upstream openai HTTP 502", fenced the one model for 15 s, and leased gpt-terra on the same
+  // dead OpenAI path (2026-10-19). The broker reads the phrase as a provider-wide `connect`.
+  {
+    matches: (message) => /^llm-auth-proxy: (?:Anthropic request|OpenAI Responses upstream request|OpenAI models upstream request) failed$/.test(message),
+    phrase: "upstream transport failed",
+  },
 ];
 
 // Reads the upstream error message out of the shared Anthropic/OpenAI JSON
@@ -112,6 +120,17 @@ const UPSTREAM_SIGNALS = [
 // phrase, or null. The body has already been fully read by the caller; the
 // 16 KB cap here is only a parser-cost ceiling for JSON.parse. Silent on parse
 // failure. The phrase is a GATEWAY STRING; the raw body never escapes.
+// The Anthropic mid-stream error frame names its type; only fixed gateway phrases leave, never
+// upstream wording. The proxy's own "upstream stream failed" frame is its socket dying (a
+// provider-wide `connect` to the broker); `overloaded_error` is transient capacity (`overload`,
+// 15 s). Anything else keeps the plain phrase.
+export const anthropicStreamFailure = (failure) => {
+  const type = typeof failure?.type === "string" ? failure.type : null;
+  if (failure?.message === "llm-auth-proxy: upstream stream failed") return "Anthropic upstream stream failed: upstream transport failed";
+  if (type === "overloaded_error") return "Anthropic upstream stream failed: overloaded";
+  return "Anthropic upstream stream failed";
+};
+
 const upstreamSignal = (body) => {
   if (typeof body !== "string" || body.length === 0 || body.length > 16384) return null;
   let parsed;
@@ -820,7 +839,7 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, o
       ?? (api === RESPONSES && event?.type === "response.failed" ? (event.response?.error ?? event) : null);
     if (failure) {
       streamError = new Error(api === MESSAGES
-        ? "Anthropic upstream stream failed"
+        ? anthropicStreamFailure(failure)
         : String(failure?.message ?? JSON.stringify(failure)).slice(0, 400));
       // An error frame with the wire still clean is a dead lane, not a dead
       // request: swallow it so the caller can fail over and the client never
@@ -1517,6 +1536,21 @@ export const createGatewayHandler = ({
     } catch { /* broker hiccup must not fail the request */ }
   };
 
+  // OpenAI says which model ACTUALLY served a request only in the `openai-model` response header
+  // (Codex reads the same header to warn "this request was routed to ..."): a flagged account is
+  // silently rerouted to an older model. Not a settlement, so it goes straight to the broker even
+  // for a session-bound (external) lease, and never blocks or fails the request.
+  const reportServedModel = (leased, headers) => {
+    const served = headers?.get?.("openai-model") ?? headers?.get?.("x-openai-model");
+    if (typeof served !== "string" || !served || !leased?.sessionID || !leased.leaseID) return;
+    Promise.resolve().then(() => brokerRequest("/served-model", {
+      sessionID: leased.sessionID,
+      leaseID: leased.leaseID,
+      ...(leased.targetID ? { targetID: leased.targetID } : {}),
+      servedModelID: served,
+    })).catch(() => {});
+  };
+
   const reportUsage = async (leased, tokens) => settle(leased, "/usage", {
     ...(callerOf(leased.sessionID) ? { caller: callerOf(leased.sessionID) } : {}),
     providerID: leased.providerID,
@@ -2115,6 +2149,8 @@ export const createGatewayHandler = ({
         // This is why the response head is written by sink.write() and not one
         // line earlier (see the sink in handle()).
         const contentType = String(response.headers?.get?.("content-type") ?? "");
+        // After the health capture's own header reads (attestation, then content-type), never before.
+        if (api === RESPONSES) reportServedModel(leased, response.headers);
         let outcome;
         try {
           // ☆ Dressing a buffered body as a stream is a chat-only courtesy: a
@@ -2298,6 +2334,7 @@ export const createGatewayHandler = ({
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
       }
+      if (api === RESPONSES) reportServedModel(leased, response.headers);
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
       // schema in some builds; instruct-mode models fence despite orders).
       // The client asked for machine-readable output: unwrap deterministically.

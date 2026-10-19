@@ -261,6 +261,12 @@ const OVERLOAD_MS = 15 * 1000;
 // hammered on every turn, short enough that a lane which comes back is used again promptly --
 // llama.cpp's own app restart took ~90 s door to door on 2026-09-14.
 const CONNECT_MS = 60 * 1000;
+// How long a session steers clear of what a provider guard refused or rerouted (see the
+// `policy` kind in lib/routing.js). Claude Code keeps a flagged session on its fallback for
+// the rest of the session, and OpenAI's cyber flags are account-level; 12 h covers a working
+// session without pinning a long-lived one forever. Bounded like assignments.
+const POLICY_AVOID_MS = 12 * 60 * 60 * 1000;
+const MAX_POLICY_AVOIDS = 512;
 // Quota with no known reset: re-probe at a bounded cadence (one failed request
 // per probe) instead of holding the provider out until state surgery.
 const QUOTA_REPROBE_MS = 15 * 60 * 1000;
@@ -309,7 +315,7 @@ const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }, source = "/i
     console.error(`[opencode-broker] ${source} dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
   }
 };
-const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy(), outages: emptyOutages() });
+const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy(), outages: emptyOutages(), policyAvoids: {} });
 const readState = () => {
   let source;
   try {
@@ -375,6 +381,7 @@ const readState = () => {
       // Optional outage-episode state (lib/model-outage-state.js): whitelisted field by field,
       // never passed through. Whatever does not decode restores as "can authorize nothing".
        outages: decodeOutages(value?.outages, { policy: CONFIG.modelOutages }),
+      policyAvoids: normalizePolicyAvoids(value?.policyAvoids),
     };
   }
 };
@@ -605,6 +612,53 @@ const hasPolicyLeaseBindingForSession = (state, sessionID) => Object.values(stat
   .some((role) => Object.values(role?.probation?.leases ?? {})
     .some((record) => record?.sessionID === sessionID));
 
+// ── Session policy avoids ─────────────────────────────────────────────────────────────────
+// A provider guard (refusal, content filter, cyber/usage-policy flag, a silent model reroute)
+// is a verdict on ONE conversation. The session that drew it avoids the refusing model -- or,
+// for OpenAI, whose flags are account-level, every OpenAI target -- for POLICY_AVOID_MS, so its
+// re-engage and every later lease land on a model that will answer. It is never a circuit:
+// every other session keeps the target. Whitelisted field by field on reload.
+const POLICY_AVOID_ID = /^[a-z0-9][a-z0-9._:-]{0,180}$/;
+const normalizePolicyAvoids = (value, now = Date.now()) => {
+  const out = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [sessionID, entry] of Object.entries(value)) {
+    if (!validSessionID(sessionID) || !entry || typeof entry !== "object") continue;
+    const until = Number(entry.until);
+    if (!Number.isFinite(until) || until <= now) continue;
+    const ids = (list) => (Array.isArray(list) ? [...new Set(list.filter((id) => typeof id === "string" && POLICY_AVOID_ID.test(id)))].slice(0, 64) : []);
+    const targetIDs = ids(entry.targetIDs), providerIDs = ids(entry.providerIDs);
+    if (!targetIDs.length && !providerIDs.length) continue;
+    out[sessionID] = { targetIDs, providerIDs, until, reason: typeof entry.reason === "string" ? entry.reason.slice(0, 200) : "policy" };
+  }
+  return out;
+};
+
+// scope "provider" avoids every target of the target's provider; "target" only that target.
+const recordPolicyAvoid = (state, sessionID, target, { scope, reason, now = Date.now() }) => {
+  if (!validSessionID(sessionID) || !target?.id) return null;
+  state.policyAvoids ??= {};
+  const prior = state.policyAvoids[sessionID];
+  const current = prior && prior.until > now ? prior : { targetIDs: [], providerIDs: [] };
+  const entry = {
+    targetIDs: scope === "provider" ? current.targetIDs : [...new Set([...current.targetIDs, target.id])],
+    providerIDs: scope === "provider" ? [...new Set([...current.providerIDs, target.providerID])] : current.providerIDs,
+    until: now + POLICY_AVOID_MS,
+    reason: String(reason ?? "policy").slice(0, 200),
+  };
+  state.policyAvoids[sessionID] = entry;
+  return entry;
+};
+
+const policyAvoidTargetIDs = (state, sessionID, targets, now = Date.now()) => {
+  const entry = state.policyAvoids?.[sessionID];
+  if (!entry || !(entry.until > now)) return [];
+  const providers = new Set(entry.providerIDs);
+  return [...new Set([...entry.targetIDs, ...Object.values(targets)
+    .filter((target) => target && providers.has(target.providerID)).map((target) => target.id)])]
+    .filter((id) => POLICY_AVOID_ID.test(id));
+};
+
 const settlementBinding = (state, body, { usage = false } = {}) => {
   const sessionID = validSessionID(body.sessionID) ? body.sessionID : null;
   if (!sessionID) {
@@ -672,6 +726,18 @@ const dropOneShotAssignment = (state, sessionID, leaseID) => {
 };
 
 const sweep = (state, now = Date.now()) => {
+  // Expired policy avoids go first; then the cap drops the soonest-expiring (oldest) ones.
+  if (state.policyAvoids) {
+    for (const [sessionID, entry] of Object.entries(state.policyAvoids)) {
+      if (!(entry?.until > now)) delete state.policyAvoids[sessionID];
+    }
+    const avoidIDs = Object.keys(state.policyAvoids);
+    if (avoidIDs.length > MAX_POLICY_AVOIDS) {
+      avoidIDs.sort((a, b) => state.policyAvoids[a].until - state.policyAvoids[b].until)
+        .slice(0, avoidIDs.length - MAX_POLICY_AVOIDS)
+        .forEach((sessionID) => delete state.policyAvoids[sessionID]);
+    }
+  }
   for (const [sessionID, lease] of Object.entries(state.leases)) {
     if (!lease?.touchedAt || now - lease.touchedAt > LEASE_TTL_MS || !isProfile(lease?.profile) || !ROUTE_TIER_NAMES.includes(lease?.tier)) {
       settlePolicyLease(state, lease, { outcome: "abandoned", source: "expiry", now });
@@ -1070,8 +1136,15 @@ const acquire = async (state, request, {
     request.excludeTargetIDs.some((id) => typeof id !== "string" || !/^[a-z0-9][a-z0-9._:-]{0,180}$/.test(id)))) {
     throw new Error("excludeTargetIDs must be an array of at most 64 target ids");
   }
-  const excludedTargetIDs = hasExcludeTargetIDs ? [...new Set(request.excludeTargetIDs)] : [];
-  const excluded = new Set(excludedTargetIDs);
+  const requestExcludedTargetIDs = hasExcludeTargetIDs ? [...new Set(request.excludeTargetIDs)] : [];
+  // A session a provider guard refused or rerouted avoids that model (or provider) for a while
+  // (see recordPolicyAvoid). Merged into the same upper fence as a caller's exclusions, so the
+  // held, sticky and fresh paths all honour it; relaxed below when it would leave NOTHING to
+  // lease, because trying a model that may refuse beats refusing the turn outright.
+  const policyAvoidIDs = policyAvoidTargetIDs(state, sessionID, allTargets(state))
+    .filter((id) => !requestExcludedTargetIDs.includes(id));
+  let excludedTargetIDs = [...requestExcludedTargetIDs, ...policyAvoidIDs];
+  let excluded = new Set(excludedTargetIDs);
   const api = request.api === "embeddings" ? "embeddings" : null;
   const requestedTargets = targetEligibleIDsFor(profile, tier, allTargets(state))
     .map((targetID) => targetForID(targetID, allTargets(state))).filter(Boolean);
@@ -1403,11 +1476,24 @@ const acquire = async (state, request, {
   }
   // Do not discard a successful staged choice and reselect it under the incumbent's head.
   // Only this selection (and its pressure retry) uses the offered heads; reuse/stickiness do not.
-  const ordinaryChoice = selectedCandidateChoice ?? chooseTarget({
+  let ordinaryChoice = selectedCandidateChoice ?? chooseTarget({
     ...selection,
     active: activeCounts(state, admittedTargets),
     localModels: availableModels,
   });
+  if (!ordinaryChoice?.target && policyAvoidIDs.length) {
+    excludedTargetIDs = requestExcludedTargetIDs;
+    excluded = new Set(excludedTargetIDs);
+    selection.excludedTargetIDs = excludedTargetIDs;
+    ordinaryChoice = chooseTarget({
+      ...selection,
+      active: activeCounts(state, admittedTargets),
+      localModels: availableModels,
+    });
+    if (ordinaryChoice?.decision) {
+      ordinaryChoice.decision.reasons = [...(ordinaryChoice.decision.reasons ?? []), "policy-avoid-relaxed"];
+    }
+  }
   let choice = ordinaryChoice;
   // Context pressure: the host compacts a session once it approaches the
   // current model's usable window (context minus the output reserve, ~60-70%).
@@ -2230,6 +2316,21 @@ const serve = async () => {
           });
           return settleFailure({ ok: true, kind: "payload" });
         }
+        if (kind === "policy") {
+          // A provider GUARD answered for this conversation (lib/routing.js `policy`). No circuit
+          // and no health evidence -- every other session on the target is fine -- but THIS
+          // session avoids what refused it, so the plugin's re-engage and its later leases land on
+          // a model that will answer. OpenAI's flags are account-level, so all of OpenAI; an
+          // Anthropic refusal is per model, so only that target.
+          const scope = target?.providerID === "openai" ? "provider" : "target";
+          const avoid = target ? recordPolicyAvoid(state, body.sessionID, target, { scope, reason: error.message }) : null;
+          logDecision({
+            at: Date.now(), sessionID: body.sessionID, targetID: targetID ?? null,
+            policy: "failure-policy",
+            reasons: ["policy", ...(avoid ? [`avoid-${scope}:${scope === "provider" ? target.providerID : target.id}`] : []), error.message].filter(Boolean),
+          });
+          return settleFailure({ ok: true, kind: "policy", ...(avoid ? { avoidUntil: avoid.until } : {}) });
+        }
         if (kind === "context") {
           // The request did not FIT the target's window. The provider is
           // healthy and answered correctly, so record no circuit and no health
@@ -2402,6 +2503,34 @@ const serve = async () => {
           outageService.worker.requestPoll("openai");
         }
         return settleFailure({ ok: true, kind, ...(circuitUntil ? { circuitUntil } : {}), ...(resetKnown !== null ? { resetKnown } : {}) });
+      }
+      if (request.url === "/served-model") {
+        // The gateway's report of the model the provider SAYS served the request (OpenAI's
+        // `openai-model` header). OpenAI reroutes a flagged account to an older model and says so
+        // only there (Codex reads the same header and warns "this request was routed to ..."). It
+        // settles nothing -- the lease stays held -- it only steers this session off the provider
+        // that downgraded it, from its next lease on. A dated snapshot of the requested model
+        // (requested id + suffix) or the base of a speed alias (base + suffix = requested) is the
+        // same model, not a reroute.
+        const binding = settlementBinding(state, body);
+        const targetID = bindingTargetID(binding, body);
+        const target = targetForID(targetID, allTargets(state));
+        const served = typeof body.servedModelID === "string" && /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,199}$/.test(body.servedModelID)
+          ? body.servedModelID : null;
+        if (!target || !served) return reply(response, 200, { ok: true, rerouted: false });
+        const requested = String(target.modelID).toLowerCase(), actual = served.toLowerCase();
+        const rerouted = actual !== requested && !actual.startsWith(`${requested}-`) && !requested.startsWith(`${actual}-`);
+        if (rerouted) {
+          const avoid = recordPolicyAvoid(state, body.sessionID, target, { scope: "provider", reason: `rerouted ${target.modelID} -> ${served}` });
+          logDecision({
+            at: Date.now(), sessionID: body.sessionID, targetID: target.id,
+            policy: "provider-reroute",
+            reasons: ["policy", `served ${served}`, `requested ${target.modelID}`, `avoid-provider:${target.providerID}`],
+          });
+          writeState(state);
+          return reply(response, 200, { ok: true, rerouted: true, avoidUntil: avoid.until });
+        }
+        return reply(response, 200, { ok: true, rerouted: false });
       }
       if (request.url === "/complete") {
         const binding = settlementBinding(state, body);
