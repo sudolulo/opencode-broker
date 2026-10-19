@@ -95,7 +95,7 @@ test("attested proxy scope409 re-leases a temporary target without settling exte
   const calls = [];
   let forwards = 0;
   const handler = createGatewayHandler({
-    config: { tier: "worker", profile: "auto", providers: { openai: { baseUrl: "http://upstream.example/v1" } } },
+    config: { tier: "worker", profile: "auto", providers: { openai: { baseUrl: "http://upstream.example/v1", responsesApi: true } } },
     gatewayKey: "frontdoor", health: { key, gatewayCredential: "private-health" }, now: () => 100,
     brokerRequest: async (path, body) => {
       calls.push({ path, body });
@@ -115,12 +115,12 @@ test("attested proxy scope409 re-leases a temporary target without settling exte
       }
       const context = options.headers["x-fleet-health-context"];
       const request = JSON.parse(Buffer.from(context, "base64url").toString("utf8"));
-      const signed = protocol.signResponse([1, request[1], request[4], request[5], request[8], `ci_${Buffer.alloc(32, 2).toString("base64url")}`, "proxy/chat", "https://upstream.example", "oauth", "chat", "codex", "upstream-response", null, sha256(context)]);
-      return { ok: true, status: 200, headers: new Headers({ "content-type": "application/json", "x-fleet-health-attestation": signed.attestation, "x-fleet-health-attestation-signature": signed.attestationSignature }), text: async () => JSON.stringify({ choices: [{ message: { content: "replacement" }, finish_reason: "stop" }] }) };
+      const signed = protocol.signResponse([1, request[1], request[4], request[5], request[8], `ci_${Buffer.alloc(32, 2).toString("base64url")}`, "proxy/responses", "https://upstream.example", "oauth", "responses", "codex", "upstream-response", null, sha256(context)]);
+      return { ok: true, status: 200, headers: new Headers({ "content-type": "application/json", "x-fleet-health-attestation": signed.attestation, "x-fleet-health-attestation-signature": signed.attestationSignature }), text: async () => JSON.stringify({ id: "r", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "replacement" }] }] }) };
     },
   });
   await withServer(handler, async (base) => {
-    const response = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: { Authorization: "Bearer frontdoor", "content-type": "application/json", "x-opencode-session-id": "session", "x-opencode-lease-id": "external-lease" }, body: JSON.stringify({ model: "real", messages: [] }) });
+    const response = await fetch(`${base}/v1/responses`, { method: "POST", headers: { Authorization: "Bearer frontdoor", "content-type": "application/json", "x-opencode-session-id": "session", "x-opencode-lease-id": "external-lease" }, body: JSON.stringify({ model: "real", input: "ping" }) });
     assert.equal(response.status, 200);
   });
   const replacement = calls.find((call) => call.path === "/lease");

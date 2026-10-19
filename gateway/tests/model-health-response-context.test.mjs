@@ -142,7 +142,7 @@ test('gateway captures invalid initial health headers before streaming body muta
   const key = Buffer.alloc(32, 3), protocol = createHealthProtocol({ key });
   const calls = [], sequence = [];
   const handler = createGatewayHandler({
-    config: { tier: 'worker', profile: 'auto', providers: { openai: { baseUrl: 'https://upstream.example/v1' } } },
+    config: { tier: 'worker', profile: 'auto', providers: { openai: { baseUrl: 'https://upstream.example/v1', responsesApi: true } } },
     gatewayKey: 'frontdoor', health: { key, gatewayCredential: 'private-health' }, now: () => 100,
     brokerRequest: async (path, body) => {
       calls.push({ path, body });
@@ -154,26 +154,52 @@ test('gateway captures invalid initial health headers before streaming body muta
     fetchImpl: async (_url, options) => {
       const context = options.headers['x-fleet-health-context'];
       const request = JSON.parse(Buffer.from(context, 'base64url').toString('utf8'));
-      const signed = protocol.signResponse([1, request[1], request[4], request[5], request[8], null, 'llm-auth-proxy/openai', 'https://chatgpt.com', 'chatgpt-oauth', 'chat', 'codex', 'upstream-response', 200, sha256(context)]);
+      const signed = protocol.signResponse([1, request[1], request[4], request[5], request[8], null, 'llm-auth-proxy/openai', 'https://chatgpt.com', 'chatgpt-oauth', 'responses', 'codex', 'upstream-response', 200, sha256(context)]);
       const values = new Headers({ 'content-type': 'text/event-stream', 'x-fleet-health-attestation': 'invalid', 'x-fleet-health-attestation-signature': 'invalid', 'x-fleet-health-private': 'hidden' });
       const headers = { get(name) { sequence.push(`header:${name}`); return values.get(name); } };
       return { ok: true, status: 200, headers, body: { async *[Symbol.asyncIterator]() {
         sequence.push('body-read');
         values.set('x-fleet-health-attestation', signed.attestation);
         values.set('x-fleet-health-attestation-signature', signed.attestationSignature);
-        yield Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+        yield Buffer.from('event: response.completed\ndata: {"type":"response.completed","response":{"id":"r","object":"response","status":"completed","output":[]}}\n\n');
       } } };
     },
   });
   await withServer(handler, async (base) => {
-    const response = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { Authorization: 'Bearer frontdoor', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'm', messages: [], stream: true }) });
+    const response = await fetch(`${base}/v1/responses`, { method: 'POST', headers: { Authorization: 'Bearer frontdoor', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'm', input: 'ping', stream: true }) });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('x-fleet-health-private'), null);
-    assert.match(await response.text(), /ok/);
+    assert.match(await response.text(), /response.completed/);
   });
   assert.deepEqual(sequence.slice(0, 3), ['header:x-fleet-health-attestation', 'header:x-fleet-health-attestation-signature', 'header:content-type']);
   assert.ok(sequence.indexOf('body-read') > 2, 'health headers are captured before the upstream body is read');
   assert.equal(calls.filter((call) => call.path === '/model-health/outcome').length, 0);
+});
+
+test('gateway sends no health context on chat completions, where the proxy cannot attest it, and the request still runs', async () => {
+  const calls = [], forwarded = [];
+  const handler = createGatewayHandler({
+    config: { tier: 'worker', profile: 'auto', providers: { anthropic: { baseUrl: 'https://upstream.example/anthropic/v1' } } },
+    gatewayKey: 'frontdoor', health: { key: Buffer.alloc(32, 3), gatewayCredential: 'private-health' }, now: () => 100,
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === '/lease') return { leaseID: 'lease', expectedCredentialInstance: null, target: { model: { providerID: 'anthropic', id: 'claude-opus-5-5' } } };
+      return { ok: true };
+    },
+    fetchImpl: async (url, options) => {
+      forwarded.push({ url: String(url), headers: Object.keys(options.headers) });
+      return new Response(JSON.stringify({ id: 'c', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { Authorization: 'Bearer frontdoor', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'smart', messages: [{ role: 'user', content: 'hi' }] }) });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /OK/);
+  });
+  assert.equal(forwarded.length, 1);
+  assert.match(forwarded[0].url, /chat\/completions$/);
+  assert.equal(forwarded[0].headers.some((name) => name.toLowerCase().startsWith('x-fleet-health-')), false, 'no private health header on chat');
+  assert.equal(calls.some(({ path }) => path === '/model-health/begin'), false);
 });
 
 test('gateway reports the original authenticated Responses attestation after its streaming body mutates headers', async () => {

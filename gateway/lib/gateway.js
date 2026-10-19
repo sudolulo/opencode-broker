@@ -1970,7 +1970,15 @@ export const createGatewayHandler = ({
         }
         const outboundBody = JSON.stringify(forwardBody);
         const purpose = probeAssignment?.purpose === "outage-health" ? "outage-health" : "real";
-        if (healthReporter) {
+        // ☠️ HEALTH CONTEXT ONLY WHERE THE PROXY CAN ATTEST IT. llm-auth-proxy verifies a private
+        // health context only on Claude Code Messages and Codex Responses (the outage design's
+        // product paths); on any other route it answers 403 "invalid health context" before the
+        // request runs. Signing a chat-completions request therefore turned every ordinary Claude
+        // chat request through this gateway into a 403 (the smart lane's 502s from 2026-10-16).
+        // Off those paths no context is sent: an ordinary primary request runs exactly as it did
+        // before health existed, and one that REQUIRES verified health (a reserve lease or an
+        // outage probe) still fails below rather than going out unverified.
+        if (healthReporter && (api === MESSAGES || api === RESPONSES)) {
           try {
             healthAttempt = await healthReporter.begin({
               leased,
