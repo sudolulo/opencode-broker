@@ -115,13 +115,44 @@ test('a lapsed grant restores the head to ordinary selection and drops the reser
 });
 
 test('an enabled policy without grants selects exactly as the disabled policy does', () => {
+  // A head fenced by its OWN circuit is the one deliberate difference (circuit stand-ins, below);
+  // a circuit on a non-head target keeps the equivalence.
   for (const tier of ['smart', 'build', 'worker', 'deep']) {
-    for (const scenario of [{}, { circuits: { 'claude-opus-5-5': { until: ACTIVE + 1 } } }, { contextTokens: 1_000_000 }, { cursors: { 'auto:build:cloud': 1 } }]) {
+    for (const scenario of [{}, { circuits: { 'gpt-terra': { until: ACTIVE + 1 } } }, { contextTokens: 1_000_000 }, { cursors: { 'auto:build:cloud': 1 } }]) {
       const enabled = chooseTarget({ ...base, ...scenario, tier, outages: emptyOutages() });
       const disabled = chooseTarget({ ...base, ...scenario, tier, outagePolicy: { enabled: false }, outages: null, canonicalHeads: null });
       assert.deepEqual(enabled, disabled, `${tier} ${JSON.stringify(scenario)}`);
     }
   }
+});
+
+test('a head fenced by its own circuit is stood in for by its reserves before any fallback rung', () => {
+  const fenced = { 'claude-opus-5-5': { until: ACTIVE + 1 } };
+  // Disabled, the smart lane loses its only primary and drops to the fallback rung.
+  const disabled = chooseTarget({ ...base, circuits: fenced, tier: 'smart', outagePolicy: { enabled: false }, outages: null, canonicalHeads: null });
+  assert.equal(disabled.decision.policy, 'strict-fallback');
+  // Active, with no grant at all, the newest reserve stands in -- no grant rides on the decision.
+  const enabled = chooseTarget({ ...base, circuits: fenced, tier: 'smart', outages: emptyOutages() });
+  assert.equal(enabled.target.id, 'claude-opus-5');
+  assert.equal(enabled.decision.policy, 'circuit-reserve');
+  assert.deepEqual(enabled.decision.reasons, ['circuit-reserve-for-claude-opus-5-5', 'reserve-rank-1']);
+  assert.equal('grant' in enabled.decision, false);
+  // Its own circuit open too: the next reserve in configured order, still before the rung.
+  const deeper = chooseTarget({ ...base, tier: 'smart', outages: emptyOutages(),
+    circuits: { ...fenced, 'claude-opus-5': { until: ACTIVE + 1 } } });
+  assert.equal(deeper.target.id, 'claude-opus-4-8');
+  assert.deepEqual(deeper.decision.reasons, ['circuit-reserve-for-claude-opus-5-5', 'reserve-rank-2']);
+  // The circuit closes: the head is back and the stand-in leaves the lane.
+  const recovered = chooseTarget({ ...base, tier: 'smart', outages: emptyOutages(), circuits: fenced, now: ACTIVE + 2 });
+  assert.equal(recovered.target.id, 'claude-opus-5-5');
+  // A provider-wide circuit is not a single-model failure: no anthropic stand-in.
+  const providerDown = chooseTarget({ ...base, tier: 'smart', outages: emptyOutages(),
+    circuits: { ...fenced, 'provider:anthropic': { until: ACTIVE + 1 } } });
+  assert.notEqual(providerDown?.target?.providerID, 'anthropic');
+  // Observe mode never routes a stand-in.
+  const observed = chooseTarget({ ...base, circuits: fenced, tier: 'smart', outages: emptyOutages(),
+    outagePolicy: { ...base.outagePolicy, mode: 'observe' } });
+  assert.equal(observed.decision.policy, 'strict-fallback');
 });
 
 test('an enabled chooseTarget without canonical heads fails explicitly instead of unrouting the managed lanes', () => {

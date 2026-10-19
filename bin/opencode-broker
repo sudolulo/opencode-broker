@@ -68,6 +68,7 @@ import {
   policyReserveIDs,
   snapshotOutageContext,
   stagedCandidateHeads,
+  circuitStandIns,
 } from "../lib/outage-policy.js";
 import { decodeOutages } from "../lib/model-outage-state.js";
 import { emptyOutages, reduceOutages } from "../lib/model-outages.js";
@@ -1248,6 +1249,7 @@ const acquire = async (state, request, {
     outages: state.outages ?? null,
     primaryIDs: targetIDsFor(profile, tier, completeAdmittedTargets),
     now: Date.now(),
+    circuits: state.circuits,
   }) : null;
   const droppedResolvableLaneModelIDs = resolvableModels
     ? targetEligibleIDsFor(profile, tier, admittedBeforeResolvableModels)
@@ -1600,6 +1602,30 @@ const acquire = async (state, request, {
         },
       },
     };
+  } else if (preferredTarget && !preferredOutgrown && outageContext && Object.hasOwn(CONFIG.modelOutages.mappings ?? {}, preferredTarget.id)) {
+    // A session pinned to a head that is down by its OWN circuit stays in the family: the head's
+    // newest eligible stand-in (claude-opus-5-5 -> claude-opus-5 -> claude-opus-4-8), not whichever
+    // head the pool balances to, because a provider switch hands the history to a different model
+    // that re-reads all of it. The newer-sibling rule above brings it home when the circuit closes.
+    const standIn = circuitStandIns(snapshotOutageContext({ ...outageContext, primaryIDs: [preferredTarget.id], now: Date.now(), circuits: state.circuits }))
+      .map((entry) => admittedTargets[entry.targetID])
+      .find((target) => target && !excluded.has(target.id) &&
+        targetEligibleFor(target, request, state, availableModels, admittedTargets, sessionID, outageContext));
+    if (standIn && choice?.target?.id !== standIn.id) {
+      choice = {
+        target: standIn,
+        cursorKey: null,
+        nextCursor: null,
+        decision: {
+          policy: "circuit-reserve",
+          reasons: [`circuit-reserve-for-${preferredTarget.id}`, "pinned-session-stays-in-family"],
+          eligibleTargetIDs: [standIn.id],
+          balancedTargetIDs: [standIn.id],
+          providerUtilization: { [standIn.providerID]: effectiveUtilization(state.budgets, standIn.providerID) },
+          source: "circuit-reserve",
+        },
+      };
+    }
   }
   const fallbackTarget = fallbackTargetID && !excluded.has(fallbackTargetID) && ordinaryChoice?.decision?.policy === "strict-fallback" &&
     ordinaryChoice.decision.eligibleTargetIDs?.includes(fallbackTargetID)
@@ -1752,7 +1778,13 @@ const acquire = async (state, request, {
   // grant (the grant lapsed between snapshot and choice) is refused rather than leased unbound.
   let outageGrant = null;
   let leasedAt = null;
-  if (outageEnabled && policyReserveIDs(CONFIG.modelOutages).has(choice.target.id)) {
+  // A circuit stand-in (a reserve covering a head fenced by its own circuit) is an ORDINARY lease:
+  // no grant, no outage assertion. It must still be a current stand-in at lease time.
+  const standInLease = outageEnabled && policyReserveIDs(CONFIG.modelOutages).has(choice.target.id) && outageContext
+    && circuitStandIns(snapshotOutageContext({ ...outageContext, now: Date.now(), circuits: state.circuits }))
+      .some((standIn) => standIn.targetID === choice.target.id)
+    && !(outageContext ? authorizedReserveIDs(outageContext) : []).some((grant) => grant.targetID === choice.target.id);
+  if (outageEnabled && !standInLease && policyReserveIDs(CONFIG.modelOutages).has(choice.target.id)) {
     const selectedGrant = (outageContext ? authorizedReserveIDs(outageContext) : [])
       .find((grant) => grant.targetID === choice.target.id) ?? null;
     leasedAt = Date.now();
