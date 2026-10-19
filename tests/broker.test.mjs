@@ -4934,3 +4934,23 @@ test("an avoid that would leave nothing to lease is relaxed rather than refusing
   const again = await leaseFastBuild(socketPath, "ses-guard-only-openai", only);
   assert.equal(again.target.id, "gpt-terra", "the only target is still leased");
 }));
+
+test("an Anthropic server-side fallback steers the session off that model only", async () => withBroker(async ({ socketPath }) => {
+  await guardFixture(socketPath);
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-guard-anthropic", profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "anthropic", id: "claude-opus-5-fast" }, resolvableModels: GUARD_RESOLVABLE,
+  });
+  assert.equal(lease.target.model.providerID, "anthropic");
+  const same = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-anthropic", leaseID: lease.leaseID, servedModelID: "claude-opus-5",
+  } });
+  assert.equal(same.body.rerouted, false, "the speed alias's base model is the same model");
+  const report = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-anthropic", leaseID: lease.leaseID, servedModelID: "claude-opus-4-8",
+  } });
+  assert.equal(report.body.rerouted, true);
+  const status = await request(socketPath, "/status");
+  assert.deepEqual(status.policyAvoids["ses-guard-anthropic"].targetIDs, [lease.target.id]);
+  assert.deepEqual(status.policyAvoids["ses-guard-anthropic"].providerIDs, [], "Anthropic is per model, not account-wide");
+}));

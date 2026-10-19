@@ -2648,6 +2648,55 @@ test("an OpenAI response names the model that served it, and the gateway tells t
   assert.equal(report.body.targetID, "gpt-terra");
 });
 
+test("with no openai-model header the served model is read from the response body, streamed or not", async () => {
+  const run = async ({ providerID, path, upstream, request }) => {
+    const brokerCalls = [];
+    const handler = createGatewayHandler({
+      config: { tier: "worker", profile: "auto", providers: {
+        [providerID]: { baseUrl: `http://${providerID}.example/v1`, chatApi: false, responsesApi: true, messagesApi: true },
+      } },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (route, body) => {
+        brokerCalls.push({ route, body });
+        return route === "/lease"
+          ? { leaseID: "lease-body", target: { id: "t", model: { providerID, id: providerID === "openai" ? "gpt-5.6-terra" : "claude-opus-5-5" } } }
+          : { ok: true };
+      },
+      fetchImpl: async () => upstream(),
+    });
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify(request),
+      });
+      assert.equal(response.status, 200);
+      await response.text();
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    return brokerCalls.filter((call) => call.route === "/served-model").map((call) => call.body.servedModelID);
+  };
+  const sse = (events) => () => new Response(events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
+    status: 200, headers: { "content-type": "text/event-stream" },
+  });
+  // The ChatGPT backend's stream: the reroute is named only on response.created.
+  assert.deepEqual(await run({ providerID: "openai", path: "/v1/responses", request: { model: "reasoning", input: "hi", stream: true },
+    upstream: sse([
+      { type: "response.created", response: { id: "r", model: "gpt-5.2" } },
+      { type: "response.completed", response: { id: "r", model: "gpt-5.2", output: [], usage: { input_tokens: 1, output_tokens: 1 } } },
+    ]) }), ["gpt-5.2"]);
+  // Anthropic non-streamed Messages names its model at the top level.
+  assert.deepEqual(await run({ providerID: "anthropic", path: "/v1/messages", request: { model: "reasoning", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+    upstream: () => new Response(JSON.stringify({ type: "message", model: "claude-opus-4-8", content: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }) }), ["claude-opus-4-8"]);
+  // Another lane's naming is never read as a reroute.
+  assert.deepEqual(await run({ providerID: "alibaba-token-plan", path: "/v1/messages", request: { model: "reasoning", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+    upstream: () => new Response(JSON.stringify({ type: "message", model: "qwen3-max-2026-01-23", content: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }) }), []);
+});
+
 test("Anthropic Messages fast-mode-credits does not relay a session-bound /failure", async () => {
   // External leases are the opencode plugin's to settle: a double-report would
   // double-count usage and could drop a lease the session still holds. The

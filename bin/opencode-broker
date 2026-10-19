@@ -2521,11 +2521,14 @@ const serve = async () => {
         const requested = String(target.modelID).toLowerCase(), actual = served.toLowerCase();
         const rerouted = actual !== requested && !actual.startsWith(`${requested}-`) && !requested.startsWith(`${actual}-`);
         if (rerouted) {
-          const avoid = recordPolicyAvoid(state, body.sessionID, target, { scope: "provider", reason: `rerouted ${target.modelID} -> ${served}` });
+          // OpenAI reroutes a flagged ACCOUNT, so all of OpenAI; Anthropic's server-side fallback is
+          // per model, so only that target (the same scopes as the `policy` failure kind).
+          const scope = target.providerID === "openai" ? "provider" : "target";
+          const avoid = recordPolicyAvoid(state, body.sessionID, target, { scope, reason: `rerouted ${target.modelID} -> ${served}` });
           logDecision({
             at: Date.now(), sessionID: body.sessionID, targetID: target.id,
             policy: "provider-reroute",
-            reasons: ["policy", `served ${served}`, `requested ${target.modelID}`, `avoid-provider:${target.providerID}`],
+            reasons: ["policy", `served ${served}`, `requested ${target.modelID}`, `avoid-${scope}:${scope === "provider" ? target.providerID : target.id}`],
           });
           writeState(state);
           return reply(response, 200, { ok: true, rerouted: true, avoidUntil: avoid.until });

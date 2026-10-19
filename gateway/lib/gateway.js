@@ -791,7 +791,7 @@ const validEmbeddingInput = (input) => typeof input === "string" || (Array.isArr
 // for: the usage tail we asked for ourselves, and error frames.
 //
 // `relayed` is the whole ballgame -- see THE FAILOVER BOUNDARY below.
-const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, observe = null }) => {
+const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, observe = null, onModel = null }) => {
   const decoder = new TextDecoder();
   let buffer = "";
   let relayed = false;
@@ -846,6 +846,13 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, o
       // learns this attempt happened.
       if (relayed && api !== MESSAGES) await emit(raw);
       return false;
+    }
+    // The model the provider says is answering: Anthropic names it on `message_start`, OpenAI on
+    // `response.created`. Reported once, never relayed differently (see reportServedModel).
+    if (onModel) {
+      const named = api === MESSAGES && event?.type === "message_start" ? event?.message?.model
+        : api === RESPONSES && event?.type === "response.created" ? event?.response?.model : null;
+      if (typeof named === "string" && named) { onModel(named); onModel = null; }
     }
     // Chat puts usage on the tail chunk; responses on the response that
     // `response.completed` carries (earlier events carry `usage: null`).
@@ -1536,12 +1543,17 @@ export const createGatewayHandler = ({
     } catch { /* broker hiccup must not fail the request */ }
   };
 
-  // OpenAI says which model ACTUALLY served a request only in the `openai-model` response header
-  // (Codex reads the same header to warn "this request was routed to ..."): a flagged account is
-  // silently rerouted to an older model. Not a settlement, so it goes straight to the broker even
-  // for a session-bound (external) lease, and never blocks or fails the request.
-  const reportServedModel = (leased, headers) => {
-    const served = headers?.get?.("openai-model") ?? headers?.get?.("x-openai-model");
+  // Which model ACTUALLY served a request: OpenAI's `openai-model` header (Codex reads it to warn
+  // "this request was routed to ..."; a flagged account is silently rerouted to an older model),
+  // else the model the response itself names (the ChatGPT backend sends no such header; an
+  // Anthropic server-side fallback names its model on `message_start`). Not a settlement, so it
+  // goes straight to the broker even for a session-bound (external) lease, and never blocks or
+  // fails the request.
+  const servedModelHeader = (headers) => headers?.get?.("openai-model") ?? headers?.get?.("x-openai-model") ?? null;
+  const reportServedModel = (leased, headers, bodyModel = null) => {
+    // Only the providers whose reroutes are documented; another lane's alias naming is not one.
+    if (leased?.providerID !== "openai" && leased?.providerID !== "anthropic") return;
+    const served = servedModelHeader(headers) ?? bodyModel;
     if (typeof served !== "string" || !served || !leased?.sessionID || !leased.leaseID) return;
     Promise.resolve().then(() => brokerRequest("/served-model", {
       sessionID: leased.sessionID,
@@ -2150,7 +2162,10 @@ export const createGatewayHandler = ({
         // line earlier (see the sink in handle()).
         const contentType = String(response.headers?.get?.("content-type") ?? "");
         // After the health capture's own header reads (attestation, then content-type), never before.
-        if (api === RESPONSES) reportServedModel(leased, response.headers);
+        const headerModel = api === RESPONSES ? servedModelHeader(response.headers) : null;
+        if (headerModel) reportServedModel(leased, response.headers);
+        const onModel = (api === RESPONSES || api === MESSAGES) && !headerModel
+          ? (model) => reportServedModel(leased, null, model) : null;
         let outcome;
         try {
           // ☆ Dressing a buffered body as a stream is a chat-only courtesy: a
@@ -2167,7 +2182,7 @@ export const createGatewayHandler = ({
               : { relayed: false, usage: null, outputChars: 0, sawDone: false,
                 error: new Error(`upstream ${leased.providerID} answered a streamed ${api.path} request with one JSON body`) })
             : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api,
-              observe: (chunk) => response.healthParser?.push(chunk) });
+              observe: (chunk) => response.healthParser?.push(chunk), onModel });
         } finally {
           clearTimeout(stallTimer);
         }
@@ -2257,6 +2272,7 @@ export const createGatewayHandler = ({
           parser.push(rawBody);
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
+        if (typeof payload?.model === "string" && payload.model) reportServedModel(leased, null, payload.model);
         if (payload?.usage) await reportUsage(leased, readMessagesUsage(payload.usage));
         await settle(leased, "/complete");
         return {
@@ -2334,7 +2350,7 @@ export const createGatewayHandler = ({
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
       }
-      if (api === RESPONSES) reportServedModel(leased, response.headers);
+      if (api === RESPONSES) reportServedModel(leased, response.headers, typeof payload?.model === "string" ? payload.model : null);
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
       // schema in some builds; instruct-mode models fence despite orders).
       // The client asked for machine-readable output: unwrap deterministically.
