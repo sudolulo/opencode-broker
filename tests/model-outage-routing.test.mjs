@@ -227,7 +227,8 @@ test('disabled outage policy is exactly equivalent for representative primary, f
     { ...common, contextTokens: 1_000_000 },
   ];
   for (const scenario of scenarios) {
-    const baseline = chooseTarget(scenario);
+    // Explicitly no policy: chooseTarget's default is the host's own config, which may enable one.
+    const baseline = chooseTarget({ ...scenario, outagePolicy: null });
     const disabled = chooseTarget({ ...scenario, outagePolicy: { enabled: false }, outages: emptyOutages(), canonicalHeads: {} });
     assert.deepEqual(disabled, baseline);
   }
@@ -240,7 +241,7 @@ test('observe policy is routing-equivalent to disabled even with an active histo
   const observe = { ...active, mode: 'observe' };
   const outages = activeOutage(active);
   const common = { profile: 'auto', tier: 'build', targets, cursors: {}, health: {}, localModels: new Set(), now: 20_000 };
-  const disabled = chooseTarget(common);
+  const disabled = chooseTarget({ ...common, outagePolicy: null });
   const observing = chooseTarget({ ...common, outagePolicy: observe, outages, canonicalHeads: {} });
   assert.deepEqual(observing, disabled);
 });
