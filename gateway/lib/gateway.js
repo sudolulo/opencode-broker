@@ -1218,6 +1218,20 @@ const assembleResponse = async (stream) => {
   return { payload: { ...(created ?? {}), object: "response", output: [...output.values()] } };
 };
 
+/** Broker tiers a rig session may ask for; anything else is ignored (the name's own tier applies). */
+const RIG_TIERS = new Set(["worker", "review", "build", "smart", "deep"]);
+/**
+ * The opt-in rig hints: a stable session id (`x-rig-session`, 8-96 of [A-Za-z0-9_-]) and an optional
+ * tier (`x-rig-tier`). Malformed values are dropped, never guessed at.
+ */
+export const rigSessionHints = (headers = {}) => {
+  const session = typeof headers.rigSession === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(headers.rigSession)
+    ? headers.rigSession : null;
+  if (!session) return null;
+  const tier = typeof headers.rigTier === "string" && RIG_TIERS.has(headers.rigTier) ? headers.rigTier : null;
+  return { session, tier };
+};
+
 export const createGatewayHandler = ({
   config,
   brokerRequest,
@@ -1328,7 +1342,8 @@ export const createGatewayHandler = ({
       // assignment it leaves behind is unreadable the moment the request settles. Saying so
       // lets the broker's assignment cap spend these before any real session's sticky pin;
       // without it, gateway traffic evicted live sessions' models purely by being newer.
-      oneShot: true,
+      // ...except a rig session, which is long-lived by design and must keep its pin.
+      ...(sessionID.startsWith("rig-") ? {} : { oneShot: true }),
       ...(api === EMBEDDINGS ? { api: "embeddings" } : {}),
       contextTokens,
       // How long THIS caller has already queued for a slot on this lane. The broker holds a
@@ -1536,7 +1551,15 @@ export const createGatewayHandler = ({
     const keepUsageFrames = requestBody?.stream_options?.include_usage === true;
     // The client's `model` is a routing request. Unmapped -> null -> every lease
     // below is byte-identical to a gateway with no modelProfiles at all.
-    const route = modelRoute(config, requestBody?.model);
+    const namedRoute = modelRoute(config, requestBody?.model);
+    // rig sessions (Pi behind the trusted frontend) name a STABLE session and a tier. The broker
+    // then pins that session to its model exactly as it pins an opencode session, so a
+    // conversation keeps its prompt cache instead of being re-rolled on every request as a
+    // one-shot gw- session is. Opt-in and additive: without both headers nothing below changes.
+    // Only a name whose route already carries a tier (the cloud-tier names `smart`/`auto`) may
+    // take another tier, so a private or local name can never be escalated to the cloud.
+    const rig = !probeAssignment && !boundLease ? rigSessionHints(requestHeaders) : null;
+    const route = rig?.tier && namedRoute?.tier ? { ...namedRoute, tier: rig.tier } : namedRoute;
     // ☠️ ONE BROKER SESSION PER CLIENT REQUEST, NOT PER ATTEMPT. A one-shot id
     // per attempt makes the retry compete with the attempt it is retrying: on a
     // capacity-1 target the gateway's own outstanding lease is the thing
@@ -1548,7 +1571,7 @@ export const createGatewayHandler = ({
     // deletes the held lease before selecting. ☆ It also collapses the
     // decisions.jsonl trail for one curl from 19 unrelated ids down to one.
     const sessionID = probeAssignment?.sessionID
-      ?? `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      ?? (rig ? `rig-${rig.session}` : `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
     if (caller) callers.set(sessionID, caller);
     try {
       return await completionsFor(
@@ -2754,6 +2777,10 @@ export const createGatewayHandler = ({
           ? request.headers["x-opencode-session-id"][0] : request.headers["x-opencode-session-id"],
         sessionKind: Array.isArray(request.headers["x-opencode-session-kind"])
           ? request.headers["x-opencode-session-kind"][0] : request.headers["x-opencode-session-kind"],
+        rigSession: Array.isArray(request.headers["x-rig-session"])
+          ? request.headers["x-rig-session"][0] : request.headers["x-rig-session"],
+        rigTier: Array.isArray(request.headers["x-rig-tier"])
+          ? request.headers["x-rig-tier"][0] : request.headers["x-rig-tier"],
       }, probeAssignment, boundLease, trace);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
