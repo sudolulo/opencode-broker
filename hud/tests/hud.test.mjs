@@ -402,11 +402,12 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
     state: {
       path: { directory: "/tmp/hud-test" },
       session: {
-        question: () => {
+        // Either state may be a per-session function, for rosters where only one child is blocked.
+        question: (id) => {
           if (questionError) throw questionError;
-          return questionState ?? [];
+          return (typeof questionState === "function" ? questionState(id) : questionState) ?? [];
         },
-        permission: () => permissionState ?? [],
+        permission: (id) => (typeof permissionState === "function" ? permissionState(id) : permissionState) ?? [],
         status: (id) => ({ type: sessionStatuses?.[id] ?? "idle" }),
         messages: () => [{ role: "user", agent: "standard" }],
         get: () => (sessionModel ? { model: sessionModel } : undefined),
@@ -1130,6 +1131,30 @@ test("narrow roster retains agent status and provider/model suffix before task m
     assert.match(row, /ver[^/]*\//);
     assert.match(row, /suffix/);
     assert.doesNotMatch(row, /\d+[sm]\s+·|tok/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a child blocked on a permission or question prompt says so instead of plain busy", async () => {
+  requireJsxRuntime();
+  const pending = { "child-perm": "permission", "child-ask": "question" };
+  const h = await withTuiHarness({ rendererWidth: 120,
+    sessionStatuses: { "child-perm": "busy", "child-ask": "busy", "child-run": "busy" },
+    permissionState: (id) => (pending[id] === "permission" ? [{ id: "per-1", sessionID: id }] : []),
+    questionState: (id) => (pending[id] === "question" ? [{ id: "que-1", sessionID: id }] : []),
+    sessionRows: ["child-perm", "child-ask", "child-run"].map((id, i) => ({
+      id, parentID: "ses-1", agent: id.slice(6), title: `task ${id}`, time: { created: i },
+    })) });
+  try {
+    await h.runAgentPoll();
+    await flushReal();
+    const rows = contentOf(h.strip()).split("\n");
+    assert.match(rows.find((r) => /child-perm/.test(r)), /needs permission/);
+    assert.match(rows.find((r) => /child-ask/.test(r)), /needs answer/);
+    const running = rows.find((r) => /child-run/.test(r));
+    assert.match(running, /busy/);
+    assert.doesNotMatch(running, /needs/);
   } finally {
     await h.cleanup();
   }
@@ -2240,6 +2265,38 @@ test("repeated F10 with ignored aborts bounds requests and recovers after they s
     assert.deepEqual(rejections.seen, []);
   } finally {
     rejections.stop();
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a shell a subagent started shows under its parent, marked as the subagent's, in the panel and F10", async () => {
+  requireJsxRuntime();
+  scriptBroker();
+  fakeBgStorePath = FAKE_BG_STORE;
+  const kidJob = { ...SHELL_JOB, id: "job-kid", sessionID: "ses-kid", description: "child build" };
+  fakeBgStore.setJobs({
+    "ses-kid": [kidJob],
+    "ses-stranger": [{ ...SHELL_JOB, id: "job-stranger", sessionID: "ses-stranger", description: "stranger build" }],
+  });
+  const h = await withTuiHarness({ rendererWidth: 120, sessionStatuses: { "ses-kid": "busy" }, sessionRows: [
+    { id: "ses-kid", parentID: "ses-a", agent: "tester", title: "run the suite", time: { created: 0 } },
+    { id: "ses-stranger", parentID: "ses-elsewhere", agent: "tester", title: "not ours", time: { created: 0 } },
+  ] });
+  try {
+    h.navigate("ses-a");
+    const strip = h.strip();
+    await h.runAgentPoll();
+    await h.clock.advance(2_000);
+    const text = contentOf(strip);
+    assert.match(text, /subagent shell\s+child build/, text);
+    assert.doesNotMatch(text, /stranger build/, "another tree's shells stay out");
+    runF10(h);
+    await flushReal();
+    assert.deepEqual(h.dialog.options.map((option) => option.value), ["ses-kid", "job-kid"]);
+  } finally {
+    fakeBgStorePath = null;
+    fakeBgStore.setJobs({});
     resetRouterHooks();
     await h.cleanup();
   }

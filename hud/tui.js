@@ -749,7 +749,12 @@ export default {
 
     // Jobs are folded into the SAME list as subagents so one panel, one cursor and
     // one Enter key cover both -- which is how Claude shows agents and shells.
-    const loadJobs = (sid, { includeFinished = false } = {}) => {
+    // `owners` is the session on screen, then its subagents: a shell a subagent started
+    // is shown here too. The root relays "the job is running" from its child, and that
+    // job's record names the CHILD, so filtering on the root alone hid it (2026-10-20,
+    // depot: bg033 started by the tester, invisible in the root's panel).
+    const loadJobs = (owners, { includeFinished = false } = {}) => {
+      const sid = owners[0];
       const result = { rows: [], warning: sid ? bgLoadWarning : null };
       if (!bg || !sid) return result;
       const storeWarning = readStore(bgDir, "shells", (job) => {
@@ -758,8 +763,11 @@ export default {
       });
       result.warning = [bgLoadWarning, storeWarning].filter(Boolean).join("; ") || null;
       try {
-        const jobs = bg.listJobs(sid);
-        if (!Array.isArray(jobs)) throw new Error("invalid job list");
+        const jobs = [...new Set(owners.filter(Boolean))].flatMap((owner) => {
+          const list = bg.listJobs(owner);
+          if (!Array.isArray(list)) throw new Error("invalid job list");
+          return list;
+        });
         for (const j of jobs) {
           if (!j || typeof j.id !== "string" || !j.id || typeof j.state !== "string" || !j.state) {
             result.warning = [bgLoadWarning, storeWarning, "shells: partial read (invalid job records)"].filter(Boolean).join("; ");
@@ -772,7 +780,8 @@ export default {
             kind: "shell",
             id: j.id,
             title: String(j.description || j.command || j.id),
-            agent: "shell",
+            // NAME is 14 columns: "subagent shell" fits it exactly.
+            agent: j.sessionID && j.sessionID !== sid ? "subagent shell" : "shell",
             status: j.state,
             code: j.code,
             session: j.session || null,
@@ -944,7 +953,7 @@ export default {
     // postpone their reads (or keep showing a finished shell as running).
     const refreshJobs = () => {
       if (jobsAt !== null && Date.now() - jobsAt < 2000) return;
-      const jobs = loadJobs(rosterSid);
+      const jobs = loadJobs([rosterSid, ...agents.filter((a) => !isShell(a)).map((a) => a.id)]);
       jobsAt = Date.now();
       jobsWarning = jobs.warning;
       agents = [...agents.filter((a) => !isShell(a)), ...jobs.rows];
@@ -953,6 +962,12 @@ export default {
     // Throws when the session list does. WARNING: The v2 SDK does NOT throw on failure by default
     // (throwOnError is off): a refused, failed or ABORTED request comes back as `{ error }`, so
     // that is checked here rather than left to fall through as an "empty" roster.
+    // An unreadable host state is not a prompt: fall back to the plain session status.
+    const childPrompt = (id) => {
+      try { if ((api.state.session.permission(id)?.length ?? 0) > 0) return "needs permission"; } catch {}
+      try { if ((api.state.session.question(id)?.length ?? 0) > 0) return "needs answer"; } catch {}
+      return null;
+    };
     const listChildren = async (parentID, signal) => {
       if (!parentID) return [];
       // The second argument is the SDK's per-request options; they are spread into the fetch's
@@ -969,8 +984,11 @@ export default {
           id: row.id,
           title: String(row.title ?? row.id),
           // status is undefined for a session the TUI has not loaded; that is not
-          // an error, it just means nothing is running in it.
-          status: api.state.session.status(row.id)?.type ?? "idle",
+          // an error, it just means nothing is running in it. A child blocked on a
+          // permission or question prompt also reports plain "busy", and its prompt
+          // renders only inside that child -- a background subagent then looks like
+          // it is waiting on the model while it is really waiting on YOU.
+          status: childPrompt(row.id) ?? api.state.session.status(row.id)?.type ?? "idle",
           // Metrics are best-effort: the row carries them under a couple of
           // spellings depending on version, and a missing one just drops that
           // part of the right-hand column rather than breaking the row.
@@ -2098,7 +2116,7 @@ export default {
       // The live panel intentionally hides completed shells; F10 remains the place
       // to inspect their retained output until the background store prunes it.
       // Shells come off disk, not from the session list, so a failed list still offers them.
-      const jobs = loadJobs(here, { includeFinished: true });
+      const jobs = loadJobs([here, ...children.map((child) => child.id)], { includeFinished: true });
       const warning = [subagentWarning, jobs.warning].filter(Boolean).join(" ");
       const entries = [...children, ...jobs.rows];
       const options = entries.map((a) => ({
