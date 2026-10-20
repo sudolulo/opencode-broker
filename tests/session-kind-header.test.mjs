@@ -21,6 +21,10 @@ const runPlugin = (body) => {
     const require = createRequire(import.meta.url);
     const http = require("node:http");
     const leases = [];
+    // The lease the broker holds: the last /lease to ARRIVE, as in state.leases[sessionID].
+    let brokerLeaseID = null;
+    // Delays the reply to the Nth /lease (1-based), so replies can come back out of order.
+    globalThis.slowLease = 0;
     http.request = (options, callback) => {
       const req = new EventEmitter();
       let sent = "";
@@ -30,17 +34,22 @@ const runPlugin = (body) => {
         const response = new EventEmitter();
         response.statusCode = 200;
         response.setEncoding = () => {};
-        callback(response);
         let reply = { ok: true };
+        let delay = 0;
         if (options.path === "/lease") {
           const lease = JSON.parse(sent || "{}");
           leases.push(lease);
           // The broker honours an eligible preference; otherwise it balances onto sol.
           const model = lease.preferredModel ?? { providerID: "openai", id: "gpt-5.6-sol" };
           reply = { leaseID: "lease-" + leases.length, target: { id: model.id, model }, decision: { policy: "weighted-depletion", reasons: [] } };
+          brokerLeaseID = reply.leaseID;
+          if (globalThis.slowLease === leases.length) delay = 50;
         }
-        response.emit("data", JSON.stringify(reply));
-        response.emit("end");
+        setTimeout(() => {
+          callback(response);
+          response.emit("data", JSON.stringify(reply));
+          response.emit("end");
+        }, delay);
       };
       req.destroy = () => {}; req.setTimeout = () => {}; req.on = EventEmitter.prototype.on;
       return req;
@@ -160,4 +169,20 @@ test("a root's own typed prompt still carries the user's model choice", () => {
   const last = result.leases.at(-1);
   assert.equal(last?.providerID, "anthropic", JSON.stringify(result.leases));
   assert.equal(last?.id, "claude-opus-5");
+});
+
+// ☠️ 2026-10-20, rig: two "child permission request is pending" notices landed 100 ms apart, and
+// each one's chat.message leased concurrently. The broker kept the later lease while the route
+// kept whichever reply came back last, so every request of the turn named a lease the broker no
+// longer held: the gateway refused it 409 and the turn stopped until the user typed "go".
+test("concurrent prompts leave the route on the lease the broker holds", () => {
+  const result = runPlugin(rootSend + `
+    globalThis.slowLease = leases.length + 1;
+    const notice = (text) => send({ providerID: "openai", id: "gpt-5.6-sol" }, [{ type: "text", text, synthetic: true }]);
+    await Promise.all([notice("A child permission request is pending"), notice("A child permission request is pending")]);
+    const output = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "ses-root", agent: "smart", model: { providerID: "openai", id: "gpt-5.6-sol" }, message: {} }, output);
+    console.log(JSON.stringify({ header: output.headers["x-opencode-lease-id"], broker: brokerLeaseID }));
+  `);
+  assert.equal(result.header, result.broker);
 });

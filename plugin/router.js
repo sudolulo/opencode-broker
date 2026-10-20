@@ -128,6 +128,25 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     readFile: options.readFile,
   });
   const routes = new Map();
+  // ☠️ ONE LEASE IN FLIGHT PER SESSION. The broker keeps the lease whose /lease ARRIVED last;
+  // the route keeps the reply that RETURNED last. Two prompts landing together (2026-10-20,
+  // rig: two child-permission notices 100 ms apart) leased concurrently, the replies crossed,
+  // and the turn sent a lease id the broker had already replaced: refused 409 until the user
+  // typed "go". Chaining keeps arrival and return in the same order.
+  // A recovery continuation is the exception: an ordinary prompt has already fenced it
+  // (cancelRecovery, checkContinuation), so it never writes the route and must not hold the
+  // prompt that superseded it behind a lease wait that may last minutes.
+  const routeQueues = new Map(); // sessionID -> { next, prior, continuation }
+  const serialRoute = (sessionID, fn, { continuation = false } = {}) => {
+    const tail = routeQueues.get(sessionID);
+    const prior = (tail && tail.continuation && !continuation ? tail.prior : tail?.next) ?? Promise.resolve();
+    const next = prior.catch(() => {}).then(fn);
+    const entry = { next, prior, continuation };
+    routeQueues.set(sessionID, entry);
+    const settle = () => { if (routeQueues.get(sessionID) === entry) routeQueues.delete(sessionID); };
+    next.then(settle, settle);
+    return next;
+  };
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
   const previousTurnClasses = new Map(); // sessionID -> last substantive normal or hard class
   const engineEffortUpdates = new Map(); // sessionID -> whether this session's engine supports safe effort updates
@@ -1576,11 +1595,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       let routed;
       try {
-        routed = await ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation);
+        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation), { continuation: ownContinuation });
       } catch (error) {
         if (!needsInventory || (!/provider inventory is stale/.test(String(error?.message ?? error)) && !isAuthRevisionRaceError(error))) throw error;
         await refreshInventory();
-        routed = await ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation);
+        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation), { continuation: ownContinuation });
       }
       checkContinuation?.();
       applyMessageModel(output?.message, routed, sessionID);

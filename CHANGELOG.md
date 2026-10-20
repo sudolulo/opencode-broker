@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two prompts arriving together no longer kill the turn.** Each prompt's `chat.message` leased concurrently; the broker kept the lease whose request arrived last while the router kept the reply that returned last, so the turn could name a lease the broker had already replaced. The gateway then refused every request `409 session holds no live lease` and the session stopped until the user typed again (2026-10-20, rig: two child-permission notices 100 ms apart, four times in twenty minutes). Leasing is now serialized per session. A recovery continuation already fenced by a newer prompt is the one thing that prompt does not wait behind.
+
 ### Added
 
 - **A lane that cannot stream is no longer asked to.** Home Assistant Assist sends `stream: true`; its profile falls back to the Anthropic lane under local pressure; and that lane is the fleet auth proxy, whose Anthropic chat route refuses streaming on purpose and whose Responses route rejects a `stream` key at all. Every such request died with `502 ... llm-auth-proxy: stream must be false`, invisibly until the failure log existed. A provider may now carry `bufferStreamingUpstream: true`: a streaming chat or Responses ask on that lane goes upstream buffered, with `stream` and `stream_options` removed, and the finished reply is sent to the client as the equivalent SSE stream (chat: role/content deltas with `reasoning_content`, one `tool_calls` delta, the finish_reason chunk, a usage chunk only when the client asked for `include_usage`, then `[DONE]`; Responses: typed events from `response.created` to `response.completed`, `.incomplete` or `.failed`). Nothing reaches the client until the reply is whole, so failover, lease settle and release, usage reporting and the failure log are unchanged, and `timeoutMs` applies as the buffered deadline. It is the mirror image of `assembleFromStream` and a lane carrying both is refused when the config loads.
