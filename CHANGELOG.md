@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- **A session whose cache has gone cold is balanced again instead of pinned.** Balancing happened only when a session got its first model, so a session pinned while one subscription's 5-hour window ran hot stayed there for its life (2026-10-20: three panes held on gpt-6.1-sol, at about half Opus speed, after the Anthropic window that sent them there had reset). A pin idle more than 60 min (`PIN_COLD_REBALANCE_MS`, past Anthropic's longest cache TTL) no longer decides the next lease: the history is re-read at full price on any model then, so moving costs nothing a stay would not. A preferred model that merely repeats the pin counts as stickiness; a different one (the user switched) is still honoured. Decisions carry `cold-cache-releases-stickiness`.
+
 - **Two prompts arriving together no longer kill the turn.** Each prompt's `chat.message` leased concurrently; the broker kept the lease whose request arrived last while the router kept the reply that returned last, so the turn could name a lease the broker had already replaced. The gateway then refused every request `409 session holds no live lease` and the session stopped until the user typed again (2026-10-20, rig: two child-permission notices 100 ms apart, four times in twenty minutes). Leasing is now serialized per session. A recovery continuation already fenced by a newer prompt is the one thing that prompt does not wait behind.
 
 ### Added

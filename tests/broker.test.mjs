@@ -1830,6 +1830,52 @@ test("a session keeps its pinned model across releases; only a NEW session is ba
   assert.deepEqual(selection.lastDecision.reasons, ["lowest-normalized-provider-utilization"]);
 }));
 
+// ☠️ 2026-10-20: three panes pinned to gpt-6.1-sol while Anthropic's 5-hour window ran hot stayed
+// there after it reset, at about half Opus speed. Once a session's prompt cache is cold (idle past
+// an hour), its next turn re-reads everything on any model, so that lease is balanced again.
+test("a pin idle past the cache lifetime is re-balanced; a warm pin and a user's switch still hold", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  writeAuth(home);
+  const inv = inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    "alibaba-token-plan": { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  });
+  const pin = (targetID, idleMinutes) => ({ targetID, profile: "auto", tier: "worker",
+    updatedAt: now - 10 * 3_600_000, activeAt: now - idleMinutes * 60_000 });
+  seedState(home, {
+    assignments: {
+      ses_warm: pin("gpt-luna", 20),
+      ses_cold: pin("gpt-luna", 90),
+      ses_cold_repeat: pin("gpt-luna", 90),
+      ses_cold_switch: pin("qwen-flash", 90),
+    },
+    inventory: inv,
+  });
+  const { child, socketPath } = await startBroker(home);
+  try {
+    // OpenAI runs hot, so balancing alone would choose alibaba.
+    await request(socketPath, "/usage", { providerID: "openai", requests: 100, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+    const lease = (sessionID, extra = {}) => request(socketPath, "/lease", { sessionID, profile: "auto", tier: "worker", replace: true, ...extra });
+    const luna = { providerID: "openai", id: "gpt-5.6-luna" };
+
+    const warm = await lease("ses_warm");
+    assert.equal(warm.target.id, "gpt-luna");
+    assert.equal(warm.decision.policy, "session-stickiness", "a warm cache keeps its model");
+
+    const cold = await lease("ses_cold");
+    assert.equal(cold.target.model.id, "qwen3.8-flash", "a cold pin is balanced like a new session");
+    assert.ok(cold.decision.reasons.includes("cold-cache-releases-stickiness"));
+
+    const repeat = await lease("ses_cold_repeat", { preferredModel: luna });
+    assert.equal(repeat.target.model.id, "qwen3.8-flash", "the pin repeated as the preferred model is still stickiness");
+
+    const switched = await lease("ses_cold_switch", { preferredModel: luna });
+    assert.equal(switched.target.id, "gpt-luna", "a model the user switched to is honoured");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 test("a preferred session model stays sticky until it becomes ineligible", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
@@ -4216,7 +4262,9 @@ test("a session keeps its pinned model across the rebalance cooldown while one-s
   });
   const statePath = seedState(home, {
     assignments: {
-      ses_sticky: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now - 3_600_000 },
+      // Recent enough to be warm: a pin idle past PIN_COLD_REBALANCE_MS is re-balanced by
+      // design, and this test is about the cap flood, not about age.
+      ses_sticky: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now - 30 * 60_000 },
       ...oneShotFlood(600, now - 60_000),
     },
     // Well inside sessionRebalance's cooldown, so the stamp is not what decides this lease:

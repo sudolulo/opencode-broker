@@ -237,6 +237,9 @@ const ASSIGNMENT_TTL_MS = 4 * 60 * 60 * 1000;
 // A pin's own `updatedAt` moves only on a fresh SELECTION; a session that keeps reusing
 // its pin moves `activeAt` instead (stampPinActivity, as each lease ends), so a long busy session
 // is not treated as idle the moment its lease is released.
+// After this long with no activity a session's provider prompt cache is gone (Anthropic's
+// longest TTL is 1 h; OpenAI's is shorter), so its next lease is re-balanced instead of pinned.
+const PIN_COLD_REBALANCE_MS = 60 * 60 * 1000;
 const assignmentLastActive = (assignment) =>
   Math.max(Number(assignment?.updatedAt) || 0, Number(assignment?.activeAt) || 0);
 // ☠️ A COUNT CAP, because the TTL alone is not a bound on anything that matters.
@@ -1537,17 +1540,36 @@ const acquire = async (state, request, {
   // circuit open, quota, not resident, outgrown, or explicitly released (restore-home).
   // A new TIER is a new decision (a bump or an escalation), so the pin only binds within
   // the tier and profile it was made in.
-  const pin = !request.releasePin && state.assignments?.[sessionID]?.fallback !== true
-    ? state.assignments?.[sessionID]
+  // A session idle past PIN_COLD_REBALANCE_MS has lost its provider prompt cache, so the next
+  // turn re-reads the whole history at full price on ANY model: moving it now costs nothing a
+  // stay would not. That is the second free balancing moment after a session's first model.
+  // Without it a session pinned while one subscription's 5-hour window ran hot stayed there for
+  // the rest of its life (2026-10-20: three panes held on gpt-6.1-sol at ~half Opus speed after
+  // the Anthropic window that sent them there had reset). Activity is the pin's own (as each
+  // lease ends) or the replaced lease's last touch, whichever is later.
+  const assignment = state.assignments?.[sessionID];
+  const lastActive = Math.max(assignmentLastActive(assignment), Number(existing?.touchedAt) || 0);
+  const coldPin = Boolean(assignment) && Date.now() - lastActive > PIN_COLD_REBALANCE_MS;
+  const pin = !request.releasePin && !coldPin && assignment?.fallback !== true
+    ? assignment
     : null;
   const pinnedTarget = pin && pin.profile === profile && pin.tier === tier
     ? admittedTargets[pin.targetID] ?? null
     : null;
+  // A cold session's preferred model only binds when it is NOT just its pin repeated: the plugin
+  // names the session's current model on every seasoned turn, so that is stickiness too. A model
+  // the user switched to differs from the pin and is still honoured.
+  const coldRepeat = coldPin && preferredModel && admittedTargets[assignment?.targetID] &&
+    admittedTargets[assignment.targetID].providerID === preferredModel.providerID &&
+    admittedTargets[assignment.targetID].modelID === preferredModel.id;
   // A per-request exclusion outranks stickiness: the caller said this target failed it.
-  const preferredTarget = [(preferredModel
+  const preferredTarget = [(preferredModel && !coldRepeat
     ? Object.values(admittedTargets).find((target) =>
       target.providerID === preferredModel.providerID && target.modelID === preferredModel.id)
     : null) ?? pinnedTarget].find((target) => target && !excluded.has(target.id)) ?? null;
+  if (coldPin && choice?.decision) {
+    choice.decision.reasons = [...(choice.decision.reasons ?? []), "cold-cache-releases-stickiness"];
+  }
   // Stickiness never holds a session on a model it has outgrown: when pressure
   // moved the selection to a roomier window, the sticky model only wins if it
   // is itself roomy enough.
