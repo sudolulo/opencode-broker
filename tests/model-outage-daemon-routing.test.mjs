@@ -377,3 +377,29 @@ for (const candidateKind of ['newer', 'alias', 'reserve', 'ambiguous']) test(`ex
     }
   } finally { await broker.stop(); }
 });
+
+test('a single-model failure stands in the head\'s reserve for pinned and fresh sessions, with no grant', async () => {
+  const broker = await spawnBroker({ lapsed: true });
+  try {
+    const pinned = await post(broker.socketPath, '/lease', { sessionID: 's-pinned', profile: 'auto', tier: 'smart' });
+    assert.equal(pinned.body.target.id, 'claude-opus-5-5');
+    // A model failure (not transport, not provider-wide) opens the head's own circuit.
+    const failure = await post(broker.socketPath, '/failure', { sessionID: 's-pinned', leaseID: pinned.body.leaseID,
+      targetID: 'claude-opus-5-5', error: { statusCode: 500, message: 'Anthropic upstream HTTP 500' } });
+    assert.equal(failure.status, 200, JSON.stringify(failure.body));
+    assert.equal(failure.body.kind, 'other');
+
+    const stayed = await post(broker.socketPath, '/lease', { sessionID: 's-pinned', profile: 'auto', tier: 'smart', replace: true });
+    assert.equal(stayed.status, 200, JSON.stringify(stayed.body));
+    assert.equal(stayed.body.target.id, 'claude-opus-5', 'the pinned session drops one version, not to the fallback rung');
+    assert.equal(stayed.body.decision.policy, 'circuit-reserve');
+    assert.equal(stayed.body.outage ?? null, null, 'an ordinary lease: no outage assertion rides on it');
+
+    const fresh = await post(broker.socketPath, '/lease', { sessionID: 's-fresh', profile: 'auto', tier: 'smart' });
+    assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+    assert.equal(fresh.body.target.id, 'claude-opus-5');
+    assert.equal(fresh.body.decision.policy, 'circuit-reserve');
+  } finally {
+    await broker.stop();
+  }
+});

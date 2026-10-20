@@ -105,6 +105,14 @@ const UPSTREAM_SIGNALS = [
     matches: (message) => /prompt is too long|context[._ -]?length[._ -]?exceeded|maximum context length/i.test(message),
     phrase: "prompt is too long",
   },
+  // ☠️ A DEAD PROXY SOCKET IS THE PROVIDER, NOT THE MODEL. llm-auth-proxy answers 502 with these
+  // exact texts when it never reached the provider; without the phrase the broker saw only
+  // "upstream openai HTTP 502", fenced the one model for 15 s, and leased gpt-terra on the same
+  // dead OpenAI path (2026-10-19). The broker reads the phrase as a provider-wide `connect`.
+  {
+    matches: (message) => /^llm-auth-proxy: (?:Anthropic request|OpenAI Responses upstream request|OpenAI models upstream request) failed$/.test(message),
+    phrase: "upstream transport failed",
+  },
 ];
 
 // Reads the upstream error message out of the shared Anthropic/OpenAI JSON
@@ -112,6 +120,17 @@ const UPSTREAM_SIGNALS = [
 // phrase, or null. The body has already been fully read by the caller; the
 // 16 KB cap here is only a parser-cost ceiling for JSON.parse. Silent on parse
 // failure. The phrase is a GATEWAY STRING; the raw body never escapes.
+// The Anthropic mid-stream error frame names its type; only fixed gateway phrases leave, never
+// upstream wording. The proxy's own "upstream stream failed" frame is its socket dying (a
+// provider-wide `connect` to the broker); `overloaded_error` is transient capacity (`overload`,
+// 15 s). Anything else keeps the plain phrase.
+export const anthropicStreamFailure = (failure) => {
+  const type = typeof failure?.type === "string" ? failure.type : null;
+  if (failure?.message === "llm-auth-proxy: upstream stream failed") return "Anthropic upstream stream failed: upstream transport failed";
+  if (type === "overloaded_error") return "Anthropic upstream stream failed: overloaded";
+  return "Anthropic upstream stream failed";
+};
+
 const upstreamSignal = (body) => {
   if (typeof body !== "string" || body.length === 0 || body.length > 16384) return null;
   let parsed;
@@ -772,7 +791,7 @@ const validEmbeddingInput = (input) => typeof input === "string" || (Array.isArr
 // for: the usage tail we asked for ourselves, and error frames.
 //
 // `relayed` is the whole ballgame -- see THE FAILOVER BOUNDARY below.
-const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, observe = null }) => {
+const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, observe = null, onModel = null }) => {
   const decoder = new TextDecoder();
   let buffer = "";
   let relayed = false;
@@ -820,13 +839,20 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, o
       ?? (api === RESPONSES && event?.type === "response.failed" ? (event.response?.error ?? event) : null);
     if (failure) {
       streamError = new Error(api === MESSAGES
-        ? "Anthropic upstream stream failed"
+        ? anthropicStreamFailure(failure)
         : String(failure?.message ?? JSON.stringify(failure)).slice(0, 400));
       // An error frame with the wire still clean is a dead lane, not a dead
       // request: swallow it so the caller can fail over and the client never
       // learns this attempt happened.
       if (relayed && api !== MESSAGES) await emit(raw);
       return false;
+    }
+    // The model the provider says is answering: Anthropic names it on `message_start`, OpenAI on
+    // `response.created`. Reported once, never relayed differently (see reportServedModel).
+    if (onModel) {
+      const named = api === MESSAGES && event?.type === "message_start" ? event?.message?.model
+        : api === RESPONSES && event?.type === "response.created" ? event?.response?.model : null;
+      if (typeof named === "string" && named) { onModel(named); onModel = null; }
     }
     // Chat puts usage on the tail chunk; responses on the response that
     // `response.completed` carries (earlier events carry `usage: null`).
@@ -1517,6 +1543,26 @@ export const createGatewayHandler = ({
     } catch { /* broker hiccup must not fail the request */ }
   };
 
+  // Which model ACTUALLY served a request: OpenAI's `openai-model` header (Codex reads it to warn
+  // "this request was routed to ..."; a flagged account is silently rerouted to an older model),
+  // else the model the response itself names (the ChatGPT backend sends no such header; an
+  // Anthropic server-side fallback names its model on `message_start`). Not a settlement, so it
+  // goes straight to the broker even for a session-bound (external) lease, and never blocks or
+  // fails the request.
+  const servedModelHeader = (headers) => headers?.get?.("openai-model") ?? headers?.get?.("x-openai-model") ?? null;
+  const reportServedModel = (leased, headers, bodyModel = null) => {
+    // Only the providers whose reroutes are documented; another lane's alias naming is not one.
+    if (leased?.providerID !== "openai" && leased?.providerID !== "anthropic") return;
+    const served = servedModelHeader(headers) ?? bodyModel;
+    if (typeof served !== "string" || !served || !leased?.sessionID || !leased.leaseID) return;
+    Promise.resolve().then(() => brokerRequest("/served-model", {
+      sessionID: leased.sessionID,
+      leaseID: leased.leaseID,
+      ...(leased.targetID ? { targetID: leased.targetID } : {}),
+      servedModelID: served,
+    })).catch(() => {});
+  };
+
   const reportUsage = async (leased, tokens) => settle(leased, "/usage", {
     ...(callerOf(leased.sessionID) ? { caller: callerOf(leased.sessionID) } : {}),
     providerID: leased.providerID,
@@ -2115,6 +2161,11 @@ export const createGatewayHandler = ({
         // This is why the response head is written by sink.write() and not one
         // line earlier (see the sink in handle()).
         const contentType = String(response.headers?.get?.("content-type") ?? "");
+        // After the health capture's own header reads (attestation, then content-type), never before.
+        const headerModel = api === RESPONSES ? servedModelHeader(response.headers) : null;
+        if (headerModel) reportServedModel(leased, response.headers);
+        const onModel = (api === RESPONSES || api === MESSAGES) && !headerModel
+          ? (model) => reportServedModel(leased, null, model) : null;
         let outcome;
         try {
           // ☆ Dressing a buffered body as a stream is a chat-only courtesy: a
@@ -2131,7 +2182,7 @@ export const createGatewayHandler = ({
               : { relayed: false, usage: null, outputChars: 0, sawDone: false,
                 error: new Error(`upstream ${leased.providerID} answered a streamed ${api.path} request with one JSON body`) })
             : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api,
-              observe: (chunk) => response.healthParser?.push(chunk) });
+              observe: (chunk) => response.healthParser?.push(chunk), onModel });
         } finally {
           clearTimeout(stallTimer);
         }
@@ -2221,6 +2272,7 @@ export const createGatewayHandler = ({
           parser.push(rawBody);
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
+        if (typeof payload?.model === "string" && payload.model) reportServedModel(leased, null, payload.model);
         if (payload?.usage) await reportUsage(leased, readMessagesUsage(payload.usage));
         await settle(leased, "/complete");
         return {
@@ -2298,6 +2350,7 @@ export const createGatewayHandler = ({
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
       }
+      if (api === RESPONSES) reportServedModel(leased, response.headers, typeof payload?.model === "string" ? payload.model : null);
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
       // schema in some builds; instruct-mode models fence despite orders).
       // The client asked for machine-readable output: unwrap deterministically.

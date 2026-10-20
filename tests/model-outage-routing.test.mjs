@@ -111,7 +111,7 @@ test('a context snapshot computes grants once and a spread copy is recomputed fo
   // lane cannot inherit another lane's substitution.
   const unrelatedLane = { ...snapshot, primaryIDs: ['gpt-6-1-sol'] };
   assert.deepEqual(authorizedReserveIDs(unrelatedLane), []);
-  assert.deepEqual(Object.keys(unrelatedLane).sort(), ['heads', 'now', 'outages', 'policy', 'primaryIDs']);
+  assert.deepEqual(Object.keys(unrelatedLane).sort(), ['circuits', 'heads', 'now', 'outages', 'policy', 'primaryIDs']);
 });
 
 test('an affected head is excluded in every lane while its reserve substitutes only in lanes that carry the head', () => {

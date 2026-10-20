@@ -4861,3 +4861,96 @@ test("/lease/verify answers only for the exact live lease, and changes nothing",
   await request(socketPath, "/forget", { sessionID: "ses-verify", leaseID: lease.leaseID });
   assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-verify", leaseID: lease.leaseID })).held, false);
 }));
+
+// A provider guard steers only the session that drew it. These are the exact texts the
+// providers sent (OpenAI cyber_policy in-stream, 2026-10-13) and the reroute OpenAI reports
+// only in its `openai-model` header.
+const guardFixture = async (socketPath, providers = {
+  openai: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+  anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 2 },
+}) => {
+  await request(socketPath, "/inventory", inventory(providers));
+};
+const GUARD_RESOLVABLE = ["openai/gpt-5.6-terra", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4-8-fast"];
+const leaseFastBuild = (socketPath, sessionID, resolvableModels = GUARD_RESOLVABLE) => request(socketPath, "/lease", {
+  sessionID, profile: "auto", tier: "fast-build", replace: true,
+  preferredModel: { providerID: "openai", id: "gpt-5.6-terra" }, resolvableModels,
+});
+
+test("an OpenAI guard verdict steers that session off OpenAI with no circuit and no evidence", async () => withBroker(async ({ socketPath }) => {
+  await guardFixture(socketPath);
+  const flagged = await leaseFastBuild(socketPath, "ses-guard-flagged");
+  assert.equal(flagged.target.id, "gpt-terra");
+  const before = await request(socketPath, "/status");
+  const failure = await rawRequest(socketPath, "/failure", { body: {
+    sessionID: "ses-guard-flagged", leaseID: flagged.leaseID, targetID: flagged.target.id,
+    error: { message: "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request." },
+  } });
+  assert.equal(failure.status, 200, JSON.stringify(failure.body));
+  assert.equal(failure.body.kind, "policy");
+  assert.ok(failure.body.avoidUntil > Date.now(), "the avoid has an expiry");
+  const after = await request(socketPath, "/status");
+  assert.deepEqual(after.circuits, before.circuits, "a guard verdict opens no circuit");
+  assert.deepEqual(after.health, before.health, "a guard verdict is no provider evidence");
+
+  const moved = await leaseFastBuild(socketPath, "ses-guard-flagged");
+  assert.equal(moved.target.model.providerID, "anthropic", "the flagged session leaves OpenAI despite preferring it");
+  const bystander = await leaseFastBuild(socketPath, "ses-guard-bystander");
+  assert.equal(bystander.target.id, "gpt-terra", "every other session keeps the target");
+}));
+
+test("an OpenAI reroute reported by the gateway moves the session off OpenAI; a dated snapshot does not", async () => withBroker(async ({ socketPath }) => {
+  await guardFixture(socketPath);
+  const snapshot = await leaseFastBuild(socketPath, "ses-guard-snapshot");
+  const same = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-snapshot", leaseID: snapshot.leaseID, servedModelID: "gpt-5.6-terra-2026-10-01",
+  } });
+  assert.equal(same.status, 200, JSON.stringify(same.body));
+  assert.equal(same.body.rerouted, false);
+  assert.equal((await leaseFastBuild(socketPath, "ses-guard-snapshot")).target.id, "gpt-terra");
+
+  const rerouted = await leaseFastBuild(socketPath, "ses-guard-rerouted");
+  const report = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-rerouted", leaseID: rerouted.leaseID, servedModelID: "gpt-5.2",
+  } });
+  assert.equal(report.status, 200, JSON.stringify(report.body));
+  assert.equal(report.body.rerouted, true);
+  assert.equal((await request(socketPath, "/status")).leases["ses-guard-rerouted"]?.leaseID, rerouted.leaseID,
+    "a served-model report settles nothing: the lease stays held");
+  const moved = await leaseFastBuild(socketPath, "ses-guard-rerouted");
+  assert.equal(moved.target.model.providerID, "anthropic");
+}));
+
+test("an avoid that would leave nothing to lease is relaxed rather than refusing the turn", async () => withBroker(async ({ socketPath }) => {
+  await guardFixture(socketPath, { openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 } });
+  const only = ["openai/gpt-5.6-terra"];
+  const first = await leaseFastBuild(socketPath, "ses-guard-only-openai", only);
+  assert.equal(first.target.id, "gpt-terra");
+  const failure = await rawRequest(socketPath, "/failure", { body: {
+    sessionID: "ses-guard-only-openai", leaseID: first.leaseID, targetID: first.target.id,
+    error: { code: "cyber_policy", message: "blocked" },
+  } });
+  assert.equal(failure.body.kind, "policy");
+  const again = await leaseFastBuild(socketPath, "ses-guard-only-openai", only);
+  assert.equal(again.target.id, "gpt-terra", "the only target is still leased");
+}));
+
+test("an Anthropic server-side fallback steers the session off that model only", async () => withBroker(async ({ socketPath }) => {
+  await guardFixture(socketPath);
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-guard-anthropic", profile: "auto", tier: "fast-build", replace: true,
+    preferredModel: { providerID: "anthropic", id: "claude-opus-5-fast" }, resolvableModels: GUARD_RESOLVABLE,
+  });
+  assert.equal(lease.target.model.providerID, "anthropic");
+  const same = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-anthropic", leaseID: lease.leaseID, servedModelID: "claude-opus-5",
+  } });
+  assert.equal(same.body.rerouted, false, "the speed alias's base model is the same model");
+  const report = await rawRequest(socketPath, "/served-model", { body: {
+    sessionID: "ses-guard-anthropic", leaseID: lease.leaseID, servedModelID: "claude-opus-4-8",
+  } });
+  assert.equal(report.body.rerouted, true);
+  const status = await request(socketPath, "/status");
+  assert.deepEqual(status.policyAvoids["ses-guard-anthropic"].targetIDs, [lease.target.id]);
+  assert.deepEqual(status.policyAvoids["ses-guard-anthropic"].providerIDs, [], "Anthropic is per model, not account-wide");
+}));

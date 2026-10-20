@@ -1924,11 +1924,35 @@ test("routing failures distinguish durable quota exhaustion from transient rate 
   assert.equal(R.classifyRoutingFailure("connection reset"), "other");
 });
 
-test("a content-filter block belongs to the session and never indicts a provider", () => {
+test("a provider guard is a session-scoped policy verdict and never indicts a provider", () => {
   // The exact text that quarantined anthropic on 2026-10-01 across opus-5-5 and opus-5.
-  assert.equal(R.classifyRoutingFailure({ message: "The response was blocked by the provider's content filter" }), "payload");
-  assert.equal(R.classifyRoutingFailure({ statusCode: 400, code: "content_filter", message: "blocked" }), "payload");
-  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "content_policy_violation: request rejected" }), "payload");
+  assert.equal(R.classifyRoutingFailure({ message: "The response was blocked by the provider's content filter" }), "policy");
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, code: "content_filter", message: "blocked" }), "policy");
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "content_policy_violation: request rejected" }), "policy");
+  // OpenAI's cyber classifier, as it arrived in-stream on gpt-6.1-sol on 2026-10-13.
+  assert.equal(R.classifyRoutingFailure({ message: "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request." }), "policy");
+  assert.equal(R.classifyRoutingFailure({ code: "cyber_policy", message: "blocked" }), "policy");
+  // OpenAI's usage-policy flag (gpt-5.6-sol, 2026-09-29).
+  assert.equal(R.classifyRoutingFailure({ message: "Invalid prompt: your prompt was flagged as potentially violating our usage policy." }), "policy");
+  assert.equal(R.classifyRoutingFailure({ message: "Anthropic upstream refusal (cyber)" }), "policy");
+});
+
+test("a dead proxy transport fences the provider, not one model", () => {
+  // llm-auth-proxy's own 502 texts when its socket to the provider never connected or died.
+  for (const message of [
+    "llm-auth-proxy: Anthropic request failed",
+    "llm-auth-proxy: OpenAI Responses upstream request failed",
+    "llm-auth-proxy: upstream stream failed",
+  ]) assert.equal(R.classifyRoutingFailure({ statusCode: 502, message }), "connect", message);
+  // The gateway's relays of the same facts.
+  assert.equal(R.classifyRoutingFailure({ statusCode: 502, message: "Anthropic upstream HTTP 502: upstream transport failed" }), "connect");
+  assert.equal(R.classifyRoutingFailure({ message: "Anthropic upstream stream failed: upstream transport failed" }), "connect");
+  const leased = { targetProviderID: "openai" };
+  assert.equal(R.classifyRoutingFailure({ message: "gateway: no provider could serve the request: upstream openai HTTP 502: upstream transport failed" }, leased), "connect");
+  // The bare gateway 5xx keeps its narrow target-scoped overload reading.
+  assert.equal(R.classifyRoutingFailure({ message: "gateway: no provider could serve the request: upstream openai HTTP 502" }, leased), "overload");
+  // A typed mid-stream overload is transient capacity, not a five-minute fence.
+  assert.equal(R.classifyRoutingFailure({ message: "Anthropic upstream stream failed: overloaded" }), "overload");
 });
 
 test("a missing model id belongs to that target and never indicts a provider", () => {

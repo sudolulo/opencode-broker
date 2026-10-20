@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import http from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
+import { anthropicStreamFailure, createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
 
 const CONFIG = {
   tier: "worker",
@@ -2580,6 +2580,121 @@ test("Anthropic Messages carries the context-overflow signal so the client can c
   assert.doesNotMatch(clientBody, /1616821/);
   const failure = brokerCalls.find((call) => call.route === "/failure");
   assert.equal(failure.body.error.message, "Anthropic upstream HTTP 400: prompt is too long");
+});
+
+test("a proxy transport 502 reaches the broker as upstream transport failed, not a bare status", async () => {
+  // llm-auth-proxy's own body when its socket to Anthropic never connected (2026-10-19).
+  const upstreamBody = JSON.stringify({ type: "error", error: { type: "api_error", message: "llm-auth-proxy: Anthropic request failed" } });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://anthropic.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "anthropic", id: "claude-opus-5" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, { status: 502, headers: { "content-type": "application/json" } }),
+  });
+  let clientBody;
+  await withServer(handler, async (base) => {
+    clientBody = await (await askMessages(base)).text();
+  });
+  assert.match(clientBody, /Anthropic upstream HTTP 502: upstream transport failed/);
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.equal(failure.body.error.message, "Anthropic upstream HTTP 502: upstream transport failed");
+});
+
+test("an Anthropic mid-stream error frame names only a fixed gateway phrase for its cause", () => {
+  assert.equal(anthropicStreamFailure({ type: "api_error", message: "llm-auth-proxy: upstream stream failed" }),
+    "Anthropic upstream stream failed: upstream transport failed");
+  assert.equal(anthropicStreamFailure({ type: "overloaded_error", message: "Overloaded" }), "Anthropic upstream stream failed: overloaded");
+  assert.equal(anthropicStreamFailure({ type: "api_error", message: "Internal server error" }), "Anthropic upstream stream failed");
+  assert.equal(anthropicStreamFailure(null), "Anthropic upstream stream failed");
+});
+
+test("an OpenAI response names the model that served it, and the gateway tells the broker", async () => {
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      openai: { baseUrl: "http://openai.example/v1", chatApi: false, responsesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { leaseID: "lease-reroute", target: { id: "gpt-terra", model: { providerID: "openai", id: "gpt-5.6-terra" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ id: "resp_1", object: "response", output: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200, headers: { "content-type": "application/json", "openai-model": "gpt-5.2" },
+    }),
+  });
+  await withServer(handler, async (base) => {
+    const response = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "reasoning", input: "hi" }),
+    });
+    assert.equal(response.status, 200, "the served answer still reaches the client");
+  });
+  const report = brokerCalls.find((call) => call.route === "/served-model");
+  assert.ok(report, "the served model is reported");
+  assert.equal(report.body.servedModelID, "gpt-5.2");
+  assert.equal(report.body.leaseID, "lease-reroute");
+  assert.equal(report.body.targetID, "gpt-terra");
+});
+
+test("with no openai-model header the served model is read from the response body, streamed or not", async () => {
+  const run = async ({ providerID, path, upstream, request }) => {
+    const brokerCalls = [];
+    const handler = createGatewayHandler({
+      config: { tier: "worker", profile: "auto", providers: {
+        [providerID]: { baseUrl: `http://${providerID}.example/v1`, chatApi: false, responsesApi: true, messagesApi: true },
+      } },
+      gatewayKey: "gw-secret",
+      brokerRequest: async (route, body) => {
+        brokerCalls.push({ route, body });
+        return route === "/lease"
+          ? { leaseID: "lease-body", target: { id: "t", model: { providerID, id: providerID === "openai" ? "gpt-5.6-terra" : "claude-opus-5-5" } } }
+          : { ok: true };
+      },
+      fetchImpl: async () => upstream(),
+    });
+    await withServer(handler, async (base) => {
+      const response = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: { Authorization: "Bearer gw-secret", "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify(request),
+      });
+      assert.equal(response.status, 200);
+      await response.text();
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    return brokerCalls.filter((call) => call.route === "/served-model").map((call) => call.body.servedModelID);
+  };
+  const sse = (events) => () => new Response(events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
+    status: 200, headers: { "content-type": "text/event-stream" },
+  });
+  // The ChatGPT backend's stream: the reroute is named only on response.created.
+  assert.deepEqual(await run({ providerID: "openai", path: "/v1/responses", request: { model: "reasoning", input: "hi", stream: true },
+    upstream: sse([
+      { type: "response.created", response: { id: "r", model: "gpt-5.2" } },
+      { type: "response.completed", response: { id: "r", model: "gpt-5.2", output: [], usage: { input_tokens: 1, output_tokens: 1 } } },
+    ]) }), ["gpt-5.2"]);
+  // Anthropic non-streamed Messages names its model at the top level.
+  assert.deepEqual(await run({ providerID: "anthropic", path: "/v1/messages", request: { model: "reasoning", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+    upstream: () => new Response(JSON.stringify({ type: "message", model: "claude-opus-4-8", content: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }) }), ["claude-opus-4-8"]);
+  // Another lane's naming is never read as a reroute.
+  assert.deepEqual(await run({ providerID: "alibaba-token-plan", path: "/v1/messages", request: { model: "reasoning", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+    upstream: () => new Response(JSON.stringify({ type: "message", model: "qwen3-max-2026-01-23", content: [], usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }) }), []);
 });
 
 test("Anthropic Messages fast-mode-credits does not relay a session-bound /failure", async () => {
