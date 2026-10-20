@@ -29,6 +29,7 @@ import {
   writeSessionContextEstimate,
   highRiskTier,
   raiseTier,
+  classifyRoutingFailure,
 } from "../lib/routing.js";
 import {
   applyMessageModel,
@@ -41,6 +42,7 @@ import {
 import { isAbortError, normalizeProviderError } from "../lib/provider-health.js";
 import { describeProviderLimit, wrapUpMessage } from "../lib/usage-limit.js";
 import { classifyTurn, nextPrevious } from "../lib/turn-effort.js";
+import { randomUUID } from "node:crypto";
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const LOCAL_CHILD_INACTIVITY_WATCHDOG_MS = 10 * 60 * 1000;
@@ -554,6 +556,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const route = routes.get(sessionID);
       const targetID = route?.target?.id;
       const routeProfile = route?.profile;
+      const recovery = ownRecovery(sessionID, route);
+      const generation = recovery?.generation;
       clearLocalChildInactivityWatchdog(sessionID);
       clearLocalChildInFlightTools(sessionID);
       stopHeartbeat(sessionID);
@@ -581,18 +585,19 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           report("error", `failed to release local child ${sessionID} after inactivity watchdog failure`, releaseError);
         }
       }
+      if (!currentRecovery(sessionID, recovery, generation)) return;
       try {
         const aborted = await client.session.abort({ path: { id: sessionID }, query: { directory } });
         if (aborted?.error) throw aborted.error;
       } catch (error) {
         report("error", `failed to abort local child ${sessionID} after inactivity watchdog failure`, error);
       }
-      if (targetID && failure?.kind) {
+      if (currentRecovery(sessionID, recovery, generation) && targetID && failure?.kind) {
         const circuitUntil = Number(failure.circuitUntil);
         const delay = !profileReachesCloud(routeProfile) && Number.isFinite(circuitUntil) && circuitUntil > Date.now()
           ? circuitUntil - Date.now() + 1
           : undefined;
-        try { scheduleReengage(sessionID, failure.kind, delay); } catch (error) {
+        try { scheduleReengage(sessionID, failure.kind, { code: LOCAL_CHILD_INACTIVITY_TIMEOUT }, delay); } catch (error) {
           report("error", `failed to re-engage local child ${sessionID} after inactivity watchdog failure`, error);
         }
       }
@@ -642,7 +647,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     scheduleWrapUpCheck();
   };
 
-  const route = async (session, preferredModel = null, turnEffort = null) => {
+  const route = async (session, preferredModel = null, turnEffort = null, checkContinuation = null) => {
     if (!session?.id) return null;
     const classifier = isClassifierAgent(session.agent);
     if (classifier) {
@@ -664,6 +669,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       sessions,
       getSession,
     });
+    checkContinuation?.();
     const localOnly = classifier && profileConfinesToLan(owner.profile);
     // High-risk content raises the tier floor: a medical/safety/legal/financial
     // question where being wrong is dangerous is served from a strong model no
@@ -714,6 +720,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     let lease;
     try {
       const contextTokens = await sessionContextTokens(session.id);
+      checkContinuation?.();
       // Stickiness exists to protect a session's warm provider cache -- so only
       // a session WITH HISTORY may prefer its current model. A brand-new
       // session's message model is just the agent's static pin (or the saved
@@ -735,6 +742,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         report("info", `${session.id}: displacement window over -- releasing model stickiness for rebalance`);
       }
       const resolvableModels = await callingProcessResolvableModels();
+      checkContinuation?.();
       const leaseBody = {
         sessionID: session.id,
         profile: resolved.profile,
@@ -766,10 +774,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const waitStarted = Date.now();
       let announced = false;
       for (;;) {
+        checkContinuation?.();
         try {
           lease = await brokerRequest("/lease", leaseBody);
+          checkContinuation?.();
           break;
         } catch (error) {
+          checkContinuation?.();
           const code = error?.code;
           if ((code !== "target-busy" && code !== "target-preparing") || Date.now() - waitStarted >= leaseWaitMaxMs) throw error;
           if (!announced) {
@@ -826,6 +837,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       rearmLocalChildInactivityWatchdog(session.id);
       return routed;
     } catch (error) {
+      // A cancelled automatic prompt's late lease response must neither clear
+      // its successor's route nor recreate a parked owner.
+      checkContinuation?.();
       // Never bypass provider admission with a static fallback. A clear block is
       // safer than silently spending an API-key provider after broker failure.
       clearLocalChildInactivityWatchdog(session.id);
@@ -845,10 +859,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   // report has already opened the circuit, so a fresh lease lands on the next
   // best target; what remains is re-running the loop. A synthetic user part
   // does exactly that -- and doubles as the transcript record of the reroute.
-  const REENGAGE_TEXT = "[opencode-broker] The previous model hit a provider limit mid-turn and the session was rerouted to the next best model. Continue the task exactly where it stopped; do not restart completed work.";
-  const REENGAGE_DELAY_MS = 2500;
-  const REENGAGE_MAX_ATTEMPTS = 2;
-  const REENGAGE_WINDOW_MS = 10 * 60 * 1000;
+  const REENGAGE_TEXT = "[opencode-broker] The previous model had a provider outage and this session is being rerouted. Continue the unfinished work while preserving completed steps; verify uncertain tool outcomes instead of replaying them.";
+  const REENGAGE_DELAYS_MS = [2500, 5000, 10000, 20000, 40000, 60000];
   const RETRY_WAIT_FAILOVER_MS = 30 * 1000;
   // A single long park is the obvious stop. The case that used to slip through is a
   // RUN of short ones: five 20s waits cost a session 100s parked against a provider
@@ -857,44 +869,190 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const RETRY_WAIT_CUMULATIVE_MS = 60 * 1000;
   const RETRY_WINDOW_MS = 5 * 60 * 1000;
   const retryWaits = new Map(); // sessionID -> [{ at, waitMs }]
-  const reengageHistory = new Map();
-  const scheduleReengage = (sessionID, kind, delay = REENGAGE_DELAY_MS) => {
-    // ☠️ `payload` joins abort/noop: the provider refused the request as MALFORMED, so
-    // re-sending the very same transcript is not a retry, it is the same failure again
-    // one model over. That auto-resend is what walked a broken `tool_use`/`tool_result`
-    // pair across two anthropic models in seven seconds on 2026-09-17 and handed the
-    // health tracker the two distinct models a quarantine needs. The turn needs a human
-    // (resend, compact, or /undo), not another lane.
-    if (kind === "abort" || kind === "noop" || kind === "payload") return;
-    const now = Date.now();
-    const history = (reengageHistory.get(sessionID) ?? []).filter((at) => now - at < REENGAGE_WINDOW_MS);
-    if (history.length >= REENGAGE_MAX_ATTEMPTS) {
-      report("warn", `${sessionID}: not re-engaging after ${kind} -- ${history.length} recent attempts already`);
+  // One owner per recovery episode, retained when the failed lease is released. Async
+  // work must hold this exact entry AND generation; cancellation never recreates it.
+  const reengagements = new Map();
+  // A session.error has no message or provider identity in OpenCode's schema. Once a
+  // human turn supersedes recovery work, that bare event can belong to either turn.
+  // Keep only the current real-human and active synthetic parent: older IDs would
+  // grow without bound and are not authoritative after supersession.
+  const recoveryAttribution = new Map();
+  const RECOVERY_ATTRIBUTION_LIMIT = 2000;
+  const setRecoveryAttribution = (sessionID, state) => {
+    recoveryAttribution.set(sessionID, state);
+    while (recoveryAttribution.size > RECOVERY_ATTRIBUTION_LIMIT) {
+      recoveryAttribution.delete(recoveryAttribution.keys().next().value);
+    }
+    return state;
+  };
+  const newRecoveryAttribution = (fenced = false) => ({
+    humanParentID: null,
+    activeParentID: null,
+    fenced,
+    recoverySeen: false,
+  });
+  const attributionForChat = (sessionID) => {
+    const existing = recoveryAttribution.get(sessionID);
+    if (existing) return existing;
+    // Session metadata outlives bounded attribution. Its presence with no entry
+    // means eviction, not a new session, so a bare error must stay fail-closed.
+    const evicted = sessions.has(sessionID);
+    return setRecoveryAttribution(sessionID, newRecoveryAttribution(evicted));
+  };
+  const recordChatAttribution = (sessionID, input, output, humanParts, syntheticOnly) => {
+    const state = attributionForChat(sessionID);
+    const outputID = typeof output?.message?.id === "string" && output.message.id ? output.message.id : null;
+    const inputID = typeof input?.messageID === "string" && input.messageID ? input.messageID : null;
+    const parentID = outputID ?? inputID;
+    if (humanParts) {
+      // Persist this fence forever for the session lifetime: an old SDK callback
+      // may surface arbitrarily late, even after the newer turn completed.
+      if (state.recoverySeen) state.fenced = true;
+      state.humanParentID = parentID;
+      state.activeParentID = parentID;
+    } else if (syntheticOnly && parentID) {
+      state.activeParentID = parentID;
+    }
+    return state;
+  };
+  const attributedToActiveTurn = (sessionID, record) => {
+    const state = recoveryAttribution.get(sessionID);
+    const parentID = record?.role === "assistant" && typeof record.parentID === "string" && record.parentID
+      ? record.parentID
+      : null;
+    if (parentID) {
+      // A positive parent is proof only when it names this turn, never merely the
+      // same provider. This rejects a superseded B on C's provider.
+      return Boolean(state && (parentID === state.humanParentID || parentID === state.activeParentID));
+    }
+    // Preserve historic behavior until a superseding human turn creates a fence.
+    // Missing state for cached metadata is an eviction and deliberately fail-closed.
+    return Boolean(state && !state.fenced) || (!state && !sessions.has(sessionID));
+  };
+  const unattributableToActiveTurn = (sessionID, record) => !attributedToActiveTurn(sessionID, record);
+  // Keep a stopped route usable by chat.params without letting a late error on
+  // that same route restart it. The next chat.message leases a fresh route object.
+  // Weak references need no session tombstone store or restart persistence.
+  const stoppedRecoveryRoutes = new WeakSet();
+  const cancelReengagement = (sessionID) => {
+    const entry = reengagements.get(sessionID);
+    if (!entry) return;
+    entry.generation += 1;
+    if (entry.timer !== null) cancelTimeout(entry.timer);
+    reengagements.delete(sessionID);
+  };
+  const cancelRecovery = (sessionID) => {
+    for (const route of [routes.get(sessionID), reengagements.get(sessionID)?.route]) {
+      if (route) stoppedRecoveryRoutes.add(route);
+    }
+    cancelReengagement(sessionID);
+    unpark(sessionID);
+  };
+  const ownRecovery = (sessionID, route, agent = sessions.get(sessionID)?.agent) => {
+    if (!route || stoppedRecoveryRoutes.has(route) || route.profile === "manual" || isClassifierAgent(agent) || parked.has(sessionID)) return null;
+    let entry = reengagements.get(sessionID);
+    if (!entry) {
+      // Unlike trimTracker, eviction must also cancel the owned timeout.
+      if (reengagements.size >= 2000) cancelReengagement(reengagements.keys().next().value);
+      entry = { timer: null, inFlight: false, generation: 0, attempts: 0, agent, route, pending: null, messages: new Set() };
+      reengagements.set(sessionID, entry);
+    }
+    entry.route = route;
+    // Remember that recovery work existed even after its owner completes or is
+    // cancelled. A later human turn must keep bare SDK events fail-closed.
+    attributionForChat(sessionID).recoverySeen = true;
+    return entry;
+  };
+  const currentRecovery = (sessionID, entry, generation) => Boolean(entry) &&
+    reengagements.get(sessionID) === entry && entry.generation === generation && !parked.has(sessionID);
+  const continuationKind = (error, route) => {
+    const kind = classifyRoutingFailure(error, { targetProviderID: route?.target?.model?.providerID });
+    if (kind === "context" && (route?.target?.kind === "local" || modelIsLocalTarget(route?.target?.model))) return "context-local";
+    // A broken stream is retryable here, but deliberately NOT a provider-wide
+    // connect circuit in lib/routing.js. Do not broaden that broker policy.
+    const safe = normalizeProviderError(error);
+    if (kind === "other" && safe.statusCode === undefined &&
+      /\b(?:ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET)\b|socket hang ?up|connection reset|connection aborted by upstream/i
+        .test(`${safe.code ?? ""} ${safe.message}`)) return "connect";
+    return kind;
+  };
+  const continuationForbidden = (kind, error) => {
+    if (isAbortError(error) || ["abort", "noop", "payload", "context", "model", "auth"].includes(kind)) return true;
+    const status = normalizeProviderError(error).statusCode;
+    if ([401, 403].includes(status) && kind !== "quota") return true;
+    if ([400, 413, 422].includes(status) && !["quota", "context-local"].includes(kind)) return true;
+    // Permission and malformed-request errors can carry misleading 503/overload
+    // wording. Neither a generic "context" nor "aborted" word is an abort signal.
+    return /\b(?:permission|forbidden|unauthori[sz]ed|authentication|malformed|payload|serializ(?:ation|e))\b/i
+      .test(providerErrorText(error));
+  };
+  const transientContinuation = (kind, error) => !continuationForbidden(kind, error) &&
+    ["rate", "quota", "overload", "connect", "context-local"].includes(kind);
+  const promptContinuation = async (sessionID, entry, text, kind) => {
+    const generation = ++entry.generation;
+    entry.inFlight = true;
+    entry.pending = null;
+    entry.promptPartID = `prt_${randomUUID()}`;
+    if (kind === "context-local") entry.contextEscapeUsed = true;
+    // Attempts count actual continuations, not duplicate error notifications.
+    entry.attempts = Math.min(entry.attempts + 1, REENGAGE_DELAYS_MS.length);
+    let promptError = null;
+    try {
+      const result = await client.session.prompt({
+        path: { id: sessionID },
+        query: { directory },
+        body: {
+          ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+          parts: [{ id: entry.promptPartID, type: "text", text, synthetic: true }],
+        },
+      });
+      if (!currentRecovery(sessionID, entry, generation)) return;
+      if (result?.error) promptError = providerErrorFrom(result.error) ?? result.error;
+    } catch (error) {
+      if (!currentRecovery(sessionID, entry, generation)) return;
+      report("error", `${sessionID}: continuation failed`, error);
+      promptError = error;
+    }
+    if (!currentRecovery(sessionID, entry, generation)) return;
+    entry.inFlight = false;
+    if (promptError) {
+      // No fallback to the previous outage kind: an unknown SDK error is not
+      // evidence of an outage. The current lease supplies local-context evidence.
+      scheduleReengage(sessionID, continuationKind(promptError, routes.get(sessionID) ?? entry.route), promptError);
+    } else if (entry.pending?.ready) {
+      const pending = entry.pending;
+      scheduleReengage(sessionID, pending.kind, pending.error, pending.delay);
+    } else {
+      report("info", `${sessionID}: re-engaged after ${kind} failure`);
+    }
+  };
+  const scheduleReengage = (sessionID, kind, error, delayOverride = null) => {
+    if (!transientContinuation(kind, error)) {
+      cancelRecovery(sessionID);
       return;
     }
-    history.push(now);
-    reengageHistory.set(sessionID, history);
-    trimTracker(reengageHistory);
-    const handle = scheduleTimeout(async () => {
-      try {
-        await client.session.prompt({
-          path: { id: sessionID },
-          query: { directory },
-          // Carry the session's own agent: an agent-less prompt runs as the pane's default
-          // (`smart`), which turned a re-engaged subagent into a primary on another tier.
-          body: {
-            ...(typeof sessions.get(sessionID)?.agent === "string" && sessions.get(sessionID).agent
-              ? { agent: sessions.get(sessionID).agent }
-              : {}),
-            parts: [{ type: "text", text: REENGAGE_TEXT, synthetic: true }],
-          },
-        });
-        report("info", `${sessionID}: re-engaged after ${kind} failure`);
-      } catch (error) {
-        report("error", `${sessionID}: re-engage failed`, error);
+    const entry = reengagements.get(sessionID);
+    if (!entry || parked.has(sessionID) || entry.timer !== null) return;
+    // Context overflow is not an outage. Preserve the one move off a small local
+    // window, but leave a repeated fit failure to compaction or a real new turn.
+    if (kind === "context-local" && entry.contextEscapeUsed) {
+      cancelRecovery(sessionID);
+      return;
+    }
+    entry.pending = { kind, error, delay: delayOverride, ready: true };
+    if (entry.inFlight) return;
+    const generation = entry.generation;
+    const delay = delayOverride ?? REENGAGE_DELAYS_MS[Math.min(entry.attempts, REENGAGE_DELAYS_MS.length - 1)];
+    entry.timer = scheduleTimeout(async () => {
+      if (!currentRecovery(sessionID, entry, generation)) return;
+      entry.timer = null;
+      if (resolveProfile({ sessionID, parentID: sessions.get(sessionID)?.parentID, agent: entry.agent }).profile === "manual") {
+        cancelRecovery(sessionID);
+        return;
       }
+      await promptContinuation(sessionID, entry, REENGAGE_TEXT, kind);
     }, delay);
-    if (typeof handle?.unref === "function") handle.unref();
+    entry.timer?.unref?.();
   };
   // --- Resume after an outage --------------------------------------------
   // Failover covers a provider stopping a session while ANOTHER can take it. When none
@@ -943,9 +1101,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         continue;
       }
       if (Date.now() < (entry.notBefore ?? 0)) continue;
+      const sameProfile = () => resolveProfile({ sessionID, parentID: sessions.get(sessionID)?.parentID, agent: entry.agent }).profile === entry.profile;
+      if (!sameProfile()) { unpark(sessionID); continue; }
       let target = null;
       try {
         const contextTokens = await sessionContextTokens(sessionID);
+        if (parked.get(sessionID) !== entry) continue;
         const preview = await brokerRequest("/preview", {
           profile: entry.profile,
           tiers: [entry.tier],
@@ -953,8 +1114,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         });
         target = preview?.preview?.[entry.tier] ?? null;
       } catch { continue; } // broker down: try again next minute
-      if (!target?.model?.id) continue;
+      // The request may have outlived a user message, abort, deletion, terminal
+      // failure or a replacement park. A stale snapshot never owns a prompt.
+      if (parked.get(sessionID) !== entry || !target?.model?.id) continue;
+      if (!sameProfile()) { unpark(sessionID); continue; }
       unpark(sessionID);
+      const recovery = ownRecovery(sessionID, { profile: entry.profile, tier: entry.tier, target }, entry.agent);
+      if (!recovery) continue;
       resumeHistory.set(sessionID, [...(resumeHistory.get(sessionID) ?? []), Date.now()]
         .filter((at) => Date.now() - at < RESUME_BACKOFF_WINDOW_MS));
       trimTracker(resumeHistory);
@@ -964,24 +1130,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         client?.tui?.showToast?.({ body: { message: `Resuming a stopped session: ${model} is available again`, variant: "success", duration: 10000 }, query: { directory } })
           ?.catch?.(() => {});
       } catch {}
-      try {
-        await client.session.prompt({
-          path: { id: sessionID },
-          query: { directory },
-          body: {
-            ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
-            parts: [{ type: "text", text: RESUME_TEXT, synthetic: true }],
-          },
-        });
-      } catch (error) {
-        // The prompt itself failing (the lane emptied again between preview and lease) parks it
-        // again through the lease path; anything else is reported and left to the user.
-        report("error", `${sessionID}: resume failed`, error);
-      }
+      await promptContinuation(sessionID, recovery, RESUME_TEXT, "parked");
     }
   };
   const parkSession = (sessionID, { profile, tier, agent, reason }) => {
     if (!sessionID || !tier) return;
+    // The preview queue owns sustained no-lane recovery; it must never race a delayed prompt.
+    cancelReengagement(sessionID);
     const existing = parked.get(sessionID);
     const recentResumes = (resumeHistory.get(sessionID) ?? []).filter((at) => Date.now() - at < RESUME_BACKOFF_WINDOW_MS).length;
     const notBefore = recentResumes
@@ -1081,7 +1236,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         } catch (error) {
           report("error", `${sessionID}: restore from fallback failed`, error);
         }
-      }, REENGAGE_DELAY_MS);
+      }, REENGAGE_DELAYS_MS[0]);
       if (typeof handle?.unref === "function") handle.unref();
     }).catch(() => {});
   };
@@ -1175,14 +1330,16 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     } catch {}
   };
 
-  const ensure = async (sessionID, agentHint, preferredModel = null, turnEffort = null) => {
+  const ensure = async (sessionID, agentHint, preferredModel = null, turnEffort = null, checkContinuation = null) => {
     if (!sessionID) return;
+    checkContinuation?.();
     let session = sessions.get(sessionID);
     try {
       // Session metadata is immutable for routing purposes. Fetch it only once when
       // a resumed session did not emit session.created in this plugin process.
       if (!session) session = await getSession(sessionID);
     } catch (error) {
+      checkContinuation?.();
       const resolved = resolveProfile({ sessionID });
       // A Manual root with a model supplied by chat.message has enough authoritative
       // data to preserve the user's selection. Every routed profile fails closed.
@@ -1199,6 +1356,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       failLease(resolved, error);
     }
+    checkContinuation?.();
     if (!session?.id) return;
     // Fresh root session.created events do not consistently include the chosen agent.
     // chat.message carries the authoritative agent while OpenCode is still building
@@ -1224,7 +1382,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         };
       }
     }
-    return route(session, preferredModel, turnEffort);
+    return route(session, preferredModel, turnEffort, checkContinuation);
   };
 
   return {
@@ -1267,12 +1425,55 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     "chat.message": async (input, output) => {
       const sessionID = extractSessionID(input);
       void retryPendingForgets();
-      if (sessionID) successCandidates.delete(sessionID);
       if (!sessionID) return;
+      const parts = Array.isArray(output?.parts) ? output.parts : [];
+      const humanParts = parts.some((part) => ["text", "file"].includes(part?.type) && part.synthetic !== true);
+      const syntheticOnly = !humanParts && parts.some((part) => part?.type === "text" && part.synthetic === true);
+      const recoveryTextPart = syntheticOnly ? parts.find((part) => part?.type === "text" && part.synthetic === true &&
+        [REENGAGE_TEXT, RESUME_TEXT].includes(part.text)) : null;
+      const candidateContinuation = recoveryTextPart ? reengagements.get(sessionID) : null;
+      const continuation = candidateContinuation && typeof candidateContinuation.promptPartID === "string" && candidateContinuation.promptPartID &&
+        recoveryTextPart?.id === candidateContinuation.promptPartID
+        ? candidateContinuation : null;
+      const ownContinuation = Boolean(continuation);
+      const continuationGeneration = continuation?.generation;
+      const checkContinuation = ownContinuation ? () => {
+        if (!currentRecovery(sessionID, continuation, continuationGeneration)) {
+          throw new Error("[opencode-broker] cancelled continuation");
+        }
+      } : null;
+      // A recovery text is ours only if the SDK returned the exact part we sent.
+      // Do this before any mutation so a late B callback cannot take C ownership.
+      if (recoveryTextPart && !ownContinuation) {
+        throw new Error("[opencode-broker] cancelled continuation");
+      }
+      checkContinuation?.();
+      successCandidates.delete(sessionID);
+      // This must precede every await: event delivery can race route acquisition.
+      // A human turn fences any cancelled recovery episode before its late SDK
+      // error can be mistaken for this turn's currently leased provider.
+      recordChatAttribution(sessionID, input, output, humanParts, syntheticOnly);
+      // Cancel BEFORE any SDK or broker await, including attachment-only turns.
+      if (humanParts) cancelRecovery(sessionID);
+      else if (syntheticOnly && !ownContinuation) {
+        // A background notice starts work too. Retire the pending send without
+        // treating the notice as a human reset of the episode's backoff/ownership.
+        const entry = reengagements.get(sessionID);
+        if (entry) {
+          entry.generation += 1;
+          if (entry.timer !== null) cancelTimeout(entry.timer);
+          entry.timer = null;
+          entry.inFlight = false;
+          entry.pending = null;
+          entry.promptPartID = null;
+        }
+        unpark(sessionID);
+      }
       let session = sessions.get(sessionID);
       if (!session) {
         try { session = await getSession(sessionID); } catch {}
       }
+      checkContinuation?.();
       // ☠️ input.agent is the agent the CALLER named, which a headless `opencode run` without
       // --agent leaves undefined: opencode resolves its default agent onto the user message
       // (output.message.agent) only after this input is built. A fresh session's record may not
@@ -1310,9 +1511,6 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // claude-opus-5 while the pane still showed Sol, and each side's next turn then failed
       // "routed model mismatch" in turn. ensure() already keeps a subagent on its route for
       // the same reason; a prompt with no user-authored text keeps the root on its route too.
-      const parts = Array.isArray(output?.parts) ? output.parts : [];
-      const syntheticOnly = parts.some((part) => part?.type === "text" && part.synthetic === true) &&
-        !parts.some((part) => part?.type === "text" && part.synthetic !== true);
       const routedModel = routes.get(sessionID)?.target?.model;
       const preferredModel = syntheticOnly && routedModel?.providerID && routedModel?.id
         ? { providerID: routedModel.providerID, id: routedModel.id, ...(typeof routedModel.variant === "string" && routedModel.variant ? { variant: routedModel.variant } : {}) }
@@ -1327,6 +1525,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const resolved = classifier
         ? { profile: "auto", explicit: false }
         : resolveProfile({ sessionID, parentID: session?.parentID, agent });
+      if (classifier || resolved.profile === "manual") cancelRecovery(sessionID);
       let turnEffort = null;
       const isCompaction = agent === "compaction";
       if (!syntheticOnly && messageText && resolved.profile !== "manual") {
@@ -1377,17 +1576,20 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       let routed;
       try {
-        routed = await ensure(sessionID, agent, preferredModel, turnEffort);
+        routed = await ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation);
       } catch (error) {
         if (!needsInventory || (!/provider inventory is stale/.test(String(error?.message ?? error)) && !isAuthRevisionRaceError(error))) throw error;
         await refreshInventory();
-        routed = await ensure(sessionID, agent, preferredModel, turnEffort);
+        routed = await ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation);
       }
+      checkContinuation?.();
       applyMessageModel(output?.message, routed, sessionID);
       // The forked engine reads this field and binds the turn to it. A pane still running
       // stock 1.18.22 ignores it and relies on the mutation above. Ceiling: drop the
       // mutation once every pane runs the fork.
       applyOutputModel(output, routed);
+      const recovery = reengagements.get(sessionID);
+      if (recovery) recovery.route = routed;
     },
     // Cache lifetime hint for claude-proxy, matching what Claude Code does on the same plan:
     // a ROOT session can sit idle for many minutes (a human thinking, or a parent waiting on
@@ -1455,7 +1657,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (event?.type === "session.created") {
         const info = properties.info ?? sessions.get(sessionID) ?? (sessionID ? await getSession(sessionID) : null);
         if (info?.id) {
+          const knownSession = sessions.has(info.id);
           sessions.set(info.id, info);
+          // Repeated metadata notifications must not erase current ownership.
+          if (!recoveryAttribution.has(info.id)) {
+            setRecoveryAttribution(info.id, newRecoveryAttribution(knownSession));
+          }
           // ☠️ A classifier lane session gets NO profile record. This line is where the
           // guard's child used to ACQUIRE its parent's `uncensored`: resolveProfile
           // inherits from the parent, and this made that inheritance the child's own, on
@@ -1491,6 +1698,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         unpark(sessionID);
         unwatchFallback(sessionID);
+        cancelRecovery(sessionID);
+        recoveryAttribution.delete(sessionID);
         displacedModels.delete(sessionID);
         try { removeFallbackMarker(sessionID); } catch {}
         await cleanupDeletedSession({
@@ -1513,8 +1722,32 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // resets, which for a plan limit is hours. A fleet has other providers.
       // Abort the wait, report the failure (opening the circuit), and re-engage
       // on the next best lease.
+      const observableStatusError = providerErrorFrom(
+        properties.error,
+        properties.message?.error,
+        properties.part?.error,
+        properties.info?.error,
+        properties.data?.error,
+        properties.session?.error,
+      );
+      // Stop/Abort is intentionally processed before attribution filtering.
+      if (isAbortError(observableStatusError)) {
+        clearLocalChildInactivityWatchdog(sessionID);
+        clearLocalChildInFlightTools(sessionID);
+        stopHeartbeat(sessionID);
+        successCandidates.delete(sessionID);
+        // The user stopped it on purpose: it must not come back on its own.
+        unpark(sessionID);
+        unwatchFallback(sessionID);
+        cancelRecovery(sessionID);
+        return;
+      }
       if (event?.type === "session.status") {
         const status = properties.status ?? properties.info?.status;
+        if (status?.type === "retry" && unattributableToActiveTurn(sessionID, null)) {
+          report("info", `${sessionID}: ignoring unattributable provider retry after recovery supersession`);
+          return;
+        }
         if (status?.type === "retry" && routes.get(sessionID)?.target?.id) {
           const now = Date.now();
           const waitMs = Number(status.next) - now;
@@ -1530,6 +1763,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             const targetID = failedRoute.target.id;
             const leaseID = failedRoute.leaseID;
             const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
+            const recovery = ownRecovery(sessionID, failedRoute);
+            const generation = recovery?.generation;
             retryWaits.delete(sessionID);
             if (!singleTooLong) {
               report("warn", `${sessionID}: ${waits.length} provider retries totalling ${Math.round(parkedMs / 1000)}s within ${RETRY_WINDOW_MS / 1000}s -- failing over from ${targetID}`);
@@ -1550,10 +1785,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
                   : `provider retry waits totalled ${Math.round(parkedMs / 1000)}s within the failover window`)) },
               });
             } catch {}
-            if (!classifier) {
+            if (!classifier && currentRecovery(sessionID, recovery, generation)) {
               markDisplaced(sessionID, targetID, failure);
               try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
-              if (failure?.kind && failure.kind !== "abort") scheduleReengage(sessionID, failure.kind);
+              if (!currentRecovery(sessionID, recovery, generation)) return;
+              const retryError = { message: String(status.message ?? ""), statusCode: status.statusCode };
+              scheduleReengage(sessionID, failure?.kind ?? continuationKind(retryError, failedRoute), retryError);
             }
             return;
           }
@@ -1579,6 +1816,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         // The user stopped it on purpose: it must not come back on its own.
         unpark(sessionID);
         unwatchFallback(sessionID);
+        // There is no correlation ID distinguishing a router abort from Stop.
+        // Safety wins: ANY observable abort cancels, even a delayed internal one.
+        cancelRecovery(sessionID);
+        return;
+      }
+      if (errorEvent && unattributableToActiveTurn(sessionID, messageRecordFrom(properties))) {
+        report("info", `${sessionID}: ignoring unattributable provider error after recovery supersession`);
         return;
       }
       // ☠️ CHARGE THE FAILURE TO THE PROVIDER THAT ACTUALLY ANSWERED, OR TO NOBODY.
@@ -1613,11 +1857,32 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         const failedRoute = routes.get(sessionID);
+        const ownedRoute = failedRoute ?? reengagements.get(sessionID)?.route;
         const failedTarget = failedRoute?.target;
         const failedLeaseID = failedRoute?.leaseID;
         const targetID = failedTarget?.id;
-        const failedOnLocal = failedTarget?.kind === "local" || modelIsLocalTarget(failedTarget?.model);
         const classifier = isClassifierAgent(sessions.get(sessionID)?.agent);
+        const kind = continuationKind(error, ownedRoute);
+        const usageRefusal = /usage limit reached -- /.test(String(error?.message ?? ""));
+        // Cancel BOTH owners for a terminal failure, even if its route was already
+        // deleted. The gateway's no-lane refusal is the existing park exception.
+        if (classifier || ownedRoute?.profile === "manual" || (!usageRefusal && !transientContinuation(kind, error))) {
+          cancelRecovery(sessionID);
+        }
+        const recovery = !classifier && (usageRefusal || transientContinuation(kind, error))
+          ? ownRecovery(sessionID, ownedRoute) : null;
+        const generation = recovery?.generation;
+        const message = messageRecordFrom(properties);
+        const messageID = message?.role === "assistant" && typeof message.id === "string" ? message.id : null;
+        if (recovery && messageID) {
+          if (recovery.messages.has(messageID)) return;
+          recovery.messages.add(messageID);
+          if (recovery.messages.size > 128) recovery.messages.delete(recovery.messages.values().next().value);
+        }
+        // Latch before /failure: prompt acceptance can resolve while this report
+        // is pending. Readiness prevents a retry outrunning its circuit report.
+        const pending = recovery && !usageRefusal && recovery.timer === null
+          ? (recovery.pending ??= { kind, error, ready: false }) : null;
         const failedModel = failedTarget?.model;
         const failedModelID = failedModel?.modelID ?? failedModel?.id;
         displacedModels.delete(sessionID);
@@ -1658,13 +1923,14 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         // The gateway's usage-limit refusal (lib/usage-limit.js wording) is a noop to the broker --
         // no provider is at fault -- so no failover follows it; the session would just stop. Park
         // it like a refused lease, to resume when its lane can be served again.
-        if (!classifier && failedRoute?.tier && /usage limit reached -- /.test(String(error?.message ?? ""))) {
+        if (usageRefusal && currentRecovery(sessionID, recovery, generation) && ownedRoute?.tier) {
           parkSession(sessionID, {
-            profile: failedRoute.profile,
-            tier: failedRoute.tier,
-            agent: sessions.get(sessionID)?.agent,
+            profile: ownedRoute.profile,
+            tier: ownedRoute.tier,
+            agent: recovery.agent,
             reason: "usage-limit",
           });
+          return;
         }
         // A context-overflow error names the real request size. Record it so
         // the re-lease cannot land back on the too-small model.
@@ -1675,19 +1941,15 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         }
         // Seamless failover: only sessions this plugin actually routed, and
         // never for user aborts -- those end turns on purpose.
-        if (!classifier && targetID && failure?.kind && failure.kind !== "abort") {
+        if (currentRecovery(sessionID, recovery, generation)) {
           markDisplaced(sessionID, targetID, failure);
-          // ☠️ A CLOUD CONTEXT OVERFLOW IS NOT A LANE TO FAIL OVER FROM. Re-engaging exists
-          // to lift a session off a small LOCAL window; a cloud lane that says "prompt is
-          // too long" is answering for a transcript no sibling lane holds either, and the
-          // host is already compacting it. On 2026-09-21 a 1.34M-token session on a 1M
-          // anthropic lane was re-prompted three times in eight minutes, each prompt
-          // riding another ~0.9M-token compaction -- 8% of the plan in five minutes.
-          if (failure.kind === "context" && !failedOnLocal) {
-            report("warn", `${sessionID}: not re-engaging after a context overflow on cloud target ${targetID} -- compaction or a human owns this turn`);
-            return;
-          }
-          scheduleReengage(sessionID, failure.kind);
+          // Local context and broken-stream retryability are plugin decisions, not
+          // changes to the broker's context/other circuit classifications.
+          const brokerKind = failure?.kind ?? kind;
+          const failureKind = (brokerKind === "context" && kind === "context-local") ||
+            (brokerKind === "other" && kind === "connect") ? kind : brokerKind;
+          if (pending) pending.ready = true;
+          scheduleReengage(sessionID, failureKind, error);
         }
         return;
       }
@@ -1698,7 +1960,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           messageModels.set(record.id, { providerID: record.providerID, modelID: record.modelID });
           trimTracker(messageModels);
         }
-        if (isCompletedAssistantMessage(properties) && !error) {
+        if (isCompletedAssistantMessage(properties) && !error && attributedToActiveTurn(sessionID, record)) {
+          // Match the engine's terminal finish semantics. A compaction summary is
+          // a completed message, NOT completion of the conversation it summarizes.
+          if (record.summary !== true && record.finish && !["tool-calls", "unknown"].includes(record.finish)) {
+            cancelRecovery(sessionID);
+          }
           // Track context size for every session, routed or not: a manual session that
           // later flips to auto must not start from an unknown (permissive) estimate.
           const total = contextTokensOf(record);
@@ -1773,9 +2040,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         return;
       }
       if (event?.type === "message.updated" && isCompletedAssistantMessage(properties) && !error) {
-        successCandidates.set(sessionID, true);
-        displacedModels.delete(sessionID);
-        retryWaits.delete(sessionID);
+        if (attributedToActiveTurn(sessionID, messageRecordFrom(properties))) {
+          successCandidates.set(sessionID, true);
+          displacedModels.delete(sessionID);
+          retryWaits.delete(sessionID);
+        }
         return;
       }
       if (event?.type === "message.part.updated" && error) {
@@ -1783,6 +2052,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         return;
       }
       if (event?.type === "session.idle") {
+        if (unattributableToActiveTurn(sessionID, null) && successCandidates.get(sessionID) !== true) {
+          report("info", `${sessionID}: ignoring unattributable session idle after recovery supersession`);
+          return;
+        }
         const leaseID = routes.get(sessionID)?.leaseID;
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);

@@ -91,6 +91,17 @@ All notable changes to this project are documented here. The format is based on
   nothing against provider health; the next inventory refresh is what removes the id.
 
 ### Changed
+- **Provider-outage recovery has one owner per session, a capped backoff, and attribution fences.**
+  Each session's re-engagement now carries a generation: an abort, a new human turn, a parked
+  session, a switch to Manual or a deletion cancels the owner, and every await re-checks that it
+  is still current, so a late SDK callback or provider event cannot resurrect a cancelled
+  recovery or start a second one. Continuations back off through 2.5, 5, 10, 20, 40 and 60 s
+  instead of a fixed 2.5 s with two attempts. After a newer turn supersedes a recovered one,
+  errors and retry statuses that cannot be attributed to the active turn by parentID are
+  reported and ignored instead of failing over the session that is now running. Covered by
+  tests/provider-outage-recovery.test.mjs (72 scenarios). Reconciled with the fallback-restore
+  work: a user abort still unparks and stops watching the fallback, and restore uses the first
+  backoff rung.
 
 - **The session burn alarm is calibrated to 3.5M weighted tokens in five minutes.** An 8.5-day
   replay of 41,872 real cloud requests across 1,787 session trees (subagents rolled into their
