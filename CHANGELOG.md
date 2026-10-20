@@ -28,6 +28,14 @@ All notable changes to this project are documented here. The format is based on
 - **A session pin now expires 4 hours after the session's last activity instead of 14 days after its model was picked.** After a few hours the provider prompt cache is cold anyway, so the pin only bought model continuity. Past a working stretch, a fresh pick is better than reviving a day-old choice. Activity is stamped on the pin (`activeAt`) whenever a lease ends (release, complete, forget, failure, idle reclaim, expiry), so a session busy on one pin all day keeps it. On this host, ~500 sessions/day had filled the 512 cap, pins were being evicted by count at ~22 h, and the cap logged a warning every few minutes; the map now holds the last few hours' sessions (113 at deploy on 2026-10-09). Existing pins were backfilled from `decisions.jsonl` at deploy.
 
 ### Fixed
+- **A local child that went idle no longer logs "failed to report local child inactivity watchdog
+  failure ... lease id is required for settlement" ten minutes later.** On `session.idle` the router
+  cleared the watchdog and then awaited `/forget` with the route still present; the turn's last
+  progress event, delivered during that wait, re-armed the watchdog, and the route was deleted
+  under it. The timer then fired with no route and sent `/failure` and `/release` without a lease
+  id, which the broker refuses, and aborted the already idle child. The idle settlement now clears
+  the watchdog again as it deletes the route, and a firing watchdog whose session no longer has a
+  local child route does nothing.
 
 - **A missing or corrupt OpenCode model cache no longer fails every prompt.** OpenCode deletes `~/.cache/opencode/models.json` whenever a read of it fails to parse, and it does not write the file back until its next models.dev fetch succeeds. The router's `chat.message` publication read that file and threw, so every prompt died with `unable to read OpenCode model cache`. On 2026-10-13 this lasted from 18:59 until the daily watch job ran at 00:01. The broker now keeps a last-good copy at `<routing state>/last-good-models.json`. It rewrites the copy only when the live cache is newer, so the prompt path pays one extra `stat`. When the live cache is unusable, publication uses that copy and logs a warning. It also restores the copy in place with its old mtime, so OpenCode still treats the file as stale and refetches. The actionable `run 'opencode models --refresh'` error remains for when neither file is usable.
 

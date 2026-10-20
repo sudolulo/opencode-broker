@@ -605,6 +605,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     if ((localChildInFlightTools.get(sessionID) ?? 0) > 0 || !isLocalChildRoute(sessionID)) return;
     const timer = scheduleTimeout(async () => {
       if (localChildInactivityWatchdogs.get(sessionID) !== timer) return;
+      // The route can be settled after this timer was armed (idle, error, deletion). Its lease is
+      // gone with it, and a lease-less /failure is refused by the broker; nothing is left to fail.
+      if (!isLocalChildRoute(sessionID)) {
+        clearLocalChildInactivityWatchdog(sessionID);
+        return;
+      }
       report("warn", `local child ${sessionID} was inactive for ${localChildInactivityWatchdogMs}ms; failing over`);
       await failInactiveLocalChild(sessionID);
     }, localChildInactivityWatchdogMs);
@@ -1689,6 +1695,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         }); } catch {
           try { writePendingForgetRecord(sessionID, { leaseID, completed }); } catch {}
         } finally {
+          // A progress event delivered while /forget was in flight re-armed the watchdog against
+          // the route that is deleted here.
+          clearLocalChildInactivityWatchdog(sessionID);
           routes.delete(sessionID);
           successCandidates.delete(sessionID);
           retryWaits.delete(sessionID);

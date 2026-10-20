@@ -1421,6 +1421,76 @@ test("only local children arm inactivity watchdogs, and idle or deletion clears 
   assert.equal(result.requests.some((request) => request.path === "/release"), false);
 }));
 
+test("a progress event during idle settlement cannot leave a watchdog armed without a route", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    const aborts = [];
+    let releaseForget;
+    const forgetHeld = new Promise((resolve) => { releaseForget = resolve; });
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const respond = () => {
+          const response = new EventEmitter();
+          response.statusCode = 200;
+          response.setEncoding = () => {};
+          callback(response);
+          const reply = options.path === "/lease"
+            ? { leaseID: "lease-1", target: { id: "local-qwen", kind: "local", model: { providerID: "llamacpp", id: "qwen" } } }
+            : {};
+          response.emit("data", JSON.stringify(reply));
+          response.emit("end");
+        };
+        if (options.path === "/forget") forgetHeld.then(respond);
+        else respond();
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const { writeSessionProfile } = await import(${JSON.stringify(routingUrl)});
+    const timers = [];
+    const session = { id: "idle-race", parentID: "parent", agent: "scout" };
+    writeSessionProfile(session.id, "local", { explicit: true });
+    const hooks = await ModelRouter({ client: { session: {
+      get: async () => session,
+      messages: async () => ({ data: [] }),
+      abort: async (request) => { aborts.push(request); },
+      prompt: async () => {},
+    } }, directory: process.env.HOME }, {
+      localChildInactivityWatchdogMs: 123,
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {}, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { timer.cleared = true; },
+    });
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+    const idle = hooks.event({ event: { type: "session.idle", properties: { sessionID: session.id } } });
+    // The final message.updated of the turn lands while /forget is still in flight.
+    await hooks.event({ event: { type: "message.updated", properties: { sessionID: session.id } } });
+    releaseForget();
+    await idle;
+    for (const timer of timers) await timer.callback();
+    process.stdout.write(JSON.stringify({ timers, aborts, requests }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.equal(result.timers.every((timer) => timer.cleared), true, "no watchdog outlives the settled route");
+  assert.deepEqual(result.aborts, []);
+  assert.deepEqual(result.requests.map((request) => request.path), ["/lease", "/forget"],
+    "a watchdog firing after idle sends no lease-less /failure or /release");
+}));
+
 test("all four progress events clear and rearm the local-child inactivity watchdog", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
