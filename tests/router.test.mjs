@@ -2096,3 +2096,294 @@ test("a Manual child inherits the parent's live model, not stale session metadat
   assert.equal(child.status, 0, child.stderr);
   assert.deepEqual(JSON.parse(child.stdout), { providerID: "openai", modelID: "gpt-5.6-sol" });
 }));
+
+// --- Content-filter failover (session turn) ------------------------------------------------
+// A provider content-filter block finishes the assistant turn with finish "content-filter".
+// The plugin fails THAT turn over to the broker's contentFilterCascade /lease mode, re-prompting
+// on the next candidate and chaining down the order, bounded by CF_MAX_ATTEMPTS. The harness
+// below runs in a subprocess (HOME is isolated for on-disk session profiles) with a stubbed
+// http.request broker, an injected scheduler, and a fake client that records aborts/prompts.
+const CF_RETRY_TEXT = "[opencode-broker] Please answer my previous request.";
+const cfSubprocess = ({ pluginUrl, routingUrl, cascadePlan, body }) => `
+  import { createRequire } from "node:module";
+  import { EventEmitter } from "node:events";
+  import { mkdirSync, writeFileSync } from "node:fs";
+  import { join } from "node:path";
+  const require = createRequire(import.meta.url);
+  const http = require("node:http");
+  const brokerCalls = [];
+  const cascadePlan = ${JSON.stringify(cascadePlan ?? [])};
+  let cascadeIdx = 0;
+  http.request = (options, callback) => {
+    const req = new EventEmitter();
+    req.end = (payload = "") => {
+      const b = payload ? JSON.parse(payload) : {};
+      brokerCalls.push({ path: options.path, body: b });
+      const response = new EventEmitter();
+      response.setEncoding = () => {};
+      let status = 200;
+      let out = { ok: true };
+      if (options.path === "/lease") {
+        if (b.contentFilterCascade) {
+          const plan = cascadePlan[Math.min(cascadeIdx, cascadePlan.length - 1)];
+          cascadeIdx += 1;
+          status = plan.status || 200;
+          out = plan.body;
+        } else {
+          out = { target: { id: "gpt-flagship", kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-sol" } }, decision: { policy: "weighted-depletion", reasons: [] } };
+        }
+      }
+      response.statusCode = status;
+      callback(response);
+      response.emit("data", JSON.stringify(out));
+      response.emit("end");
+    };
+    req.destroy = () => {};
+    req.setTimeout = () => {};
+    req.on = EventEmitter.prototype.on;
+    return req;
+  };
+  mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+  mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+  writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+  writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" }, anthropic: { type: "oauth" } }) + "\\n");
+  const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+  const routing = await import(${JSON.stringify(routingUrl)});
+  const logs = [];
+  const aborts = [];
+  const prompts = [];
+  const sessions = new Map();
+  const client = {
+    provider: { list: async () => ({ data: { connected: ["openai", "anthropic"], all: [{ id: "openai", models: {} }, { id: "anthropic", models: {} }] } }) },
+    session: {
+      get: async (r) => sessions.get(r.path.id) || { id: r.path.id, agent: "standard" },
+      messages: async () => ({ data: [] }),
+      abort: async (i) => { aborts.push(i); return { data: true }; },
+      prompt: async (i) => { prompts.push(i); return { data: true }; },
+    },
+    app: { log: async (e) => { logs.push(e.body); } },
+  };
+  const timers = [];
+  const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+    setTimeout: (fn, delay) => { const t = { fn, delay, cleared: false, ran: false, unref() {} }; timers.push(t); return t; },
+    clearTimeout: (t) => { if (t) t.cleared = true; },
+  });
+  const flush = async () => { await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r)); };
+  const runNewTimers = async () => {
+    for (const t of timers.filter((x) => !x.ran && !x.cleared)) { t.ran = true; await t.fn(); }
+  };
+  const created = async (id, agent, parentID) => {
+    sessions.set(id, { id, agent, parentID });
+    await hooks.event({ event: { type: "session.created", properties: { info: { id, agent, parentID } } } });
+  };
+  const start = async (id, agent, model) => {
+    const input = model ? { sessionID: id, agent, model } : { sessionID: id, agent };
+    const output = model ? { message: { model: { providerID: model.providerID, modelID: model.id } }, parts: [] } : { message: {}, parts: [] };
+    await hooks["chat.message"](input, output);
+  };
+  const block = async (id, providerID, modelID, mid) => {
+    await hooks.event({ event: { type: "message.updated", properties: { sessionID: id, info: { id: mid, role: "assistant", providerID, modelID, finish: "content-filter", time: { completed: Date.now() } } } } });
+    await flush();
+  };
+  const finish = async (id, providerID, modelID, mid, reason) => {
+    await hooks.event({ event: { type: "message.updated", properties: { sessionID: id, info: { id: mid, role: "assistant", providerID, modelID, finish: reason, time: { completed: Date.now() } } } } });
+    await flush();
+  };
+  const human = async (id, agent, text) => {
+    await hooks["chat.message"]({ sessionID: id, agent }, { message: {}, parts: [{ type: "text", text, synthetic: false }] });
+  };
+  const feedReprompt = async (id) => {
+    const p = prompts[prompts.length - 1];
+    const part = p.body.parts[0];
+    const agent = p.body.agent;
+    await hooks["chat.message"](agent ? { sessionID: id, agent } : { sessionID: id }, { message: {}, parts: [part] });
+  };
+  const cascadeLeases = () => brokerCalls.filter((c) => c.path === "/lease" && c.body.contentFilterCascade === true);
+  ${body}
+`;
+const runCf = (opts) => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-cf-home-"));
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = cfSubprocess({
+    pluginUrl: new URL("../plugin/router.js", import.meta.url).href,
+    routingUrl: new URL("../lib/routing.js", import.meta.url).href,
+    ...opts,
+  });
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout.trim().split("\n").filter(Boolean).at(-1));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+};
+
+test("a content-filter finish fails the turn over with a cascade /lease and a synthetic re-prompt", () => {
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-a", "standard");
+      await start("cf-a", "standard");
+      await block("cf-a", "openai", "gpt-5.6-sol", "m-a-1");
+      await runNewTimers();
+      await feedReprompt("cf-a");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({
+        aborts: aborts.length,
+        prompts: prompts.length,
+        promptText: prompts[0] && prompts[0].body.parts[0].text,
+        promptSynthetic: prompts[0] && prompts[0].body.parts[0].synthetic,
+        promptHasId: Boolean(prompts[0] && prompts[0].body.parts[0].id),
+        cascadeCount: casc.length,
+        first: casc[0] && casc[0].body,
+      }));
+    `,
+  });
+  assert.ok(result.aborts >= 1, "the blocked turn is aborted");
+  assert.equal(result.prompts, 1, "exactly one synthetic re-prompt");
+  assert.equal(result.promptText, CF_RETRY_TEXT);
+  assert.equal(result.promptSynthetic, true);
+  assert.equal(result.promptHasId, true, "the re-prompt carries the minted part id");
+  assert.equal(result.cascadeCount, 1, "the re-prompt drives a contentFilterCascade /lease");
+  assert.equal(result.first.contentFilterCascade, true);
+  assert.deepEqual(result.first.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" });
+  assert.deepEqual(result.first.excludeTargetIDs, []);
+  assert.ok(!("preferredModel" in result.first), "the blocked model is never preferred");
+  assert.ok(!("releasePin" in result.first) && !("fallbackTargetID" in result.first));
+});
+
+test("a second block on the cascade candidate chains, excluding the model already tried", () => {
+  const result = runCf({
+    cascadePlan: [
+      { body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } } } },
+      { body: { target: { id: "gpt-terra", kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-terra" } } } },
+    ],
+    body: `
+      await created("cf-b", "standard");
+      await start("cf-b", "standard");
+      await block("cf-b", "openai", "gpt-5.6-sol", "m-b-1");
+      await runNewTimers();
+      await feedReprompt("cf-b");
+      await block("cf-b", "anthropic", "claude-opus-5", "m-b-2");
+      await runNewTimers();
+      await feedReprompt("cf-b");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({
+        prompts: prompts.length,
+        cascadeCount: casc.length,
+        first: casc[0] && casc[0].body,
+        second: casc[1] && casc[1].body,
+      }));
+    `,
+  });
+  assert.equal(result.prompts, 2, "two re-prompts, one per block");
+  assert.equal(result.cascadeCount, 2);
+  assert.deepEqual(result.first.excludeTargetIDs, [], "the first cascade excludes nothing yet");
+  assert.deepEqual(result.second.excludeTargetIDs, ["claude-opus-5"], "the second cascade excludes the candidate just tried");
+  assert.deepEqual(result.second.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" }, "the blocked head stays the ORIGINAL routed model across the chain; tried candidates are excluded by target id");
+});
+
+test("a clean finish triggers no content-filter cascade", () => {
+  const result = runCf({
+    body: `
+      await created("cf-c", "standard");
+      await start("cf-c", "standard");
+      await finish("cf-c", "openai", "gpt-5.6-sol", "m-c-1", "stop");
+      await runNewTimers();
+      console.log(JSON.stringify({ aborts: aborts.length, prompts: prompts.length, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.aborts, 0);
+  assert.equal(result.prompts, 0);
+  assert.equal(result.cascadeCount, 0);
+});
+
+test("a human turn clears an active content-filter failover", () => {
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } } } }],
+    body: `
+      await created("cf-d", "standard");
+      await start("cf-d", "standard");
+      await block("cf-d", "openai", "gpt-5.6-sol", "m-d-1");
+      await runNewTimers();
+      const activePrompts = prompts.length;
+      await human("cf-d", "standard", "please keep going on the task");
+      await feedReprompt("cf-d");
+      console.log(JSON.stringify({ activePrompts, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.activePrompts, 1, "the failover re-prompt was live before the human turn");
+  assert.equal(result.cascadeCount, 0, "the human turn cleared it; the stale re-prompt no longer cascades");
+});
+
+test("content-filter-exhausted stops the cascade without re-prompting again", () => {
+  const result = runCf({
+    cascadePlan: [{ status: 400, body: { error: "content-filter cascade exhausted", code: "content-filter-exhausted" } }],
+    body: `
+      await created("cf-e", "standard");
+      await start("cf-e", "standard");
+      await block("cf-e", "openai", "gpt-5.6-sol", "m-e-1");
+      await runNewTimers();
+      let threw = false;
+      try { await feedReprompt("cf-e"); } catch (error) { threw = /profile blocked/.test(String(error && error.message)); }
+      await runNewTimers();
+      console.log(JSON.stringify({ threw, prompts: prompts.length, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.threw, true, "the exhausted cascade surfaces as the normal no-target failure");
+  assert.equal(result.cascadeCount, 1, "exactly one cascade /lease was attempted");
+  assert.equal(result.prompts, 1, "no further re-prompt after exhaustion");
+});
+
+test("manual, classifier and local (llamacpp) blocked turns never cascade", () => {
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } } } }],
+    body: `
+      routing.writeSessionProfile("cf-man", "manual", { explicit: true });
+      await created("cf-man", "standard");
+      await start("cf-man", "standard", { providerID: "openai", id: "gpt-5.6-sol" });
+      await block("cf-man", "openai", "gpt-5.6-sol", "m-f-1");
+
+      await created("cf-cls", "fleet-classifier");
+      await start("cf-cls", "fleet-classifier");
+      await block("cf-cls", "openai", "gpt-5.6-sol", "m-f-2");
+
+      await created("cf-loc", "standard");
+      await start("cf-loc", "standard");
+      await block("cf-loc", "llamacpp", "qwen3.5-9b-coder", "m-f-3");
+
+      await runNewTimers();
+      console.log(JSON.stringify({ aborts: aborts.length, prompts: prompts.length, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.aborts, 0, "no guarded session is aborted");
+  assert.equal(result.prompts, 0, "no guarded session is re-prompted");
+  assert.equal(result.cascadeCount, 0, "no guarded session cascades");
+});
+
+test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
+  const cascadePlan = Array.from({ length: 6 }, (_, i) => ({
+    body: { target: { id: "cand-" + i, kind: "cloud", model: { providerID: "openai", id: "cand-" + i } } },
+  }));
+  const result = runCf({
+    cascadePlan,
+    body: `
+      await created("cf-g", "standard");
+      await start("cf-g", "standard");
+      for (let i = 0; i < 7; i += 1) {
+        const before = prompts.length;
+        await block("cf-g", "openai", "blk-" + i, "m-g-" + i);
+        await runNewTimers();
+        if (prompts.length > before) await feedReprompt("cf-g");
+      }
+      const gaveUp = logs.some((e) => e && /content-filter failover gave up/.test(String(e.message)));
+      console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: cascadeLeases().length, gaveUp }));
+    `,
+  });
+  assert.equal(result.prompts, 6, "the chain re-prompts exactly CF_MAX_ATTEMPTS times");
+  assert.equal(result.cascadeCount, 6, "one cascade /lease per re-prompt, and no more");
+  assert.equal(result.gaveUp, true, "the 7th block gives up instead of re-prompting");
+});

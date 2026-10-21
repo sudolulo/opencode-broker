@@ -666,7 +666,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     scheduleWrapUpCheck();
   };
 
-  const route = async (session, preferredModel = null, turnEffort = null, checkContinuation = null) => {
+  const route = async (session, preferredModel = null, turnEffort = null, checkContinuation = null, cfReprompt = false) => {
     if (!session?.id) return null;
     const classifier = isClassifierAgent(session.agent);
     if (classifier) {
@@ -736,6 +736,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       routes.set(session.id, locked);
       return locked;
     }
+    // A content-filter re-prompt asks the broker for the NEXT cascade candidate instead of
+    // the routed model. Declared out here so the catch below can clear the episode on an
+    // exhausted/disabled cascade. Reachable only on a cfReprompt turn (step 5 flag + entry).
+    const cfEntry = cfReprompt ? cfFailover.get(session.id) : null;
+    const cfCascade = Boolean(cfEntry && cfEntry.blocked?.providerID && cfEntry.blocked?.modelID);
     let lease;
     try {
       const contextTokens = await sessionContextTokens(session.id);
@@ -768,13 +773,24 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         tier,
         replace: true,
         ...(classifier ? { localOnly } : {}),
-        ...(!classifier && !rebalanceFallback && seasoned && preferredModel?.providerID && preferredModel?.id ? { preferredModel } : {}),
-        // The broker pins every session to its model; the one time this plugin WANTS the
-        // session re-decided is restore-home after a displacement, so it says so.
-        ...(restoreDue ? { releasePin: true } : {}),
-        ...(marker?.policy === "strict-fallback" && typeof marker.targetID === "string" && marker.targetID
-          ? { fallbackTargetID: marker.targetID }
-          : {}),
+        // A content-filter re-prompt drives the broker's contentFilterCascade mode: it must
+        // NOT prefer, pin or fall back to the model that was just blocked, so preferredModel,
+        // releasePin and fallbackTargetID are all omitted in favour of the cascade fields.
+        ...(cfCascade
+          ? {
+              contentFilterCascade: true,
+              blockedModel: { providerID: cfEntry.blocked.providerID, id: cfEntry.blocked.modelID },
+              excludeTargetIDs: [...cfEntry.tried],
+            }
+          : {
+              ...(!classifier && !rebalanceFallback && seasoned && preferredModel?.providerID && preferredModel?.id ? { preferredModel } : {}),
+              // The broker pins every session to its model; the one time this plugin WANTS the
+              // session re-decided is restore-home after a displacement, so it says so.
+              ...(restoreDue ? { releasePin: true } : {}),
+              ...(marker?.policy === "strict-fallback" && typeof marker.targetID === "string" && marker.targetID
+                ? { fallbackTargetID: marker.targetID }
+                : {}),
+            }),
         ...(contextTokens !== null && contextTokens !== undefined ? { contextTokens } : {}),
         ...(resolvableModels ? { resolvableModels } : {}),
         ...(turnEffort && session.agent !== "compaction" ? {
@@ -817,6 +833,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (!target?.model?.providerID || !target?.model?.id) {
         throw new Error(lease?.error ?? lease?.reason ?? lease?.message ?? "broker returned no model target");
       }
+      // Record the candidate this cascade step leased so the next step (if it also blocks)
+      // excludes it and the broker advances down the order.
+      if (cfEntry && typeof target.id === "string" && target.id) cfEntry.tried.add(target.id);
       if (localOnly && target.kind !== "local") {
         throw new Error(`broker returned non-local classifier target ${target.id ?? `${target.model.providerID}/${target.model.id}`} for a local-only lease`);
       }
@@ -862,6 +881,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // Never bypass provider admission with a static fallback. A clear block is
       // safer than silently spending an API-key provider after broker failure.
       clearLocalChildInactivityWatchdog(session.id);
+      // A cascade that ran out of candidates (content-filter-exhausted / -disabled) or
+      // otherwise failed to lease ends the episode here: the normal no-target path reports
+      // the failure, and there is NO further re-prompt (loop safety).
+      if (cfCascade) cancelContentFilterFailover(session.id);
       routes.delete(session.id);
       // Nothing in the lane can serve it: park it to resume when something can. Classifier
       // lanes are excluded -- they serve a guard decision, not a task to pick back up.
@@ -960,11 +983,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     if (entry.timer !== null) cancelTimeout(entry.timer);
     reengagements.delete(sessionID);
   };
-  const cancelRecovery = (sessionID) => {
+  // keepContentFilter leaves an in-progress content-filter failover episode intact: a
+  // content-filter finish still cancels any stale OUTAGE reengagement (as every terminal
+  // finish did before), but must not wipe the cascade's tried/history that a chained block
+  // depends on. Every other caller (human turn, abort, session delete, terminal non-cf
+  // finish) clears the cascade too.
+  const cancelRecovery = (sessionID, { keepContentFilter = false } = {}) => {
     for (const route of [routes.get(sessionID), reengagements.get(sessionID)?.route]) {
       if (route) stoppedRecoveryRoutes.add(route);
     }
     cancelReengagement(sessionID);
+    if (!keepContentFilter) cancelContentFilterFailover(sessionID);
     unpark(sessionID);
   };
   const ownRecovery = (sessionID, route, agent = sessions.get(sessionID)?.agent) => {
@@ -1271,6 +1300,90 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     }).catch(() => {});
   };
 
+  // --- Content-filter failover ---------------------------------------------
+  // A provider's content filter refusing ONE query lands as a COMPLETED assistant message
+  // with finish "content-filter" -- a healthy model declining this prompt, not an outage.
+  // The broker's contentFilterCascade /lease mode walks a per-request, non-sticky chain of
+  // fallback models; this re-prompts the session on the next candidate (aborting the blocked
+  // turn, then a short delay, then a synthetic prompt -- the exact shape restoreAtStepBoundary
+  // uses) and chains down the order until a model answers or the order is exhausted. The
+  // broker marks the cascade assignment fallback:true, so the session returns to its routed
+  // model on its next NORMAL turn with no "restore home" work here. This is a PARALLEL,
+  // narrow mechanism to the outage reengagement machinery above: every path below is reachable
+  // only after a turn finished "content-filter", and it is bounded so it can never re-prompt
+  // storm. CF_RETRY_TEXT is the sentinel that chat.message matches (with the minted part id)
+  // to recognise its own re-prompt.
+  const CF_RETRY_TEXT = "[opencode-broker] Please answer my previous request.";
+  const CF_MAX_ATTEMPTS = 6;
+  const CF_WINDOW_MS = 10 * 60 * 1000;
+  // sessionID -> { blocked: { providerID, modelID }, tried: Set<targetId>, agent, promptPartID, history: number[], timer }
+  const cfFailover = new Map();
+  const cancelContentFilterFailover = (sessionID) => {
+    const entry = cfFailover.get(sessionID);
+    if (!entry) return;
+    if (entry.timer !== null && entry.timer !== undefined) cancelTimeout(entry.timer);
+    cfFailover.delete(sessionID);
+  };
+  const beginContentFilterFailover = (sessionID, record) => {
+    if (!sessionID || !record) return;
+    // The cascade excludes the blocked model by provider+model; without both we cannot form
+    // a valid blockedModel and the broker could re-lease the very model that just refused.
+    if (!record.providerID || !record.modelID) return;
+    // Guards: keep general behaviour and non-cloud/manual/classifier/parked sessions wholly
+    // untouched. A local lane does not content-filter this way, and a LAN/private or manual
+    // session must never be cascaded onto a cloud model.
+    if (routes.get(sessionID)?.profile === "manual") return;
+    if (isClassifierAgent(sessions.get(sessionID)?.agent)) return;
+    if (record.providerID === "llamacpp") return;
+    if (parked.has(sessionID)) return;
+    const now = Date.now();
+    let entry = cfFailover.get(sessionID);
+    if (!entry) {
+      entry = { blocked: null, tried: new Set(), agent: undefined, promptPartID: null, history: [], timer: null };
+      cfFailover.set(sessionID, entry);
+      trimTracker(cfFailover);
+    }
+    entry.history = entry.history.filter((at) => now - at < CF_WINDOW_MS);
+    if (entry.history.length >= CF_MAX_ATTEMPTS) {
+      report("warn", `${sessionID}: content-filter failover gave up after ${entry.history.length} re-prompts within ${CF_WINDOW_MS / 60000} min -- leaving the refusal in place`);
+      cancelContentFilterFailover(sessionID);
+      return;
+    }
+    // Keep the ORIGINAL blocked model as the cascade head for the whole episode: the broker
+    // skips the head by provider+model and every already-tried candidate by target id, so the
+    // order always advances. Overwriting the head with each chained block would stop excluding
+    // the first refusing model, letting the broker re-lease it for one wasted re-prompt.
+    if (!entry.blocked) entry.blocked = { providerID: record.providerID, modelID: record.modelID };
+    entry.agent = sessions.get(sessionID)?.agent;
+    entry.history.push(now);
+    entry.promptPartID = `prt_${randomUUID()}`;
+    // A new cascade step supersedes any still-pending re-prompt timer for this session.
+    if (entry.timer !== null && entry.timer !== undefined) { cancelTimeout(entry.timer); entry.timer = null; }
+    report("info", `${sessionID}: content-filter block on ${record.providerID}/${record.modelID} -- failing this turn over to the next cascade model`);
+    Promise.resolve().then(async () => {
+      try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
+      // Superseded or cancelled while the abort was in flight: do not re-prompt.
+      if (cfFailover.get(sessionID) !== entry) return;
+      const handle = scheduleTimeout(async () => {
+        if (cfFailover.get(sessionID) !== entry) return;
+        try {
+          await client.session.prompt({
+            path: { id: sessionID },
+            query: { directory },
+            body: {
+              ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+              parts: [{ id: entry.promptPartID, type: "text", text: CF_RETRY_TEXT, synthetic: true }],
+            },
+          });
+        } catch (error) {
+          report("error", `${sessionID}: content-filter failover re-prompt failed`, error);
+        }
+      }, REENGAGE_DELAYS_MS[0]);
+      entry.timer = handle;
+      if (typeof handle?.unref === "function") handle.unref();
+    }).catch(() => {});
+  };
+
   // --- Wrap up before usage runs out ----------------------------------------
   // Failover moves a session when one provider stops it; parking resumes it when one comes
   // back. Neither helps the moment before: when every provider the lane can use is about to
@@ -1360,7 +1473,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     } catch {}
   };
 
-  const ensure = async (sessionID, agentHint, preferredModel = null, turnEffort = null, checkContinuation = null) => {
+  const ensure = async (sessionID, agentHint, preferredModel = null, turnEffort = null, checkContinuation = null, cfReprompt = false) => {
     if (!sessionID) return;
     checkContinuation?.();
     let session = sessions.get(sessionID);
@@ -1412,7 +1525,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         };
       }
     }
-    return route(session, preferredModel, turnEffort, checkContinuation);
+    return route(session, preferredModel, turnEffort, checkContinuation, cfReprompt);
   };
 
   return {
@@ -1467,6 +1580,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         ? candidateContinuation : null;
       const ownContinuation = Boolean(continuation);
       const continuationGeneration = continuation?.generation;
+      // A content-filter failover re-prompt is ours only if the SDK returned the exact
+      // synthetic part we minted (CF_RETRY_TEXT + the stored promptPartID). Parallel to the
+      // outage-continuation recognition above; its own narrow mechanism, never mixed in.
+      const cfRepromptEntry = syntheticOnly ? cfFailover.get(sessionID) : null;
+      const cfReprompt = Boolean(cfRepromptEntry && typeof cfRepromptEntry.promptPartID === "string" && cfRepromptEntry.promptPartID &&
+        parts.some((part) => part?.type === "text" && part.synthetic === true &&
+          part.text === CF_RETRY_TEXT && part.id === cfRepromptEntry.promptPartID));
       const checkContinuation = ownContinuation ? () => {
         if (!currentRecovery(sessionID, continuation, continuationGeneration)) {
           throw new Error("[opencode-broker] cancelled continuation");
@@ -1542,9 +1662,14 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // "routed model mismatch" in turn. ensure() already keeps a subagent on its route for
       // the same reason; a prompt with no user-authored text keeps the root on its route too.
       const routedModel = routes.get(sessionID)?.target?.model;
-      const preferredModel = syntheticOnly && routedModel?.providerID && routedModel?.id
-        ? { providerID: routedModel.providerID, id: routedModel.id, ...(typeof routedModel.variant === "string" && routedModel.variant ? { variant: routedModel.variant } : {}) }
-        : currentModel;
+      // A content-filter re-prompt must NOT prefer the last routed model -- that is the model
+      // the provider just blocked. Drop the preference entirely so route()'s cascade branch
+      // asks the broker for the next candidate (the only override of the syntheticOnly rule).
+      const preferredModel = cfReprompt
+        ? null
+        : syntheticOnly && routedModel?.providerID && routedModel?.id
+          ? { providerID: routedModel.providerID, id: routedModel.id, ...(typeof routedModel.variant === "string" && routedModel.variant ? { variant: routedModel.variant } : {}) }
+          : currentModel;
       const classifier = isClassifierAgent(agent);
       if (classifier) {
         try { removeSessionProfile(sessionID); } catch {}
@@ -1606,11 +1731,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       let routed;
       try {
-        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation), { continuation: ownContinuation });
+        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation, cfReprompt), { continuation: ownContinuation });
       } catch (error) {
         if (!needsInventory || (!/provider inventory is stale/.test(String(error?.message ?? error)) && !isAuthRevisionRaceError(error))) throw error;
         await refreshInventory();
-        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation), { continuation: ownContinuation });
+        routed = await serialRoute(sessionID, () => ensure(sessionID, agent, preferredModel, turnEffort, checkContinuation, cfReprompt), { continuation: ownContinuation });
       }
       checkContinuation?.();
       applyMessageModel(output?.message, routed, sessionID);
@@ -1999,7 +2124,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           // Match the engine's terminal finish semantics. A compaction summary is
           // a completed message, NOT completion of the conversation it summarizes.
           if (record.summary !== true && record.finish && !["tool-calls", "unknown"].includes(record.finish)) {
-            cancelRecovery(sessionID);
+            if (record.finish === "content-filter") {
+              // A provider content-filter block: fail THIS turn over to the next cascade
+              // model instead of stopping. The ONLY content-filter-specific path; every other
+              // finish takes the unchanged cancelRecovery branch below. keepContentFilter
+              // still cancels a stale outage reengagement (as a terminal finish always did)
+              // but keeps this episode's tried/history so a chained block can advance.
+              cancelRecovery(sessionID, { keepContentFilter: true });
+              beginContentFilterFailover(sessionID, record);
+            } else {
+              cancelRecovery(sessionID);
+            }
           }
           // Track context size for every session, routed or not: a manual session that
           // later flips to auto must not start from an unknown (permissive) estimate.
