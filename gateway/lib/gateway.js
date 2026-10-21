@@ -2913,6 +2913,21 @@ export const createGatewayHandler = ({
           sessionID: boundSessionID,
           ...(typeof boundLeaseID === "string" && boundLeaseID ? { leaseID: boundLeaseID } : {}),
         });
+        // ☠️ A STALE LEASE ID MUST NOT STRAND A TURN ON ITS OWN MODEL. The session's lease id
+        // rotates whenever a fresh selection re-mints it (bin/opencode-broker: a release at
+        // session.idle, the LEASE_TTL sweep, or a revalidation miss deletes the lease, and the
+        // next turn re-leases a NEW leaseID) while session-stickiness holds the SAME model ("NO
+        // LIVE REBALANCING"). An in-flight request then carries the old id, and the exact-id
+        // verify above answers held:false even though the session holds a live lease for the
+        // very model it is asking for -- the stall behind "no live lease for <model>". When an
+        // exact-id check misses, re-verify by session alone and let leaseCoversWireModel below
+        // decide: a same-model rotation now forwards on the current lease, while a genuine model
+        // change still fails (its lease will not cover the wire model). This never reaches a
+        // model the broker did not grant -- coverage is still enforced and the session id is
+        // still loopback-gated above -- it only stops a leaseID rotation from stranding a turn.
+        if (!held?.held && typeof boundLeaseID === "string" && boundLeaseID) {
+          held = await brokerRequest("/lease/verify", { sessionID: boundSessionID });
+        }
       } catch { held = null; }
       const model = held?.target?.model;
       if (!held?.held || typeof model?.providerID !== "string" ||
