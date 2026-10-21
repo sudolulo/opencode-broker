@@ -6,7 +6,19 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-10-20
+
+### Added
+
+- Operator-only `manualApiTargets` allowlist and dedicated profiles, quarantined from automatic routing, discovery, tiers, and fallbacks.
+- Opt-in native Anthropic Messages spend-budget gate requiring verified identity and policy binding plus one exclusive promotional funding epoch. Accounting uses zero-default BigInt balances, durable worst-case reservations per HTTP attempt, and the full hold by default with no automatic refunds.
+- Offline initialize, fund, and status CLI; bounded JSON/SSE receipt handling; and operator documentation. Node >=22.13 is required for the SQLite feature; the ordinary runtime baseline is unchanged.
+
 ### Fixed
+
+- Financial refusals before headers use HTTP 402 and `x-should-retry: false`; deterministic paid 4xx responses other than 408, 409, and 429 never duplicate an attempt.
+- Fixed null-provider startup, cancellation-error precedence and awaited cleanup, and inherited manual-target membership regressions.
+- Serialize same-process operations per spending ledger without weakening SQLite durability or cross-process locking, and keep held-lease verification independent of model-catalog variant changes.
 
 - **A shell a subagent started shows in its parent's HUD panel and F10.** Jobs were listed only for the exact session on screen, but a background shell records the session that STARTED it, so a job a subagent ran never appeared under the root that relays "the job is running" (2026-10-20, depot: `bg033` started by the tester, invisible in the root's panel). The panel and F10 now list the session's own shells plus those of every subagent on its roster, labelled `subagent shell`.
 

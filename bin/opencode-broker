@@ -492,11 +492,23 @@ const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z
 // The prefix a per-request session id must carry. The gateway builds `gw-<time36>-<rand>`
 // for every client call; nothing else may claim oneShot (acquire() refuses it).
 const ONE_SHOT_SESSION_PREFIX = /^gw-/;
+// Spend admission is based only on this broker-generated claim.  A lease target can
+// be influenced by the caller's profile/provider selection, but its paid classification
+// must match one immutable static registration exactly; never relay caller metadata.
+const manualApiAttestation = (target) => {
+  const registered = typeof target?.id === "string" ? CONFIG.manualApiTargets[target.id] : null;
+  return target?.source === undefined && target?.kind === "cloud" &&
+    registered?.providerID === target.providerID && registered.modelID === target.modelID
+    ? { requiresSpendBudget: true, billingClass: "manual-api" }
+    : {};
+};
+
 const publicTarget = (target, tier, modelVariants) => target && {
   id: target.id,
   model: modelRefForTier(target, tier, modelVariants),
   kind: target.kind,
   ...(target.embedding === true ? { embedding: true } : {}),
+  ...manualApiAttestation(target),
 };
 
 const publicState = (state, resolverProcesses = null) => ({
@@ -1029,7 +1041,7 @@ const stagedOutageContext = (outageContext, candidate) => {
 
 const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null, outageContext = null) => {
   if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets, outageContext).includes(target.id)) return false;
-  if (!cloudTargetAdmitted(target, state.inventory?.providers)) return false;
+  if (!cloudTargetAdmitted(target, state.inventory?.providers, request.profile)) return false;
   if (target.kind === "local") {
     // The output reserve too, exactly as chooseTarget applies it. Without it this check sized
     // a reserve-declaring target by the headroom FRACTION instead -- 117,964 of a 196,608
@@ -1169,7 +1181,16 @@ const acquire = async (state, request, {
   const requestedCloud = targetIDsFor(profile, tier, targets)
     .map((targetID) => targetForID(targetID, targets))
     .some((target) => target?.kind === "cloud");
+  // A dedicated reserve profile has no subscription identity to refresh: its
+  // credential remains gateway-owned. Any fallback rung makes the profile
+  // mixed, even if that rung is local, so it retains the auth.json revision gate.
+  const profilePrimaries = CONFIG.profiles[profile] ?? [];
+  const profileFallbacks = CONFIG.profileFallbacks[profile] ?? [];
+  const dedicatedManualApiProfile = profile !== "auto" && profile !== "manual" && profilePrimaries.length > 0 &&
+    profileFallbacks.length === 0 &&
+    profilePrimaries.every((targetID) => Object.hasOwn(CONFIG.manualApiTargets, targetID) && CONFIG.manualApiTargets[targetID]?.profiles.includes(profile));
   if (requestedCloud &&
+    !dedicatedManualApiProfile &&
     (!state.inventory.authRevision || state.inventory.authRevision !== authRevision())) {
     // Auth rotated (OAuth token refreshes rewrite auth.json routinely). Refusing
     // here starved every caller that lacks the router plugin's republish-retry
@@ -1214,7 +1235,7 @@ const acquire = async (state, request, {
   // constructed before request-local provider, locality, and API narrowing: those
   // constraints choose from a lane, but must not redefine that lane's canonical head.
   const cloudAdmittedTargets = Object.fromEntries(Object.entries(targets)
-    .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers)));
+    .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers, profile)));
   const completeAdmittedTargets = Object.fromEntries(Object.entries(cloudAdmittedTargets)
     .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`)));
   const admittedBeforeResolvableModels = Object.fromEntries(Object.entries(cloudAdmittedTargets)
@@ -2284,7 +2305,15 @@ const serve = async () => {
         return reply(response, 200, {
           held: true,
           leaseID: lease.leaseID,
-          target: { id: target.id, kind: target.kind, model: { providerID: target.providerID, id: target.modelID } },
+          // Verification is about an EXISTING grant: the plain identity, never a fresh
+          // variant resolution, which throws once a catalog refresh drops an
+          // effortCeiling variant. Only the broker's own paid attestation is added.
+          target: {
+            id: target.id,
+            kind: target.kind,
+            model: { providerID: target.providerID, id: target.modelID },
+            ...manualApiAttestation(target),
+          },
           expectedCredentialInstance: reserve ? lease.outage.expectedCredentialInstance : null,
           generation: reserve ? lease.outage.generation : null,
         });
@@ -2742,7 +2771,7 @@ const serve = async () => {
           ? markManagedOutageScope(allTargets(state), { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles })
           : allTargets(state);
         const admitted = Object.fromEntries(Object.entries(targets)
-          .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers)));
+          .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers, profile)));
         // Match /lease's default resolver snapshot: preview has no caller-local
         // narrowing, so calculate heads from the complete admitted view once and
         // reuse that exact outage snapshot for every requested tier. Staged probation-only

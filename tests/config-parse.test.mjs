@@ -88,6 +88,18 @@ test("trusted subscription and role effort policy survive config normalization",
   assert.equal(CONFIG.modelRoles["openai:gpt-sol"].requiredReasoningMode, "low");
 });
 
+test("manual API targets normalize from static cloud targets and reject fallback placement", async () => {
+  const { CONFIG } = await loadConfig(`{
+    "targets": { "reserve": { "providerID": "paid", "modelID": "sonnet", "kind": "cloud" } },
+    "profiles": { "api-reserve": ["reserve"] },
+    "manualApiTargets": { "reserve": ["api-reserve"] }
+  }`);
+  assert.deepEqual(CONFIG.manualApiTargets.reserve, {
+    providerID: "paid", modelID: "sonnet", profiles: ["api-reserve"],
+  });
+  assert.ok(Object.isFrozen(CONFIG.manualApiTargets));
+});
+
 test("per-target contextHeadroom is kept for local targets and rejected otherwise", async () => {
   const { CONFIG } = await loadConfig(`{
     "targets": {

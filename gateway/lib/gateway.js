@@ -29,6 +29,9 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { usageLimitMessage } from "../../lib/usage-limit.js";
 import { createGatewayHealth, createTerminalParser } from "./model-health.js";
+import { normalizeSpendPolicy, prepareSpendAttempt } from "./spend-policy.js";
+import { reserveAttempt, settleAttempt, markUncertain } from "./spend-budget.js";
+import { collectSpendJSON, relaySpendSSE } from "./spend-transport.js";
 
 // Constant-time comparison of a presented credential with its expected wire value. Hashing first
 // gives both sides the same length, which timingSafeEqual requires for bearer and x-api-key auth.
@@ -486,11 +489,49 @@ export const readGatewayKeyFile = (keyPath) => {
 // both is a config that contradicts itself, and whichever one silently won would be wrong for
 // half its traffic. Refused at load and again at handler construction (tests and embedders pass
 // config without loading a file).
+const spendError = (code) => Object.assign(new Error(`spend budget refused: ${code}`), { code });
+const SPEND_CODES = new Set(["missing_policy", "invalid_policy", "unsupported_runtime", "missing_ledger",
+  "invalid_ledger", "binding_mismatch", "expired", "insufficient_funds", "frozen", "locked", "unsupported_request"]);
+// A FINANCIAL REFUSAL MUST BE TERMINAL FOR DEFAULT CLIENTS, NOT MERELY LABELLED SO. A 503
+// is retried by both default clients (Vercel AI SDK: 408/409/429/>=500; Anthropic SDK: the same
+// unless x-should-retry says otherwise), and every retry is a NEW paid request: a post-dispatch
+// refusal could become three paid sends. 402 is outside both retry predicates, x-should-retry
+// tells the Anthropic SDK explicitly, and the native `type:"error"` envelope keeps the AI SDK's
+// Anthropic error schema parsing. Only possible before the response head is committed; a
+// started stream ends with an owned SSE error frame instead (see refuseSpend).
+const spendRefusal = (error) => {
+  const code = SPEND_CODES.has(error?.code) ? error.code : "invalid_ledger";
+  return { status: 402, headers: { "x-should-retry": "false" }, payload: { type: "error", error: {
+    type: "spend_budget_refusal", code, message: `spend budget refused: ${code}`, retryable: false } } };
+};
+// Upstream statuses the inherited loop may retry on a paid lane: request timeout, conflict,
+// rate limit and server errors (the same set default clients treat as transient). Any other
+// 4xx is deterministic for an identical request and must not buy a second paid send.
+const retryablePaidStatus = (status) => status === 408 || status === 409 || status === 429 || status >= 500;
+// Preserve presence and false/null values. Only broker-returned target objects
+// call this function; caller JSON/header metadata never supplies classification.
+const spendClassification = (target) => Object.fromEntries(["requiresSpendBudget", "billingClass"]
+  .filter(key => target && Object.hasOwn(target, key)).map(key => [key, target[key]]));
+const providerSpendPolicy = (providerID, provider, leased = {}) => {
+  const declared = Object.hasOwn(leased, "requiresSpendBudget") || Object.hasOwn(leased, "billingClass");
+  if (declared && (leased.requiresSpendBudget !== true || leased.billingClass !== "manual-api")) throw spendError("invalid_policy");
+  if (!provider || !Object.hasOwn(provider, "spendBudget")) {
+    if (declared) throw spendError("missing_policy");
+    return null;
+  }
+  const policy = normalizeSpendPolicy(provider.spendBudget);
+  if (typeof provider.baseUrl !== "string" || !provider.baseUrl) throw spendError("invalid_policy");
+  let origin;
+  try { origin = new URL(provider.baseUrl).origin; } catch { throw spendError("binding_mismatch"); }
+  if (policy.binding.providerID !== providerID || policy.binding.origin !== origin) throw spendError("binding_mismatch");
+  return policy;
+};
 const validateProviderFlags = (providers) => {
   for (const [name, provider] of Object.entries(providers ?? {})) {
     if (provider?.bufferStreamingUpstream === true && provider?.assembleFromStream === true) {
       throw new Error(`providers["${name}"] sets both bufferStreamingUpstream and assembleFromStream: a lane either cannot stream (buffer) or should always stream (assemble), not both`);
     }
+    providerSpendPolicy(name, provider);
   }
 };
 
@@ -1285,6 +1326,13 @@ export const createGatewayHandler = ({
   logLine = (line) => { process.stderr.write(`${line}\n`); },
 }) => {
   validateProviderFlags(config.providers);
+  // The gateway has no registered-target discovery contract. Do not imply that
+  // local shape validation checked the broker's paid inventory. Admission does.
+  // Information, not an alert: report it through the log contract, and only when a
+  // provider actually configures a spend budget (null siblings are skipped).
+  if (Object.values(config.providers).some(provider => provider && Object.hasOwn(provider, "spendBudget"))) {
+    logLine(JSON.stringify({ event: "spend_budget_validation", registration: "deferred", policyShape: "validated" }));
+  }
   const allowedProviders = Object.keys(config.providers);
   const healthReporter = health?.key instanceof Uint8Array && typeof health.gatewayCredential === "string"
     ? createGatewayHealth({ key: health.key, gatewayCredential: health.gatewayCredential, brokerRequest, now, sleepImpl })
@@ -1405,6 +1453,7 @@ export const createGatewayHandler = ({
       ...(wireModelID ? { wireModelID } : {}),
       targetID: typeof lease?.target?.id === "string" ? lease.target.id : model.id,
       embedding: lease?.target?.embedding === true,
+      ...spendClassification(lease?.target),
       expectedCredentialInstance: typeof lease?.expectedCredentialInstance === "string" ? lease.expectedCredentialInstance : null,
     };
   };
@@ -1748,6 +1797,17 @@ export const createGatewayHandler = ({
       }
       acquiredLease = true;
       lastLeased = leased;
+      const providerConfig = config.providers[leased.providerID];
+      let spendPolicy;
+      try {
+        spendPolicy = providerSpendPolicy(leased.providerID, providerConfig, leased);
+        if (spendPolicy && (api !== MESSAGES || probeAssignment || leased.outageAssignment
+          || leased.expectedCredentialInstance != null || leased.expectedScopePolicy != null
+          || leased.modelID.endsWith("-fast"))) throw spendError("unsupported_request");
+      } catch (error) {
+        await settle(leased, "/release");
+        return spendRefusal(error);
+      }
       // A broker lease is authoritative about target capability. Releasing here keeps a
       // misconfigured chain from pinning a slot while ensuring request types never cross.
       if (api === EMBEDDINGS ? !leased.embedding : leased.embedding) {
@@ -1759,7 +1819,6 @@ export const createGatewayHandler = ({
             : "gateway: chat, responses and messages require a chat target", type: "invalid_request_error" } },
         };
       }
-      const providerConfig = config.providers[leased.providerID];
       if (!providerConfig?.baseUrl) {
         await settle(leased, "/release");
         lastError = new Error(`no forward config for ${leased.providerID}`);
@@ -1772,6 +1831,7 @@ export const createGatewayHandler = ({
       let key;
       try { key = await providerKey(providerConfig, authPath); } catch (error) {
         await settle(leased, "/release");
+        if (spendPolicy) return spendRefusal(spendError("binding_mismatch"));
         excludeLane(leased.providerID);
         // ☠️ SAY SO. This path spends a real lease and produces nothing: no usage is reported and
         // no `/failure` is filed (deliberately -- a stale LOCAL credential must not indict a
@@ -1845,14 +1905,33 @@ export const createGatewayHandler = ({
       let response;
       let healthAttempt = null;
       let instructedJson = false;
+      const spendAbort = spendPolicy ? new AbortController() : null;
+      let spendSignal = null;
+      let spendReservation = null;
+      let spendDeadlineMs = null;
+      let spendDispatched = false;
+      const uncertainSpend = async (reason) => {
+        if (spendReservation) await markUncertain({ ...spendReservation, reason, now: now() });
+      };
+      const refuseSpend = async (error) => {
+        clearTimeout(stallTimer);
+        await settle(leased, "/release");
+        if (sink?.started && !clientAbort?.aborted) {
+          // A partial upstream event may already be on the wire. Start a new
+          // event boundary, then emit only a gateway-owned, nonretryable error.
+          await sink.write(`\n\nevent: error\ndata: ${JSON.stringify(spendRefusal(error).payload)}\n\n`);
+        }
+        return spendRefusal(error);
+      };
       try {
-        const abort = upstreamStreaming
+        let abort = upstreamStreaming
           ? (AbortSignal.any
             ? AbortSignal.any([stallAbort.signal, ...(clientAbort ? [clientAbort] : [])])
             : stallAbort.signal)
           : (AbortSignal.any
             ? AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(clientAbort ? [clientAbort] : [])])
             : AbortSignal.timeout(timeoutMs));
+        if (spendAbort) { abort = AbortSignal.any([abort, spendAbort.signal]); spendSignal = abort; }
         if (upstreamStreaming) touch(idleMs);
         // Providers without OpenAI's json_object mode (Anthropic's compat
         // endpoint accepts only strict closed schemas) get the instruct
@@ -1862,6 +1941,11 @@ export const createGatewayHandler = ({
         // A session-bound lease may name a speed alias the upstream does not know; it carries the
         // id the client sent as wireModelID (see leaseCoversWireModel). Gateway leases have none.
         let forwardBody = { ...requestBody, model: leased.wireModelID ?? leased.modelID };
+        if (spendPolicy) {
+          if (Object.hasOwn(forwardBody, "service_tier") && forwardBody.service_tier !== "standard_only") throw spendError("unsupported_request");
+          forwardBody.service_tier = "standard_only";
+          if (requestHeaders.unsupportedSpendControls) throw spendError("unsupported_request");
+        }
         const extras = api === MESSAGES ? {} : {
           ...(providerConfig.bodyExtras && typeof providerConfig.bodyExtras === "object" ? providerConfig.bodyExtras : {}),
           ...(route?.bodyExtras ?? {}),
@@ -1957,9 +2041,9 @@ export const createGatewayHandler = ({
           "Content-Type": api === MESSAGES
             ? String(requestHeaders.contentType ?? "application/json")
             : "application/json",
-          ...(api === MESSAGES && requestHeaders.anthropicVersion
-            ? { "anthropic-version": requestHeaders.anthropicVersion } : {}),
-          ...(api === MESSAGES && requestHeaders.anthropicBeta
+          ...(api === MESSAGES && (requestHeaders.anthropicVersion || spendPolicy)
+            ? { "anthropic-version": requestHeaders.anthropicVersion ?? "2023-06-01" } : {}),
+          ...(api === MESSAGES && (spendPolicy ? requestHeaders.anthropicBeta !== undefined : requestHeaders.anthropicBeta)
             ? { "anthropic-beta": requestHeaders.anthropicBeta } : {}),
           ...(providerConfig.headers && typeof providerConfig.headers === "object" ? providerConfig.headers : {}),
           // The opencode session hints: which session is asking, and whether it is a
@@ -1973,7 +2057,7 @@ export const createGatewayHandler = ({
           // the hints behind. Only validated values reach this point -- an invalid
           // one is dropped, silently, because the hints steer cache and diagnostics,
           // they are not auth.
-          ...(providerConfig.forwardSessionHints === true
+          ...(!spendPolicy && providerConfig.forwardSessionHints === true
             ? {
               ...(forwardSessionID ? { "x-opencode-session-id": forwardSessionID } : {}),
               ...(forwardSessionKind ? { "x-opencode-session-kind": forwardSessionKind } : {}),
@@ -1982,7 +2066,10 @@ export const createGatewayHandler = ({
         };
         if (providerConfig.keyFile) {
           for (const name of Object.keys(forwardHeaders)) {
-            if (["authorization", "x-api-key"].includes(name.toLowerCase())) delete forwardHeaders[name];
+            if (["authorization", "x-api-key"].includes(name.toLowerCase())) {
+              if (spendPolicy) throw spendError("unsupported_request");
+              delete forwardHeaders[name];
+            }
           }
           if (key) forwardHeaders["x-api-key"] = key;
         } else if (key) {
@@ -2024,7 +2111,7 @@ export const createGatewayHandler = ({
         // Off those paths no context is sent: an ordinary primary request runs exactly as it did
         // before health existed, and one that REQUIRES verified health (a reserve lease or an
         // outage probe) still fails below rather than going out unverified.
-        if (healthReporter && (api === MESSAGES || api === RESPONSES)) {
+        if (!spendPolicy && healthReporter && (api === MESSAGES || api === RESPONSES)) {
           try {
             healthAttempt = await healthReporter.begin({
               leased,
@@ -2049,14 +2136,46 @@ export const createGatewayHandler = ({
         // Generated context is the sole health header source. Provider config is deployment
         // input, not a private authority, so remove all health-prefixed values before install.
         for (const name of Object.keys(forwardHeaders)) {
-          if (name.toLowerCase().startsWith("x-fleet-health-")) delete forwardHeaders[name];
+          if (!spendPolicy && name.toLowerCase().startsWith("x-fleet-health-")) delete forwardHeaders[name];
         }
         if (healthAttempt) Object.assign(forwardHeaders, healthAttempt.headers);
-        response = await fetchImpl(`${providerConfig.baseUrl.replace(/\/$/, "")}${api.path}`, {
+        const upstreamURL = `${providerConfig.baseUrl.replace(/\/$/, "")}${api.path}`;
+        let prepared = null;
+        if (spendPolicy) {
+          if (now() >= spendPolicy.validUntilMs) throw spendError("expired");
+          if (typeof key !== "string" || createHash("sha256").update(key).digest("hex") !== spendPolicy.binding.credentialSHA256) throw spendError("binding_mismatch");
+          const prepareArgs = { policy: spendPolicy, providerID: leased.providerID, url: upstreamURL,
+            body: outboundBody, credentialFingerprint: createHash("sha256").update(key).digest("hex"), now: now() };
+          // Validate the pre-Headers record first: Headers would otherwise merge
+          // duplicate/case-colliding controls and destroy refusal evidence. Then
+          // bind fetch's effective whitespace-normalized application headers.
+          const checked = prepareSpendAttempt({ ...prepareArgs, headers: forwardHeaders });
+          let wireHeaders;
+          try { wireHeaders = new Headers(checked.headers); } catch { throw spendError("unsupported_request"); }
+          prepared = prepareSpendAttempt({ ...prepareArgs, headers: wireHeaders });
+          const args = { ledgerPath: spendPolicy.ledgerPath, policy: spendPolicy, attemptID: randomUUID() };
+          const reservation = await reserveAttempt({ ...args, prepared, now: now() });
+          spendReservation = args;
+          spendDeadlineMs = reservation.dispatchDeadlineMs;
+          if (abort.aborted) { await uncertainSpend("aborted_before_send"); return await refuseSpend(spendError("unsupported_request")); }
+        }
+        // Final expiry gate, with NO await between it and the fetch below: the ledger
+        // admitted this reservation at its own `now`, but time may have passed while it
+        // queued. An expired hold is retained (never released or refunded) as uncertain.
+        // A missing/non-numeric deadline compares false and refuses: fail closed.
+        if (spendReservation && !(now() < spendDeadlineMs)) {
+          await uncertainSpend("expired_before_send");
+          return await refuseSpend(spendError("expired"));
+        }
+        // Only this site sends upstream. The immutable prepared snapshot is the
+        // actual fetch input, not merely a digest of an earlier draft.
+        spendDispatched = Boolean(spendPolicy);
+        response = await fetchImpl(prepared?.url ?? upstreamURL, {
           method: "POST",
-          headers: forwardHeaders,
-          body: outboundBody,
+          headers: prepared?.headers ?? forwardHeaders,
+          body: prepared?.body ?? outboundBody,
           signal: abort,
+          ...(prepared ? { redirect: "error" } : {}),
         });
         // Keep this attempt local to the loop body while every terminal branch reports it.
         response.healthAttempt = healthAttempt;
@@ -2064,6 +2183,12 @@ export const createGatewayHandler = ({
         if (healthAttempt) response.healthParser = createTerminalParser(healthAttempt.api);
       } catch (error) {
         clearTimeout(stallTimer);
+        if (spendPolicy) {
+          if (!spendDispatched) return await refuseSpend(error);
+          try { await uncertainSpend("fetch_failed"); } catch (storageError) { return await refuseSpend(storageError); }
+          // Never let a transport exception echo credentials or request bytes.
+          error = Object.assign(new Error("paid upstream fetch failed"), { name: isAbort(error) ? "AbortError" : "Error" });
+        }
         if (healthAttempt) {
           const parser = createTerminalParser(healthAttempt.api);
           await healthReporter.finish(healthAttempt, { responseHeaders: new Headers(), terminal: parser.finish({ status: 0, contentType: "", cancelled: clientAbort?.aborted, networkError: true }), finishedAt: now() }).catch(() => null);
@@ -2109,7 +2234,16 @@ export const createGatewayHandler = ({
         // regex. Messages and Responses, by contrast, DROP the upstream body
         // and only name the status; the suffix is how the signal reaches the
         // broker there.
-        const raw = await response.text().catch(() => "");
+        let raw;
+        if (spendReservation) {
+          try {
+            ({ rawBody: raw } = await collectSpendJSON({ response, controller: spendAbort, signal: spendSignal }));
+            await uncertainSpend("http_error");
+          } catch (error) {
+            try { await uncertainSpend(error?.spendReason ?? "response_error"); } catch (storageError) { return await refuseSpend(storageError); }
+            return await refuseSpend(error);
+          }
+        } else raw = await response.text().catch(() => "");
         if (response.healthAttempt) {
           const parser = createTerminalParser(response.healthAttempt.api);
           parser.push(raw);
@@ -2139,10 +2273,50 @@ export const createGatewayHandler = ({
             ? `upstream ${leased.providerID} HTTP ${response.status}${suffix}`
             : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
         if (usageLimit) error.usageLimit = { providerID: leased.providerID, ...usageLimit };
-        noteAttempt(leased, usageLimit ? "usage_limit" : `http_${response.status}`, upstreamDetail(raw) || `HTTP ${response.status}`);
+        noteAttempt(leased, usageLimit ? "usage_limit" : `http_${response.status}`, spendPolicy ? `HTTP ${response.status}` : upstreamDetail(raw) || `HTTP ${response.status}`);
+        // A DETERMINISTIC PAID 4xx IS NOT RETRIED. The identical prepared request would be
+        // refused again, and on a profile-mapped route excludeLane is a no-op, so the inherited
+        // second attempt is just a second paid send. The full hold stays UNCERTAIN (provider
+        // charge treatment of a 4xx is unverified); no new lease, fetch or reservation follows.
+        if (spendReservation && !retryablePaidStatus(response.status)) return spendRefusal(spendError("unsupported_request"));
         rememberForwardError(error);
         excludeLane(leased.providerID);
         continue;
+      }
+      if (spendReservation) {
+        // Handler-owned: transport completion, financial settlement and broker
+        // completion are all awaited before the Node response ends. No tee or
+        // detached receipt hunt can refund an abandoned request.
+        let receipt;
+        try {
+          if (streaming) {
+            if (!String(response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+              // Wrong dialect is still a bounded body, not an unconsumed socket.
+              await collectSpendJSON({ response, controller: spendAbort, signal: spendSignal });
+              throw spendError("unsupported_request");
+            }
+            receipt = await relaySpendSSE({ response, controller: spendAbort, signal: spendSignal, sink, touch: () => touch(idleMs) });
+          } else {
+            receipt = await collectSpendJSON({ response, controller: spendAbort, signal: spendSignal });
+            if (receipt.evidence.errorCode === "malformed_json" || receipt.evidence.errorCode === "duplicate_field") throw spendError("unsupported_request");
+          }
+          if (spendSignal.aborted) throw spendError("unsupported_request");
+        } catch (error) {
+          try { await uncertainSpend(error?.spendReason ?? "response_error"); } catch (storageError) { return await refuseSpend(storageError); }
+          return await refuseSpend(error);
+        } finally { clearTimeout(stallTimer); }
+        try {
+          await settleAttempt({ ...spendReservation, evidence: receipt.evidence, now: now() });
+        } catch (error) {
+          // Storage failure/bounds freeze is not a provider capacity failure.
+          // Already-sent stream bytes cannot be recalled; signal the terminal
+          // failure safely and retain the hold (no fabricated successful cost).
+          return await refuseSpend(error);
+        }
+        if (receipt.evidence.usage) await reportUsage(leased, readMessagesUsage(receipt.evidence.usage));
+        await settle(leased, "/complete");
+        return streaming ? { status: 200, streamed: true, providerID: leased.providerID, modelID: leased.modelID }
+          : { status: response.status, rawBody: receipt.rawBody, contentType: String(response.headers.get("content-type") ?? "application/json"), providerID: leased.providerID, modelID: leased.modelID };
       }
       if (streaming) {
         // ══ THE FAILOVER BOUNDARY ══════════════════════════════════════════
@@ -2704,6 +2878,7 @@ export const createGatewayHandler = ({
           expectedScopePolicy: consumed.expectedScopePolicy,
           external: true,
           outageAssignment: true,
+          ...spendClassification(consumed),
         };
       }
     }
@@ -2754,6 +2929,7 @@ export const createGatewayHandler = ({
         modelID: model.id,
         targetID: typeof held?.target?.id === "string" ? held.target.id : model.id,
         wireModelID: requestedModel,
+        ...spendClassification(held.target),
         expectedCredentialInstance: typeof held.expectedCredentialInstance === "string" ? held.expectedCredentialInstance : null,
         external: true,
       };
@@ -2842,6 +3018,13 @@ export const createGatewayHandler = ({
           ? request.headers["x-rig-session"][0] : request.headers["x-rig-session"],
         rigTier: Array.isArray(request.headers["x-rig-tier"])
           ? request.headers["x-rig-tier"][0] : request.headers["x-rig-tier"],
+        // Reject unknown paid controls before existing forwarding can discard
+        // them. Front-door authorization/session headers are not provider auth.
+        unsupportedSpendControls: Object.keys(request.headers).some(name =>
+          (name.startsWith("anthropic-") && !["anthropic-version", "anthropic-beta"].includes(name))
+          || name.startsWith("x-fleet-health-") || /(?:^|[-_])(region|speed|tier|beta)(?:$|[-_])/.test(name) && name !== "anthropic-beta" && name !== "x-rig-tier")
+          || ["content-type", "anthropic-version", "anthropic-beta"].some(name =>
+            (request.rawHeaders ?? []).filter((value, index) => index % 2 === 0 && value.toLowerCase() === name).length > 1),
       }, probeAssignment, boundLease, trace);
     } finally {
       if (holdTimer) clearInterval(holdTimer);
@@ -2860,7 +3043,7 @@ export const createGatewayHandler = ({
       response.end(result.rawBody);
       return;
     }
-    response.writeHead(result.status, { "Content-Type": "application/json" });
+    response.writeHead(result.status, { "Content-Type": "application/json", ...(result.headers ?? {}) });
     response.end(JSON.stringify(result.payload));
   };
 

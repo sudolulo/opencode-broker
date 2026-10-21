@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+import { readFile } from 'node:fs/promises';
+import { normalizeSpendPolicy } from '../lib/spend-policy.js';
+import { initializeLedger, fundLedger, inspectStatus } from '../lib/spend-budget.js';
+
+const error = (code, message = code) => { const value = new Error(message); value.code = code; throw value; };
+const stringify = value => JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item);
+
+function flags(args) {
+  const result = Object.create(null);
+  for (let index = 0; index < args.length; index += 1) {
+    const key = args[index];
+    if (!key.startsWith('--') || Object.hasOwn(result, key)) error('unknown_flag');
+    if (key === '--confirm-exclusive-promotional-allocation') { result[key] = true; continue; }
+    if (key === '--raw-key' || key === '--key' || index + 1 >= args.length || !args[index + 1] || args[index + 1].startsWith('--')) error('unknown_flag');
+    result[key] = args[index + 1]; index += 1;
+  }
+  return result;
+}
+
+const command = process.argv[2];
+try {
+  if (!['init', 'fund', 'status'].includes(command)) error('invalid_command');
+  const options = flags(process.argv.slice(3));
+  const required = command === 'fund'
+    ? ['--policy', '--amount-usd', '--reference', '--confirmed-at', '--expires-at', '--provider-id', '--origin', '--credential-sha256', '--confirm-exclusive-promotional-allocation']
+    : ['--policy'];
+  const allowed = new Set(required);
+  if (Object.keys(options).some(key => !allowed.has(key)) || required.some(key => options[key] === undefined)) error('invalid_flags');
+  const raw = JSON.parse(await readFile(options['--policy'], 'utf8'));
+  const policy = normalizeSpendPolicy(raw); const now = Date.now();
+  let result;
+  if (command === 'init') result = await initializeLedger({ ledgerPath: policy.ledgerPath, policy, now });
+  else if (command === 'status') result = await inspectStatus({ ledgerPath: policy.ledgerPath, policy, now });
+  else result = await fundLedger({ ledgerPath: policy.ledgerPath, policy, allocation: { amountUSD: options['--amount-usd'], reference: options['--reference'], confirmedAt: options['--confirmed-at'], expiresAt: options['--expires-at'], providerID: options['--provider-id'], origin: options['--origin'], credentialFingerprint: options['--credential-sha256'], exclusivePromotionalAllocation: true }, now });
+  process.stdout.write(`${stringify(result)}\n`);
+} catch (caught) {
+  // JSON parse and filesystem errors can quote arbitrary policy bytes/paths.
+  // Only our fixed refusal vocabulary crosses the CLI boundary.
+  const codes = new Set(['invalid_command', 'unknown_flag', 'invalid_flags', 'invalid_policy', 'unsupported_runtime', 'missing_ledger', 'invalid_ledger', 'binding_mismatch', 'expired', 'insufficient_funds', 'frozen', 'locked']);
+  const code = codes.has(caught.code) ? caught.code : 'invalid_policy';
+  process.stderr.write(`${stringify({ error: { code, message: code } })}\n`);
+  process.exitCode = 1;
+}

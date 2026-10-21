@@ -5,6 +5,9 @@ Issues and pull requests are welcome.
 - **Run the tests.** `npm test` runs every suite (broker, gateway, HUD) with
   Node's built-in test runner. Node 20.18 or later is required for the module
   mocks the HUD tests use.
+  The full test suite requires Node >=22.13 because it exercises the native
+  SQLite spending ledger. Ordinary unbudgeted operation retains the Node
+  >=20.18 baseline; the release is verified on Node 24.16.0.
 - **Add a test with every behaviour change.** Most of this code exists because
   a specific failure happened; a test that fails without the change is what
   keeps it from coming back. Tests must not touch a real installation: point
