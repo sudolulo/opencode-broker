@@ -101,6 +101,7 @@ import { createResolverGenerationManager } from "../lib/resolver-generations.js"
 import { createResolverProcessRegistry } from "../lib/resolver-processes.js";
 import { probationOnlyModelKeys, resolvePolicyLane } from "../lib/policy-targets.js";
 import { createProbeBrokerState, runOutageProbe } from "../lib/model-probe.js";
+import { contentFilterCascadeOrder, isCascadeEnabled } from "../lib/content-filter-cascade.js";
 import {
   accrueOpportunityTime,
   recordCandidateLease,
@@ -1052,8 +1053,12 @@ const stagedOutageContext = (outageContext, candidate) => {
   return heads === outageContext.heads ? outageContext : snapshotOutageContext({ ...outageContext, heads });
 };
 
-const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null, outageContext = null) => {
-  if (!target || !targetEligibleIDsFor(request.profile, request.tier, targets, outageContext).includes(target.id)) return false;
+const targetEligibleFor = (target, request, state, availableModels, targets = allTargets(state), excludeSessionID = null, outageContext = null, allowAnyTier = false) => {
+  if (!target) return false;
+  // ☆ allowAnyTier is for the content-filter cascade ONLY: it descends tiers and may use an
+  // outage reserve (both barred by tier membership here), so it skips the membership gate while
+  // keeping every real-world check below (admission, context fit, circuit, capacity, health).
+  if (!allowAnyTier && !targetEligibleIDsFor(request.profile, request.tier, targets, outageContext).includes(target.id)) return false;
   if (!cloudTargetAdmitted(target, state.inventory?.providers, request.profile)) return false;
   if (target.kind === "local") {
     // The output reserve too, exactly as chooseTarget applies it. Without it this check sized
@@ -1483,6 +1488,73 @@ const acquire = async (state, request, {
   // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
   ensureActive();
   reclaimIdleLeases(state, admittedTargets, sessionID);
+  // ── Content-filter cascade lease ─────────────────────────────────────────────────────────
+  // A per-request, NON-STICKY failover a provider content filter triggers (lib/content-filter-
+  // cascade.js computes the order: older generations of the blocked model, then the other
+  // provider at this tier, then down the tiers, then an uncensored local floor). Unlike every
+  // other lease it deliberately descends tiers and may use an outage reserve WITHOUT a grant --
+  // a content filter is a healthy model refusing one query, not an outage, and the same account
+  // serves the older model on its ordinary credential. So it bypasses only the tier-membership
+  // gate (allowAnyTier) while keeping admission, context, circuit, capacity and health checks;
+  // it opens no circuit, records no stickiness and never pins. The routed model returns on the
+  // very next request. The gateway settles a blocked attempt with /release (never /failure), so
+  // nothing here leaves a mark once the request ends.
+  if (request.contentFilterCascade === true) {
+    if (!isCascadeEnabled(CONFIG)) throw refusal("content-filter cascade is disabled", "content-filter-disabled");
+    const blockedModel = request.blockedModel
+      && typeof request.blockedModel.providerID === "string" && request.blockedModel.providerID
+      && typeof request.blockedModel.id === "string" && request.blockedModel.id
+      ? { providerID: request.blockedModel.providerID, modelID: request.blockedModel.id }
+      : null;
+    const order = contentFilterCascadeOrder({
+      config: CONFIG,
+      tier,
+      blockedModel,
+      apiEligibleProviders: providerAllowlist ? [...providerAllowlist] : null,
+      excludeTargetIDs: excludedTargetIDs,
+    });
+    // Cascade candidates may be local even when the request's own tier is cloud, so the resident
+    // set has to be known here regardless of includesLocal above.
+    if (availableModels === undefined && order.some((candidate) => candidate.kind === "local")) {
+      try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+      ensureActive();
+    }
+    const cascadeRequest = { profile, tier, contextTokens };
+    let picked = null;
+    for (const candidate of order) {
+      const target = admittedTargets[candidate.targetID];
+      if (!target || excluded.has(target.id)) continue;
+      if (targetEligibleFor(target, cascadeRequest, state, availableModels ?? new Set(), admittedTargets, sessionID, null, true)) {
+        picked = target;
+        break;
+      }
+    }
+    if (!picked) throw refusal("every content-filter cascade candidate is unavailable", "content-filter-exhausted");
+    const leaseID = randomUUID();
+    const leasedAt = Date.now();
+    ensureActive();
+    state.leases[sessionID] = {
+      targetID: picked.id, leaseID, sessionID, touchedAt: leasedAt, profile, tier,
+    };
+    state.assignments[sessionID] = {
+      targetID: picked.id, leaseID, sessionID, profile, tier,
+      updatedAt: leasedAt,
+      // A cascade lease answers one blocked query and must be the first thing the assignment cap
+      // spends, never a pin that survives the request. The gateway's gw- session makes it a
+      // one-shot by prefix even if the flag is absent (isOneShotAssignment); mark it when declared.
+      ...(oneShot ? { oneShot: true } : {}),
+    };
+    recordLeaseDecision({
+      at: leasedAt, sessionID, targetID: picked.id, profile, tier, contextTokens,
+      policy: "content-filter-cascade",
+      reasons: [`content-filter-cascade:${picked.id}`,
+        ...(blockedModel ? [`blocked:${blockedModel.providerID}/${blockedModel.modelID}`] : [])],
+      eligibleTargetIDs: order.map((candidate) => candidate.targetID),
+      balancedTargetIDs: [picked.id],
+      providerUtilization: { [picked.providerID]: effectiveUtilization(state.budgets, picked.providerID) },
+    });
+    return { target: picked, existing: false, leaseID, outage: null };
+  }
   let selectedCandidateChoice = null;
   let candidateSelection = null;
   if (policyLane.policyTargetID) {
