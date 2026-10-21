@@ -1539,9 +1539,12 @@ const acquire = async (state, request, {
     state.assignments[sessionID] = {
       targetID: picked.id, leaseID, sessionID, profile, tier,
       updatedAt: leasedAt,
-      // A cascade lease answers one blocked query and must be the first thing the assignment cap
-      // spends, never a pin that survives the request. The gateway's gw- session makes it a
-      // one-shot by prefix even if the flag is absent (isOneShotAssignment); mark it when declared.
+      // ☠️ NEVER A STICKY PIN. A cascade lease answers one blocked query; the session must return
+      // to its routed model on the very next turn ("bump back ASAP"). A gw- one-shot (the gateway
+      // path) is reclaimed by prefix; a real session (the opencode router's failover path) would
+      // otherwise PIN this fallback and keep answering on it. `fallback: true` makes it a degraded
+      // route that yields to the lane's primary the moment one is eligible -- recorded, never pinned.
+      fallback: true,
       ...(oneShot ? { oneShot: true } : {}),
     };
     recordLeaseDecision({
