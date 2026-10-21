@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
+import { normalizeApiSpendGrant } from '../../lib/api-spend-grant.js';
 
 const MAX_SQLITE = 9223372036854775807n;
-const POLICY_KEYS = new Set(['ledgerPath', 'policyID', 'validUntil', 'ceilingUSD', 'binding', 'models', 'reconcileUsage', 'billingReceiptContract']);
+const POLICY_KEYS = new Set(['ledgerPath', 'policyID', 'validUntil', 'ceilingUSD', 'binding', 'models', 'reconcileUsage', 'billingReceiptContract', 'allocations']);
 const REQUEST_KEYS = new Set(['model', 'messages', 'max_tokens', 'stream', 'system', 'temperature', 'top_p', 'top_k', 'stop_sequences', 'metadata', 'tools', 'tool_choice', 'thinking', 'service_tier']);
 const HEADER_KEYS = new Set(['content-type', 'accept', 'anthropic-version', 'x-api-key', 'user-agent', 'x-request-id', 'traceparent', 'tracestate']);
 
@@ -11,6 +12,7 @@ const plain = value => value !== null && typeof value === 'object' && !Array.isA
 const safePositive = value => Number.isSafeInteger(value) && value > 0;
 const own = (object, key) => Object.hasOwn(object, key);
 const exactKeys = (value, keys) => plain(value) && Object.keys(value).every(key => keys.includes(key));
+const identifier = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0-\x1f\x7f]/.test(value);
 
 function deepFreeze(value) {
   if (Array.isArray(value)) return Object.freeze(value.map(deepFreeze));
@@ -162,7 +164,7 @@ function canonicalHeaders(headers) {
   return pairs.sort(([left], [right]) => left.localeCompare(right));
 }
 
-export function normalizeSpendPolicy(raw) {
+export function normalizeSpendPolicy(raw, registeredIdentity) {
   if (!plain(raw) || Object.keys(raw).some(key => !POLICY_KEYS.has(key)) || typeof raw.ledgerPath !== 'string' || !raw.ledgerPath.startsWith('/') || typeof raw.policyID !== 'string' || !raw.policyID || !plain(raw.binding) || !plain(raw.models) || Object.keys(raw.models).length === 0) fail('invalid_policy', 'invalid policy');
   if (!exactKeys(raw.binding, ['providerID', 'origin', 'credentialSHA256']) || typeof raw.binding.providerID !== 'string' || !raw.binding.providerID) fail('invalid_policy', 'invalid binding');
   const binding = { providerID: raw.binding.providerID, origin: originOf(raw.binding.origin), credentialSHA256: digest(raw.binding.credentialSHA256) };
@@ -178,6 +180,23 @@ export function normalizeSpendPolicy(raw) {
     models[id] = { maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens, ratesNanoUSD };
   }
   const ceilingNano = nanos(raw.ceilingUSD);
+  let allocations;
+  if (raw.allocations !== undefined) {
+    if (!exactKeys(raw.allocations, ['continuationUSD', 'manualReserveUSD', 'releaseWindowHours']) || !Number.isSafeInteger(raw.allocations.releaseWindowHours) || raw.allocations.releaseWindowHours < 1 || raw.allocations.releaseWindowHours > 744) fail('invalid_policy', 'invalid allocations');
+    if ([raw.allocations.continuationUSD, raw.allocations.manualReserveUSD].some(value => typeof value !== 'string' || (value.split('.')[1]?.slice(9).match(/[1-9]/)))) fail('invalid_policy', 'allocation amount is subnano');
+    const continuationNano = nanos(raw.allocations.continuationUSD, { allowZero: false });
+    const manualReserveNano = nanos(raw.allocations.manualReserveUSD, { allowZero: false });
+    if (continuationNano + manualReserveNano !== ceilingNano) fail('invalid_policy', 'allocation total differs from ceiling');
+    allocations = { continuationUSD: canonicalUSD(continuationNano), manualReserveUSD: canonicalUSD(manualReserveNano), continuationNano, manualReserveNano, releaseWindowHours: raw.allocations.releaseWindowHours, releaseWindowMs: raw.allocations.releaseWindowHours * 3600000 };
+  }
+  let registered;
+  if (registeredIdentity !== undefined) {
+    if (!exactKeys(registeredIdentity, ['targetID', 'providerID', 'modelID'])
+      || !identifier(registeredIdentity.targetID) || !identifier(registeredIdentity.providerID)
+      || !identifier(registeredIdentity.modelID) || registeredIdentity.providerID !== binding.providerID
+      || !own(models, registeredIdentity.modelID)) fail('invalid_policy', 'invalid registered identity');
+    registered = { targetID: registeredIdentity.targetID, providerID: registeredIdentity.providerID, modelID: registeredIdentity.modelID };
+  }
   const reconcileUsage = raw.reconcileUsage === undefined ? false : raw.reconcileUsage;
   if (typeof reconcileUsage !== 'boolean') fail('invalid_policy', 'invalid reconciliation setting');
   let billingReceiptContract;
@@ -186,12 +205,12 @@ export function normalizeSpendPolicy(raw) {
     timestamp(raw.billingReceiptContract.confirmedAt);
     billingReceiptContract = { confirmedAt: raw.billingReceiptContract.confirmedAt, reference: raw.billingReceiptContract.reference };
   }
-  const normalized = { ledgerPath: raw.ledgerPath, policyID: raw.policyID, validUntil: raw.validUntil, validUntilMs: timestamp(raw.validUntil), ceilingUSD: canonicalUSD(ceilingNano), ceilingNano, binding, models, reconcileUsage, ...(billingReceiptContract ? { billingReceiptContract } : {}) };
-  const hashable = { ...normalized, ceilingNano: ceilingNano.toString(), models: Object.fromEntries(Object.entries(models).map(([id, model]) => [id, { ...model, ratesNanoUSD: Object.fromEntries(Object.entries(model.ratesNanoUSD).map(([name, rate]) => [name, rate.toString()])) }])) };
+  const normalized = { ledgerPath: raw.ledgerPath, policyID: raw.policyID, validUntil: raw.validUntil, validUntilMs: timestamp(raw.validUntil), ceilingUSD: canonicalUSD(ceilingNano), ceilingNano, binding, models, reconcileUsage, ...(billingReceiptContract ? { billingReceiptContract } : {}), ...(allocations ? { allocations } : {}) };
+  const hashable = { ...normalized, ceilingNano: ceilingNano.toString(), models: Object.fromEntries(Object.entries(models).map(([id, model]) => [id, { ...model, ratesNanoUSD: Object.fromEntries(Object.entries(model.ratesNanoUSD).map(([name, rate]) => [name, rate.toString()])) }])), ...(allocations ? { allocations: { ...allocations, continuationNano: allocations.continuationNano.toString(), manualReserveNano: allocations.manualReserveNano.toString() } } : {}), ...(registered ? { registeredIdentity: registered } : {}) };
   return deepFreeze({ ...normalized, policyHash: hash(canonical(hashable)) });
 }
 
-export function prepareSpendAttempt({ policy, providerID, url, body, headers, credentialFingerprint, now }) {
+export function prepareSpendAttempt({ policy, providerID, url, body, headers, credentialFingerprint, now, spendGrant }) {
   if (!policy || typeof body !== 'string' || !Number.isSafeInteger(now) || now >= policy.validUntilMs) fail('unsupported_request', 'invalid or expired request');
   let parsedURL; try { parsedURL = new URL(url); } catch { fail('unsupported_request', 'invalid request URL'); }
   if (parsedURL.username || parsedURL.password || parsedURL.origin !== policy.binding.origin || parsedURL.pathname !== '/v1/messages' || parsedURL.search || parsedURL.hash) fail('unsupported_request', 'unsupported request URL');
@@ -206,6 +225,12 @@ export function prepareSpendAttempt({ policy, providerID, url, body, headers, cr
   if (reserveNano > MAX_SQLITE) fail('unsupported_request', 'reservation exceeds SQLite range');
   const bodyDigest = hash(body);
   const digestHeaders = pairs.map(([name, value]) => [name, name === 'x-api-key' ? actualFingerprint : value]);
-  const requestDigest = hash(canonical({ method: 'POST', url: parsedURL.toString(), headers: digestHeaders, bodyDigest, policyHash: policy.policyHash, providerID, credentialFingerprint: actualFingerprint }));
-  return deepFreeze({ policyHash: policy.policyHash, providerID, origin: parsedURL.origin, credentialFingerprint: actualFingerprint, model: parsed.model, maxInputTokens: model.maxInputTokens, maxOutputTokens: parsed.max_tokens, ratesNanoUSD: model.ratesNanoUSD, reserveNano, body, bodyDigest, requestDigest, url: parsedURL.toString(), headers: pairs });
+  let canonicalGrant;
+  if (policy.allocations) {
+    try { canonicalGrant = normalizeApiSpendGrant(spendGrant, { now, providerID, modelID: parsed.model }); }
+    catch (error) { if (error?.code === 'invalid_authorization') throw error; fail('unsupported_request', 'invalid spend authorization'); }
+    if (canonicalGrant.policyRevision !== policy.policyHash) fail('unsupported_request', 'spend authorization policy mismatch');
+  }
+  const requestDigest = hash(canonical({ method: 'POST', url: parsedURL.toString(), headers: digestHeaders, bodyDigest, policyHash: policy.policyHash, providerID, credentialFingerprint: actualFingerprint, ...(canonicalGrant ? { spendGrant: canonicalGrant } : {}) }));
+  return deepFreeze({ policyHash: policy.policyHash, providerID, origin: parsedURL.origin, credentialFingerprint: actualFingerprint, model: parsed.model, maxInputTokens: model.maxInputTokens, maxOutputTokens: parsed.max_tokens, ratesNanoUSD: model.ratesNanoUSD, reserveNano, body, bodyDigest, requestDigest, url: parsedURL.toString(), headers: pairs, ...(canonicalGrant ? { spendGrant: canonicalGrant } : {}) });
 }

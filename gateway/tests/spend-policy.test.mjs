@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { FINGERPRINT, MODEL, NOW, ORIGIN, PROVIDER_ID, bodyFor, headersFor, policyFor, preparedFor, rawPolicy } from './helpers/spend-fixture.mjs';
+import { FINGERPRINT, MODEL, NOW, OPUS_MODEL, ORIGIN, PROVIDER_ID, bodyFor, headersFor, policyFor, preparedFor, rawPolicy } from './helpers/spend-fixture.mjs';
 import { normalizeSpendPolicy, prepareSpendAttempt } from '../lib/spend-policy.js';
 
 const ledger = '/synthetic/wallet.sqlite';
+const LEGACY_HASH = '50a945d5f24e04aa262a470e6331d8eb46bd6376e15c139b9ea0835d7dcf5608';
 test('maximum context, not short text, sets the reservation', () => {
   assert.equal(preparedFor(policyFor(ledger)).reserveNano, 350n);
 });
@@ -23,6 +24,51 @@ test('policy canonicalization is order independent and immutable', () => {
   assert.equal(policy.policyHash, normalizeSpendPolicy(b).policyHash);
   assert.throws(() => { policy.models[MODEL].maxInputTokens = 1; }, TypeError);
   assert.equal(policy.models[MODEL].maxInputTokens, 100);
+});
+test('legacy policies keep their exact pre-allocation hash', () => {
+  assert.equal(normalizeSpendPolicy(rawPolicy('/synthetic/legacy-hash-wallet.sqlite')).policyHash, LEGACY_HASH);
+});
+test('allocation policies normalize exact money, hash allocations, and require complete valid splits', () => {
+  const allocations = { continuationUSD: '150.000000000', manualReserveUSD: '50', releaseWindowHours: 48 };
+  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations }));
+  assert.deepEqual(policy.allocations, { continuationUSD: '150', manualReserveUSD: '50', continuationNano: 150000000000n, manualReserveNano: 50000000000n, releaseWindowHours: 48, releaseWindowMs: 172800000 });
+  assert.notEqual(policy.policyHash, normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { ...allocations, releaseWindowHours: 49 } })).policyHash);
+  for (const invalid of [
+    { continuationUSD: '150', manualReserveUSD: '49.999999999', releaseWindowHours: 48 },
+    { continuationUSD: '150', manualReserveUSD: '50.0000000001', releaseWindowHours: 48 },
+    { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 0 },
+    { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 745 },
+    { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 1.5 },
+    { continuationUSD: '0', manualReserveUSD: '200', releaseWindowHours: 48 },
+    { continuationUSD: 150, manualReserveUSD: '50', releaseWindowHours: 48 },
+    { continuationUSD: '9223372036.854775808', manualReserveUSD: '50', releaseWindowHours: 48 },
+    { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48, unexpected: true },
+  ]) assert.throws(() => normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: invalid })), { code: 'invalid_policy' });
+});
+test('split policy revisions bind the registered target, provider, and model identity', () => {
+  const raw = rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
+  const registered = { targetID: 'target-a', providerID: PROVIDER_ID, modelID: MODEL };
+  const policy = normalizeSpendPolicy(raw, registered);
+  assert.notEqual(policy.policyHash, normalizeSpendPolicy(raw, { ...registered, targetID: 'target-b' }).policyHash);
+  assert.notEqual(policy.policyHash, normalizeSpendPolicy(raw, { ...registered, modelID: OPUS_MODEL }).policyHash);
+  assert.throws(() => normalizeSpendPolicy(raw, { ...registered, providerID: 'other-provider' }), { code: 'invalid_policy' });
+  assert.throws(() => normalizeSpendPolicy(raw, { targetID: 'target-a', providerID: PROVIDER_ID, modelID: 'unknown' }), { code: 'invalid_policy' });
+});
+test('allocation-enabled admissions require an exact broker grant and bind it into the digest', () => {
+  const policy = policyFor(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
+  const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };
+  assert.throws(() => preparedFor(policy), { code: 'invalid_authorization' });
+  const prepared = prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant: grant });
+  assert.deepEqual(prepared.spendGrant, grant);
+  assert.notEqual(prepared.requestDigest, prepareSpendAttempt({ policy: policyFor(ledger), providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW }).requestDigest);
+  assert.throws(() => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant: { ...grant, modelID: 'wrong' } }), { code: 'invalid_authorization' });
+});
+test('split admission preserves malformed and expired grant authorization failures', () => {
+  const policy = policyFor(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
+  const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };
+  const attempt = spendGrant => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant });
+  assert.throws(() => attempt({ ...grant, issuedAtMs: NOW + 1 }), { code: 'invalid_authorization' });
+  assert.throws(() => attempt({ ...grant, expiresAtMs: NOW }), { code: 'invalid_authorization' });
 });
 test('closed envelope refuses paid controls and accepts inert client tool JSON', () => {
   const policy = policyFor(ledger);
