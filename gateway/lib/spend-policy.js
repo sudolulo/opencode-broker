@@ -190,7 +190,7 @@ export function normalizeSpendPolicy(raw, registeredIdentity) {
     allocations = { continuationUSD: canonicalUSD(continuationNano), manualReserveUSD: canonicalUSD(manualReserveNano), continuationNano, manualReserveNano, releaseWindowHours: raw.allocations.releaseWindowHours, releaseWindowMs: raw.allocations.releaseWindowHours * 3600000 };
   }
   let registered;
-  if (registeredIdentity !== undefined) {
+  if (allocations) {
     if (!exactKeys(registeredIdentity, ['targetID', 'providerID', 'modelID'])
       || !identifier(registeredIdentity.targetID) || !identifier(registeredIdentity.providerID)
       || !identifier(registeredIdentity.modelID) || registeredIdentity.providerID !== binding.providerID
@@ -205,12 +205,12 @@ export function normalizeSpendPolicy(raw, registeredIdentity) {
     timestamp(raw.billingReceiptContract.confirmedAt);
     billingReceiptContract = { confirmedAt: raw.billingReceiptContract.confirmedAt, reference: raw.billingReceiptContract.reference };
   }
-  const normalized = { ledgerPath: raw.ledgerPath, policyID: raw.policyID, validUntil: raw.validUntil, validUntilMs: timestamp(raw.validUntil), ceilingUSD: canonicalUSD(ceilingNano), ceilingNano, binding, models, reconcileUsage, ...(billingReceiptContract ? { billingReceiptContract } : {}), ...(allocations ? { allocations } : {}) };
+  const normalized = { ledgerPath: raw.ledgerPath, policyID: raw.policyID, validUntil: raw.validUntil, validUntilMs: timestamp(raw.validUntil), ceilingUSD: canonicalUSD(ceilingNano), ceilingNano, binding, models, reconcileUsage, ...(billingReceiptContract ? { billingReceiptContract } : {}), ...(allocations ? { allocations, registeredIdentity: registered } : {}) };
   const hashable = { ...normalized, ceilingNano: ceilingNano.toString(), models: Object.fromEntries(Object.entries(models).map(([id, model]) => [id, { ...model, ratesNanoUSD: Object.fromEntries(Object.entries(model.ratesNanoUSD).map(([name, rate]) => [name, rate.toString()])) }])), ...(allocations ? { allocations: { ...allocations, continuationNano: allocations.continuationNano.toString(), manualReserveNano: allocations.manualReserveNano.toString() } } : {}), ...(registered ? { registeredIdentity: registered } : {}) };
   return deepFreeze({ ...normalized, policyHash: hash(canonical(hashable)) });
 }
 
-export function prepareSpendAttempt({ policy, providerID, url, body, headers, credentialFingerprint, now, spendGrant }) {
+export function prepareSpendAttempt({ policy, providerID, targetID, url, body, headers, credentialFingerprint, now, spendGrant }) {
   if (!policy || typeof body !== 'string' || !Number.isSafeInteger(now) || now >= policy.validUntilMs) fail('unsupported_request', 'invalid or expired request');
   let parsedURL; try { parsedURL = new URL(url); } catch { fail('unsupported_request', 'invalid request URL'); }
   if (parsedURL.username || parsedURL.password || parsedURL.origin !== policy.binding.origin || parsedURL.pathname !== '/v1/messages' || parsedURL.search || parsedURL.hash) fail('unsupported_request', 'unsupported request URL');
@@ -227,7 +227,8 @@ export function prepareSpendAttempt({ policy, providerID, url, body, headers, cr
   const digestHeaders = pairs.map(([name, value]) => [name, name === 'x-api-key' ? actualFingerprint : value]);
   let canonicalGrant;
   if (policy.allocations) {
-    try { canonicalGrant = normalizeApiSpendGrant(spendGrant, { now, providerID, modelID: parsed.model }); }
+    if (!policy.registeredIdentity || targetID !== policy.registeredIdentity.targetID) fail('invalid_authorization', 'spend authorization target mismatch');
+    try { canonicalGrant = normalizeApiSpendGrant(spendGrant, { now, targetID, providerID, modelID: parsed.model }); }
     catch (error) { if (error?.code === 'invalid_authorization') throw error; fail('unsupported_request', 'invalid spend authorization'); }
     if (canonicalGrant.policyRevision !== policy.policyHash) fail('unsupported_request', 'spend authorization policy mismatch');
   }

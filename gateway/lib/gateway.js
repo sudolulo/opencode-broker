@@ -519,7 +519,9 @@ const providerSpendPolicy = (providerID, provider, leased = {}) => {
     if (declared) throw spendError("missing_policy");
     return null;
   }
-  const policy = normalizeSpendPolicy(provider.spendBudget);
+  const policy = normalizeSpendPolicy(provider.spendBudget, provider.spendBudget?.allocations === undefined
+    ? undefined
+    : { targetID: leased.targetID, providerID, modelID: leased.modelID });
   if (typeof provider.baseUrl !== "string" || !provider.baseUrl) throw spendError("invalid_policy");
   let origin;
   try { origin = new URL(provider.baseUrl).origin; } catch { throw spendError("binding_mismatch"); }
@@ -531,7 +533,10 @@ const validateProviderFlags = (providers) => {
     if (provider?.bufferStreamingUpstream === true && provider?.assembleFromStream === true) {
       throw new Error(`providers["${name}"] sets both bufferStreamingUpstream and assembleFromStream: a lane either cannot stream (buffer) or should always stream (assemble), not both`);
     }
-    providerSpendPolicy(name, provider);
+    // A split policy is bound to the broker-selected target, which does not exist
+    // while static gateway config is loading. Its full validation happens only
+    // after the broker supplies that identity for an admission.
+    if (provider?.spendBudget?.allocations === undefined) providerSpendPolicy(name, provider);
   }
 };
 
@@ -2144,8 +2149,8 @@ export const createGatewayHandler = ({
         if (spendPolicy) {
           if (now() >= spendPolicy.validUntilMs) throw spendError("expired");
           if (typeof key !== "string" || createHash("sha256").update(key).digest("hex") !== spendPolicy.binding.credentialSHA256) throw spendError("binding_mismatch");
-          const prepareArgs = { policy: spendPolicy, providerID: leased.providerID, url: upstreamURL,
-            body: outboundBody, credentialFingerprint: createHash("sha256").update(key).digest("hex"), now: now() };
+          const prepareArgs = { policy: spendPolicy, providerID: leased.providerID, targetID: leased.targetID, url: upstreamURL,
+            body: outboundBody, credentialFingerprint: createHash("sha256").update(key).digest("hex"), now: now(), spendGrant: leased.spendGrant };
           // Validate the pre-Headers record first: Headers would otherwise merge
           // duplicate/case-colliding controls and destroy refusal evidence. Then
           // bind fetch's effective whitespace-normalized application headers.

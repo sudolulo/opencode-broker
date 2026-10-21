@@ -27,12 +27,14 @@ test('policy canonicalization is order independent and immutable', () => {
 });
 test('legacy policies keep their exact pre-allocation hash', () => {
   assert.equal(normalizeSpendPolicy(rawPolicy('/synthetic/legacy-hash-wallet.sqlite')).policyHash, LEGACY_HASH);
+  assert.equal(normalizeSpendPolicy(rawPolicy('/synthetic/legacy-hash-wallet.sqlite'), { targetID: 'ignored-target', providerID: PROVIDER_ID, modelID: MODEL }).policyHash, LEGACY_HASH);
 });
 test('allocation policies normalize exact money, hash allocations, and require complete valid splits', () => {
   const allocations = { continuationUSD: '150.000000000', manualReserveUSD: '50', releaseWindowHours: 48 };
-  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations }));
+  const registered = { targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL };
+  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations }), registered);
   assert.deepEqual(policy.allocations, { continuationUSD: '150', manualReserveUSD: '50', continuationNano: 150000000000n, manualReserveNano: 50000000000n, releaseWindowHours: 48, releaseWindowMs: 172800000 });
-  assert.notEqual(policy.policyHash, normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { ...allocations, releaseWindowHours: 49 } })).policyHash);
+  assert.notEqual(policy.policyHash, normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { ...allocations, releaseWindowHours: 49 } }), registered).policyHash);
   for (const invalid of [
     { continuationUSD: '150', manualReserveUSD: '49.999999999', releaseWindowHours: 48 },
     { continuationUSD: '150', manualReserveUSD: '50.0000000001', releaseWindowHours: 48 },
@@ -45,9 +47,10 @@ test('allocation policies normalize exact money, hash allocations, and require c
     { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48, unexpected: true },
   ]) assert.throws(() => normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: invalid })), { code: 'invalid_policy' });
 });
-test('split policy revisions bind the registered target, provider, and model identity', () => {
+test('split policies require and bind the registered target, provider, and model identity', () => {
   const raw = rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
   const registered = { targetID: 'target-a', providerID: PROVIDER_ID, modelID: MODEL };
+  assert.throws(() => normalizeSpendPolicy(raw), { code: 'invalid_policy' });
   const policy = normalizeSpendPolicy(raw, registered);
   assert.notEqual(policy.policyHash, normalizeSpendPolicy(raw, { ...registered, targetID: 'target-b' }).policyHash);
   assert.notEqual(policy.policyHash, normalizeSpendPolicy(raw, { ...registered, modelID: OPUS_MODEL }).policyHash);
@@ -55,18 +58,21 @@ test('split policy revisions bind the registered target, provider, and model ide
   assert.throws(() => normalizeSpendPolicy(raw, { targetID: 'target-a', providerID: PROVIDER_ID, modelID: 'unknown' }), { code: 'invalid_policy' });
 });
 test('allocation-enabled admissions require an exact broker grant and bind it into the digest', () => {
-  const policy = policyFor(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
+  const registered = { targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL };
+  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } }), registered);
   const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };
   assert.throws(() => preparedFor(policy), { code: 'invalid_authorization' });
-  const prepared = prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant: grant });
+  const prepare = (targetID, spendGrant) => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, targetID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant });
+  const prepared = prepare('target', grant);
   assert.deepEqual(prepared.spendGrant, grant);
-  assert.notEqual(prepared.requestDigest, prepareSpendAttempt({ policy: policyFor(ledger), providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW }).requestDigest);
-  assert.throws(() => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant: { ...grant, modelID: 'wrong' } }), { code: 'invalid_authorization' });
+  assert.throws(() => prepare('other-target', grant), { code: 'invalid_authorization' });
+  assert.throws(() => prepare('target', { ...grant, targetID: 'other-target' }), { code: 'invalid_authorization' });
+  assert.throws(() => prepare('target', { ...grant, modelID: 'wrong' }), { code: 'invalid_authorization' });
 });
 test('split admission preserves malformed and expired grant authorization failures', () => {
-  const policy = policyFor(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } });
+  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } }), { targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL });
   const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };
-  const attempt = spendGrant => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant });
+  const attempt = spendGrant => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, targetID: 'target', url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant });
   assert.throws(() => attempt({ ...grant, issuedAtMs: NOW + 1 }), { code: 'invalid_authorization' });
   assert.throws(() => attempt({ ...grant, expiresAtMs: NOW }), { code: 'invalid_authorization' });
 });
