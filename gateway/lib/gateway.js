@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { usageLimitMessage } from "../../lib/usage-limit.js";
 import { createGatewayHealth, createTerminalParser } from "./model-health.js";
+import { replyContentFilter } from "./content-filter.js";
 import { normalizeSpendPolicy, prepareSpendAttempt } from "./spend-policy.js";
 import { reserveAttempt, settleAttempt, markUncertain } from "./spend-budget.js";
 import { collectSpendJSON, relaySpendSSE } from "./spend-transport.js";
@@ -70,6 +71,10 @@ const leaseCoversWireModel = (leasedModelID, wireModelID) => {
 
 const DEFAULT_TIER = "worker";
 const ATTEMPTS = 2;
+// How many fallback models the content-filter cascade will try for one blocked query before it
+// gives up and delivers the original refusal. A ceiling on the broker's ordered candidate walk
+// (the broker enforces its own `maxAttempts` too); the shared request deadline is the real bound.
+const CASCADE_MAX_ATTEMPTS = 8;
 export const MAX_EMBEDDING_BATCH_ITEMS = 2048;
 export const MAX_EMBEDDINGS_BODY_BYTES = 1024 * 1024;
 
@@ -960,7 +965,7 @@ const relayStream = async ({ stream, sink, keepUsageFrames, touch, api = CHAT, o
 // dialect gap would punish every buffered request too -- so the body is dressed
 // as the stream it should have been. Usage comes straight off the payload, so
 // this path accounts exactly, not by estimate.
-const relayBufferedAsStream = async ({ response, sink, keepUsageFrames, observe = null }) => {
+const relayBufferedAsStream = async ({ response, sink, keepUsageFrames, observe = null, detect = false }) => {
   let payload;
   try {
     if (observe) {
@@ -973,6 +978,12 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames, observe 
       error: new Error("upstream returned 200 with an unparseable JSON body") };
   }
   const usage = payload?.usage && typeof payload.usage === "object" ? readUsage(payload.usage) : null;
+  // A content-filter block is caught here, before the first byte is written, so the caller can
+  // release (not indict) the lane and cascade to another model. Nothing is relayed.
+  if (detect) {
+    const reason = replyContentFilter("chat", payload && typeof payload === "object" ? payload : {});
+    if (reason) return { relayed: false, contentFilterBlock: reason, payload, usage, outputChars: 0, sawDone: false, error: null };
+  }
   // Keep this dialect-recovery path byte-for-byte aligned with a deliberately buffered upstream
   // reply: tool calls and reasoning are part of the stream contract too.
   const frames = bufferedChatFrames(payload && typeof payload === "object" ? payload : {}, keepUsageFrames);
@@ -990,7 +1001,7 @@ const relayBufferedAsStream = async ({ response, sink, keepUsageFrames, observe 
 // is exactly the buffered path's. The cost, named: the client sees no token until the last one.
 // Returns relayStream's outcome shape. A failed read (our timeout, the client's abort) surfaces as
 // the error itself, so the caller can tell impatience from a broken body.
-const relayBufferedReply = async ({ response, sink, keepUsageFrames, api, observe = null }) => {
+const relayBufferedReply = async ({ response, sink, keepUsageFrames, api, observe = null, detect = false }) => {
   const failed = (error) => ({ relayed: false, usage: null, outputChars: 0, sawDone: false, error });
   let raw;
   try { raw = await response.text(); observe?.(raw); } catch (error) { return failed(error); }
@@ -1000,7 +1011,15 @@ const relayBufferedReply = async ({ response, sink, keepUsageFrames, api, observ
   }
   if (!payload || typeof payload !== "object") return failed(new Error("upstream returned 200 with an unparseable JSON body"));
   const usage = payload.usage && typeof payload.usage === "object" ? readUsage(payload.usage) : null;
-  const frames = api === RESPONSES ? bufferedResponseEvents(payload) : bufferedChatFrames(payload, keepUsageFrames);
+  // A content-filter block is caught here, before the first byte, so the caller can release the
+  // lane (not indict it) and cascade to another model. Nothing is relayed.
+  if (detect) {
+    const reason = replyContentFilter(api.name, payload);
+    if (reason) return { relayed: false, contentFilterBlock: reason, payload, usage, outputChars: 0, sawDone: false, error: null };
+  }
+  const frames = api === MESSAGES ? bufferedMessagesFrames(payload)
+    : api === RESPONSES ? bufferedResponseEvents(payload)
+    : bufferedChatFrames(payload, keepUsageFrames);
   for (const frame of frames.text) await sink.write(frame);
   return { relayed: true, usage, outputChars: frames.outputChars, error: null, sawDone: true };
 };
@@ -1084,6 +1103,47 @@ const bufferedResponseEvents = (payload) => {
     text: events.map((event, sequence) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number: sequence })}\n\n`),
     outputChars,
   };
+};
+
+// One Anthropic Messages response as the SSE event sequence its stream would have carried:
+// message_start (the envelope minus content, stop_reason null, output usage zeroed), then per
+// content block a start -> delta -> stop (text as text_delta, tool_use as input_json_delta over an
+// empty input, anything else -- a thinking block -- passed whole on the start), then message_delta
+// carrying the real stop_reason and output usage, then message_stop. The mirror of
+// bufferedChatFrames/bufferedResponseEvents for the Messages dialect, used so a Messages turn
+// buffered for content-filter inspection (or served by a cascade fallback) can still be streamed.
+const bufferedMessagesFrames = (payload) => {
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  let outputChars = 0;
+  const frame = (type, obj) => `event: ${type}\ndata: ${JSON.stringify({ type, ...obj })}\n\n`;
+  const text = [];
+  const startUsage = payload.usage && typeof payload.usage === "object"
+    ? { ...payload.usage, output_tokens: 0 }
+    : { input_tokens: 0, output_tokens: 0 };
+  text.push(frame("message_start", { message: { ...payload, content: [], stop_reason: null, stop_sequence: null, usage: startUsage } }));
+  content.forEach((block, index) => {
+    if (block?.type === "text" && typeof block.text === "string") {
+      outputChars += block.text.length;
+      text.push(frame("content_block_start", { index, content_block: { type: "text", text: "" } }));
+      if (block.text.length) text.push(frame("content_block_delta", { index, delta: { type: "text_delta", text: block.text } }));
+      text.push(frame("content_block_stop", { index }));
+    } else if (block?.type === "tool_use") {
+      const args = JSON.stringify(block.input ?? {});
+      outputChars += args.length;
+      text.push(frame("content_block_start", { index, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } }));
+      text.push(frame("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: args } }));
+      text.push(frame("content_block_stop", { index }));
+    } else {
+      // A thinking/redacted_thinking or unknown block has no incremental slot: ship it whole on the
+      // start so the client still sees it, with a matching stop.
+      text.push(frame("content_block_start", { index, content_block: block }));
+      text.push(frame("content_block_stop", { index }));
+    }
+  });
+  const outputTokens = payload.usage && typeof payload.usage === "object" ? Number(payload.usage.output_tokens) || 0 : 0;
+  text.push(frame("message_delta", { delta: { stop_reason: payload.stop_reason ?? "end_turn", stop_sequence: payload.stop_sequence ?? null }, usage: { output_tokens: outputTokens } }));
+  text.push(frame("message_stop", {}));
+  return { text, outputChars };
 };
 
 // TRAP: WHY A BUFFERED ASK CAN GO UPSTREAM AS A STREAM (`assembleFromStream: true`). llama.cpp in
@@ -1673,22 +1733,90 @@ export const createGatewayHandler = ({
     const sessionID = probeAssignment?.sessionID
       ?? (rig ? `rig-${rig.session}` : `gw-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
     if (caller) callers.set(sessionID, caller);
-    try {
-      return await completionsFor(
+    // Lease the next content-filter cascade candidate: the broker returns one model from its
+    // non-sticky fallback order (older generations, other provider, down the tiers, uncensored
+    // floor), excluding everything already tried. Shaped exactly like leaseOnce's return so it can
+    // ride into completionsFor as a boundLease. Throws when the order is exhausted or disabled.
+    const cascadeLease = async (blockedModel, tried) => {
+      const providersForApi = allowedProviders.filter((id) => providerServes(config.providers[id] ?? {}, api));
+      const lease = await brokerRequest("/lease", {
         sessionID,
-        requestBody,
-        clientAbort,
-        sink,
-        api,
-        route,
-        streaming,
-        wantedJson,
-        keepUsageFrames,
-        requestHeaders,
-        probeAssignment,
-        boundLease,
-        trace,
+        profile: route?.profile ?? config.profile,
+        tier: route?.tier ?? config.tier,
+        replace: true,
+        ...(sessionID.startsWith("rig-") ? {} : { oneShot: true }),
+        contextTokens: estimateContextTokens(requestBody),
+        providers: providersForApi,
+        contentFilterCascade: true,
+        blockedModel: { providerID: blockedModel.providerID, id: blockedModel.modelID },
+        excludeTargetIDs: tried,
+        ...(callerOf(sessionID) ? { caller: callerOf(sessionID) } : {}),
+      });
+      const model = lease?.target?.model;
+      if (!model?.providerID || !model?.id) {
+        const error = new Error(String(lease?.error ?? "no content-filter cascade candidate"));
+        if (typeof lease?.code === "string") error.code = lease.code;
+        throw error;
+      }
+      const wireModelID = speedAliasBase(model.id);
+      return {
+        sessionID,
+        leaseID: lease?.leaseID,
+        providerID: model.providerID,
+        modelID: model.id,
+        ...(wireModelID ? { wireModelID } : {}),
+        targetID: typeof lease?.target?.id === "string" ? lease.target.id : model.id,
+        embedding: lease?.target?.embedding === true,
+        ...spendClassification(lease?.target),
+        // An ordinary cascade lease carries no reserve grant, so no verified-health requirement:
+        // null, exactly as leaseOnce reports for a gateway lease (undefined would trip the
+        // expectedCredentialInstance !== null gate and fail the attempt as "health unavailable").
+        expectedCredentialInstance: typeof lease?.expectedCredentialInstance === "string" ? lease.expectedCredentialInstance : null,
+      };
+    };
+    // The cascade exhausted every candidate: deliver the ORIGINAL refusal so the client still gets
+    // the routed model's answer (nothing has been committed to the sink yet).
+    const deliverContentFilterBlock = async (block) => {
+      if (!streaming) {
+        return block.api === MESSAGES
+          ? { status: 200, rawBody: block.rawBody, contentType: block.contentType ?? "application/json", providerID: block.blockedModel.providerID, modelID: block.blockedModel.modelID }
+          : { status: 200, payload: block.payload, providerID: block.blockedModel.providerID, modelID: block.blockedModel.modelID };
+      }
+      const payload = block.payload ?? {};
+      const frames = block.api === MESSAGES ? bufferedMessagesFrames(payload)
+        : block.api === RESPONSES ? bufferedResponseEvents(payload)
+        : bufferedChatFrames(payload, keepUsageFrames);
+      for (const frame of frames.text) await sink.write(frame);
+      return { status: 200, streamed: true, providerID: block.blockedModel.providerID, modelID: block.blockedModel.modelID };
+    };
+    try {
+      // A probe owns its own lifecycle and embeddings have no cascade; everything else may cascade
+      // (a spend attempt is skipped per-attempt inside completionsFor). The first call detects a
+      // block and returns a sentinel without committing.
+      const cascadeAllowed = !probeAssignment && api !== EMBEDDINGS;
+      const first = await completionsFor(
+        sessionID, requestBody, clientAbort, sink, api, route, streaming,
+        wantedJson, keepUsageFrames, requestHeaders, probeAssignment, boundLease, trace,
+        cascadeAllowed, false,
       );
+      if (!cascadeAllowed || !first?.contentFilterBlock) return first;
+      // Walk the fallback order for THIS query, forwarding each candidate buffered so its reply is
+      // inspected before a byte is committed. One shared deadline across the whole cascade.
+      const overallDeadline = now() + waitFor(route);
+      const tried = first.blockedTargetID ? [first.blockedTargetID] : [];
+      for (let step = 0; step < CASCADE_MAX_ATTEMPTS && now() < overallDeadline && !clientAbort?.aborted; step++) {
+        let candidate;
+        try { candidate = await cascadeLease(first.blockedModel, tried); }
+        catch { break; } // exhausted, disabled, or unavailable -> deliver the original refusal below
+        const attempt = await completionsFor(
+          sessionID, requestBody, clientAbort, sink, api, route, streaming,
+          wantedJson, keepUsageFrames, requestHeaders, null, candidate, trace,
+          true, true,
+        );
+        if (!attempt?.contentFilterBlock) return attempt; // a clean answer (committed) or a non-block error
+        if (attempt.blockedTargetID && !tried.includes(attempt.blockedTargetID)) tried.push(attempt.blockedTargetID);
+      }
+      return await deliverContentFilterBlock(first);
     } finally {
       callers.delete(sessionID);
       if (probeAssignment) {
@@ -1718,11 +1846,39 @@ export const createGatewayHandler = ({
     probeAssignment = null,
     boundLease = null,
     trace = null,
+    // Content-filter cascade. `cascadeDetect` turns on pre-commit block detection (the FIRST call
+    // of a real, non-spend request, and every cascade re-issue); `forceBuffered` makes a streaming
+    // ask go upstream buffered so the whole reply can be inspected before a byte is committed (set
+    // on cascade re-issues, where the candidate rides in as `boundLease`). A detected block returns
+    // a `{ contentFilterBlock }` sentinel instead of committing -- `completions` drives the loop.
+    cascadeDetect = false,
+    forceBuffered = false,
   ) => {
+    // Detect-and-signal applies only where a block is actionable: never for a spend attempt (its
+    // ledger owns settlement), an outage-health probe, or embeddings.
+    const detectBlocks = cascadeDetect && api !== EMBEDDINGS && probeAssignment?.purpose !== "outage-health";
     // One entry per upstream attempt that failed, for the failure log (see handle's wrapper).
     // Recording only: nothing here reads it back, so routing cannot depend on it.
     const noteAttempt = (leased, outcome, detail) => {
       trace?.attempts.push({ provider: leased.providerID, model: leased.modelID, outcome, detail: logDetail(detail) });
+    };
+    // A content-filter block is released, never indicted: a policy refusal is not a model fault, and
+    // a /failure would open a circuit -- the opposite of the cascade's "back to the routed model on
+    // the very next request". An EXTERNAL session lease is the plugin's to settle, so it is left
+    // alone (same rule as the scope-mismatch path). Returns the sentinel `completions` loops on,
+    // carrying what it needs to re-deliver this refusal if the whole cascade is exhausted.
+    const contentFilterSentinel = async (leased, reason, carry = {}) => {
+      if (!boundLease?.external) await settle(leased, "/release");
+      noteAttempt(leased, "content_filter", reason);
+      return {
+        contentFilterBlock: reason,
+        blockedModel: { providerID: leased.providerID, modelID: leased.modelID },
+        blockedTargetID: leased.targetID,
+        api,
+        payload: carry.payload ?? null,
+        rawBody: carry.rawBody ?? null,
+        contentType: carry.contentType ?? null,
+      };
     };
     // The session hints are validated once per request; whether they go out at all is
     // decided per provider, per attempt, at the forward site (forwardHeaders).
@@ -1888,8 +2044,15 @@ export const createGatewayHandler = ({
       // plus the client's abort -- and never the stall watchdog: a buffered upstream sends nothing
       // until it is done, which the watchdog would read as a stall. Messages keeps its native
       // stream; the flag covers the two OpenAI-shaped routes.
-      const bufferingStream = streaming && providerConfig.bufferStreamingUpstream === true
-        && (api === CHAT || api === RESPONSES);
+      // Content-filter buffering is the one case that also covers MESSAGES: a cascade re-issue
+      // (forceBuffered) or a lane that opted into `bufferStreamingForContentFilter` reads the whole
+      // reply so a refusal is caught before the first byte. relayBufferedReply dresses all three
+      // dialects (bufferedMessagesFrames for MESSAGES), so the client still gets its stream.
+      const contentFilterBuffer = streaming
+        && (forceBuffered || (detectBlocks && providerConfig.bufferStreamingForContentFilter === true));
+      const bufferingStream = streaming && (
+        (providerConfig.bufferStreamingUpstream === true && (api === CHAT || api === RESPONSES))
+        || contentFilterBuffer);
       const upstreamStreaming = streaming && !bufferingStream;
       const stallAbort = upstreamStreaming ? new AbortController() : null;
       let stallTimer = null;
@@ -2354,10 +2517,10 @@ export const createGatewayHandler = ({
           // stream. Until it is whole `relayed` stays false, so everything below sorts it exactly
           // like a streamed attempt that failed with the wire clean.
           outcome = bufferingStream
-            ? await relayBufferedReply({ response, sink, keepUsageFrames, api, observe: (chunk) => response.healthParser?.push(chunk) })
+            ? await relayBufferedReply({ response, sink, keepUsageFrames, api, observe: (chunk) => response.healthParser?.push(chunk), detect: detectBlocks })
             : contentType.includes("application/json")
             ? (api === CHAT
-              ? await relayBufferedAsStream({ response, sink, keepUsageFrames, observe: (chunk) => response.healthParser?.push(chunk) })
+              ? await relayBufferedAsStream({ response, sink, keepUsageFrames, observe: (chunk) => response.healthParser?.push(chunk), detect: detectBlocks })
               : { relayed: false, usage: null, outputChars: 0, sawDone: false,
                 error: new Error(`upstream ${leased.providerID} answered a streamed ${api.path} request with one JSON body`) })
             : await relayStream({ stream: response.body ?? [], sink, keepUsageFrames, touch: () => touch(idleMs), api,
@@ -2371,6 +2534,12 @@ export const createGatewayHandler = ({
         if (response.healthAttempt) {
           const parser = response.healthParser ?? createTerminalParser(response.healthAttempt.api);
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType, cancelled: clientAbort?.aborted }), finishedAt: now() }).catch(() => null);
+        }
+        // A buffered reply caught as a content-filter block before any byte was written: hand the
+        // cascade a sentinel (release, not indict). The buffered relays return relayed:false here,
+        // so this must precede the empty-stream handling below.
+        if (outcome.contentFilterBlock) {
+          return await contentFilterSentinel(leased, outcome.contentFilterBlock, { payload: outcome.payload });
         }
         if (!outcome.relayed) {
           // Wire still clean. No usage is reported for a lane that produced no
@@ -2451,6 +2620,10 @@ export const createGatewayHandler = ({
           parser.push(rawBody);
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
+        if (detectBlocks) {
+          const blockReason = replyContentFilter("messages", payload);
+          if (blockReason) return await contentFilterSentinel(leased, blockReason, { payload, rawBody, contentType: String(response.headers?.get?.("content-type") ?? "application/json") });
+        }
         if (typeof payload?.model === "string" && payload.model) reportServedModel(leased, null, payload.model);
         if (payload?.usage) await reportUsage(leased, readMessagesUsage(payload.usage));
         await settle(leased, "/complete");
@@ -2530,6 +2703,10 @@ export const createGatewayHandler = ({
         }
       }
       if (api === RESPONSES) reportServedModel(leased, response.headers, typeof payload?.model === "string" ? payload.model : null);
+      if (detectBlocks) {
+        const blockReason = replyContentFilter(api.name, payload);
+        if (blockReason) return await contentFilterSentinel(leased, blockReason, { payload });
+      }
       // ANY model may fence its JSON (llama.cpp ignores json_object without a
       // schema in some builds; instruct-mode models fence despite orders).
       // The client asked for machine-readable output: unwrap deterministically.
