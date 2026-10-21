@@ -2918,8 +2918,13 @@ export const createGatewayHandler = ({
       if (!held?.held || typeof model?.providerID !== "string" ||
         !leaseCoversWireModel(model.id, requestedModel) || !config.providers[model.providerID]) {
         // The plugin classifies this wording as its own route error (noop), so a stale binding
-        // never indicts the provider; the session re-leases on the next prompt.
-        return respondJson(response, 409, {
+        // never indicts the provider; the session re-leases on the next prompt. Status 400 (not
+        // 409) is deliberate: a no-live-lease mismatch is DETERMINISTIC, so the provider SDK must
+        // not blind-retry it (the OpenAI/Anthropic clients retry 408/409/429/5xx, never 400) --
+        // 400 surfaces it immediately to the router, which re-leases, instead of ~40s of wasted
+        // backoff. The fork's session/retry.ts retries neither 409 nor 400, so the session-layer
+        // outcome is identical; only the SDK's useless retry of a deterministic refusal is removed.
+        return respondJson(response, 400, {
           type: "error",
           error: {
             type: "invalid_request_error",
