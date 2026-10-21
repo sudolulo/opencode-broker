@@ -318,6 +318,19 @@ test("fast-mode-credits classifier negatives keep today's behaviour", () => {
     message: "route unavailable; resend the prompt (gateway: session holds no live lease, re-lease to resume)",
     statusCode: 409,
   }), "noop");
+  // Since 297ac7a the gateway answers 400 with this exact wording, and opencode's SDK
+  // delivers it inside an APIError envelope. The broker must still indict nothing: the
+  // plugin's resume of this refusal is a plugin-local decision, never a health signal.
+  const current = '[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "claude-opus-5-5")';
+  assert.equal(classifyRoutingFailure({ message: current, statusCode: 400 }), "noop");
+  assert.equal(classifyRoutingFailure({
+    name: "APIError",
+    data: {
+      message: current,
+      statusCode: 400,
+      responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: current } }),
+    },
+  }, { targetProviderID: "anthropic" }), "noop");
 });
 
 // A full window locks only when Anthropic says it is refusing (`locked_reason` on the

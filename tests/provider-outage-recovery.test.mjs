@@ -182,6 +182,132 @@ scenario("SDK failures back off through the third attempt and remain capped at s
   assert.ok(h.prompts.every((prompt) => prompt.body.agent === "worker"));
 });
 
+// The gateway's no-live-lease refusal (gateway/lib/gateway.js), as opencode's SDK
+// surfaces it: an APIError NamedError whose data carries the message, the HTTP status
+// and the raw JSON body. The broker classifies it noop -- no provider is at fault --
+// but the turn must resume on a fresh lease instead of waiting for a human resend.
+const gatewayNoLease = '[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "gpt-5.6-luna")';
+const gatewayNoLeaseBody = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: gatewayNoLease } });
+const sdkGatewayError = (statusCode, message = gatewayNoLease) => ({
+  name: "APIError",
+  data: { message, ...(statusCode === undefined ? {} : { statusCode }), responseBody: gatewayNoLeaseBody },
+});
+const relocatableNoLease = {
+  "SDK APIError with the nested gateway message at HTTP 400": sdkGatewayError(400),
+  "direct gateway message at HTTP 400": { message: gatewayNoLease, statusCode: 400 },
+  "SDK APIError with the JSON body appended to its message at HTTP 400": sdkGatewayError(400, `Bad Request: ${gatewayNoLeaseBody}`),
+  "legacy HTTP 409 gateway refusal": sdkGatewayError(409),
+  "gateway refusal whose status the SDK lost": { name: "APIError", data: { message: gatewayNoLease } },
+};
+
+for (const [shape, failure] of Object.entries(relocatableNoLease)) {
+  scenario(`gateway no-live-lease refusal resumes on a fresh lease despite the broker noop: ${shape}`, async (failure) => {
+    const h = await create();
+    await h.chat();
+    h.state.failure = async () => ({ kind: "noop" });
+    await h.error(failure);
+    // OpenCode can deliver the same refusal twice; one recovery owns one timer.
+    await h.error(failure);
+    assert.deepEqual(h.live().map((timer) => timer.delay), [2500], "exactly one owned recovery timer");
+    const leasesBefore = h.calls.filter((call) => call.path === "/lease").length;
+    h.state.target = { ...cloud, id: "cloud-relocated" };
+    h.state.prompt = async () => { await h.synthetic("recovery-relocated"); return { data: true }; };
+    await h.fire();
+    assert.equal(h.prompts.length, 1);
+    const [part] = h.prompts[0].body.parts;
+    assert.equal(part.synthetic, true);
+    assert.match(part.text, /^\[opencode-broker\] The previous model had a provider outage and this session is being rerouted\./);
+    assert.equal(h.prompts[0].body.agent, "worker");
+    assert.equal(h.calls.filter((call) => call.path === "/lease").length, leasesBefore + 1, "the continuation takes a fresh lease");
+    await h.checkCurrentRoute("recovery-relocated");
+    assert.equal(h.live().length, 0, "an accepted continuation leaves no further timer");
+  }, failure);
+}
+
+scenario("gateway no-live-lease refusal still resumes when the broker failure report is unreachable", async (failure) => {
+  const h = await create();
+  await h.chat();
+  h.state.failure = async () => { throw new Error("broker socket closed"); };
+  await h.error(failure);
+  assert.deepEqual(h.live().map((timer) => timer.delay), [2500]);
+}, relocatableNoLease["SDK APIError with the nested gateway message at HTTP 400"]);
+
+scenario("a repeated no-live-lease refusal on the continuation backs off to the next delay", async (failure) => {
+  const h = await create();
+  await h.chat();
+  h.state.failure = async () => ({ kind: "noop" });
+  await h.error(failure);
+  assert.deepEqual(h.live().map((timer) => timer.delay), [2500]);
+  h.state.prompt = async () => ({ error: failure });
+  await h.fire();
+  assert.deepEqual(h.live().map((timer) => timer.delay), [5000]);
+}, relocatableNoLease["SDK APIError with the nested gateway message at HTTP 400"]);
+
+scenario("a relocated continuation that meets the gateway no-lane refusal stops instead of looping", async (failure) => {
+  const h = await create();
+  await h.chat();
+  h.state.failure = async () => ({ kind: "noop" });
+  await h.error(failure);
+  assert.deepEqual(h.live().map((timer) => timer.delay), [2500]);
+  h.state.prompt = async () => ({ error: { name: "APIError", data: {
+    message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: all smart routing targets are busy or unavailable","type":"upstream_error"}}',
+    statusCode: 502,
+  } } });
+  await h.fire();
+  assert.equal(h.prompts.length, 1);
+  assert.equal(h.live().length, 0, "a whole-lane refusal is terminal, not another relocate");
+}, relocatableNoLease["SDK APIError with the nested gateway message at HTTP 400"]);
+
+for (const [shape, failure] of Object.entries({
+  "generic HTTP 400": { name: "APIError", data: { message: "invalid_request_error: messages.3.content.0.text must be a string", statusCode: 400 } },
+  "the plugin's own route-unavailable throw": { message: "[opencode-broker] route unavailable; resend the prompt" },
+  "the plugin's own route-unavailable wording at HTTP 400": { message: "[opencode-broker] route unavailable; resend the prompt", statusCode: 400 },
+  "no-live-lease wording without the gateway prefix": { message: "route unavailable; resend the prompt (session holds no live lease)", statusCode: 400 },
+  "gateway no-lane refusal": { message: 'Bad Gateway: {"error":{"message":"gateway: no provider could serve the request: all smart routing targets are busy or unavailable","type":"upstream_error"}}', statusCode: 502 },
+  "gateway no-lane refusal without a status": { message: "gateway: no provider could serve the request: all smart routing targets are busy or unavailable" },
+  "unrelated noop": { message: "routed model mismatch: expected openai/gpt-5.6-luna, got llamacpp/qwen3.5-9b" },
+  "financial HTTP 402 carrying the gateway wording": sdkGatewayError(402),
+  "HTTP 401 carrying the gateway wording": sdkGatewayError(401),
+  "HTTP 403 carrying the gateway wording": sdkGatewayError(403),
+  "HTTP 413 carrying the gateway wording": sdkGatewayError(413),
+  "HTTP 422 carrying the gateway wording": sdkGatewayError(422),
+  "HTTP 500 carrying the gateway wording": sdkGatewayError(500),
+  "malformed request beside the gateway wording": sdkGatewayError(400, `${gatewayNoLease}: malformed request`),
+  "permission refusal beside the gateway wording": sdkGatewayError(400, `${gatewayNoLease}: permission denied`),
+  "an abort envelope carrying the gateway wording": { name: "MessageAbortedError", data: { message: gatewayNoLease } },
+})) {
+  scenario(`a broker noop stays terminal for ${shape}`, async (failure) => {
+    const h = await create();
+    await h.chat();
+    h.state.failure = async () => ({ kind: "noop" });
+    await h.error(failure);
+    assert.equal(h.live().length, 0);
+    assert.equal(h.prompts.length, 0);
+  }, failure);
+}
+
+for (const brokerKind of ["auth", "payload", "model", "context", "abort"]) {
+  scenario(`a terminal broker verdict still cancels the gateway no-live-lease refusal: ${brokerKind}`, async ({ brokerKind, failure }) => {
+    const h = await create();
+    await h.chat();
+    h.state.failure = async () => ({ kind: brokerKind });
+    await h.error(failure);
+    assert.equal(h.live().length, 0);
+    assert.equal(h.prompts.length, 0);
+  }, { brokerKind, failure: relocatableNoLease["SDK APIError with the nested gateway message at HTTP 400"] });
+}
+
+for (const mode of ["manual", "classifier"]) {
+  scenario(`${mode} sessions never relocate on the gateway no-live-lease refusal`, async ({ mode, failure }) => {
+    const h = await create({ profile: mode === "manual" ? "manual" : "auto", agent: mode === "classifier" ? "fleet-classifier" : "worker" });
+    await h.chat();
+    h.state.failure = async () => ({ kind: "noop" });
+    await h.error(failure);
+    assert.equal(h.live().length, 0);
+    assert.equal(h.prompts.length, 0);
+  }, { mode, failure: relocatableNoLease["SDK APIError with the nested gateway message at HTTP 400"] });
+}
+
 scenario("a broker noop verdict overrides an otherwise retryable network signal", async () => {
   const h = await create();
   await h.chat();

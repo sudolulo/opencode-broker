@@ -993,20 +993,31 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     if (kind === "other" && safe.statusCode === undefined &&
       /\b(?:ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET)\b|socket hang ?up|connection reset|connection aborted by upstream/i
         .test(`${safe.code ?? ""} ${safe.message}`)) return "connect";
+    // The GATEWAY's no-live-lease refusal (gateway/lib/gateway.js) means this session's
+    // target was fenced mid-turn and its lease dropped. No provider is at fault, so the
+    // classifier and the broker keep it "noop" and indict nothing -- but "noop" also means
+    // no failover, stranding the turn until the user resends. A fresh lease lands on a
+    // healthy target, so this one sub-case gets a plugin-local failover-eligible kind.
+    // Deliberately narrow: only the gateway's own wording (never the plugin's chat.params
+    // "route unavailable" throw, which lacks it), and only at the gateway's statuses --
+    // 400 today, 409 before 297ac7a, or none when the SDK dropped it. Any other known
+    // status (402, 401, 403, 413, 422, 5xx ...) is a different answer and stays terminal.
+    if (kind === "noop" && [undefined, 400, 409].includes(safe.statusCode) &&
+      /gateway: session holds no live lease/i.test(providerErrorText(error))) return "relocate";
     return kind;
   };
   const continuationForbidden = (kind, error) => {
     if (isAbortError(error) || ["abort", "noop", "payload", "context", "model", "auth"].includes(kind)) return true;
     const status = normalizeProviderError(error).statusCode;
     if ([401, 403].includes(status) && kind !== "quota") return true;
-    if ([400, 413, 422].includes(status) && !["quota", "context-local"].includes(kind)) return true;
+    if ([400, 413, 422].includes(status) && !["quota", "context-local", "relocate"].includes(kind)) return true;
     // Permission and malformed-request errors can carry misleading 503/overload
     // wording. Neither a generic "context" nor "aborted" word is an abort signal.
     return /\b(?:permission|forbidden|unauthori[sz]ed|authentication|malformed|payload|serializ(?:ation|e))\b/i
       .test(providerErrorText(error));
   };
   const transientContinuation = (kind, error) => !continuationForbidden(kind, error) &&
-    ["rate", "quota", "overload", "connect", "context-local"].includes(kind);
+    ["rate", "quota", "overload", "connect", "context-local", "relocate"].includes(kind);
   const promptContinuation = async (sessionID, entry, text, kind) => {
     const generation = ++entry.generation;
     entry.inFlight = true;
@@ -1965,8 +1976,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           // Local context and broken-stream retryability are plugin decisions, not
           // changes to the broker's context/other circuit classifications.
           const brokerKind = failure?.kind ?? kind;
+          // The broker answers a no-live-lease refusal "noop" (correctly: it indicts nothing),
+          // while the plugin treats it as failover-eligible "relocate". Keep the plugin kind
+          // over that "noop" ONLY -- any other broker verdict (auth, payload, model ...) still
+          // wins, or scheduleReengage's re-check would cancel recovery on the broker's "noop".
           const failureKind = (brokerKind === "context" && kind === "context-local") ||
-            (brokerKind === "other" && kind === "connect") ? kind : brokerKind;
+            (brokerKind === "other" && kind === "connect") ||
+            (brokerKind === "noop" && kind === "relocate") ? kind : brokerKind;
           if (pending) pending.ready = true;
           scheduleReengage(sessionID, failureKind, error);
         }
