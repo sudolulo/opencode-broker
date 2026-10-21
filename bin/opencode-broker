@@ -240,6 +240,16 @@ const ASSIGNMENT_TTL_MS = 4 * 60 * 60 * 1000;
 // After this long with no activity a session's provider prompt cache is gone (Anthropic's
 // longest TTL is 1 h; OpenAI's is shorter), so its next lease is re-balanced instead of pinned.
 const PIN_COLD_REBALANCE_MS = 60 * 60 * 1000;
+// ☆ Worker-tier pins (opencode subagents) are EPHEMERAL: a subagent runs one task and is then
+// deleted, so its pin has no "next day" to return to. Past the cache-cold mark the pin buys
+// nothing -- its next lease re-balances anyway (PIN_COLD_REBALANCE_MS) -- yet it holds a cap slot
+// for the full ASSIGNMENT_TTL_MS, and a fan-out of subagents is exactly what fills the map: 267 of
+// 487 stale pins were a single worker model on 2026-10-21, forcing the cap to evict live-session
+// pins (the stranding this prevents). So an IDLE worker pin is reclaimed at the cache-cold mark,
+// not at 4 h. An ACTIVE subagent is never touched here: it holds a live lease (excluded below),
+// and activeAt keeps its pin fresh between turns. The cap stays 512, so the per-request
+// writeState() cost the cap comment weighs is unchanged -- this empties the map, not enlarges it.
+const WORKER_ASSIGNMENT_TTL_MS = PIN_COLD_REBALANCE_MS;
 const assignmentLastActive = (assignment) =>
   Math.max(Number(assignment?.updatedAt) || 0, Number(assignment?.activeAt) || 0);
 // ☠️ A COUNT CAP, because the TTL alone is not a bound on anything that matters.
@@ -768,7 +778,10 @@ const sweep = (state, now = Date.now()) => {
   // costing it its pinned model on its next selection. The lease loop above has already dropped
   // the expired leases, so what remains in state.leases is alive right now.
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
-    if (!state.leases[sessionID] && now - assignmentLastActive(assignment) > ASSIGNMENT_TTL_MS) {
+    // Worker-tier (subagent) pins reclaim at the cache-cold mark; every other pin at the full TTL.
+    // A missing/unknown tier falls through to the long TTL, so an interactive pin is never cut short.
+    const idleTTL = assignment?.tier === "worker" ? WORKER_ASSIGNMENT_TTL_MS : ASSIGNMENT_TTL_MS;
+    if (!state.leases[sessionID] && now - assignmentLastActive(assignment) > idleTTL) {
       removePolicyLeaseBinding(state, assignment);
       delete state.assignments[sessionID];
     }

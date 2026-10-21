@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fan-out of subagents no longer saturates the assignment-pin cap.** A worker-tier (subagent) session runs one task and is then deleted, but its pin was held for the full 4 h idle TTL like any session, so hundreds of finished worker pins accumulated faster than they aged out (2026-10-21, games: 487 of 511 pins stale at the 512 cap, 267 of them a single worker model). With no settled one-shots left to spend, the cap then evicted live-session pins every few seconds, re-rolling a session caught between turns and stranding it on `409 session holds no live lease` (the same symptom the 1.26.0 per-session serialization fixed for the concurrent-prompt trigger; this is the saturation trigger). An idle, lease-free worker-tier pin is now reclaimed at the cache-cold mark (`PIN_COLD_REBALANCE_MS`, 60 min) instead of 4 h — past that mark the pin buys nothing a re-balance would not. An active subagent is untouched: it holds a live lease (excluded from reclamation) and `activeAt` keeps its pin fresh between turns. The cap stays 512, so the per-request `writeState()` cost is unchanged.
+
 ## [1.26.0] — 2026-10-20
 
 ### Added
