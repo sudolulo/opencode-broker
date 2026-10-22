@@ -1130,6 +1130,33 @@ const matchCascadeGrant = (sessionID, wireModel) => {
   return null;
 };
 
+// ☠️ CONTENT-FILTER FLOOR HOLD — per session, in-memory. When a content-filter cascade had to
+// descend all the way to a LOCAL floor to get an answer, every cloud tier refused this context,
+// and a content filter's verdict clusters: the next turns in the same context refuse too. Re-walking
+// the cloud descent each time wastes turns and the provider's weekly quota, and swapping the local
+// floor on and off the card (a 27b swap is ~2m40s each way) thrashes the GPU. So reaching a local
+// floor arms a HOLD: while it is live the session's ORDINARY turns fast-path straight to that floor
+// (acquire short-circuits to it below), which both skips the doomed cloud descent AND keeps the
+// floor continuously leased -- hence warm-resident, since the swap-back logic will not evict an
+// in-use model. The hold self-expires after FLOOR_HOLD_MS, and the next block then re-runs the full
+// descent to re-test whether the context still refuses (a cloud answer simply never re-arms it).
+const FLOOR_HOLD_MS = 30 * 60 * 1000;
+const floorHold = new Map(); // sessionID -> { targetID, until }
+const setFloorHold = (sessionID, targetID) => {
+  if (!sessionID || !targetID) return;
+  floorHold.set(sessionID, { targetID, until: Date.now() + FLOOR_HOLD_MS });
+  if (floorHold.size > 256) {
+    const now = Date.now();
+    for (const [sid, h] of floorHold) if (h.until <= now) floorHold.delete(sid);
+  }
+};
+const getFloorHold = (sessionID) => {
+  const h = sessionID ? floorHold.get(sessionID) : null;
+  if (!h) return null;
+  if (h.until <= Date.now()) { floorHold.delete(sessionID); return null; }
+  return h;
+};
+
 const acquire = async (state, request, {
   isAbandoned = () => false,
   caller = null,
@@ -1531,6 +1558,49 @@ const acquire = async (state, request, {
   // reconsidered in the same call rather than refusing and hoping the next attempt is luckier.
   ensureActive();
   reclaimIdleLeases(state, admittedTargets, sessionID);
+  // ── Content-filter floor hold (fast-path) ──────────────────────────────────────────────────
+  // A session whose context a provider content filter is refusing was just served from a local
+  // floor (the cascade arms the hold below). While it is held, send ORDINARY turns straight to that
+  // floor instead of re-deciding to the cloud home model that will only refuse again -- skipping the
+  // whole cloud descent (saving the weekly quota) and keeping the floor leased, hence warm-resident
+  // (no re-swap thrash). A content-filter cascade request falls through to the branch below; a
+  // one-shot gateway session is never held. The hold self-expires; the next block then re-descends.
+  if (request.contentFilterCascade !== true && !oneShot) {
+    const hold = getFloorHold(sessionID);
+    if (hold) {
+      const floor = admittedTargets[hold.targetID] ?? targetForID(hold.targetID, allTargets(state));
+      if (floor && floor.kind === "local") {
+        if (availableModels === undefined) {
+          try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+          ensureActive();
+        }
+        if (!availableModels.has(floor.modelID)) {
+          // The held floor was swapped off the card; bring it back and wait, same idiom as the cascade.
+          const prep = floor.prepareCommand ? prepareTarget(floor, { sessionID }) : null;
+          if (prep) throw refusal(`${floor.modelID} is not resident; ${prep === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`, "target-preparing", floor);
+          // No prepareCommand / spawn failed: fall through to normal routing rather than wedge.
+        } else if (targetEligibleFor(floor, { profile, tier, contextTokens }, state, availableModels, admittedTargets, sessionID, null, true)) {
+          const leaseID = randomUUID();
+          const leasedAt = Date.now();
+          ensureActive();
+          state.leases[sessionID] = { targetID: floor.id, leaseID, sessionID, touchedAt: leasedAt, profile, tier };
+          // fallback:true -- degraded route, never pinned; the hold (not a pin) is what keeps it.
+          state.assignments[sessionID] = { targetID: floor.id, leaseID, sessionID, profile, tier, updatedAt: leasedAt, fallback: true };
+          setFloorHold(sessionID, floor.id); // continued use refreshes the hold window
+          recordLeaseDecision({
+            at: leasedAt, sessionID, targetID: floor.id, profile, tier, contextTokens,
+            policy: "content-filter-floor-hold", reasons: [`content-filter-floor-hold:${floor.id}`],
+            eligibleTargetIDs: [floor.id], balancedTargetIDs: [floor.id],
+            providerUtilization: { [floor.providerID]: effectiveUtilization(state.budgets, floor.providerID) },
+          });
+          recordCascadeGrant(sessionID, { providerID: floor.providerID, modelID: floor.modelID, targetID: floor.id, kind: "local", leaseID, at: leasedAt });
+          return { target: floor, existing: false, leaseID, outage: null };
+        }
+        // Held floor resident but not eligible right now (context too big, circuit, full): fall
+        // through to normal routing -- the hold stays armed and a later turn can use it again.
+      }
+    }
+  }
   // ── Content-filter cascade lease ─────────────────────────────────────────────────────────
   // A per-request, NON-STICKY failover a provider content filter triggers (lib/content-filter-
   // cascade.js computes the order: older generations of the blocked model, then the other
@@ -1572,7 +1642,22 @@ const acquire = async (state, request, {
         break;
       }
     }
-    if (!picked) throw refusal("every content-filter cascade candidate is unavailable", "content-filter-exhausted");
+    if (!picked) {
+      // The last resort may just not be RESIDENT yet: a local cascade candidate (the uncensored
+      // floor, or a local tier above it) needs a GPU swap. Trigger it and ask the caller to wait --
+      // do NOT give up as "exhausted", which would strand a universally-refused query with nowhere
+      // to go. Reuses the normal-path prepare + target-preparing idiom; the router's lease wait-loop
+      // holds until it lands, and the retry then leases it.
+      const absentLocal = order
+        .map((candidate) => admittedTargets[candidate.targetID])
+        .find((target) => target && !excluded.has(target.id) && target.kind === "local"
+          && target.prepareCommand && !(availableModels ?? new Set()).has(target.modelID));
+      if (absentLocal) {
+        const prep = prepareTarget(absentLocal, { sessionID });
+        if (prep) throw refusal(`${absentLocal.modelID} is not resident; ${prep === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`, "target-preparing", absentLocal);
+      }
+      throw refusal("every content-filter cascade candidate is unavailable", "content-filter-exhausted");
+    }
     const leaseID = randomUUID();
     const leasedAt = Date.now();
     ensureActive();
@@ -1606,6 +1691,10 @@ const acquire = async (state, request, {
       providerID: picked.providerID, modelID: picked.modelID, targetID: picked.id,
       kind: picked.kind ?? "cloud", leaseID, at: leasedAt,
     });
+    // Reaching a LOCAL floor means every cloud tier refused this context. Arm the floor hold so the
+    // session's ordinary turns fast-path to this warm floor (above) instead of re-descending the
+    // cloud tiers that will only refuse again -- until the hold expires and the next block re-tests.
+    if (picked.kind === "local") setFloorHold(sessionID, picked.id);
     return { target: picked, existing: false, leaseID, outage: null };
   }
   let selectedCandidateChoice = null;
