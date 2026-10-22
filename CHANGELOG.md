@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.1] — 2026-10-22
+
+### Fixed
+
+- **A failed paid dispatch is terminal for default clients.** After any paid (spend-budget) send that fails — any upstream HTTP status, or a transport failure after dispatch — the gateway never makes a second attempt and answers HTTP 402 `spend_budget_refusal` with code `paid_upstream_failed`, `retryable: false` and `x-should-retry: false`. The message names only the upstream status (`spend budget refused: paid_upstream_failed (upstream HTTP 503)`) or `(transport)`, never upstream body text. Previously a paid 408/409/429/5xx could be retried once by the gateway (a second paid send) and the request then ended in a 502, which the Vercel AI SDK retries as yet another paid request; a paid deterministic 4xx returned 402 `unsupported_request`. The attempt's full hold stays UNCERTAIN, as before. This applies to gateway-originated and session-bound requests alike. Exceptions that keep their own code: a failure before dispatch, and a paid error body that overflows the JSON cap or cannot be collected.
+- **Paid streaming is never buffered for content-filter detection.** `bufferStreamingForContentFilter` and the cascade's forced buffering no longer apply to a request with a spend policy, so a paid stream keeps its stall watchdog and idle abort, and the paid body keeps its `stream` field. The idle timer is also null-safe: on an attempt with no stall controller it can no longer throw an uncaught exception.
+- **A settlement that hits a locked ledger is retried once.** After SQLite's own busy timeout, a `locked` settle is retried once after 200 ms. If the ledger is still locked the attempt is marked UNCERTAIN with reason `settle_locked` (full hold retained, never a refund) instead of staying `DISPATCH_COMMITTED`, and the client still receives the completed paid answer: a stream already carries every byte, and a buffered reply returns its validated body rather than a 402 that would invite a manual re-send.
+- **The content-filter cascade never leases a paid target.** A cascade candidate that is a registered manual API target (`manualApiTargets`) or a registered paid target is skipped, since a cascade lease carries no spend grant. A config whose `uncensoredFloorTargetID` names a manual API target, or anything other than a static `kind: "local"` target, is rejected at load: the cascade stays disabled and the broker logs `CONTENT-FILTER CASCADE CONFIG REJECTED`. This does not set `CONFIG_ERROR` (so reconcile and evidence tooling keep working) and is not yet reported on `/status`.
+- **A cascading subagent keeps its 1 h pin TTL.** Cascade leases and assignments now record `sessionKind` like the ordinary lease path, so a worker-tier subagent that cascades is still reclaimed at the cache-cold mark instead of holding the 4 h TTL.
+- **Content-filter cascade refusal codes reach clients.** `content-filter-disabled` and `content-filter-exhausted` were thrown with a code outside the `/lease` refusal allowlist and so reached clients without one. They are now forwarded, together with the new `content-filter-cascade-requires-replace`.
+
+### Changed
+
+- **A cascade `/lease` without `replace: true` is refused.** A `contentFilterCascade` lease without `replace: true` is now refused with `content-filter-cascade-requires-replace` before any state is touched; previously held-lease reuse could answer it with the held lease, which is the model that was just blocked. The gateway and router plugin already send `replace: true`.
+- **The spend-budget CLI refuses a split epoch no longer than its release window.** `fund` on a policy with `allocations` whose `--expires-at` minus `--confirmed-at` is at most `releaseWindowHours` fails with `epoch_shorter_than_release_window` before the ledger is opened. Such an epoch would have opened the protected reserve to continuation from the moment of funding. The library `fundLedger` does not enforce this rule.
+
 ## [1.27.0] — 2026-10-22
 
 ### Added
