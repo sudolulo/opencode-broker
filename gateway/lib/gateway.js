@@ -3138,6 +3138,9 @@ export const createGatewayHandler = ({
       try {
         held = await brokerRequest("/lease/verify", {
           sessionID: boundSessionID,
+          // The wire model lets the broker honor a fresh content-filter cascade grant for this model
+          // even if the session's single lease slot was stomped back to the home model mid-cascade.
+          wireModel: requestedModel,
           ...(typeof boundLeaseID === "string" && boundLeaseID ? { leaseID: boundLeaseID } : {}),
         });
         // ☠️ A STALE LEASE ID MUST NOT STRAND A TURN ON ITS OWN MODEL. The session's lease id
@@ -3153,7 +3156,7 @@ export const createGatewayHandler = ({
         // model the broker did not grant -- coverage is still enforced and the session id is
         // still loopback-gated above -- it only stops a leaseID rotation from stranding a turn.
         if (!held?.held && typeof boundLeaseID === "string" && boundLeaseID) {
-          held = await brokerRequest("/lease/verify", { sessionID: boundSessionID });
+          held = await brokerRequest("/lease/verify", { sessionID: boundSessionID, wireModel: requestedModel });
         }
       } catch { held = null; }
       const model = held?.target?.model;

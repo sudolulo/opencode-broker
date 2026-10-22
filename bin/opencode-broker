@@ -1087,6 +1087,49 @@ const targetEligibleFor = (target, request, state, availableModels, targets = al
   return true;
 };
 
+// ☠️ CONTENT-FILTER CASCADE GRANTS — brief, in-memory, per session. A cascade lease is deliberately
+// NON-STICKY (it answers one blocked query, then the session bumps back to its routed model), so it
+// is stored in the SINGLE-SLOT `state.leases[sessionID]` like any lease. But the session keeps taking
+// normal turns on its (blocked) home model between cascade steps, and each such normal /lease
+// re-decides and OVERWRITES that slot back to the home model. The cascade candidate's in-flight
+// request then reaches /lease/verify after its slot was stomped, so the gateway 400s it "no live
+// lease for <candidate>" even though the broker DID just grant it -- the candidate never runs, the
+// turn fails, the session falls back to the home model, re-blocks, and the cascade loops without
+// advancing (petsafe, 2026-10-22). These grants let /lease/verify honor a request whose WIRE MODEL
+// matches a candidate this session was granted within the TTL, independent of the stomped slot. It
+// can only ever confirm a model the broker itself just handed this session, so a session id still
+// cannot reach a model it was not granted; the grant self-expires, so normal leasing resumes once
+// the cascade stops (no fresh grants -> window ages out).
+const CASCADE_GRANT_TTL_MS = 30_000;
+const CASCADE_GRANT_MAX_PER_SESSION = 16;
+const cascadeGrants = new Map(); // sessionID -> [{ providerID, modelID, targetID, kind, leaseID, at }]
+const recordCascadeGrant = (sessionID, grant) => {
+  if (!sessionID || !grant?.modelID) return;
+  const now = grant.at ?? Date.now();
+  const kept = (cascadeGrants.get(sessionID) ?? []).filter((g) => now - g.at < CASCADE_GRANT_TTL_MS);
+  kept.push(grant);
+  cascadeGrants.set(sessionID, kept.slice(-CASCADE_GRANT_MAX_PER_SESSION));
+  // Opportunistic sweep so a cascade that ran once and stopped does not pin a session's row forever.
+  if (cascadeGrants.size > 256) {
+    for (const [sid, list] of cascadeGrants) {
+      const live = list.filter((g) => now - g.at < CASCADE_GRANT_TTL_MS);
+      if (live.length) cascadeGrants.set(sid, live); else cascadeGrants.delete(sid);
+    }
+  }
+};
+const matchCascadeGrant = (sessionID, wireModel) => {
+  if (!sessionID || !wireModel) return null;
+  const list = cascadeGrants.get(sessionID);
+  if (!list) return null;
+  const now = Date.now();
+  // Newest matching, still within TTL.
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const g = list[i];
+    if (now - g.at < CASCADE_GRANT_TTL_MS && g.modelID === wireModel) return g;
+  }
+  return null;
+};
+
 const acquire = async (state, request, {
   isAbandoned = () => false,
   caller = null,
@@ -1555,6 +1598,13 @@ const acquire = async (state, request, {
       eligibleTargetIDs: order.map((candidate) => candidate.targetID),
       balancedTargetIDs: [picked.id],
       providerUtilization: { [picked.providerID]: effectiveUtilization(state.budgets, picked.providerID) },
+    });
+    // Remember this grant so /lease/verify can confirm the candidate's in-flight request even if a
+    // normal re-lease stomps the session's single lease slot back to the home model (see the
+    // cascadeGrants note). Keyed by the WIRE model id the candidate request will carry.
+    recordCascadeGrant(sessionID, {
+      providerID: picked.providerID, modelID: picked.modelID, targetID: picked.id,
+      kind: picked.kind ?? "cloud", leaseID, at: leasedAt,
     });
     return { target: picked, existing: false, leaseID, outage: null };
   }
@@ -2380,6 +2430,23 @@ const serve = async () => {
       // alone can never reach a model the broker did not grant it.
       if (request.url === "/lease/verify") {
         if (!validSessionID(body.sessionID)) throw new Error("invalid session id");
+        // A content-filter cascade candidate's request is honored by a FRESH grant for the same wire
+        // model even if the session's single lease slot was since stomped back to the home model by a
+        // normal re-lease. Only a model this session was actually granted (within the TTL) matches,
+        // so this never reaches an ungranted model; absent a match it falls through to the slot check.
+        const wireModel = typeof body.wireModel === "string" && body.wireModel ? body.wireModel : null;
+        if (wireModel) {
+          const grant = matchCascadeGrant(body.sessionID, wireModel);
+          if (grant) {
+            return reply(response, 200, {
+              held: true,
+              leaseID: grant.leaseID,
+              target: { id: grant.targetID, kind: grant.kind, model: { providerID: grant.providerID, id: grant.modelID } },
+              expectedCredentialInstance: null,
+              generation: null,
+            });
+          }
+        }
         const lease = state.leases[body.sessionID];
         const leaseMatches = lease && (body.leaseID === undefined || body.leaseID === lease.leaseID);
         const target = leaseMatches ? targetForID(lease.targetID, allTargets(state)) : null;
