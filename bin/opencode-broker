@@ -1430,8 +1430,12 @@ const prepareTarget = (target, { sessionID } = {}) => {
 // held out by a plan window or quota stop, and the message names each one and when it returns.
 // `api-continuation-config-invalid`: the lane names a registered manual API target that an invalid
 // apiContinuation block fails closed; terminal until the operator fixes the config.
+// `content-filter-disabled` / `content-filter-exhausted`: a contentFilterCascade /lease with the
+// feature off (or its config rejected), or with every cascade candidate spent or unavailable.
+// `content-filter-cascade-requires-replace`: a contentFilterCascade /lease without replace:true,
+// which held-lease reuse would otherwise answer with the very model that was just blocked.
 const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target", "usage-limit",
-  "api-continuation-config-invalid"]);
+  "api-continuation-config-invalid", "content-filter-disabled", "content-filter-exhausted", "content-filter-cascade-requires-replace"]);
 // ☠️ `refusalCode`, NOT `code`. This handler's catch sees EVERY error, and node puts
 // its own `code` on system errors (ENOENT from a state write, EPIPE from a socket) --
 // forwarding that field would publish "ENOENT" as a routing refusal code, outside the
@@ -1515,6 +1519,12 @@ const acquire = async (state, request, {
   if (!validSessionID(sessionID)) throw new Error("invalid session id");
   if (!isProfile(profile)) throw new Error("invalid routing profile");
   if (!ROUTE_TIER_NAMES.includes(tier)) throw new Error("invalid routing tier");
+  // A content-filter cascade lease replaces the blocked turn's lease by definition. Without
+  // replace:true the held-lease reuse below would revalidate and hand back the held lease -- the
+  // very model whose filter just refused -- so it is refused here, before any state is touched.
+  if (request.contentFilterCascade === true && replace !== true) {
+    throw refusal("contentFilterCascade requires replace:true", "content-filter-cascade-requires-replace");
+  }
   // Session identity comes from the router's SDK session.parentID. Never infer subagent status
   // from tier: primary callers legitimately use worker. Once recorded, retain the known identity
   // across gateway verification requests that omit it (or send conflicting traffic).
@@ -1953,6 +1963,10 @@ const acquire = async (state, request, {
     for (const candidate of order) {
       const target = admittedTargets[candidate.targetID];
       if (!target || excluded.has(target.id)) continue;
+      // NEVER PAID. A cascade lease is minted with no spendGrant and no financial pin, so a
+      // manual API target reached here -- through a reserve mapping, the floor, or a manual
+      // profile's own admission -- would be paid capacity leased outside every spend boundary.
+      if (Object.hasOwn(CONFIG.manualApiTargets, target.id) || registeredPaidTarget(target)) continue;
       if (targetEligibleFor(target, cascadeRequest, state, availableModels ?? new Set(), admittedTargets, sessionID, null, true)) {
         picked = target;
         break;
@@ -1962,11 +1976,14 @@ const acquire = async (state, request, {
     const leaseID = randomUUID();
     const leasedAt = Date.now();
     ensureActive();
+    // sessionKind exactly as the ordinary path writes it, so a cascading subagent keeps its TTL.
     state.leases[sessionID] = {
       targetID: picked.id, leaseID, sessionID, touchedAt: leasedAt, profile, tier,
+      ...(sessionKind ? { sessionKind } : {}),
     };
     state.assignments[sessionID] = {
       targetID: picked.id, leaseID, sessionID, profile, tier,
+      ...(sessionKind ? { sessionKind } : {}),
       updatedAt: leasedAt,
       // ☠️ NEVER A STICKY PIN. A cascade lease answers one blocked query; the session must return
       // to its routed model on the very next turn ("bump back ASAP"). A gw- one-shot (the gateway

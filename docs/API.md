@@ -289,6 +289,33 @@ deployment pins any targets for that provider does not change it. Broker state w
 before 0.43 used `classification: "static" | "subscription"`; the reader migrates both
 values to `admission: "admitted"`.
 
+## Content-filter cascade on `/lease`
+
+A `/lease` with `contentFilterCascade: true` asks for the next fallback after a provider's
+content filter refused one turn (order: older generations of the blocked model, the other
+provider at that tier, down `tierDescent`, then the `uncensoredFloorTargetID` local floor; see
+`lib/content-filter-cascade.js`). Fields:
+
+- `contentFilterCascade: true` -- selects the mode; `preferredModel`, `releasePin` and
+  `fallbackTargetID` do not apply.
+- `blockedModel: { providerID, id }` -- the model that was blocked; never re-served.
+- `providers` -- the providers that can serve the request's wire API; candidates outside it are skipped.
+- `excludeTargetIDs` -- targets already tried for this request.
+- `replace: true` -- **required**; without it the call is refused with
+  `content-filter-cascade-requires-replace` before any state is touched, because held-lease
+  reuse would otherwise hand back the blocked model.
+
+The lease is non-sticky (the assignment is `fallback: true`), opens no circuit, carries
+`sessionKind` like any lease, and its decision records `policy: "content-filter-cascade"`. It
+never selects a manual API target (`manualApiTargets`) or any other registered paid target: a
+cascade lease has no spend grant. A floor naming a manual API target, or anything other than a
+static `kind: "local"` target, is rejected at config load and the cascade is disabled; the broker
+logs the rejection on stderr, but it is not a `CONFIG_ERROR` and does not appear on `/status`.
+On the gateway, content-filter buffering never applies to a paid request
+([SPEND-BUDGET.md](SPEND-BUDGET.md)). Refusals carry `content-filter-disabled`
+or `content-filter-exhausted` (below); unlike the lane refusals they are not written to
+`decisions.jsonl`.
+
 ## Refusals
 
 A `/lease` that cannot be served answers 400 with the human message **and** a
@@ -313,6 +340,9 @@ matching prose:
 | `no-resolvable-target` | The calling OpenCode process cannot resolve any otherwise eligible model. Restart it to load the current provider config; the error names up to five dropped models. |
 | `usage-limit` | `no-eligible-target` with the cause known: every cloud provider in the lane is held out by a plan-window or quota stop; the message names each one and when it returns. |
 | `api-continuation-config-invalid` | The lane names a registered manual API target, and the present `apiContinuation` config block is invalid, so every manual target fails closed. Terminal until the operator fixes the block and restarts the broker. |
+| `content-filter-disabled` | A `contentFilterCascade` lease while the cascade is off, or its config block was rejected at load. Terminal. |
+| `content-filter-exhausted` | A `contentFilterCascade` lease with every cascade candidate tried, excluded, paid, or otherwise ineligible. Terminal for this request. |
+| `content-filter-cascade-requires-replace` | A `contentFilterCascade` lease without `replace: true`. Caller bug; terminal. |
 
 Only `target-preparing` and `target-busy` are retryable: the client must resend after either.
 `no-resolvable-target` requires restarting the OpenCode process to load the current provider

@@ -84,7 +84,7 @@ async function spawnBroker() {
 }
 
 const cascade = (socketPath, sessionID, excludeTargetIDs) => post(socketPath, "/lease", {
-  sessionID, profile: "auto", tier: "smart", oneShot: true,
+  sessionID, profile: "auto", tier: "smart", oneShot: true, replace: true,
   contentFilterCascade: true,
   blockedModel: { providerID: "anthropic", id: "claude-opus-5-5" },
   providers: ["anthropic", "openai"],
