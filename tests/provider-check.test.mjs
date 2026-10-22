@@ -42,9 +42,9 @@ test("count-tokens: 200 is a live plan, 403 Unpurchased a lapsed one, anything e
 
 test("usage readings: a free plan is a lapse; a paid reading is active and authoritative", () => {
   assert.deepEqual(planUsageResult({ windows: [], lockedUntil: null, plan: "prolite" }),
-    { entitlement: "active", quotaAuthoritative: true, lockedUntil: null });
+    { entitlement: "active", quotaAuthoritative: true, lockedUntil: null, saturated: false });
   assert.deepEqual(planUsageResult({ windows: [], lockedUntil: 5, plan: "pro" }),
-    { entitlement: "active", quotaAuthoritative: true, lockedUntil: 5 });
+    { entitlement: "active", quotaAuthoritative: true, lockedUntil: 5, saturated: false });
   assert.deepEqual(planUsageResult({ windows: [], lockedUntil: null, plan: "free" }),
     { entitlement: "lapsed", quotaAuthoritative: true });
   assert.equal(planUsageResult(null), null);
@@ -100,6 +100,41 @@ test("an ordinary quota stop is lifted only by an authoritative, unlocked, not-t
   assert.ok(circuits[KEY]);
   circuits = stop();
   assert.equal(applyProviderCheck(circuits, KEY, { entitlement: "active", quotaAuthoritative: true, lockedUntil: null }, now), "recovered");
+  assert.equal(circuits[KEY], undefined);
+});
+
+// 2026-10-21: anthropic's five_hour window read 100% with locked_reason null while
+// every request answered 429 "5-hour limit". Lifting on "no lock reported" resumed
+// parked sessions into a fresh 429 every ~16 minutes until the window reset.
+const usageWindow = (id, percent) => ({ id, percent, resetsAt: "2099-01-01T00:00:00.000Z", active: true, severity: null });
+const anthropicStop = (now) => ({ [KEY]: {
+  kind: "quota", reason: "usage limit reached (5-hour limit)", until: now + 60 * 60_000, updatedAt: now - 16 * 60_000,
+} });
+
+test("a saturated plan-wide window never lifts a quota stop, even with no lock reported", () => {
+  const now = 10 * QUOTA_CLEAR_MIN_AGE_MS;
+  const circuits = anthropicStop(now);
+  const result = planUsageResult({ windows: [usageWindow("5h", 100), usageWindow("wk", 40)], lockedUntil: null });
+  assert.equal(applyProviderCheck(circuits, KEY, result, now), null);
+  assert.ok(circuits[KEY]);
+  assert.equal(result.saturated, true);
+});
+
+test("a model-scoped weekly cap at 100% is not the provider's limit and still lets a stop lift", () => {
+  const now = 10 * QUOTA_CLEAR_MIN_AGE_MS;
+  const circuits = anthropicStop(now);
+  const result = planUsageResult({ windows: [usageWindow("5h", 30), usageWindow("wk:fable", 100)], lockedUntil: null });
+  assert.equal(result.saturated, false);
+  assert.equal(applyProviderCheck(circuits, KEY, result, now), "recovered");
+  assert.equal(circuits[KEY], undefined);
+});
+
+test("a reading with headroom on every plan-wide window lifts an old quota stop", () => {
+  const now = 10 * QUOTA_CLEAR_MIN_AGE_MS;
+  const circuits = anthropicStop(now);
+  const result = planUsageResult({ windows: [usageWindow("5h", 99), usageWindow("wk", 40)], lockedUntil: null });
+  assert.equal(result.saturated, false);
+  assert.equal(applyProviderCheck(circuits, KEY, result, now), "recovered");
   assert.equal(circuits[KEY], undefined);
 });
 
