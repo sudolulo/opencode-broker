@@ -2314,6 +2314,28 @@ test("the cascade re-prompt CARRIES the blocked turn's effort as PromptInput.var
   assert.equal(result.promptVariant, "high", "the re-prompt carries the blocked turn's effort (variant) so the turn matches the lease");
 });
 
+test("chat.params does NOT throw a model mismatch while a content-filter cascade episode is active", () => {
+  // The cascade walks the tiers, so a just-blocked candidate's turn can reach chat.params after the
+  // episode's re-prompt advanced the route. Throwing a mismatch there kills the descent and strands
+  // the session short of the uncensored floor (petsafe 2026-10-22: opus-5-5 blocked, opus-5 threw).
+  // While the episode is active the cascade owns the model sequence, so the guard must not throw.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-g", "standard");
+      await start("cf-g", "standard");
+      await block("cf-g", "openai", "gpt-5.6-sol", "m-g-1");
+      let mismatchDuring = false;
+      try {
+        await hooks["chat.params"]({ sessionID: "cf-g", agent: "standard", model: { providerID: "anthropic", id: "claude-opus-4-8" }, message: { model: { providerID: "anthropic", id: "claude-opus-4-8" } } });
+      } catch (e) { mismatchDuring = String((e && e.message) || e); }
+      console.log(JSON.stringify({ mismatchDuring }));
+    `,
+  });
+  assert.ok(result.mismatchDuring === false || !/routed model mismatch/.test(result.mismatchDuring),
+    "no 'routed model mismatch' is thrown while the cascade episode is active");
+});
+
 test("the failover's OWN abort event does not cancel the episode before its re-prompt", () => {
   // beginContentFilterFailover aborts the blocked turn before re-prompting (restoreAtStepBoundary's
   // shape). OpenCode surfaces that abort as an abort error event, which the handler's "any abort

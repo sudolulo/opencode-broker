@@ -1822,6 +1822,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           input?.model?.providerID === displaced?.providerID &&
           input?.model?.id === displaced?.modelID &&
           actualVariant === (displaced?.variant ?? undefined)) return;
+        // ☠️ DO NOT BREAK A CONTENT-FILTER CASCADE MID-DESCENT. While an episode is active the model
+        // is INTENTIONALLY walking the tiers (blocked model -> next tier -> ... -> uncensored floor
+        // as last resort), and the just-blocked candidate's turn can finalize after the episode's
+        // re-prompt already advanced the route -- so chat.params sees route=next vs turn=prev and
+        // would throw "routed model mismatch", killing the descent and stranding the session short
+        // of the floor (petsafe, 2026-10-22: opus-5-5 blocked, then opus-5 threw mismatch and the
+        // cascade never continued). The cascade OWNS the model sequence for the life of its episode,
+        // so a mismatch here is expected, not a routing fault. Normal (non-cascade) turns are
+        // unaffected -- the episode exists only between a content-filter block and its clean finish,
+        // human turn, or exhaustion (cancelContentFilterFailover clears it).
+        if (cfFailover.get(sessionID)) return;
         throw new Error(`routed model mismatch: expected ${providerID}/${modelID}${variant ? `/${variant}` : ""}, got ${input?.model?.providerID}/${input?.model?.id}${actualVariant ? `/${actualVariant}` : ""}; resend the prompt`);
       }
     },
