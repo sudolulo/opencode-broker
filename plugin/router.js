@@ -1339,7 +1339,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     const now = Date.now();
     let entry = cfFailover.get(sessionID);
     if (!entry) {
-      entry = { blocked: null, tried: new Set(), agent: undefined, promptPartID: null, history: [], timer: null };
+      entry = { blocked: null, tried: new Set(), agent: undefined, promptPartID: null, history: [], timer: null, reprompting: false };
       cfFailover.set(sessionID, entry);
       trimTracker(cfFailover);
     }
@@ -1360,12 +1360,19 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // A new cascade step supersedes any still-pending re-prompt timer for this session.
     if (entry.timer !== null && entry.timer !== undefined) { cancelTimeout(entry.timer); entry.timer = null; }
     report("info", `${sessionID}: content-filter block on ${record.providerID}/${record.modelID} -- failing this turn over to the next cascade model`);
+    // The abort below ends the blocked turn, and OpenCode surfaces it as an abort error event.
+    // The handler's "any abort cancels" rule would mistake that for a user Stop and tear down
+    // THIS episode before its re-prompt fires. Flag the episode as driving a re-prompt so the
+    // abort-cancel sites spare it; a genuine Stop outside this brief window still cancels.
+    entry.reprompting = true;
     Promise.resolve().then(async () => {
       try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
       // Superseded or cancelled while the abort was in flight: do not re-prompt.
       if (cfFailover.get(sessionID) !== entry) return;
       const handle = scheduleTimeout(async () => {
         if (cfFailover.get(sessionID) !== entry) return;
+        // The re-prompt turn is starting: close the self-abort window so a later Stop cancels.
+        entry.reprompting = false;
         try {
           await client.session.prompt({
             path: { id: sessionID },
@@ -1891,10 +1898,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         successCandidates.delete(sessionID);
-        // The user stopped it on purpose: it must not come back on its own.
+        // The user stopped it on purpose: it must not come back on its own -- unless this abort
+        // is the content-filter failover's OWN (it ends the blocked turn before re-prompting),
+        // which keepContentFilter spares so the episode can still fire its next candidate.
         unpark(sessionID);
         unwatchFallback(sessionID);
-        cancelRecovery(sessionID);
+        cancelRecovery(sessionID, { keepContentFilter: cfFailover.get(sessionID)?.reprompting === true });
         return;
       }
       if (event?.type === "session.status") {
@@ -1972,8 +1981,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         unpark(sessionID);
         unwatchFallback(sessionID);
         // There is no correlation ID distinguishing a router abort from Stop.
-        // Safety wins: ANY observable abort cancels, even a delayed internal one.
-        cancelRecovery(sessionID);
+        // Safety wins: ANY observable abort cancels, even a delayed internal one -- EXCEPT the
+        // content-filter failover's own abort (reprompting), which keepContentFilter spares so
+        // the episode can still fire its next candidate.
+        cancelRecovery(sessionID, { keepContentFilter: cfFailover.get(sessionID)?.reprompting === true });
         return;
       }
       if (errorEvent && unattributableToActiveTurn(sessionID, messageRecordFrom(properties))) {

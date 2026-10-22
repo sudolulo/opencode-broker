@@ -2255,6 +2255,30 @@ test("a content-filter finish fails the turn over with a cascade /lease and a sy
   assert.ok(!("releasePin" in result.first) && !("fallbackTargetID" in result.first));
 });
 
+test("the failover's OWN abort event does not cancel the episode before its re-prompt", () => {
+  // beginContentFilterFailover aborts the blocked turn before re-prompting (restoreAtStepBoundary's
+  // shape). OpenCode surfaces that abort as an abort error event, which the handler's "any abort
+  // cancels" rule would treat like a user Stop -- tearing down the very episode the abort is part of
+  // so the re-prompt never fires. The abort the failover issued must not cancel its own episode.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-ab", "standard");
+      await start("cf-ab", "standard");
+      await block("cf-ab", "anthropic", "claude-opus-5-5", "m-ab-1");
+      // The abort the failover just issued comes back as an abort error event mid-window.
+      await hooks.event({ event: { type: "session.error", properties: { sessionID: "cf-ab", error: { name: "MessageAbortedError", message: "aborted" } } } });
+      await flush();
+      await runNewTimers();
+      await feedReprompt("cf-ab");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: casc.length }));
+    `,
+  });
+  assert.equal(result.prompts, 1, "the re-prompt still fires despite the failover's own abort event");
+  assert.equal(result.cascadeCount, 1, "and it drives a contentFilterCascade /lease");
+});
+
 test("a second block on the cascade candidate chains, excluding the model already tried", () => {
   const result = runCf({
     cascadePlan: [
