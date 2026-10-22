@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import http from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { anthropicStreamFailure, createGatewayHandler, loadGatewayConfig } from "../lib/gateway.js";
+import { anthropicStreamFailure, createGatewayHandler, loadGatewayConfig, rejectsAssistantPrefill, snipAssistantPrefill } from "../lib/gateway.js";
 
 const CONFIG = {
   tier: "worker",
@@ -540,6 +540,100 @@ test("a lane without dropBodyKeys forwards the body untouched", async () => {
   });
   assert.equal(upstream[0].top_p, 0.9, "llama.cpp accepts both and must keep both");
   assert.equal(upstream[0].temperature, 0.3);
+});
+
+test("rejectsAssistantPrefill is scoped to the 4.6+/5.x Claude families", () => {
+  // ☠️ Every Claude model from Opus 4.6 on, and the whole 5.x line, 400 on an assistant prefill;
+  // 4.5 and older still accept it. A blanket strip would silently reshape sonnet-4-5 requests.
+  for (const id of [
+    "claude-opus-5-5", "claude-opus-5-5-fast", "claude-opus-5", "claude-sonnet-5-5",
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5-5", "claude-fable-5",
+    "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-4-8", "claude-opus-4-6", "CLAUDE-OPUS-5-5",
+  ]) assert.equal(rejectsAssistantPrefill(id), true, `${id} rejects prefill`);
+  for (const id of [
+    "claude-sonnet-4-5-20250929", "claude-opus-4-5", "claude-haiku-4-5", "claude-3-5-sonnet",
+    "qwen3.8-27b", "gpt-6.1-sol", "", null, undefined, "claude-code",
+  ]) assert.equal(rejectsAssistantPrefill(id), false, `${id ?? "(nullish)"} is left to send a prefill`);
+});
+
+test("snipAssistantPrefill drops a text prefill but never a real tool_use turn", () => {
+  const base = [{ role: "user", content: "hi" }];
+  // A string prefill, an empty-array prefill, and a text-block prefill all go.
+  assert.deepEqual(snipAssistantPrefill([...base, { role: "assistant", content: "Sure, " }]), base);
+  assert.deepEqual(snipAssistantPrefill([...base, { role: "assistant", content: [] }]), base);
+  assert.deepEqual(
+    snipAssistantPrefill([...base, { role: "assistant", content: [{ type: "text", text: "{" }] }]),
+    base,
+  );
+  // An assistant turn carrying a tool_use is a real turn, not a prefill -- left intact.
+  const withTool = [...base, { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "x", input: {} }] }];
+  assert.equal(snipAssistantPrefill(withTool), withTool, "same reference: nothing snipped");
+  // Nothing to snip returns the same reference so the forward path can skip the copy.
+  const ends_user = [{ role: "user", content: "hi" }];
+  assert.equal(snipAssistantPrefill(ends_user), ends_user);
+  // A non-array (or malformed) body is returned untouched.
+  assert.equal(snipAssistantPrefill(undefined), undefined);
+});
+
+test("a Messages request to a 5.x model forwards without its trailing assistant prefill", async () => {
+  // ☠️ The fork always ends the turn with an assistant prefill; claude-opus-5-5 400s on it with
+  // "...must end with a user message", which the gateway used to turn into a 502 that killed the
+  // turn with no resume (2026-10-22). Snip it at the forward site so the request simply succeeds.
+  const rawMessage = '{ "type": "message", "content": [], "usage": { "input_tokens": 2, "output_tokens": 3 } }';
+  const upstream = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://claude.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path) => path === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-opus-5-5" } } }
+      : { ok: true },
+    fetchImpl: async (url, options) => {
+      upstream.push(JSON.parse(options.body));
+      return new Response(rawMessage, { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await withServer(handler, async (base) => {
+    const response = await askMessages(base, {
+      messages: [
+        { role: "user", content: "write a haiku" },
+        { role: "assistant", content: "Here is the haiku:" },
+      ],
+    });
+    assert.equal(response.status, 200);
+  });
+  assert.deepEqual(upstream[0].messages, [{ role: "user", content: "write a haiku" }],
+    "☠️ the trailing assistant prefill is gone so the turn ends with a user message");
+});
+
+test("a Messages request to claude-sonnet-4-5 keeps its assistant prefill (that lane accepts it)", async () => {
+  const rawMessage = '{ "type": "message", "content": [], "usage": { "input_tokens": 2, "output_tokens": 3 } }';
+  const upstream = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      anthropic: { baseUrl: "http://claude.example/v1", messagesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (path) => path === "/lease"
+      ? { target: { model: { providerID: "anthropic", id: "claude-sonnet-4-5-20250929" } } }
+      : { ok: true },
+    fetchImpl: async (url, options) => {
+      upstream.push(JSON.parse(options.body));
+      return new Response(rawMessage, { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await withServer(handler, async (base) => {
+    await askMessages(base, {
+      messages: [
+        { role: "user", content: "write a haiku" },
+        { role: "assistant", content: "Here is the haiku:" },
+      ],
+    });
+  });
+  assert.deepEqual(upstream[0].messages[upstream[0].messages.length - 1],
+    { role: "assistant", content: "Here is the haiku:" },
+    "☆ a lane that accepts prefill is left exactly as the client sent it");
 });
 
 test("an expired credential releases the lease and never indicts the provider", async () => {

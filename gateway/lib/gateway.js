@@ -187,6 +187,47 @@ export const upstreamUsageLimit = (status, body, headers, now = Date.now()) => {
   const claim = header("anthropic-ratelimit-unified-representative-claim");
   return { limit: UNIFIED_CLAIMS[claim] ?? null, until };
 };
+// ☠️ CLAUDE 4.6+ / 5.x REJECT AN ASSISTANT-MESSAGE PREFILL. The fork always ends a Messages turn
+// with an assistant prefill (its db is literally `opencode-fork-snip-always-prefix`). Older Claude
+// models accepted it; every model from Opus 4.6 on and the whole 5.x line 400 with
+// `"...does not support assistant message prefill. The conversation must end with a user message."`
+// The gateway scored that as a provider fault and wrapped it as a 502 "no provider could serve the
+// request", which OpenCode cannot un-prefill and does not resume -- the turn just died (2026-10-22,
+// 23:15->03:49 on claude-opus-5-5, the games/rig panes among the casualties). Anthropic's rejection
+// is permanent going forward and model-autoupgrade keeps moving the primary cloud target onto the
+// newest served model, so the gateway snips the trailing assistant prefill before forwarding to a
+// model that rejects it.
+// ☆ Scoped by FAMILY, not blanket: claude-sonnet-4-5 and older (4.5 / 3.x) still accept prefill and
+// are left untouched; an id that does not parse is treated as accepting (every rejecting model the
+// fleet serves matches). The minor defaults to 0 so a bare `claude-opus-5` counts as 5.x.
+const PREFILL_REJECTING_CLAUDE = /^claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?\b/;
+export const rejectsAssistantPrefill = (modelID) => {
+  const match = PREFILL_REJECTING_CLAUDE.exec(String(modelID ?? "").toLowerCase());
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = match[2] === undefined ? 0 : Number(match[2]);
+  if (major >= 5) return true;
+  return major === 4 && minor >= 6;
+};
+// Drops any trailing assistant *prefill* (text-only or empty) so the turn ends with a non-assistant
+// message. An assistant turn carrying a tool_use (or any non-text block) is a real turn, not a
+// prefill, and stops the scan: the gateway snips, it never invents or reshapes a conversation.
+// Returns the same array reference when there is nothing to snip, so the caller can skip the copy.
+export const snipAssistantPrefill = (messages) => {
+  if (!Array.isArray(messages)) return messages;
+  let end = messages.length;
+  while (end > 0) {
+    const message = messages[end - 1];
+    if (!message || typeof message !== "object" || message.role !== "assistant") break;
+    const content = message.content;
+    const textOnly = content == null
+      || typeof content === "string"
+      || (Array.isArray(content) && content.every((block) => block && typeof block === "object" && block.type === "text"));
+    if (!textOnly) break;
+    end -= 1;
+  }
+  return end === messages.length ? messages : messages.slice(0, end);
+};
 // The shape a forwarded session fingerprint may take. Anything else is dropped at the
 // forward site, never an error: the hints steer cache and diagnostics, they are not
 // auth (see the x-opencode-session-* comment at the forward site).
@@ -2113,6 +2154,15 @@ export const createGatewayHandler = ({
           if (Object.hasOwn(forwardBody, "service_tier") && forwardBody.service_tier !== "standard_only") throw spendError("unsupported_request");
           forwardBody.service_tier = "standard_only";
           if (requestHeaders.unsupportedSpendControls) throw spendError("unsupported_request");
+        }
+        // ☠️ See rejectsAssistantPrefill. The fork always sends an assistant prefill, and every
+        // Claude 4.6+/5.x model 400s on it ("...must end with a user message"), which the gateway
+        // used to surface as a 502 that killed the turn with no resume. Snip the trailing prefill
+        // for a model that rejects it; a lane that still accepts one (claude-sonnet-4-5, older) is
+        // left exactly as the client sent it.
+        if (api === MESSAGES && rejectsAssistantPrefill(forwardBody.model)) {
+          const snipped = snipAssistantPrefill(forwardBody.messages);
+          if (snipped !== forwardBody.messages) forwardBody = { ...forwardBody, messages: snipped };
         }
         const extras = api === MESSAGES ? {} : {
           ...(providerConfig.bodyExtras && typeof providerConfig.bodyExtras === "object" ? providerConfig.bodyExtras : {}),
