@@ -4253,6 +4253,57 @@ test("the assignment TTL counts idle time from the session's last activity", asy
   }
 }));
 
+test("only explicit worker subagent pins expire at one hour and held revalidation preserves their identity", async () => withTempHome(async (home) => {
+  const now = Date.now();
+  const statePath = seedState(home, {
+    assignments: {
+      ses_subagent: { targetID: "gpt-luna", profile: "auto", tier: "worker", sessionKind: "subagent", updatedAt: now - 90 * 60_000 },
+      ses_primary: { targetID: "gpt-luna", profile: "auto", tier: "worker", sessionKind: "primary", updatedAt: now - 90 * 60_000 },
+      ses_legacy: { targetID: "gpt-luna", profile: "auto", tier: "worker", updatedAt: now - 90 * 60_000 },
+      ses_invalid: { targetID: "gpt-luna", profile: "auto", tier: "worker", sessionKind: "other", updatedAt: now - 90 * 60_000 },
+      ses_live_subagent: { targetID: "gpt-luna", profile: "auto", tier: "worker", sessionKind: "subagent", updatedAt: now - 90 * 60_000 },
+    },
+    leases: {
+      ses_live_subagent: { targetID: "gpt-luna", touchedAt: now, profile: "auto", tier: "worker", sessionKind: "subagent" },
+    },
+  });
+  const { child, socketPath } = await startBroker(home);
+  try {
+    const swept = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(swept.assignments.ses_subagent, undefined, "an idle explicit subagent is reclaimed at one hour");
+    for (const sessionID of ["ses_primary", "ses_legacy", "ses_invalid", "ses_live_subagent"]) {
+      assert.ok(swept.assignments[sessionID], `${sessionID} retains the four-hour pin`);
+    }
+
+    await request(socketPath, "/inventory", inventory({
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const fresh = await request(socketPath, "/lease", {
+      sessionID: "ses_identity", profile: "auto", tier: "worker", sessionKind: "subagent", replace: true,
+    });
+    const held = await request(socketPath, "/lease", {
+      sessionID: "ses_identity", profile: "auto", tier: "worker",
+    });
+    assert.equal(held.leaseID, fresh.leaseID, "the same lease is held when gateway revalidation omits session kind");
+    const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(persisted.leases.ses_identity.sessionKind, "subagent");
+    assert.equal(persisted.assignments.ses_identity.sessionKind, "subagent");
+
+    await request(socketPath, "/lease", {
+      sessionID: "ses_primary_identity", profile: "auto", tier: "worker", sessionKind: "primary", replace: true,
+    });
+    await request(socketPath, "/lease", {
+      sessionID: "ses_primary_identity", profile: "auto", tier: "worker", sessionKind: "subagent",
+    });
+    const conflicting = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(conflicting.leases.ses_primary_identity.sessionKind, "primary",
+      "conflicting traffic cannot weaken a known primary identity");
+    assert.equal(conflicting.assignments.ses_primary_identity.sessionKind, "primary");
+  } finally {
+    await stopBroker(child);
+  }
+}));
+
 test("a session keeps its pinned model across the rebalance cooldown while one-shot traffic floods the cap", async () => withTempHome(async (home) => {
   const now = Date.now();
   writeAuth(home);

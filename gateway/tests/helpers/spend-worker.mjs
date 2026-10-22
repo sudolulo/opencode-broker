@@ -35,17 +35,31 @@ async function gatewayDeathBarrier() {
   try { await harness.send(); }
   finally { await harness.close(); moduleMock?.restore(); }
 }
+// Split-policy admissions are isolated in their own mode: the parent supplies the
+// registered identity, tested clock, per-case integer max_tokens (which selects the
+// synthetic exact reservation) and broker-shaped grant explicitly.
+let split;
+async function splitReserve() {
+  const { now, model, maxTokens, grant } = split;
+  const prepared = prepareSpendAttempt({ policy, providerID: PROVIDER_ID, targetID: grant.targetID, url: `${ORIGIN}/v1/messages`, body: bodyFor({ model, max_tokens: maxTokens }), headers: headersFor(), credentialFingerprint: FINGERPRINT, now, spendGrant: grant });
+  await reserveAttempt({ ledgerPath, policy, prepared, attemptID, now });
+  await send({ type: 'result', ok: true });
+}
 process.on('message', async message => {
   try {
+    if (message.type === 'policy' && !policy && mode === 'split-reserve') { split = message.split; policy = normalizeSpendPolicy(message.raw, message.registered); await send({ type: 'ready' }); return; }
     if (message.type === 'policy' && !policy) { rawPolicy = message.raw; policy = normalizeSpendPolicy(message.raw); await send({ type: 'ready' }); return; }
-    if (message.type !== 'go' || !policy || started || !['reserve', 'reserve-then-wait', 'gateway-before-send', 'gateway-after-send'].includes(mode)) return;
+    if (message.type !== 'go' || !policy || started || !['reserve', 'reserve-then-wait', 'gateway-before-send', 'gateway-after-send', 'split-reserve'].includes(mode)) return;
     started = true;
     if (mode.startsWith('gateway-')) { await gatewayDeathBarrier(); return; }
-    const prepared = prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW });
-    await reserveAttempt({ ledgerPath, policy, prepared, attemptID, now: NOW });
-    await send({ type: mode === 'reserve-then-wait' ? 'committed' : 'result', ok: true });
-    // The live IPC channel is the barrier, not a timer or a network request.
-    if (mode === 'reserve-then-wait') return;
+    if (mode === 'split-reserve') await splitReserve();
+    else {
+      const prepared = prepareSpendAttempt({ policy, providerID: PROVIDER_ID, url: `${ORIGIN}/v1/messages`, body: bodyFor(), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW });
+      await reserveAttempt({ ledgerPath, policy, prepared, attemptID, now: NOW });
+      await send({ type: mode === 'reserve-then-wait' ? 'committed' : 'result', ok: true });
+      // The live IPC channel is the barrier, not a timer or a network request.
+      if (mode === 'reserve-then-wait') return;
+    }
   } catch (error) { await send({ type: 'result', ok: false, code: error.code ?? 'worker_error' }); }
   process.disconnect();
 });

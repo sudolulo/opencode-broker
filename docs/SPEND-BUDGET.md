@@ -134,7 +134,7 @@ The example is a synthetic temporary fixture only. Replace the placeholder with 
 
 ## Broker admission and request envelope
 
-The trusted registered manual target must declare `requiresSpendBudget: true` and `billingClass: "manual-api"`; `provider.spendBudget` is a policy object, not a boolean. Either a trusted paid attestation or an explicit provider policy independently requires a matching policy. Missing both is not safe against old binaries. False/manual contradictions or unknown classes fail closed. A financial refusal sent before the response head returns **HTTP 402** with header `x-should-retry: false` and the native Anthropic error envelope `{"type":"error","error":{"type":"spend_budget_refusal","code":...,"message":...,"retryable":false}}`. It is terminal, with no fallback. Deliberately removing both declarations or using an old binary is outside this guarantee.
+The trusted registered manual target must declare `requiresSpendBudget: true` and `billingClass: "manual-api"` (or, for a broker-granted API continuation lease, `billingClass: "api-continuation"`; see [Split allocations](#split-allocations-schema-2)); `provider.spendBudget` is a policy object, not a boolean. Either a trusted paid attestation or an explicit provider policy independently requires a matching policy. Missing both is not safe against old binaries. False/manual contradictions or unknown classes fail closed. A financial refusal sent before the response head returns **HTTP 402** with header `x-should-retry: false` and the native Anthropic error envelope `{"type":"error","error":{"type":"spend_budget_refusal","code":...,"message":...,"retryable":false}}`. It is terminal, with no fallback. Deliberately removing both declarations or using an old binary is outside this guarantee.
 
 Startup normalizes policy and checks provider/origin binding without opening the wallet. The gateway has no broker-inventory discovery contract: startup explicitly reports registration validation as deferred, not verified. Admission always checks the trusted fields from both `/lease` and `/lease/verify`; legacy leases are still guarded by an explicit provider policy. Invalid/null policy properties are never ignored. Key/config failures on a paid route are terminal, not a reason to try another lane. Only credential fingerprints, never raw keys or request bodies, are stored in the ledger or financial errors.
 
@@ -195,6 +195,79 @@ A guarded upstream response of 400–499, other than 408, 409 or 429, is not ret
 The four API descriptors in [the gateway source](file:///home/dev/opencode-broker/gateway/lib/gateway.js) converge in `completions` → `completionsFor`. There is one actual upstream `fetchImpl` site. Normal leases, verified session leases and outage-bound leases all pass the policy/classification check before credential resolution. Policy alone protects the outage path even when it bypasses normal `/lease` construction. Guarded unsupported APIs/probes/health scopes are refused before that site.
 
 The existing two-attempt loop encloses final preparation and reservation, so HTTP/fetch retries cannot reuse a UUID or an earlier hold. Only 408, 409, 429, 5xx and fetch failures reach the second attempt on a paid lane; any other paid 4xx is terminal (see above). Financial errors return directly, never entering capacity failure/backoff/fallback. Only after reservation succeeds does the single fetch use prepared bytes/headers and `redirect: 'error'`. Guarded bodies are consumed by [the bounded transport helper](file:///home/dev/opencode-broker/gateway/lib/spend-transport.js); ordinary JSON/SSE and nonfinancial estimated usage retain their existing paths. The helper has no fetch, lease, policy bypass or independent production handler.
+
+## Split allocations (schema 2)
+
+An optional `allocations` object splits one funded epoch into a continuation allocation and a
+protected manual reserve, for [API continuation](API-CONTINUATION.md) and pinned
+[manual grants](MANUAL-API.md#manual-spend-grants-and-api-continuation). A policy without
+`allocations` keeps its exact legacy normalization, hash, schema-1 ledger and manual-only
+behavior.
+
+```json
+{ "ceilingUSD": "200", "allocations": { "continuationUSD": "150", "manualReserveUSD": "50", "releaseWindowHours": 48 } }
+```
+
+The fragment above augments a full policy; it is not one. These are the deployment values the
+design selected, not product defaults.
+
+- **Exact keys.** `continuationUSD` and `manualReserveUSD` are positive USD strings with no
+  sub-nano digits, and they must sum exactly to `ceilingUSD`. `releaseWindowHours` is an integer
+  from 1 through 744. Any other key or value is `invalid_policy`. All allocation settings are
+  part of `policyHash`.
+- **Registered identity.** A split policy is bound to exactly one registered paid target:
+  `{ targetID, providerID, modelID }`, where `targetID` is the broker's `manualApiTargets` ID,
+  `providerID` must equal `binding.providerID`, and `modelID` must be one of the policy's
+  `models`. The identity is part of `policyHash`. The gateway supplies it from the broker lease;
+  the CLI requires `--target-id` and `--model-id` for split policies and refuses them for legacy
+  policies (`invalid_flags`). Only the registered model is spendable, even when `models` approves
+  others (`invalid_authorization`).
+- **Fresh schema-2 ledger.** A split policy selects ledger schema version 2 (`user_version` 2,
+  `wallet.schema_version` 2). The funding epoch adds `continuation_allocated_nano` and
+  `manual_reserve_allocated_nano`; every attempt adds `spend_purpose` (`manual` or
+  `continuation`), `continuation_reserved_nano`, `manual_reserve_reserved_nano`,
+  `authorization_json` (the canonical broker grant) and `authorization_hash` (its SHA-256). It
+  needs a freshly initialized ledger path: a schema-1 file is never upgraded or reinterpreted, and
+  any schema/policy mismatch is `invalid_ledger` or `binding_mismatch`.
+- **Funding.** With reserve R and ceiling C, a funded amount F must satisfy R <= F <= C. The reserve
+  is funded first and in full, so continuation gets F - R: F = 200 gives 150/50, F = 180 gives
+  130/50, F below 50 is refused. Initialization still funds zero.
+- **Draws.** Every reservation draws its complete worst-case cost atomically, or is refused with
+  `allocation_exhausted`; it is never split into extra paid calls. Manual grants draw only from the
+  reserve. Continuation draws only from its own allocation before the unlock instant
+  U = epoch expiry - `releaseWindowHours`; from U until expiry it draws its own allocation first,
+  then the reserve's **available** remainder. Held, uncertain and settled reserve money is never
+  released. There is no timer or transfer at U; eligibility is evaluated when a request reserves.
+- **Settlement.** Retained cost is attributed continuation-first, then reserve, so any permitted
+  refund reverses the original draw; refunds never move money between allocations.
+- **Grant binding.** The gateway refuses a grant with less than 2 s left before reserving. The
+  dispatch deadline is the earliest of policy validity, epoch expiry and grant expiry. Historical
+  validation re-proves each row's grant at that row's creation time, so a settled grant stays
+  valid history after it expires.
+- **Validation.** Before and after every mutation, per-allocation funded/held/spent/available
+  amounts are recomputed from every attempt, alongside the global invariant. A manual row that
+  touched the continuation allocation, a continuation row that drew the reserve before U, an
+  overdrawn allocation, or a draw that does not sum to the reservation is `invalid_ledger`. As
+  with the rest of this ledger, an actor with direct write access can still rewrite otherwise
+  balanced provenance; the authoritative, unmodified ledger is an assumption.
+
+`status` (and `init`/`fund`) on a schema-2 ledger adds `schemaVersion: 2`, `registeredIdentity`,
+`allocations.continuation` and `allocations.manualReserve` (each `fundedNano`, `availableNano`,
+`heldNano`, `spentNano`), `epochExpiresAtMs`, `reserveUnlockAtMs`, `reserveWindowOpen`, and
+`continuationMayUseReserve` (false when frozen, expired, unfunded or the reserve has nothing
+available). Legacy status keys are unchanged. `policyHash` in this output is the value the
+operator copies into the broker's `apiContinuation.spendPolicyHashes`; compare
+`registeredIdentity` with the broker registration before funding.
+
+```sh
+node gateway/bin/opencode-broker-spend-budget status --policy /absolute/path/split-policy.json --target-id <manual target ID> --model-id <registered model ID>
+```
+
+New refusal codes, passed through by both the gateway's 402 envelope and the CLI:
+`invalid_authorization` (missing, malformed or misbound grant, or wrong registered target or
+model) and `allocation_exhausted` (no eligible funds in the grant's allocation). The gateway's own
+grant binding refuses with `invalid_policy`, `binding_mismatch` or `expired`; see
+[API-CONTINUATION.md](API-CONTINUATION.md#gateway-admission-and-ledger-allocations).
 
 ## Runtime and storage requirements
 

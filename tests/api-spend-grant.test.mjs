@@ -63,6 +63,24 @@ test('grant parser refuses malformed fields, bindings, and non-current authority
   assert.throws(() => normalizeApiSpendGrant(continuationGrant(), { now: NOW, leaseID: 'other-lease' }), { code: 'invalid_authorization' });
 });
 
+test('continuation grants reject quota observations after issuance', () => {
+  assert.throws(() => normalizeApiSpendGrant(continuationGrant({
+    source: { ...continuationGrant().source, quotaObservedAtMs: NOW - 999 },
+  }), { now: NOW }), { code: 'invalid_authorization' });
+});
+
+test('continuation grants reject quota observations after the current time', () => {
+  assert.throws(() => normalizeApiSpendGrant(continuationGrant({
+    source: { ...continuationGrant().source, quotaObservedAtMs: NOW + 1 },
+  }), { now: NOW }), { code: 'invalid_authorization' });
+});
+
+test('continuation grants reject quota observations after expiry', () => {
+  assert.throws(() => normalizeApiSpendGrant(continuationGrant({
+    source: { ...continuationGrant().source, quotaObservedAtMs: NOW + 1_001 },
+  }), { now: NOW }), { code: 'invalid_authorization' });
+});
+
 test('manual grants have no quota source and are still time-bound', () => {
   const manual = continuationGrant({ purpose: 'manual', source: null });
   assert.equal(normalizeApiSpendGrant(manual, { now: NOW }).purpose, 'manual');

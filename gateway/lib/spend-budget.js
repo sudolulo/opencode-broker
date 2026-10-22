@@ -1,6 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, open as openFile, unlink } from 'node:fs/promises';
 import { dirname, parse, resolve, sep } from 'node:path';
+import { normalizeApiSpendGrant } from '../../lib/api-spend-grant.js';
+import { allocationDraw, allocationRetained, fundedAllocation } from './spend-allocations.js';
 import { prepareSpendAttempt } from './spend-policy.js';
 import { validateSpendReceipt } from './spend-receipt.js';
 
@@ -17,7 +19,19 @@ const DDL = {
   attempts: "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL REFERENCES funding_epoch(epoch_id), state TEXT NOT NULL CHECK(state IN('DISPATCH_COMMITTED','SETTLED','UNCERTAIN')), request_digest TEXT NOT NULL, body_digest TEXT NOT NULL, model TEXT NOT NULL, max_input_tokens INTEGER NOT NULL, max_output_tokens INTEGER NOT NULL, rates_json TEXT NOT NULL, policy_hash TEXT NOT NULL, provider_id TEXT NOT NULL, origin TEXT NOT NULL, credential_sha256 TEXT NOT NULL, reserved_nano INTEGER NOT NULL CHECK(reserved_nano>0), retained_nano INTEGER, receipt_hash TEXT, receipt_json TEXT, message_id TEXT, actual_cost_nano_text TEXT, additional_liability_nano_text TEXT NOT NULL DEFAULT '0', uncertain_reason TEXT, created_at_ms INTEGER NOT NULL, settled_at_ms INTEGER)",
   violations: 'CREATE TABLE violations (violation_id TEXT PRIMARY KEY, attempt_id TEXT REFERENCES attempts(attempt_id), kind TEXT NOT NULL, evidence_hash TEXT NOT NULL, details_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)',
 };
+// Version 2 is selected ONLY by an allocation-enabled policy and only for a freshly
+// initialized path; a version 1 file is never upgraded. The funding epoch stores its
+// immutable split, and every attempt stores its purpose, original per-allocation draw
+// and the canonical broker authorization that admitted it.
+const DDL_V2 = {
+  wallet: 'CREATE TABLE wallet (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER CHECK(schema_version=2), policy_hash TEXT NOT NULL, provider_id TEXT NOT NULL, origin TEXT NOT NULL, credential_sha256 TEXT NOT NULL, funded_nano INTEGER NOT NULL CHECK(funded_nano>=0), available_nano INTEGER NOT NULL CHECK(available_nano>=0), held_nano INTEGER NOT NULL CHECK(held_nano>=0), spent_nano INTEGER NOT NULL CHECK(spent_nano>=0), frozen INTEGER NOT NULL CHECK(frozen IN(0,1)), freeze_reason TEXT, created_at_ms INTEGER NOT NULL)',
+  funding_epoch: 'CREATE TABLE funding_epoch (epoch_id TEXT PRIMARY KEY, singleton INTEGER NOT NULL UNIQUE CHECK(singleton=1) REFERENCES wallet(id), reference TEXT NOT NULL UNIQUE, amount_nano INTEGER NOT NULL CHECK(amount_nano>0), confirmed_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, policy_hash TEXT NOT NULL, provider_id TEXT NOT NULL, origin TEXT NOT NULL, credential_sha256 TEXT NOT NULL, continuation_allocated_nano INTEGER NOT NULL CHECK(continuation_allocated_nano>=0), manual_reserve_allocated_nano INTEGER NOT NULL CHECK(manual_reserve_allocated_nano>0))',
+  attempts: "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL REFERENCES funding_epoch(epoch_id), state TEXT NOT NULL CHECK(state IN('DISPATCH_COMMITTED','SETTLED','UNCERTAIN')), request_digest TEXT NOT NULL, body_digest TEXT NOT NULL, model TEXT NOT NULL, max_input_tokens INTEGER NOT NULL, max_output_tokens INTEGER NOT NULL, rates_json TEXT NOT NULL, policy_hash TEXT NOT NULL, provider_id TEXT NOT NULL, origin TEXT NOT NULL, credential_sha256 TEXT NOT NULL, reserved_nano INTEGER NOT NULL CHECK(reserved_nano>0), retained_nano INTEGER, receipt_hash TEXT, receipt_json TEXT, message_id TEXT, actual_cost_nano_text TEXT, additional_liability_nano_text TEXT NOT NULL DEFAULT '0', uncertain_reason TEXT, created_at_ms INTEGER NOT NULL, settled_at_ms INTEGER, spend_purpose TEXT NOT NULL CHECK(spend_purpose IN('manual','continuation')), continuation_reserved_nano INTEGER NOT NULL CHECK(continuation_reserved_nano>=0), manual_reserve_reserved_nano INTEGER NOT NULL CHECK(manual_reserve_reserved_nano>=0), authorization_json TEXT NOT NULL, authorization_hash TEXT NOT NULL)",
+  violations: DDL.violations,
+};
 const INDEXES = { wallet: [], funding_epoch: [['epoch_id'], ['singleton'], ['reference']], attempts: [['attempt_id']], violations: [['violation_id']] };
+const PURPOSES = ['manual', 'continuation'];
+const schemaVersionOf = policy => policy.allocations ? 2 : 1;
 
 function error(code, message = code, cause) { return Object.assign(new Error(message, cause ? { cause } : undefined), { code }); }
 function fail(code, message = code) { throw error(code, message); }
@@ -202,14 +216,37 @@ const refundEnabled = policy => policy.reconcileUsage === true && !!policy.billi
 function receiptDetails(receipt) {
   return { evidence: receipt.evidence, boundsViolated: receipt.boundsViolated, actualCostNano: receipt.actualCostNano.toString(), additionalLiabilityNano: receipt.additionalLiabilityNano.toString() };
 }
+const sha256 = text => createHash('sha256').update(text).digest('hex');
+// Stored allocation arithmetic that cannot be satisfied is ledger corruption, not a
+// new refusal class; only admission-time draws surface allocation_exhausted.
+function storedAllocation(compute) {
+  try { return compute(); } catch (cause) { if (cause.code === 'invalid_allocation') fail('invalid_ledger', 'invalid stored allocation'); throw cause; }
+}
+// The authorization is re-proved from the row alone: canonical bytes, their hash,
+// and a grant valid AT ITS ROW'S CREATION TIME (not now, so history stays settleable
+// after expiry) bound to this row's provider, the registered target, the registered
+// model (which the row's model must equal, even when the policy approves others) and
+// policy. The request digest was computed over this grant at admission; final
+// headers/body are deliberately not stored, so the digest cannot be recomputed here.
+function validateAuthorization(row, policy) {
+  requireValid(row.model === policy.registeredIdentity.modelID, 'registered model mismatch');
+  const value = parsedJSON(row.authorization_json);
+  requireValid(isDigest(row.authorization_hash) && row.authorization_hash === sha256(row.authorization_json), 'authorization hash mismatch');
+  let grant;
+  try { grant = normalizeApiSpendGrant(value, { now: storedTime(row.created_at_ms), targetID: policy.registeredIdentity.targetID, providerID: row.provider_id, modelID: policy.registeredIdentity.modelID }); }
+  catch (cause) { if (cause.code === 'invalid_authorization') fail('invalid_ledger', 'invalid stored authorization'); throw cause; }
+  requireValid(json(grant) === row.authorization_json && grant.purpose === row.spend_purpose && grant.policyRevision === policy.policyHash, 'authorization binding mismatch');
+}
+const bucket = funded => ({ funded, held: 0n, spent: 0n });
 
 function validateSchema(db, policy) {
+  const version = schemaVersionOf(policy); const split = version === 2;
   const objects = rows(db, 'SELECT type,name,tbl_name,sql FROM sqlite_schema');
-  const expected = Object.entries(DDL).map(([name, sql]) => ({ type: 'table', name, tbl_name: name, sql }));
+  const expected = Object.entries(split ? DDL_V2 : DDL).map(([name, sql]) => ({ type: 'table', name, tbl_name: name, sql }));
   for (const [table, indexes] of Object.entries(INDEXES)) for (let i = 0; i < indexes.length; i++) expected.push({ type: 'index', name: `sqlite_autoindex_${table}_${i + 1}`, tbl_name: table, sql: null });
   const ordered = list => [...list].sort((a, b) => a.name.localeCompare(b.name));
   requireValid(json(ordered(objects)) === json(ordered(expected)), 'unexpected schema');
-  requireValid(one(db, 'PRAGMA user_version').user_version === 1n, 'unknown schema version');
+  requireValid(one(db, 'PRAGMA user_version').user_version === BigInt(version), 'unknown schema version');
   const checks = rows(db, 'PRAGMA quick_check');
   requireValid(checks.length === 1 && checks[0].quick_check === 'ok' && rows(db, 'PRAGMA foreign_key_check').length === 0, 'database integrity failed');
   // quick_check deliberately omits UNIQUE and index/table correspondence.
@@ -227,7 +264,7 @@ function validateSchema(db, policy) {
     }
   }
   const wallets = rows(db, 'SELECT * FROM wallet');
-  requireValid(wallets.length === 1 && wallets[0].id === 1n && wallets[0].schema_version === 1n && policyMatch(wallets[0], policy), 'wallet binding mismatch');
+  requireValid(wallets.length === 1 && wallets[0].id === 1n && wallets[0].schema_version === BigInt(version) && policyMatch(wallets[0], policy), 'wallet binding mismatch');
   const wallet = wallets[0]; storedTime(wallet.created_at_ms);
   for (const key of ['funded_nano', 'available_nano', 'held_nano', 'spent_nano']) money(wallet[key]);
   requireValid(wallet.funded_nano <= policy.ceilingNano && [0n, 1n].includes(wallet.frozen));
@@ -239,10 +276,31 @@ function validateSchema(db, policy) {
     const confirmed = storedTime(epoch.confirmed_at_ms); const expires = storedTime(epoch.expires_at_ms);
     requireValid(confirmed < expires && expires <= policy.validUntilMs && wallet.created_at_ms < epoch.expires_at_ms, 'invalid epoch times');
   } else requireValid(wallet.funded_nano === 0n);
+  // Per-allocation contributions are recomputed from every historical row, exactly
+  // like the global sums; nothing is cached or carried between transactions.
+  let allocation = null;
+  if (split) {
+    let funded = { continuationFundedNano: 0n, manualReserveFundedNano: 0n };
+    if (epoch) {
+      funded = storedAllocation(() => fundedAllocation({ fundedNano: epoch.amount_nano, allocations: policy.allocations }));
+      requireValid(money(epoch.continuation_allocated_nano) === funded.continuationFundedNano && money(epoch.manual_reserve_allocated_nano) === funded.manualReserveFundedNano, 'funding split mismatch');
+    }
+    allocation = { continuation: bucket(funded.continuationFundedNano), manualReserve: bucket(funded.manualReserveFundedNano) };
+  }
   const attempts = rows(db, 'SELECT * FROM attempts');
   const violations = rows(db, 'SELECT * FROM violations');
   let held = 0n; let spent = 0n;
   for (const row of attempts) {
+    let draw = null;
+    if (split) {
+      requireValid(epoch && PURPOSES.includes(row.spend_purpose), 'invalid spend purpose');
+      draw = { continuationReservedNano: money(row.continuation_reserved_nano), manualReserveReservedNano: money(row.manual_reserve_reserved_nano) };
+      requireValid(draw.continuationReservedNano + draw.manualReserveReservedNano === row.reserved_nano, 'allocation draw mismatch');
+      // Manual is protected-only; continuation may touch protected funds only from U.
+      if (row.spend_purpose === 'manual') requireValid(draw.continuationReservedNano === 0n, 'manual draw outside reserve');
+      else if (draw.manualReserveReservedNano > 0n) requireValid(row.created_at_ms >= epoch.expires_at_ms - BigInt(policy.allocations.releaseWindowMs), 'reserve drawn before unlock');
+      validateAuthorization(row, policy);
+    }
     requireValid(epoch && isUUID(row.attempt_id) && row.epoch_id === epoch.epoch_id && STATES.includes(row.state) && policyMatch(row, policy));
     requireValid(isDigest(row.request_digest) && isDigest(row.body_digest) && Object.hasOwn(policy.models, row.model));
     const model = policy.models[row.model];
@@ -265,6 +323,12 @@ function validateSchema(db, policy) {
       storedTime(row.settled_at_ms); requireValid(row.settled_at_ms >= row.created_at_ms);
       requireValid(money(row.retained_nano) <= row.reserved_nano && row.retained_nano === (refundEnabled(policy) ? receipt.actualCostNano : row.reserved_nano));
       spent += row.retained_nano;
+      if (split) {
+        // Retained normal-first; any refund therefore reverses the original draw.
+        const retained = storedAllocation(() => allocationRetained({ ...draw, retainedNano: row.retained_nano }));
+        allocation.continuation.spent += retained.continuationRetainedNano;
+        allocation.manualReserve.spent += retained.manualReserveRetainedNano;
+      }
     } else {
       requireValid(row.retained_nano === null && row.settled_at_ms === null);
       if (row.state === 'DISPATCH_COMMITTED') requireValid(!receipt && row.uncertain_reason === null);
@@ -274,6 +338,12 @@ function validateSchema(db, policy) {
         else requireValid(row.uncertain_reason !== 'bounds_violation');
       }
       held += row.reserved_nano;
+      // Held and uncertain attempts (including frozen violations) keep the FULL
+      // original draw; nothing is reclassified at unlock or expiry.
+      if (split) {
+        allocation.continuation.held += draw.continuationReservedNano;
+        allocation.manualReserve.held += draw.manualReserveReservedNano;
+      }
     }
   }
   for (const violation of violations) {
@@ -291,7 +361,14 @@ function validateSchema(db, policy) {
   requireValid(violations.length ? wallet.frozen === 1n && violations.some(v => v.kind === wallet.freeze_reason) : wallet.frozen === 0n && wallet.freeze_reason === null, 'freeze/violation mismatch');
   // Never SQL SUM: even corrupt rows must not overflow into a REAL or lose evidence.
   requireValid(wallet.available_nano + wallet.held_nano + wallet.spent_nano === wallet.funded_nano && held === wallet.held_nano && spent === wallet.spent_nano, 'wallet invariant failed');
-  return { wallet, epoch, attempts };
+  if (split) {
+    for (const item of Object.values(allocation)) {
+      item.available = item.funded - item.held - item.spent;
+      requireValid(item.available >= 0n, 'allocation overdrawn');
+    }
+    requireValid(allocation.continuation.available + allocation.manualReserve.available === wallet.available_nano, 'allocation invariant failed');
+  }
+  return { wallet, epoch, attempts, allocation };
 }
 
 async function transaction(db, args, action, { read = false, initializing = false } = {}) {
@@ -313,7 +390,19 @@ async function transaction(db, args, action, { read = false, initializing = fals
 function statusOf(state, policy, now) {
   let observed = 0n; let liability = 0n;
   for (const row of state.attempts) { if (row.actual_cost_nano_text !== null) observed += moneyText(row.actual_cost_nano_text); liability += moneyText(row.additional_liability_nano_text); }
-  return Object.freeze({ schemaVersion: 1, policyHash: policy.policyHash, fundedNano: state.wallet.funded_nano, availableNano: state.wallet.available_nano, heldNano: state.wallet.held_nano, spentNano: state.wallet.spent_nano, observedCostNano: observed, additionalLiabilityNano: liability, frozen: state.wallet.frozen === 1n, expired: now >= policy.validUntilMs || (state.epoch !== null && now >= storedTime(state.epoch.expires_at_ms)), epochID: state.epoch?.epoch_id ?? null, reference: state.epoch?.reference ?? null, attemptCounts: Object.freeze(Object.fromEntries(STATES.map(key => [key, state.attempts.filter(row => row.state === key).length]))) });
+  const base = { schemaVersion: 1, policyHash: policy.policyHash, fundedNano: state.wallet.funded_nano, availableNano: state.wallet.available_nano, heldNano: state.wallet.held_nano, spentNano: state.wallet.spent_nano, observedCostNano: observed, additionalLiabilityNano: liability, frozen: state.wallet.frozen === 1n, expired: now >= policy.validUntilMs || (state.epoch !== null && now >= storedTime(state.epoch.expires_at_ms)), epochID: state.epoch?.epoch_id ?? null, reference: state.epoch?.reference ?? null, attemptCounts: Object.freeze(Object.fromEntries(STATES.map(key => [key, state.attempts.filter(row => row.state === key).length]))) };
+  if (!state.allocation) return Object.freeze(base);
+  const view = item => Object.freeze({ fundedNano: item.funded, availableNano: item.available, heldNano: item.held, spentNano: item.spent });
+  // Unlock is an eligibility instant evaluated at admission, never a transfer and
+  // never new money. A frozen or expired wallet advertises no permission to draw.
+  const epochExpiresAtMs = state.epoch ? storedTime(state.epoch.expires_at_ms) : null;
+  const reserveUnlockAtMs = epochExpiresAtMs === null ? null : epochExpiresAtMs - policy.allocations.releaseWindowMs;
+  const reserveWindowOpen = epochExpiresAtMs !== null && now >= reserveUnlockAtMs && now < epochExpiresAtMs && now < policy.validUntilMs;
+  const continuationMayUseReserve = reserveWindowOpen && state.wallet.frozen === 0n && state.allocation.manualReserve.available > 0n;
+  // Echo of the registered paid identity bound into the policy hash, so an operator
+  // can compare it before funding. Legacy (schema 1) status keys stay unchanged.
+  const { targetID, providerID, modelID } = policy.registeredIdentity;
+  return Object.freeze({ ...base, schemaVersion: 2, registeredIdentity: Object.freeze({ targetID, providerID, modelID }), allocations: Object.freeze({ continuation: view(state.allocation.continuation), manualReserve: view(state.allocation.manualReserve) }), epochExpiresAtMs, reserveUnlockAtMs, reserveWindowOpen, continuationMayUseReserve });
 }
 
 export async function initializeLedger(args) {
@@ -334,6 +423,13 @@ export async function initializeLedger(args) {
     await handle.sync();
     await handle.close(); handle = null;
     result = await connected(args, db => transaction(db, args, () => {
+      // The policy alone selects the exact schema; initialization never funds.
+      if (schemaVersionOf(policy) === 2) {
+        for (const ddl of Object.values(DDL_V2)) db.exec(ddl);
+        db.exec('PRAGMA user_version = 2');
+        statement(db, 'INSERT INTO wallet VALUES(1,2,?,?,?,?,0,0,0,0,0,NULL,?)').run(policy.policyHash, policy.binding.providerID, policy.binding.origin, policy.binding.credentialSHA256, now);
+        return statusOf(validateSchema(db, policy), policy, now);
+      }
       for (const ddl of Object.values(DDL)) db.exec(ddl);
       db.exec('PRAGMA user_version = 1');
       statement(db, 'INSERT INTO wallet VALUES(1,1,?,?,?,?,0,0,0,0,0,NULL,?)').run(policy.policyHash, policy.binding.providerID, policy.binding.origin, policy.binding.credentialSHA256, now);
@@ -376,7 +472,12 @@ export async function fundLedger(args) {
     const [whole, fraction = ''] = allocation.amountUSD.split('.');
     const amount = BigInt(whole) * 1000000000n + BigInt((fraction.slice(0, 9) + '000000000').slice(0, 9));
     requireValid(amount > 0n && amount <= policy.ceilingNano && amount <= MAX, 'invalid allocation amount');
-    statement(db, 'INSERT INTO funding_epoch VALUES(?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), 1, allocation.reference, amount, confirmed, expires, policy.policyHash, policy.binding.providerID, policy.binding.origin, policy.binding.credentialSHA256);
+    if (policy.allocations) {
+      // R <= F <= C+R: the protected reserve is funded first and in full, so a
+      // partial balance reduces normal capacity, never the promised reserve.
+      const split = storedAllocation(() => fundedAllocation({ fundedNano: amount, allocations: policy.allocations }));
+      statement(db, 'INSERT INTO funding_epoch VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), 1, allocation.reference, amount, confirmed, expires, policy.policyHash, policy.binding.providerID, policy.binding.origin, policy.binding.credentialSHA256, split.continuationFundedNano, split.manualReserveFundedNano);
+    } else statement(db, 'INSERT INTO funding_epoch VALUES(?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), 1, allocation.reference, amount, confirmed, expires, policy.policyHash, policy.binding.providerID, policy.binding.origin, policy.binding.credentialSHA256);
     statement(db, 'UPDATE wallet SET funded_nano=?,available_nano=? WHERE id=1').run(amount, amount);
     return statusOf(validateSchema(db, policy), policy, now);
   }));
@@ -392,13 +493,33 @@ function rebuildPrepared(prepared, policy, now) {
     const name = pair[0].toLowerCase(); requireValid(!seen.has(name), 'duplicate prepared header'); seen.add(name);
     Object.defineProperty(headers, pair[0], { value: pair[1], enumerable: true });
   }
-  const rebuilt = prepareSpendAttempt({ policy, providerID: prepared.providerID, url: prepared.url, body: prepared.body, headers, credentialFingerprint: prepared.credentialFingerprint, now });
+  // A split admission re-normalizes the supplied grant at THIS clock against the
+  // registered target; the rebuilt digest covers the canonical grant.
+  const authorization = policy.allocations ? { targetID: prepared.spendGrant?.targetID, spendGrant: prepared.spendGrant } : {};
+  const rebuilt = prepareSpendAttempt({ policy, providerID: prepared.providerID, url: prepared.url, body: prepared.body, headers, credentialFingerprint: prepared.credentialFingerprint, now, ...authorization });
   for (const key of Object.keys(rebuilt)) {
     if (key === 'headers') requireValid(json(rebuilt.headers) === json(prepared.headers), 'prepared headers changed');
+    else if (key === 'spendGrant') requireValid(json(rebuilt.spendGrant) === json(prepared.spendGrant), 'prepared authorization changed');
     else if (key === 'ratesNanoUSD') requireValid(prepared[key] && Object.keys(prepared[key]).length === 4 && RATE_KEYS.every(rate => prepared[key][rate] === rebuilt[key][rate]), 'prepared rates changed');
     else requireValid(prepared[key] === rebuilt[key], 'prepared attempt changed');
   }
   return rebuilt;
+}
+// Runs inside reserveAttempt's single BEGIN IMMEDIATE transaction, after the full
+// historical validation produced `state.allocation`. The complete worst-case cost is
+// drawn atomically from eligible availability or refused; it is never split into
+// extra paid calls. The transaction revalidates everything again before COMMIT.
+function reserveSplit(db, state, policy, p, attemptID, now) {
+  const grant = p.spendGrant;
+  const expiresAtMs = storedTime(state.epoch.expires_at_ms);
+  const draw = allocationDraw({ purpose: grant.purpose, reserveNano: p.reserveNano, continuationAvailableNano: state.allocation.continuation.available, manualReserveAvailableNano: state.allocation.manualReserve.available, now, expiresAtMs, releaseWindowMs: policy.allocations.releaseWindowMs });
+  const authorization = json(grant);
+  statement(db, 'INSERT INTO attempts(attempt_id,epoch_id,state,request_digest,body_digest,model,max_input_tokens,max_output_tokens,rates_json,policy_hash,provider_id,origin,credential_sha256,reserved_nano,created_at_ms,spend_purpose,continuation_reserved_nano,manual_reserve_reserved_nano,authorization_json,authorization_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(attemptID, state.epoch.epoch_id, 'DISPATCH_COMMITTED', p.requestDigest, p.bodyDigest, p.model, p.maxInputTokens, p.maxOutputTokens, canonicalRates(p.ratesNanoUSD), p.policyHash, p.providerID, p.origin, p.credentialFingerprint, p.reserveNano, now, grant.purpose, draw.continuationReservedNano, draw.manualReserveReservedNano, authorization, sha256(authorization));
+  statement(db, 'UPDATE wallet SET available_nano=available_nano-?,held_nano=held_nano+? WHERE id=1').run(p.reserveNano, p.reserveNano);
+  const snapshot = storedAttempt(one(db, 'SELECT * FROM attempts WHERE attempt_id=?', [attemptID]));
+  // The send deadline is the earliest of policy, actual epoch and grant expiry.
+  const dispatchDeadlineMs = Math.min(policy.validUntilMs, expiresAtMs, grant.expiresAtMs);
+  return Object.freeze({ ...snapshot, ratesNanoUSD: Object.freeze(snapshot.ratesNanoUSD), state: 'DISPATCH_COMMITTED', createdAtMs: now, dispatchDeadlineMs, spendPurpose: grant.purpose, allocationDraw: Object.freeze({ continuationReservedNano: draw.continuationReservedNano, manualReserveReservedNano: draw.manualReserveReservedNano }), spendGrant: grant });
 }
 export async function reserveAttempt(args) {
   const { policy, prepared, attemptID, now } = args;
@@ -409,6 +530,7 @@ export async function reserveAttempt(args) {
     const p = rebuildPrepared(prepared, policy, now);
     if (!state.epoch) fail('insufficient_funds');
     requireValid(!one(db, 'SELECT attempt_id FROM attempts WHERE attempt_id=?', [attemptID]), 'attempt already exists');
+    if (policy.allocations) return reserveSplit(db, state, policy, p, attemptID, now);
     if (state.wallet.available_nano < p.reserveNano) fail('insufficient_funds');
     statement(db, 'INSERT INTO attempts(attempt_id,epoch_id,state,request_digest,body_digest,model,max_input_tokens,max_output_tokens,rates_json,policy_hash,provider_id,origin,credential_sha256,reserved_nano,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(attemptID, state.epoch.epoch_id, 'DISPATCH_COMMITTED', p.requestDigest, p.bodyDigest, p.model, p.maxInputTokens, p.maxOutputTokens, canonicalRates(p.ratesNanoUSD), p.policyHash, p.providerID, p.origin, p.credentialFingerprint, p.reserveNano, now);
     statement(db, 'UPDATE wallet SET available_nano=available_nano-?,held_nano=held_nano+? WHERE id=1').run(p.reserveNano, p.reserveNano);

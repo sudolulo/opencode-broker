@@ -25,10 +25,17 @@ try {
   const required = command === 'fund'
     ? ['--policy', '--amount-usd', '--reference', '--confirmed-at', '--expires-at', '--provider-id', '--origin', '--credential-sha256', '--confirm-exclusive-promotional-allocation']
     : ['--policy'];
-  const allowed = new Set(required);
+  // A split policy's hash binds its registered paid target identity, so only those
+  // policies require (and accept) the target/model identifiers. They are not
+  // credentials and never fund, reserve or reset anything.
+  const identity = ['--target-id', '--model-id'];
+  const allowed = new Set([...required, ...identity]);
   if (Object.keys(options).some(key => !allowed.has(key)) || required.some(key => options[key] === undefined)) error('invalid_flags');
   const raw = JSON.parse(await readFile(options['--policy'], 'utf8'));
-  const policy = normalizeSpendPolicy(raw); const now = Date.now();
+  const split = raw !== null && typeof raw === 'object' && Object.hasOwn(raw, 'allocations');
+  if (identity.some(key => (options[key] === undefined) === split)) error('invalid_flags');
+  const policy = normalizeSpendPolicy(raw, split ? { targetID: options['--target-id'], providerID: raw.binding?.providerID, modelID: options['--model-id'] } : undefined);
+  const now = Date.now();
   let result;
   if (command === 'init') result = await initializeLedger({ ledgerPath: policy.ledgerPath, policy, now });
   else if (command === 'status') result = await inspectStatus({ ledgerPath: policy.ledgerPath, policy, now });
@@ -37,7 +44,7 @@ try {
 } catch (caught) {
   // JSON parse and filesystem errors can quote arbitrary policy bytes/paths.
   // Only our fixed refusal vocabulary crosses the CLI boundary.
-  const codes = new Set(['invalid_command', 'unknown_flag', 'invalid_flags', 'invalid_policy', 'unsupported_runtime', 'missing_ledger', 'invalid_ledger', 'binding_mismatch', 'expired', 'insufficient_funds', 'frozen', 'locked']);
+  const codes = new Set(['invalid_command', 'unknown_flag', 'invalid_flags', 'invalid_policy', 'unsupported_runtime', 'missing_ledger', 'invalid_ledger', 'binding_mismatch', 'expired', 'insufficient_funds', 'frozen', 'locked', 'invalid_authorization', 'allocation_exhausted']);
   const code = codes.has(caught.code) ? caught.code : 'invalid_policy';
   process.stderr.write(`${stringify({ error: { code, message: code } })}\n`);
   process.exitCode = 1;

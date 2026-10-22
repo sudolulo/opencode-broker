@@ -11,16 +11,17 @@ tooling) is a supported client.
 
 | Endpoint | Body | Purpose |
 |---|---|---|
-| `/lease` | `{ sessionID, profile, tier, replace?, preferredModel?, contextTokens?, providers?, resolvableModels?, localOnly?, releasePin?, oneShot?, waitedMs?, resolverToken? }` | Acquire (or revalidate) a model lease. Returns `{ leaseID, target: { id, model: { providerID, id, variant? }, kind }, existing, decision: { registration } }`. The broker-minted `leaseID` identifies this exact lease and must accompany every later settlement report for it. `registration` is the token's validated generation eligibility and never contains the token. Fails with a clear error when no eligible target fits (context, circuits, health, admission) — see **Refusals** below. `providers`, `resolvableModels`, and `localOnly` NARROW admission and can never widen it: `providers` to callers a client can actually speak to; `resolvableModels` is up to 2,048 non-empty `provider/model` strings from an OpenCode process's startup catalog, so it is never leased a model added after it started; and `localOnly: true` to targets on the LAN, for content that may not leave it. A session keeps the model it was last assigned while that model can serve it; `releasePin: true` asks for a fresh decision. `oneShot: true` declares that this `sessionID` is minted per request and will never be reused (the gateway does this): it does not affect selection, it only marks the assignment as safe to discard ahead of real sessions' pins. It is **refused** unless the `sessionID` starts with `gw-`, the per-request naming contract — a real session must not be able to ask for its own pin to be spent first. `waitedMs` is the optional non-negative finite count of milliseconds this caller has **already** spent waiting for its primary in the current lease loop; it defaults to 0 and gates rungs carrying `profileFallbackAfterMs` (see **Selection semantics**). Callers reset it for a new upstream-forward attempt, so a retry after a failed forward does not inherit the first attempt's elapsed time. An invalid value is refused rather than coerced: read as 0 it would hold a delayed rung shut forever, and read as huge it would surrender a scarce shared slot immediately. |
+| `/lease` | `{ sessionID, profile, tier, replace?, preferredModel?, contextTokens?, providers?, resolvableModels?, localOnly?, releasePin?, oneShot?, waitedMs?, sessionKind?, resolverToken? }` | Acquire (or revalidate) a model lease. Returns `{ leaseID, target: { id, model: { providerID, id, variant? }, kind }, existing, decision: { registration } }`. The broker-minted `leaseID` identifies this exact lease and must accompany every later settlement report for it. `registration` is the token's validated generation eligibility and never contains the token. Fails with a clear error when no eligible target fits (context, circuits, health, admission) — see **Refusals** below. `providers`, `resolvableModels`, and `localOnly` NARROW admission and can never widen it: `providers` to callers a client can actually speak to; `resolvableModels` is up to 2,048 non-empty `provider/model` strings from an OpenCode process's startup catalog, so it is never leased a model added after it started; and `localOnly: true` to targets on the LAN, for content that may not leave it. A session keeps the model it was last assigned while that model can serve it; `releasePin: true` asks for a fresh decision. `oneShot: true` declares that this `sessionID` is minted per request and will never be reused (the gateway does this): it does not affect selection, it only marks the assignment as safe to discard ahead of real sessions' pins. It is **refused** unless the `sessionID` starts with `gw-`, the per-request naming contract — a real session must not be able to ask for its own pin to be spent first. `waitedMs` is the optional non-negative finite count of milliseconds this caller has **already** spent waiting for its primary in the current lease loop; it defaults to 0 and gates rungs carrying `profileFallbackAfterMs` (see **Selection semantics**). Callers reset it for a new upstream-forward attempt, so a retry after a failed forward does not inherit the first attempt's elapsed time. An invalid value is refused rather than coerced: read as 0 it would hold a delayed rung shut forever, and read as huge it would surrender a scarce shared slot immediately. |
 | `/release` | `{ sessionID, leaseID }` | Drop the exact session lease. Missing, unknown, stale, or session-mismatched broker-minted bindings are refused. A one-shot session's assignment is dropped with it (nothing can read it back); an ordinary session's pin stays. |
-| `/lease/verify` | `{ sessionID, leaseID? }` | Read-only. Returns `{ held: true, leaseID, target: { id, kind, model: { providerID, id } } }` when the session holds a live lease (and it is `leaseID`, when given), else `{ held: false }`. The gateway uses it to forward an opencode session's request on the session's own lease. |
+| `/lease/verify` | `{ sessionID, leaseID? }` | Read-only. Returns `{ held: true, leaseID, target: { id, kind, model: { providerID, id }, requiresSpendBudget?, billingClass?, spendGrant? }, expectedCredentialInstance, generation }` when the session holds a live lease (and it is `leaseID`, when given), else `{ held: false }`. The gateway uses it to forward an opencode session's request on the session's own lease. The paid fields follow **Paid lease attestation** below; a grant-bearing lease answers `held: true` only for its exact non-empty `leaseID`, and only while its paid context is current. |
 | `/touch` | `{ sessionID }` | Heartbeat; leases expire after 2h untouched. |
 | `/failure` | `{ sessionID, leaseID, targetID?, error, failureClass? }` | Report a provider failure for the exact broker-minted lease/session binding. Quota errors open a **provider-wide** circuit until the reported reset; other failures open a 5-minute target circuit and add health evidence (two distinct targets within 15 min quarantines the provider). For a governed candidate lease, `failureClass` is also classified by the closed model-policy taxonomy below; an absent or unknown class is neutral. |
 | `/complete` | `{ sessionID, leaseID }` | Successful end: clears probation for the target's provider, settles an exactly bound candidate lease once, drops only that exact lease, and drops a one-shot session's assignment with it. |
-| `/forget` | `{ sessionID, leaseID, completed? }` | Drop the exact lease at the end of a turn. `completed: true` settles a governed candidate's success and every other value settles neutral abandonment. The assignment (the session's pinned model) stays and ages out after 14 days — unless the session is one-shot, which has no next turn to read it, so its assignment goes with the lease; `completed: true` also clears provider probation. Assignments are also capped at 512: eviction is oldest-first, but it spends every settled one-shot entry before any session pin. **An assignment whose session still holds a live lease is never evicted**, by the cap or by the 14-day age rule — a session that only revalidates a held lease never moves `updatedAt`, so age is not evidence that it is idle. An entry counts as one-shot if it carries the `oneShot` flag, or carries no flag at all and its id starts with `gw-` (entries written before the flag existed). |
+| `/forget` | `{ sessionID, leaseID, completed? }` | Drop the exact lease at the end of a turn. `completed: true` settles a governed candidate's success and every other value settles neutral abandonment. The assignment (the session's pinned model) stays and ages out 4 hours after the session's last activity (1 hour for a `worker`-tier assignment whose recorded `sessionKind` is `subagent`) — unless the session is one-shot, which has no next turn to read it, so its assignment goes with the lease; `completed: true` also clears provider probation. Assignments are also capped at 512: eviction is oldest-first, but it spends every settled one-shot entry before any session pin. **An assignment whose session still holds a live lease is never evicted**, by the cap or by the age rule — a session that only revalidates a held lease never moves `updatedAt`, so age is not evidence that it is idle. An entry counts as one-shot if it carries the `oneShot` flag, or carries no flag at all and its id starts with `gw-` (entries written before the flag existed). |
 | `/usage` | `{ sessionID?, rootSessionID?, leaseID?, providerID, modelID?, observedAt?, requests, tokens: { input, output, cacheRead, cacheWrite }, caller? }` | Feed the budget ledger and the burn watch (one report per provider request). Usage for a broker lease requires its exact broker-minted lease/session binding; unleased/manual usage may omit both. `rootSessionID`, when given, names the parent session (same shape rule as `sessionID`) so the burn watch rolls a fan-out of subagents into their root for spend accounting; a lone session is a tree of one. A non-future observation whose provider/model exactly matches that retained binding settles candidate success; a later `/complete` is an idempotent replay. Returns current `utilization`, plus `burn: { stop: true, reason }` when this report tipped the session into a runaway: the client that owns the session must stop its turn. |
 | `/inventory` | `{ targets, providers, modelContexts, modelOutputs, modelVariants, authRevision, configFingerprint, authOnly? }` | Publish discovered provider/model inventory. Refused unless `authRevision` matches the broker's own hash of opencode's `auth.json` and `configFingerprint` matches the exact config bytes loaded at broker startup. An OAuth-to-API-key or config change can never publish stale admission. |
-| `/status` | `{ resolverToken? }` | Full public state: leases, circuits (with `renewsAt`), health, budget report, last decision, non-secret active resolver-process registrations by generation, and `deprecations` when the broker is still reading a renamed setting. |
+| `/quota-evidence` | Exactly `{ sessionID, leaseID, targetID, subscriptionQuota }` | Non-settling gateway report that an actual session-bound 429 carried a typed subscription-quota signal. See **Quota evidence** below. |
+| `/status` | `{ resolverToken? }` | Public state: leases, circuits (with `renewsAt`), health, budget report, last decision, non-secret active resolver-process registrations by generation, and `deprecations` when the broker is still reading a renamed setting. API continuation internals are redacted; see **`/status` redaction** below. |
 | `/selection` | `{}` | Just `lastDecision` — why the last lease chose its target. |
 | `/preview` | `{ profile?, tiers?, contextTokens? }` | Side-effect-free selection: what each tier WOULD get right now. No lease, no cursor advance. Returns `{ preview: { <tier>: target \| null }, delayedProfileFallbacks: [{ targetIDs, afterMs }] }`. Preview answers for the present moment, so it selects as `waitedMs: 0` and a rung that is merely *not yet* open reads as `null`. `delayedProfileFallbacks` is what keeps that honest: it names the profile's delayed rungs and their thresholds, so a reader can tell "this profile has no fallback" from "its fallback has not opened yet". |
 | `/rearm` | `{ targetID? , reasonCode? }` | Clear a circuit. `provider:<id>` rearms a quarantined provider into probation; a target id clears that target; empty clears all circuits. |
@@ -38,6 +39,104 @@ no remote address and is local by construction; any future TCP peer must have an
 IPv4 or IPv6 loopback address. A non-loopback peer is rejected before a control
 body is parsed. The broker enforces exact mode `0600` on the socket; that
 same-UID boundary is checked again before issuing a probe-launch nonce.
+
+## Session kind on `/lease`
+
+`sessionKind` is optional and accepts exactly `"primary"` or `"subagent"`; anything else is
+ignored. The router plugin derives it from the SDK session's `parentID`, never from the agent or
+tier. Once a lease or assignment for the session records a kind, that recorded kind wins over a
+later request's value (gateway verification traffic omits it). It decides one thing: a
+lease-free `worker`-tier assignment whose kind is `subagent` ages out after 1 hour idle; every
+other assignment, including generic `worker` primaries and legacy entries without a kind, keeps
+the 4-hour idle TTL.
+
+## Paid lease attestation
+
+The `target` of a `/lease` reply and of a `held: true` `/lease/verify` reply carries the paid
+context of that actual lease (`currentLeaseAttestation`), re-proven on every read:
+
+| Lease | Fields on `target` |
+|---|---|
+| Ordinary | none |
+| Legacy manual API target with no financial pin | `requiresSpendBudget: true`, `billingClass: "manual-api"` |
+| Grant-bearing manual lease | `requiresSpendBudget: true`, `billingClass: "manual-api"`, `spendGrant` |
+| API continuation lease | `requiresSpendBudget: true`, `billingClass: "api-continuation"`, `spendGrant` |
+
+`spendGrant` is the broker-minted grant: exactly `{ version: 1, grantID, purpose, sessionID,
+leaseID, targetID, providerID, modelID, profile, tier, issuedAtMs, expiresAtMs, policyRevision,
+source }`, where `purpose` is `manual` or `continuation`, `policyRevision` is the target's
+financial pin from `apiContinuation.spendPolicyHashes`, and `source` is `null` for manual or
+exactly `{ providerID, targetID, leaseID, modelID, quotaObservedAtMs, quotaUntilMs }` for
+continuation. See [API-CONTINUATION.md](API-CONTINUATION.md).
+
+A paid lease that cannot attest itself now attests nothing: a malformed, expired or rebound grant;
+a drifted pin, registration, admission, profile or tier; a grant-bearing lease untouched for
+longer than the 2 h lease TTL; a continuation whose exact source proof is no longer current; a pinned paid target
+leased without a grant; or any registered manual target while the `apiContinuation` block is
+invalid. On `/lease` such a just-granted lease is deleted and the call fails with
+`lease authority could not be attested` (no `code`); on `/lease/verify` it answers
+`{ held: false }`.
+
+**Exact lease ID rule.** A grant-bearing lease verifies only when the request names its exact,
+non-empty `leaseID` and the lease's own `sessionID` is the requested one. An omitted, empty, older
+or different ID answers `{ held: false }`; it never falls back to whatever lease the session holds
+now. Ordinary and legacy unpinned manual leases keep the previous behavior (an omitted `leaseID`
+matches the current lease). The gateway's same-model lease-ID rotation retry is likewise never
+applied to a grant-bearing lease.
+
+`/preview` has no lease, so it shows only the static legacy attestation and never a grant.
+
+## Quota evidence
+
+`POST /quota-evidence` with exactly `{ sessionID, leaseID, targetID, subscriptionQuota }`, where
+`subscriptionQuota` is exactly `{ version: 1, kind, window, resetAtMs }`: `kind`
+`anthropic-unified` with `window` `five_hour` or `seven_day`, or `kind` `openai-usage-limit` with
+`window` `usage_limit`; `resetAtMs` a future epoch-millisecond time within the window's horizon
+(5 h, 7 days, 31 days respectively). The gateway sends it once, awaited with a 400 ms deadline,
+for a session-bound (external, non-outage) request on a durable `ses_` session whose upstream
+answered 429 with a typed signal (see [API-CONTINUATION.md](API-CONTINUATION.md)).
+
+It is **non-settling**: it creates no circuit, usage, settlement, release, proof or grant. It
+stores only a broker-timestamped observation on the exact current lease, which the plugin's later
+exact `/failure` consumes. The plan-usage refresh that precedes other requests is skipped for it.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{ ok: true, accepted: true }` | Stored, or an identical normalized repeat (the first timestamp stands) |
+| 400 | `{ error: "quota evidence refused", code: "invalid-quota-evidence" }` | Body is not exactly the four keys, or an ID is malformed |
+| 400 | `code: "invalid-subscription-quota"` | `subscriptionQuota` does not normalize at the broker's clock |
+| 409 | `code: "unknown-or-stale-lease"` | No current lease for the session, or its `leaseID` or `targetID` differs |
+| 409 | `code: "not-a-continuation-source"` | The lease carries no current source snapshot (continuation disabled, ineligible session or target, auth or inventory revision moved, lease TTL lapsed) |
+| 409 | `code: "quota-evidence-conflict"` | A different observation already exists, or a conflict tombstone does |
+
+Refusals other than a conflict never touch state, so a stale or misbound report cannot poison the
+current lease. A second, **different** observation for the same lease erases the stored one,
+writes the tombstone `quotaObservationConflict: { version: 1, conflictedAtMs }`, and answers 409;
+from then on neither value can be restored until that exact lease's `/failure` consumes it or the
+lease is replaced. Refusal bodies never echo the request. The gateway's transport treats any
+non-2xx as a failure and surfaces only its HTTP status and the static `code`. A 409
+`not-a-continuation-source` is the ordinary answer while continuation is off and is dropped
+silently; every other failure logs only `{"event":"quota_evidence_delivery_failed"}` (or
+`quota_evidence_rejected` for a 2xx without `ok`/`accepted`). The client's response is unchanged.
+
+## `/status` redaction
+
+`/status` is readable by any local client, so continuation internals stay in the private state
+file:
+
+- On each lease, `spendGrant`, `apiContinuationSource`, `quotaObservation` and
+  `quotaObservationConflict` are removed and replaced by `hasSpendGrant`,
+  `hasApiContinuationSource`, `hasQuotaObservation` and `hasQuotaObservationConflict`, each `true`
+  when the field held a value (absent otherwise).
+- A grant-bearing lease (`hasSpendGrant: true`) loses its `leaseID`, because that ID is what
+  `/lease/verify` attests. Ordinary leases keep every field.
+- An assignment loses its `leaseID` when that ID belongs to a currently held grant-bearing lease or
+  the assignment carries the `grantLease: true` mark (so the ID stays hidden after the lease ends).
+  Every other assignment field, and every ordinary assignment, is unchanged.
+- `apiContinuations` is reduced to `{ "<sessionID>": true }`.
+- `apiContinuationConfigError` is a boolean: `true` while a present `apiContinuation` block is
+  invalid and every registered manual API target is failing closed. The message itself is only in
+  the broker's startup log.
 
 ## Gateway embeddings API
 
@@ -212,6 +311,8 @@ matching prose:
 | `no-eligible-local-target` | Every wanted target is local and none is deployed, free, or within its context window (or the request was `localOnly`). Nothing is being done about it. |
 | `no-eligible-target` | The mixed/cloud case: no target in the lane is currently usable. |
 | `no-resolvable-target` | The calling OpenCode process cannot resolve any otherwise eligible model. Restart it to load the current provider config; the error names up to five dropped models. |
+| `usage-limit` | `no-eligible-target` with the cause known: every cloud provider in the lane is held out by a plan-window or quota stop; the message names each one and when it returns. |
+| `api-continuation-config-invalid` | The lane names a registered manual API target, and the present `apiContinuation` config block is invalid, so every manual target fails closed. Terminal until the operator fixes the block and restarts the broker. |
 
 Only `target-preparing` and `target-busy` are retryable: the client must resend after either.
 `no-resolvable-target` requires restarting the OpenCode process to load the current provider

@@ -28,6 +28,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { usageLimitMessage } from "../../lib/usage-limit.js";
+import { durableOpenCodeSessionID, extractSubscriptionQuota } from "../../lib/api-continuation.js";
+import { normalizeApiSpendGrant } from "../../lib/api-spend-grant.js";
 import { createGatewayHealth, createTerminalParser } from "./model-health.js";
 import { replyContentFilter } from "./content-filter.js";
 import { normalizeSpendPolicy, prepareSpendAttempt } from "./spend-policy.js";
@@ -496,7 +498,9 @@ export const readGatewayKeyFile = (keyPath) => {
 // config without loading a file).
 const spendError = (code) => Object.assign(new Error(`spend budget refused: ${code}`), { code });
 const SPEND_CODES = new Set(["missing_policy", "invalid_policy", "unsupported_runtime", "missing_ledger",
-  "invalid_ledger", "binding_mismatch", "expired", "insufficient_funds", "frozen", "locked", "unsupported_request"]);
+  "invalid_ledger", "binding_mismatch", "expired", "insufficient_funds", "frozen", "locked", "unsupported_request",
+  // Split-policy refusals: prepare (missing/mismatched authorization) and reserve (allocation draw).
+  "invalid_authorization", "allocation_exhausted"]);
 // A FINANCIAL REFUSAL MUST BE TERMINAL FOR DEFAULT CLIENTS, NOT MERELY LABELLED SO. A 503
 // is retried by both default clients (Vercel AI SDK: 408/409/429/>=500; Anthropic SDK: the same
 // unless x-should-retry says otherwise), and every retry is a NEW paid request: a post-dispatch
@@ -517,9 +521,24 @@ const retryablePaidStatus = (status) => status === 408 || status === 409 || stat
 // call this function; caller JSON/header metadata never supplies classification.
 const spendClassification = (target) => Object.fromEntries(["requiresSpendBudget", "billingClass"]
   .filter(key => target && Object.hasOwn(target, key)).map(key => [key, target[key]]));
+// The broker's spend grant rides ONLY on the target object of a /lease or /lease/verify
+// response; this is called from exactly those two sites. The outage-probe consumed path
+// keeps spendClassification alone (paid probes are refused as unsupported_request).
+const spendAttestation = (target) => ({ ...spendClassification(target),
+  ...(target && Object.hasOwn(target, "spendGrant") ? { spendGrant: target.spendGrant } : {}) });
+// Billing class (broker target attestation) -> grant purpose (lib/api-spend-grant.js vocabulary).
+const SPEND_GRANT_PURPOSE = Object.freeze({ "manual-api": "manual", "api-continuation": "continuation" });
+// A grant this close to expiry is refused BEFORE reserving. Reservation (a ledger write) and
+// the final no-await gate both take time; a grant that expires in between would leave its hold
+// stranded as UNCERTAIN (retained, never refunded) for a request that was never sent. 2 s covers
+// a queued SQLite reservation with margin while costing a live grant (minutes) nothing.
+const SPEND_GRANT_MIN_REMAINING_MS = 2000;
 const providerSpendPolicy = (providerID, provider, leased = {}) => {
-  const declared = Object.hasOwn(leased, "requiresSpendBudget") || Object.hasOwn(leased, "billingClass");
-  if (declared && (leased.requiresSpendBudget !== true || leased.billingClass !== "manual-api")) throw spendError("invalid_policy");
+  // A grant with no declared class is a declaration too: it fails closed below rather than
+  // being silently ignored on an unclassified lease.
+  const declared = Object.hasOwn(leased, "requiresSpendBudget") || Object.hasOwn(leased, "billingClass")
+    || Object.hasOwn(leased, "spendGrant");
+  if (declared && (leased.requiresSpendBudget !== true || !Object.hasOwn(SPEND_GRANT_PURPOSE, leased.billingClass))) throw spendError("invalid_policy");
   if (!provider || !Object.hasOwn(provider, "spendBudget")) {
     if (declared) throw spendError("missing_policy");
     return null;
@@ -532,6 +551,35 @@ const providerSpendPolicy = (providerID, provider, leased = {}) => {
   try { origin = new URL(provider.baseUrl).origin; } catch { throw spendError("binding_mismatch"); }
   if (policy.binding.providerID !== providerID || policy.binding.origin !== origin) throw spendError("binding_mismatch");
   return policy;
+};
+// Binds a broker-issued grant to the lease this gateway actually holds, BEFORE prepare.
+// prepareSpendAttempt re-normalizes the grant against target/provider/model and the policy
+// revision, but knows nothing of the session or lease: those, and purpose versus billing
+// class, are checked only here. Throws a spendError (terminal 402) on any refusal.
+//   api-continuation -- needs a split (allocations) policy AND a grant; never a legacy path.
+//   manual-api + grant -- the grant must be a manual grant bound to this lease.
+//   manual-api, no grant -- returns untouched: the legacy behavior stays exactly as it was.
+const admitSpendGrant = (leased, policy, at) => {
+  const hasGrant = Object.hasOwn(leased, "spendGrant");
+  if (leased.billingClass === "api-continuation") {
+    if (!policy.allocations) throw spendError("invalid_policy");
+    if (!hasGrant) throw spendError("binding_mismatch");
+  }
+  if (!hasGrant) return;
+  const grant = leased.spendGrant;
+  // normalizeApiSpendGrant skips any expected field that is undefined, so every lease
+  // identity must be present and non-empty here or the binding would silently loosen.
+  const expected = { sessionID: leased.sessionID, leaseID: leased.leaseID, targetID: leased.targetID,
+    providerID: leased.providerID, modelID: leased.modelID };
+  if (Object.values(expected).some(value => typeof value !== "string" || value === "")) throw spendError("binding_mismatch");
+  if (grant && typeof grant === "object" && Number.isSafeInteger(grant.expiresAtMs) && grant.expiresAtMs <= at) throw spendError("expired");
+  let normalized;
+  try { normalized = normalizeApiSpendGrant(grant, { now: at, ...expected }); } catch { throw spendError("binding_mismatch"); }
+  if (normalized.purpose !== SPEND_GRANT_PURPOSE[leased.billingClass]) throw spendError("binding_mismatch");
+  // policyRevision is the broker's pin of the policy it authorized. Spending under any other
+  // gateway policy fails closed here for every grant: an unpartitioned policy never reads the
+  // grant in prepare, and a split policy would otherwise refuse only later, as unsupported_request.
+  if (normalized.policyRevision !== policy.policyHash) throw spendError("binding_mismatch");
 };
 const validateProviderFlags = (providers) => {
   for (const [name, provider] of Object.entries(providers ?? {})) {
@@ -1518,7 +1566,7 @@ export const createGatewayHandler = ({
       ...(wireModelID ? { wireModelID } : {}),
       targetID: typeof lease?.target?.id === "string" ? lease.target.id : model.id,
       embedding: lease?.target?.embedding === true,
-      ...spendClassification(lease?.target),
+      ...spendAttestation(lease?.target),
       expectedCredentialInstance: typeof lease?.expectedCredentialInstance === "string" ? lease.expectedCredentialInstance : null,
     };
   };
@@ -1655,6 +1703,33 @@ export const createGatewayHandler = ({
         ...body,
       });
     } catch { /* broker hiccup must not fail the request */ }
+  };
+
+  const observeQuotaEvidence = async (leased, response, raw) => {
+    // An isolated outage-health assignment is a probe context, never a session lease: its 429 is
+    // health evidence only, whatever session id shape ingress admitted for it.
+    if (!leased?.external || leased.outageAssignment || !durableOpenCodeSessionID(leased.sessionID)
+      || typeof leased.leaseID !== "string" || !leased.leaseID
+      || typeof leased.targetID !== "string" || !leased.targetID) return;
+    const subscriptionQuota = extractSubscriptionQuota({ status: response.status, body: raw, headers: response.headers, now: now() });
+    if (!subscriptionQuota) return;
+    try {
+      const acknowledgement = await brokerRequest("/quota-evidence", {
+        sessionID: leased.sessionID, leaseID: leased.leaseID, targetID: leased.targetID, subscriptionQuota,
+      });
+      if (acknowledgement?.ok !== true || acknowledgement?.accepted !== true) {
+        logLine(JSON.stringify({ event: "quota_evidence_rejected" }));
+      }
+    } catch (error) {
+      // The broker refuses evidence for a lease that is not a continuation source (continuation
+      // off, or this target is not one). That is the ordinary outcome for most subscription 429s,
+      // not a delivery fault, so it stays silent. Matched on the transport's HTTP status and the
+      // broker's static code only. unknown-or-stale-lease still logs: the gateway awaits this
+      // report before answering the client, so the plugin has not yet settled this step's lease
+      // and a binding mismatch is not an expected outcome.
+      if (error?.status === 409 && error?.code === "not-a-continuation-source") return;
+      logLine(JSON.stringify({ event: "quota_evidence_delivery_failed" }));
+    }
   };
 
   // Which model ACTUALLY served a request: OpenAI's `openai-model` header (Codex reads it to warn
@@ -1965,6 +2040,7 @@ export const createGatewayHandler = ({
         if (spendPolicy && (api !== MESSAGES || probeAssignment || leased.outageAssignment
           || leased.expectedCredentialInstance != null || leased.expectedScopePolicy != null
           || leased.modelID.endsWith("-fast"))) throw spendError("unsupported_request");
+        if (spendPolicy) admitSpendGrant(leased, spendPolicy, now());
       } catch (error) {
         await settle(leased, "/release");
         return spendRefusal(error);
@@ -2321,10 +2397,19 @@ export const createGatewayHandler = ({
           let wireHeaders;
           try { wireHeaders = new Headers(checked.headers); } catch { throw spendError("unsupported_request"); }
           prepared = prepareSpendAttempt({ ...prepareArgs, headers: wireHeaders });
+          // Too little grant life left to reserve and still pass the final gate: refuse now,
+          // unreserved (the catch below releases the lease like every pre-reserve refusal).
+          if (Object.hasOwn(leased, "spendGrant")
+            && leased.spendGrant.expiresAtMs - now() < SPEND_GRANT_MIN_REMAINING_MS) throw spendError("expired");
           const args = { ledgerPath: spendPolicy.ledgerPath, policy: spendPolicy, attemptID: randomUUID() };
           const reservation = await reserveAttempt({ ...args, prepared, now: now() });
           spendReservation = args;
-          spendDeadlineMs = reservation.dispatchDeadlineMs;
+          // A split reservation already bounds this by grant expiry; an unpartitioned policy
+          // never reads the grant, so bound it here too. admitSpendGrant proved expiresAtMs is
+          // a safe integer whenever a grant is present. Synchronous: no await is introduced.
+          spendDeadlineMs = Object.hasOwn(leased, "spendGrant")
+            ? Math.min(reservation.dispatchDeadlineMs, leased.spendGrant.expiresAtMs)
+            : reservation.dispatchDeadlineMs;
           if (abort.aborted) { await uncertainSpend("aborted_before_send"); return await refuseSpend(spendError("unsupported_request")); }
         }
         // Final expiry gate, with NO await between it and the fetch below: the ledger
@@ -2417,6 +2502,7 @@ export const createGatewayHandler = ({
           parser.push(raw);
           await healthReporter.finish(response.healthAttempt, { responseHeaders: response.headers, terminal: parser.finish({ status: response.status, contentType: String(response.headers?.get?.("content-type") ?? "") }), finishedAt: now() }).catch(() => null);
         }
+        await observeQuotaEvidence(leased, response, raw);
         const text = raw.slice(0, 400);
         const usageLimit = upstreamUsageLimit(response.status, raw, response.headers, now());
         const signal = api === CHAT ? null : (upstreamSignal(raw) ?? (usageLimit ? "usage limit reached" : null));
@@ -3107,7 +3193,14 @@ export const createGatewayHandler = ({
         }
       } catch { held = null; }
       const model = held?.target?.model;
-      if (!held?.held || typeof model?.providerID !== "string" ||
+      // ☠️ PAID LEASES NEVER INHERIT THE ROTATION ABOVE. A grant-bearing held lease is spend
+      // authority for exactly one lease, so the request must name that exact lease; a session-
+      // only re-verify answer (or a missing lease header) refuses as routing, not finance: the
+      // same no-live-lease 400 below, before any reservation, fetch or settlement.
+      const paidRotation = Boolean(held?.target) && typeof held.target === "object"
+        && Object.hasOwn(held.target, "spendGrant")
+        && !(typeof boundLeaseID === "string" && boundLeaseID !== "" && boundLeaseID === held.leaseID);
+      if (!held?.held || paidRotation || typeof model?.providerID !== "string" ||
         !leaseCoversWireModel(model.id, requestedModel) || !config.providers[model.providerID]) {
         // The plugin classifies this wording as its own route error (noop), so a stale binding
         // never indicts the provider; the session re-leases on the next prompt. Status 400 (not
@@ -3131,7 +3224,7 @@ export const createGatewayHandler = ({
         modelID: model.id,
         targetID: typeof held?.target?.id === "string" ? held.target.id : model.id,
         wireModelID: requestedModel,
-        ...spendClassification(held.target),
+        ...spendAttestation(held.target),
         expectedCredentialInstance: typeof held.expectedCredentialInstance === "string" ? held.expectedCredentialInstance : null,
         external: true,
       };

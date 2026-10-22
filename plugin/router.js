@@ -40,6 +40,7 @@ import {
   routeTierForSession,
 } from "../lib/router-core.js";
 import { isAbortError, normalizeProviderError } from "../lib/provider-health.js";
+import { normalizeApiSpendGrant } from "../lib/api-spend-grant.js";
 import { describeProviderLimit, wrapUpMessage } from "../lib/usage-limit.js";
 import { classifyTurn, nextPrevious } from "../lib/turn-effort.js";
 import { randomUUID } from "node:crypto";
@@ -119,6 +120,35 @@ const contextTokensOf = (message) => {
 const SMALL_MODEL_AGENTS = new Set(["title"]);
 // Subscription providers opencode reaches through the fleet gateway (see chat.headers).
 const GATEWAY_BOUND_PROVIDERS = new Set(["anthropic", "openai"]);
+
+// A broker-attested PAID route (manual grant or API continuation). The paid provider is NOT added
+// to GATEWAY_BOUND_PROVIDERS: only this exact route's own model is bound, per route, from what the
+// broker's /lease reply attested. Any spendGrant or api-continuation claim makes the route paid.
+const PAID_PURPOSE_BY_CLASS = Object.freeze({ "manual-api": "manual", "api-continuation": "continuation" });
+const paidRouteClaim = (target) => Boolean(target) && typeof target === "object" &&
+  (Object.hasOwn(target, "spendGrant") || target.billingClass === "api-continuation");
+// Structural binding only, NOT financial admission: the grant must be closed and bound to this
+// exact session, route lease, target, provider and model, with the purpose its class names. Its
+// expiry is deliberately not judged here (it is checked at its own issue time): an expired but
+// broker-issued grant still carries its exact session/lease so the gateway and broker refuse the
+// stale authority, instead of the request silently becoming a new unbound gateway request.
+const paidRouteBound = (route, sessionID) => {
+  const target = route?.target;
+  const grant = target?.spendGrant;
+  const leaseID = route?.leaseID;
+  if (target?.requiresSpendBudget !== true || !Object.hasOwn(PAID_PURPOSE_BY_CLASS, target.billingClass ?? "")) return false;
+  if (typeof leaseID !== "string" || !leaseID || typeof sessionID !== "string" || !sessionID) return false;
+  if (typeof target.id !== "string" || typeof target.model?.providerID !== "string" || typeof target.model?.id !== "string") return false;
+  try {
+    const bound = normalizeApiSpendGrant(grant, {
+      now: grant?.issuedAtMs, sessionID, leaseID,
+      targetID: target.id, providerID: target.model.providerID, modelID: target.model.id,
+    });
+    return bound.purpose === PAID_PURPOSE_BY_CLASS[target.billingClass];
+  } catch {
+    return false;
+  }
+};
 
 export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   const brokerRequest = await createResolverProcessBrokerRequest({
@@ -771,6 +801,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         sessionID: session.id,
         profile: resolved.profile,
         tier,
+        // `parentID` is the SDK's session identity, unlike agent/tier which describe the
+        // requested work and cannot prove that this is a disposable child session.
+        sessionKind: session.parentID ? "subagent" : "primary",
         replace: true,
         ...(classifier ? { localOnly } : {}),
         // A content-filter re-prompt drives the broker's contentFilterCascade mode: it must
@@ -844,6 +877,15 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       const policy = lease?.decision?.policy ?? null;
       if (policy === "strict-fallback") {
         report("warn", `${resolved.profile}/${tier} FALLBACK: leased ${target.id} (${target.model.providerID}/${target.model.id}) because no primary ${tier} target was eligible (${(lease.decision.reasons ?? []).join(", ") || "circuits/quota/health"})`);
+        try { writeFallbackMarker(session.id, { policy, targetID: target.id, reasons: lease.decision.reasons }); } catch {}
+        if (!classifier && !session.parentID) {
+          watchFallback(session.id, { profile: resolved.profile, tier, agent: session.agent, targetID: target.id });
+        }
+      } else if (policy === "api-continuation") {
+        // A paid API continuation spends real money because the subscription lane ran out: it is
+        // a degraded route too, so it gets the same visibility (warn log + hud marker) and the
+        // same restore-home watch, and must never take the healthy branch that clears marks.
+        report("warn", `${resolved.profile}/${tier} PAID API CONTINUATION: leased ${target.id} (${target.model.providerID}/${target.model.id}) -- this turn runs on paid API continuation, billed per token, because no subscription ${tier} target was eligible (${(lease.decision.reasons ?? []).join(", ") || "quota/circuits/health"})`);
         try { writeFallbackMarker(session.id, { policy, targetID: target.id, reasons: lease.decision.reasons }); } catch {}
         if (!classifier && !session.parentID) {
           watchFallback(session.id, { profile: resolved.profile, tier, agent: session.agent, targetID: target.id });
@@ -1756,8 +1798,30 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // The same session id, plus the turn's lease id, is how the fleet gateway recognizes a
     // request this plugin already routed: it forwards on that exact lease instead of leasing
     // again from its own default tier. Sent for both subscription providers behind the gateway.
+    // A broker-attested PAID route binds ONLY its own exact model: the conversation's paid lease
+    // is never lent to a small-model or unrelated-provider call (those send nothing and stay
+    // ordinary), and a malformed attestation on the matching paid model fails before the SDK sends
+    // anything. Only session, lease and kind headers -- never a grant, purpose or billing header.
     "chat.headers": async (input, output) => {
-      if (!GATEWAY_BOUND_PROVIDERS.has(input?.model?.providerID) || !input?.sessionID || !output?.headers) return;
+      if (!input?.sessionID || !output?.headers) return;
+      const paidRoute = routes.get(input.sessionID);
+      if (paidRouteClaim(paidRoute?.target)) {
+        const model = paidRoute.target.model;
+        if (input?.model?.providerID !== model?.providerID || input?.model?.id !== model?.id) return;
+        if (!paidRouteBound(paidRoute, input.sessionID)) {
+          throw new Error("[opencode-broker] paid route attestation is malformed or unbound; resend the prompt");
+        }
+        output.headers["x-opencode-session-id"] = input.sessionID;
+        output.headers["x-opencode-lease-id"] = paidRoute.leaseID;
+        let paidSession = sessions.get(input.sessionID);
+        if (!paidSession) {
+          try { paidSession = await getSession(input.sessionID); } catch { return; }
+        }
+        if (!paidSession?.id) return;
+        output.headers["x-opencode-session-kind"] = paidSession.parentID ? "subagent" : "primary";
+        return;
+      }
+      if (!GATEWAY_BOUND_PROVIDERS.has(input?.model?.providerID)) return;
       // Lets the proxy's prompt fingerprints compare consecutive requests of one session, and the
       // gateway find the lease below. Set before the session lookup, which can fail.
       output.headers["x-opencode-session-id"] = input.sessionID;

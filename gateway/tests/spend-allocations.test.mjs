@@ -10,6 +10,10 @@ test('protected remainder is unavailable one ms before unlock', () => {
   assert.throws(() => allocationDraw({ purpose: 'continuation', reserveNano: N,
     continuationAvailableNano: 0n, manualReserveAvailableNano: 50n * N,
     now: E - W - 1, expiresAtMs: E, releaseWindowMs: W }), { code: 'allocation_exhausted' });
+  assert.deepEqual(allocationDraw({ purpose: 'continuation', reserveNano: N,
+    continuationAvailableNano: 0n, manualReserveAvailableNano: N,
+    now: E - W, expiresAtMs: E, releaseWindowMs: W }),
+  { continuationReservedNano: 0n, manualReserveReservedNano: N });
 });
 
 test('unlock is inclusive and continuation uses normal first', () => {
@@ -29,6 +33,10 @@ test('unlock is inclusive and continuation uses normal first', () => {
 test('manual draws protected funds only and expiry is exclusive', () => {
   assert.deepEqual(allocationDraw({ purpose: 'manual', reserveNano: N, continuationAvailableNano: 99n * N,
     manualReserveAvailableNano: N, now: E - 1, expiresAtMs: E, releaseWindowMs: W }),
+  { continuationReservedNano: 0n, manualReserveReservedNano: N });
+  assert.deepEqual(allocationDraw({ purpose: 'continuation', reserveNano: N,
+    continuationAvailableNano: 0n, manualReserveAvailableNano: N,
+    now: E - 1, expiresAtMs: E, releaseWindowMs: W }),
   { continuationReservedNano: 0n, manualReserveReservedNano: N });
   assert.throws(() => allocationDraw({ purpose: 'manual', reserveNano: N, continuationAvailableNano: 99n * N,
     manualReserveAvailableNano: 0n, now: E - 1, expiresAtMs: E, releaseWindowMs: W }), { code: 'allocation_exhausted' });

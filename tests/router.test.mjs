@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { createServer } from "node:http";
+import http, { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 // Route the config loader at the fleet-shaped fixture BEFORE any router module
 // loads -- config.js reads its file once at import time.
@@ -1679,8 +1679,85 @@ test("a brand-new session never seeds stickiness from the agent's pinned model",
     "the broker's fit-led choice lands on the message");
 }));
 
-test("router leases use the calling process provider catalog lazily and cache it", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+// The provider-catalog cases below drive chat.message on a factory-built router with an
+// injected brokerRequest, but chat.message first calls refreshInventory(), which uses the
+// module-level publishCachedSubscriptionInventory from lib/routing.js. That function has its
+// own default broker transport (socket path fixed at import time under the OUTER HOME), so
+// without this helper those cases escape their fake lease transport and fail with ENOENT --
+// or, on a live host, would talk to the real broker. The helper mocks lib/routing.js with
+// every real export copied verbatim except publishCachedSubscriptionInventory, which becomes
+// a recording fake that reports an accepted, unchanged inventory. A FRESH plugin/router.js is
+// imported under a unique query so its bindings link to the mock (the plain specifier is
+// already cached with the real bindings by earlier tests). While a case runs, http.request is
+// trapped: any request reaching it is recorded and rejected, and the helper fails the case if
+// one was recorded or if the fake publisher was never reached. Both mocks are restored in
+// finally, whatever the case did.
+let catalogFixtureSequence = 0;
+const withIsolatedCatalogRouter = async (run) => {
+  const realRouting = await import("../lib/routing.js");
+  const namedExports = {};
+  for (const name of Object.keys(realRouting)) {
+    if (name !== "default" && name !== "publishCachedSubscriptionInventory") namedExports[name] = realRouting[name];
+  }
+  const publishCalls = [];
+  const escapedRequests = [];
+  namedExports.publishCachedSubscriptionInventory = async (...args) => {
+    publishCalls.push(args);
+    return { accepted: true, changed: false };
+  };
+  const routingMock = mock.module("../lib/routing.js", { namedExports });
+  let httpTrap = null;
+  try {
+    httpTrap = mock.method(http, "request", (options) => {
+      escapedRequests.push({ socketPath: options?.socketPath ?? null, path: options?.path ?? null });
+      throw new Error("catalog fixture escaped to a real broker HTTP request");
+    });
+    catalogFixtureSequence += 1;
+    const { ModelRouter } = await import(`../plugin/router.js?catalog-fixture=${catalogFixtureSequence}`);
+    const result = await run({ ModelRouter, publishCalls, escapedRequests });
+    assert.deepEqual(escapedRequests, [], "no catalog case may reach a real broker over HTTP");
+    assert.ok(publishCalls.length >= 1, "inventory publication must go through the fixture publisher");
+    return result;
+  } finally {
+    httpTrap?.mock.restore();
+    routingMock.restore();
+  }
+};
+
+test("catalog fixture routes inventory publication to the fake publisher and traps broker HTTP", async () => withTempHome(async (home) => {
+  const originalRequest = http.request;
+  const calls = [];
+  await withIsolatedCatalogRouter(async ({ ModelRouter, publishCalls, escapedRequests }) => {
+    assert.notEqual(http.request, originalRequest, "http.request is trapped while the case runs");
+    assert.throws(() => http.request({ socketPath: "/nonexistent/broker.sock", path: "/inventory" }), /escaped to a real broker/);
+    assert.deepEqual(escapedRequests, [{ socketPath: "/nonexistent/broker.sock", path: "/inventory" }]);
+    // The probe above is the only expected trapped request; clear it so the helper's own
+    // no-escape check judges the plugin traffic below.
+    escapedRequests.splice(0);
+    const hooks = await ModelRouter({
+      client: {
+        config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+        session: {
+          get: async () => ({ id: "ses-catalog-fixture-probe", agent: "standard" }),
+          messages: async () => ({ data: [] }),
+        },
+        app: { log: async () => {} },
+      },
+      directory: home,
+    }, {
+      brokerRequest: async (path, body) => {
+        calls.push({ path, body });
+        return path === "/lease" ? { target: { kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } } } : {};
+      },
+    });
+    await hooks["chat.message"]({ sessionID: "ses-catalog-fixture-probe", agent: "standard" }, { message: {}, parts: [] });
+    assert.equal(publishCalls.length, 1, "one chat.message refreshes inventory through the fake publisher exactly once");
+    assert.equal(calls.filter((call) => call.path === "/lease").length, 1, "the lease still goes through the injected transport");
+  });
+  assert.equal(http.request, originalRequest, "the http.request trap is restored after the case");
+}));
+
+test("router leases use the calling process provider catalog lazily and cache it", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   let providerCatalogCalls = 0;
@@ -1720,10 +1797,9 @@ test("router leases use the calling process provider catalog lazily and cache it
   assert.deepEqual(leases[1].body.resolvableModels, ["openai/gpt-5.6-luna", "anthropic/claude-opus-5"]);
   assert.equal(providerCatalogCalls, 1, "the successful catalog result is cached for later leases");
   assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 0);
-}));
+})));
 
-test("router continues leasing without a catalog when the provider config endpoint fails", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router continues leasing without a catalog when the provider config endpoint fails", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   const hooks = await ModelRouter({
@@ -1748,10 +1824,9 @@ test("router continues leasing without a catalog when the provider config endpoi
   const lease = calls.find((call) => call.path === "/lease");
   assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
   assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
-}));
+})));
 
-test("router times out a hung provider catalog and leases without resolvableModels", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router times out a hung provider catalog and leases without resolvableModels", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   const hooks = await ModelRouter({
@@ -1777,10 +1852,9 @@ test("router times out a hung provider catalog and leases without resolvableMode
   const lease = calls.find((call) => call.path === "/lease");
   assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
   assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
-}));
+})));
 
-test("router omits a provider catalog whose JSON field would exceed the broker request budget", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router omits a provider catalog whose JSON field would exceed the broker request budget", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   const models = Object.fromEntries(Array.from({ length: 2000 }, (_, index) => [`model-${index.toString().padStart(30, "0")}`, {}]));
@@ -1807,10 +1881,9 @@ test("router omits a provider catalog whose JSON field would exceed the broker r
   assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
   const warning = logs.find((entry) => entry.level === "warn" && /provider catalog/.test(entry.message));
   assert.match(warning?.message ?? "", /\d+ characters/);
-}));
+})));
 
-test("router omits a provider catalog with more models than the broker accepts", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router omits a provider catalog with more models than the broker accepts", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   const models = Object.fromEntries(Array.from({ length: 2049 }, (_, index) => [`model-${index}`, {}]));
@@ -1834,10 +1907,9 @@ test("router omits a provider catalog with more models than the broker accepts",
   const lease = calls.find((call) => call.path === "/lease");
   assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
   assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
-}));
+})));
 
-test("router omits a provider catalog with a model id the broker rejects", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router omits a provider catalog with a model id the broker rejects", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const calls = [];
   const logs = [];
   const hooks = await ModelRouter({
@@ -1860,10 +1932,9 @@ test("router omits a provider catalog with a model id the broker rejects", async
   const lease = calls.find((call) => call.path === "/lease");
   assert.equal(Object.hasOwn(lease.body, "resolvableModels"), false);
   assert.equal(logs.filter((entry) => entry.level === "warn" && /provider catalog/.test(entry.message)).length, 1);
-}));
+})));
 
-test("router caches a timed-out provider catalog failure for sixty seconds", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router caches a timed-out provider catalog failure for sixty seconds", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   const timers = [];
   let now = 10_000;
   let providerCatalogCalls = 0;
@@ -1906,10 +1977,9 @@ test("router caches a timed-out provider catalog failure for sixty seconds", asy
   timers.shift()();
   await expired;
   assert.equal(providerCatalogCalls, 2, "the failure cache expires after sixty seconds");
-}));
+})));
 
-test("router shares one in-flight provider catalog read between concurrent leases", async () => withTempHome(async (home) => {
-  const { ModelRouter } = await import("../plugin/router.js");
+test("router shares one in-flight provider catalog read between concurrent leases", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   let providerCatalogCalls = 0;
   let resolveCatalog;
   let providerReadStarted;
@@ -1934,7 +2004,7 @@ test("router shares one in-flight provider catalog read between concurrent lease
   assert.equal(providerCatalogCalls, 1, "concurrent leases share the first catalog read");
   resolveCatalog({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } });
   await Promise.all([first, second]);
-}));
+})));
 
 // The router's messages used to go to console.error, which reaches the TUI ONLY and
 // never opencode.log -- so routine telemetry looked like an unexplained on-screen error

@@ -228,7 +228,10 @@ export function prepareSpendAttempt({ policy, providerID, targetID, url, body, h
   let canonicalGrant;
   if (policy.allocations) {
     if (!policy.registeredIdentity || targetID !== policy.registeredIdentity.targetID) fail('invalid_authorization', 'spend authorization target mismatch');
-    try { canonicalGrant = normalizeApiSpendGrant(spendGrant, { now, targetID, providerID, modelID: parsed.model }); }
+    // A split policy may approve several models, but paid egress is registered for
+    // exactly one. Another approved model is refused even with rates and a grant.
+    if (parsed.model !== policy.registeredIdentity.modelID) fail('invalid_authorization', 'spend authorization model mismatch');
+    try { canonicalGrant = normalizeApiSpendGrant(spendGrant, { now, targetID, providerID, modelID: policy.registeredIdentity.modelID }); }
     catch (error) { if (error?.code === 'invalid_authorization') throw error; fail('unsupported_request', 'invalid spend authorization'); }
     if (canonicalGrant.policyRevision !== policy.policyHash) fail('unsupported_request', 'spend authorization policy mismatch');
   }

@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createGatewayHandler } from '../../lib/gateway.js';
+import { normalizeSpendPolicy } from '../../lib/spend-policy.js';
 import { rawPolicy, policyFor, bodyFor, messageFor, NOW, MODEL, PROVIDER_ID, ORIGIN, TEST_KEY } from './spend-fixture.mjs';
 
 export const FRONTDOOR_KEY = 'synthetic-gateway-frontdoor';
@@ -22,14 +23,17 @@ export async function makeHarness({ ledgerPath, policyOverrides = {}, attested =
   const directory = await mkdtemp(join(dirname(ledgerPath), 'gateway-'));
   const keyFile = join(directory, 'synthetic-key');
   await writeFile(keyFile, TEST_KEY, { mode: 0o600 });
-  const policy = policyFor(ledgerPath, policyOverrides);
+  const target = { id: 'synthetic-target', model: { providerID: PROVIDER_ID, id: MODEL },
+    ...(attested ? { requiresSpendBudget: true, billingClass: 'manual-api' } : {}), ...brokerTargetOverrides };
+  // A split (allocations) policy is bound to the broker-selected target, so it can only be
+  // normalized with that registered identity; unpartitioned fixtures are unchanged.
+  const policy = policyOverrides.allocations === undefined ? policyFor(ledgerPath, policyOverrides)
+    : normalizeSpendPolicy(rawPolicy(ledgerPath, policyOverrides), { targetID: target.id, providerID: target.model.providerID, modelID: target.model.id });
   const provider = { baseUrl: `${ORIGIN}/v1`, keyFile, messagesApi: true,
     responsesApi: true, embeddingsApi: true,
     ...(includePolicy ? { spendBudget: rawPolicy(ledgerPath, policyOverrides) } : {}), ...providerOverrides };
   const config = { tier: 'worker', profile: 'auto', modelProfiles: { [MODEL]: 'synthetic-paid' },
     providers: { [PROVIDER_ID]: provider } };
-  const target = { id: 'synthetic-target', model: { providerID: PROVIDER_ID, id: MODEL },
-    ...(attested ? { requiresSpendBudget: true, billingClass: 'manual-api' } : {}), ...brokerTargetOverrides };
   const brokerCalls = [], logs = [], calls = [], active = new Set();
   let handler;
   try {

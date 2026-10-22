@@ -69,6 +69,18 @@ test('allocation-enabled admissions require an exact broker grant and bind it in
   assert.throws(() => prepare('target', { ...grant, targetID: 'other-target' }), { code: 'invalid_authorization' });
   assert.throws(() => prepare('target', { ...grant, modelID: 'wrong' }), { code: 'invalid_authorization' });
 });
+test('split admission refuses a second approved model that is not the registered model', () => {
+  const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } }), { targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL });
+  assert.ok(Object.hasOwn(policy.models, OPUS_MODEL), 'the second model is approved with its own rates and bounds');
+  const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: OPUS_MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };
+  const prepare = (model, grantModel = model) => prepareSpendAttempt({ policy, providerID: PROVIDER_ID, targetID: 'target', url: `${ORIGIN}/v1/messages`, body: bodyFor({ model }), headers: headersFor(), credentialFingerprint: FINGERPRINT, now: NOW, spendGrant: { ...grant, modelID: grantModel } });
+  const mismatch = { code: 'invalid_authorization', message: 'spend authorization model mismatch' };
+  assert.throws(() => prepare(OPUS_MODEL), mismatch);
+  // A grant for the registered model must not carry an unregistered body model past the
+  // prepare fence; the grant parser alone would accept this grant.
+  assert.throws(() => prepare(OPUS_MODEL, MODEL), mismatch);
+  assert.equal(prepare(MODEL).model, MODEL);
+});
 test('split admission preserves malformed and expired grant authorization failures', () => {
   const policy = normalizeSpendPolicy(rawPolicy(ledger, { ceilingUSD: '200', allocations: { continuationUSD: '150', manualReserveUSD: '50', releaseWindowHours: 48 } }), { targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL });
   const grant = { version: 1, grantID: '11111111-1111-4111-8111-111111111111', purpose: 'manual', sessionID: 'session', leaseID: 'lease', targetID: 'target', providerID: PROVIDER_ID, modelID: MODEL, profile: 'Manual Model', tier: 'paid', issuedAtMs: NOW - 1, expiresAtMs: NOW + 1, policyRevision: policy.policyHash, source: null };

@@ -36,6 +36,44 @@ test("seeding never overwrites a live reading or accepts junk", () => {
   assert.equal(P.seedPlanUsageCache(undefined), 0);
 });
 
+// A later plan lockout must not re-kind an exact quota circuit. A known-reset, unreasoned
+// quota circuit is the authority continuation records are bound to; replacing it with a
+// plan-window circuit revoked every record on the provider. It is extended in place instead.
+test("a later plan lockout extends a known-reset quota circuit in place, keeping it quota", () => {
+  const now = Date.parse("2026-10-22T10:00:00Z");
+  const reset = now + 30 * 60_000;
+  const locked = now + 3 * 3600_000;
+  const circuits = { "provider:src": { kind: "quota", until: reset, resetKnown: true, updatedAt: now - 60_000 } };
+  P.applyPlanUsageCircuit(circuits, "provider:src", { lockedUntil: locked }, now);
+  assert.deepEqual(circuits["provider:src"], { kind: "quota", until: locked, resetKnown: true, updatedAt: now });
+
+  // A healthy report still never clears the (non-plan) quota circuit.
+  P.applyPlanUsageCircuit(circuits, "provider:src", { lockedUntil: null }, now + 1000);
+  assert.deepEqual(circuits["provider:src"], { kind: "quota", until: locked, resetKnown: true, updatedAt: now });
+});
+
+test("every other shorter circuit is still replaced by the plan window, unchanged", () => {
+  const now = Date.parse("2026-10-22T10:00:00Z");
+  const reset = now + 30 * 60_000;
+  const locked = now + 3 * 3600_000;
+  for (const [label, existing] of [
+    ["unknown-reset quota", { kind: "quota", until: reset, resetKnown: false, updatedAt: now - 1 }],
+    ["reasoned (lapsed) quota", { kind: "quota", reason: "plan-lapsed", until: reset, resetKnown: true, updatedAt: now - 1 }],
+    ["legacy quota without resetKnown", { kind: "quota", until: reset, updatedAt: now - 1 }],
+    ["rate circuit", { kind: "rate", until: reset, updatedAt: now - 1 }],
+    ["older plan window", { kind: P.PLAN_WINDOW_KIND, until: reset, updatedAt: now - 1 }],
+  ]) {
+    const circuits = { "provider:src": { ...existing } };
+    P.applyPlanUsageCircuit(circuits, "provider:src", { lockedUntil: locked }, now);
+    assert.deepEqual(circuits["provider:src"], { kind: P.PLAN_WINDOW_KIND, until: locked, updatedAt: now }, label);
+  }
+  // A longer known-reset quota circuit is still never shortened or touched.
+  const longer = { kind: "quota", until: locked + 1000, resetKnown: true, updatedAt: now - 1 };
+  const circuits = { "provider:src": { ...longer } };
+  P.applyPlanUsageCircuit(circuits, "provider:src", { lockedUntil: locked }, now);
+  assert.deepEqual(circuits["provider:src"], longer);
+});
+
 test("a usage CLI that never closes its pipes cannot hang the fleet", async () => {
   // execFile's `timeout` SIGTERMs the child but promisify settles on `close`, which a
   // grandchild holding stdout keeps from ever firing. /lease awaits this refresh, so the

@@ -105,6 +105,24 @@ test("chat.headers marks gateway-bound requests as primary or subagent, with the
   });
 });
 
+test("leases carry the SDK session kind derived from parentID", () => {
+  const result = runPlugin(`
+    const send = (sessionID, agent) => hooks["chat.message"](
+      { sessionID, agent, model: { providerID: "openai", id: "gpt-5.6-sol" } },
+      { message: { agent, model: { providerID: "openai", modelID: "gpt-5.6-sol" } }, parts: [{ type: "text", text: "go" }] },
+    );
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-root", agent: "smart" } } } });
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "ses-child", parentID: "ses-root", agent: "sp-implementer" } } } });
+    await send("ses-root", "smart");
+    await send("ses-child", "sp-implementer");
+    console.log(JSON.stringify(leases.map((lease) => ({ sessionID: lease.sessionID, sessionKind: lease.sessionKind }))));
+  `);
+  assert.deepEqual(result, [
+    { sessionID: "ses-root", sessionKind: "primary" },
+    { sessionID: "ses-child", sessionKind: "subagent" },
+  ]);
+});
+
 // The gateway forwards a routed session's request on that session's own lease, so the
 // header must name the lease the turn actually holds.
 test("chat.headers carries the routed turn's lease id", () => {

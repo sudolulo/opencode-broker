@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { DEFAULT_GATEWAY_CONFIG, createGatewayHandler, loadGatewayConfig, readGatewayKeyFile } from "../lib/gateway.js";
-import { brokerRequest, createHealthBrokerRequest, selectBrokerTransport } from "../../lib/client.js";
+import { brokerRequest, createHealthBrokerRequest, createQuotaEvidenceBrokerRequest, selectBrokerTransport } from "../../lib/client.js";
 import { readHealthKey } from "../../lib/model-health-key.js";
 
 const deprecations = [];
@@ -93,7 +93,8 @@ try {
   }
 } catch { /* broker down: nothing to sweep */ }
 const healthRequest = createHealthBrokerRequest();
-const request = selectBrokerTransport({ brokerRequest, healthRequest });
+const quotaEvidenceRequest = createQuotaEvidenceBrokerRequest();
+const request = selectBrokerTransport({ brokerRequest, healthRequest, quotaEvidenceRequest });
 const handler = createGatewayHandler({ config, brokerRequest: request, gatewayKey, tenantToken, health });
 const port = Number(process.env.PORT) || 8790;
 const host = process.env.HOST || "127.0.0.1";

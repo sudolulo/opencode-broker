@@ -45,6 +45,7 @@ import {
   isProfile,
   normalizeDiscoveredInventory,
   revalidateAdmission,
+  providerAuthRevision,
   providerCircuitID,
   quotaRenewalAt,
   routingStateDir,
@@ -62,6 +63,7 @@ import {
 } from "../lib/routing.js";
 import {
   authorizedReserveIDs,
+  automaticAllowed,
   buildCanonicalHeads,
   markManagedOutageScope,
   outageRoutingEnabled,
@@ -90,7 +92,23 @@ import { sanitizeCaller, summarizeUsage, usageRecord } from "../lib/usage-log.js
 import { resolveTurnEffort, TURN_CLASSES, TURN_REASONS } from "../lib/turn-effort.js";
 import { TURN_EFFORT_CONFIG, TURN_EFFORT_CONFIG_ERROR } from "../lib/turn-effort-config.js";
 import { notifyArgv } from "../lib/notify.js";
-import { CONFIG_FINGERPRINT, DEPRECATIONS, envSetting, ROUTE_TIER_NAMES } from "../lib/config.js";
+import { API_CONTINUATION_CONFIG_ERROR, CONFIG_FINGERPRINT, DEPRECATIONS, envSetting, ROUTE_TIER_NAMES } from "../lib/config.js";
+import {
+  continuationAuthorityCurrent,
+  continuationRecordPermanentlyInvalid,
+  continuationSessionEligible,
+  durableOpenCodeSessionID,
+  lateContinuationRequestEligible,
+  mintSpendGrant,
+  NON_GENERATION_TIERS,
+  normalizeApiContinuationRecord,
+  normalizeApiContinuationRecords,
+  normalizeSubscriptionQuota,
+  sourceTargetEligible,
+  subscriptionQuotaFailureContradicted,
+} from "../lib/api-continuation.js";
+import { normalizeApiSpendGrant } from "../lib/api-spend-grant.js";
+import { manualApiAdmission } from "../lib/manual-api.js";
 import {
   compareAndSwapModelPolicy,
   emptyModelPolicy,
@@ -120,6 +138,7 @@ import {
   markProbationSuccessHealthy,
   normalizeHealth,
   normalizeProviderError,
+  providerErrorText,
   operatorQuarantineProvider,
   providerEligible,
   isProviderOriginated,
@@ -330,7 +349,7 @@ const reportInventoryDrops = ({ droppedTargets, droppedModelKeys }, source = "/i
     console.error(`[opencode-broker] ${source} dropped catalog data for ${droppedModelKeys.length} unresolvable model(s): ${named}${overflow(droppedModelKeys, 10)}`);
   }
 };
-const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy(), outages: emptyOutages(), policyAvoids: {} });
+const emptyState = () => ({ version: 5, leases: {}, assignments: {}, circuits: {}, cursors: {}, inventory: emptyInventory(), health: emptyHealth(), budgets: {}, lastDecision: null, planUsage: {}, rebalances: {}, modelPolicy: emptyModelPolicy(), outages: emptyOutages(), policyAvoids: {}, apiContinuations: {} });
 const readState = () => {
   let source;
   try {
@@ -397,6 +416,11 @@ const readState = () => {
       // never passed through. Whatever does not decode restores as "can authorize nothing".
        outages: decodeOutages(value?.outages, { policy: CONFIG.modelOutages }),
       policyAvoids: normalizePolicyAvoids(value?.policyAvoids),
+      // Subscription-quota source proof (lib/api-continuation.js). Untrusted on reload like
+      // everything else here: a malformed or non-durable record is dropped, never repaired. The
+      // decoded map is frozen, so a mutable copy is kept; serve()'s first sweep then re-proves
+      // every survivor against the live circuit, auth and policy before anything reads it.
+      apiContinuations: { ...normalizeApiContinuationRecords(value?.apiContinuations, { now: Date.now(), max: MAX_ASSIGNMENTS }) },
     };
   }
 };
@@ -500,6 +524,9 @@ const writeState = (state, { requireDurable = false } = {}) => {
 };
 
 const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(sessionID);
+const normalizeSessionKind = (sessionKind) => sessionKind === "primary" || sessionKind === "subagent"
+  ? sessionKind
+  : null;
 // The prefix a per-request session id must carry. The gateway builds `gw-<time36>-<rand>`
 // for every client call; nothing else may claim oneShot (acquire() refuses it).
 const ONE_SHOT_SESSION_PREFIX = /^gw-/;
@@ -514,17 +541,64 @@ const manualApiAttestation = (target) => {
     : {};
 };
 
-const publicTarget = (target, tier, modelVariants) => target && {
+// `attestation` is the paid context of an ACTUAL lease (currentLeaseAttestation). Only a caller
+// without a lease -- /preview -- falls back to the static legacy manual attestation, which never
+// carries a grant and can never say api-continuation.
+const publicTarget = (target, tier, modelVariants, attestation = manualApiAttestation(target)) => target && {
   id: target.id,
   model: modelRefForTier(target, tier, modelVariants),
   kind: target.kind,
   ...(target.embedding === true ? { embedding: true } : {}),
-  ...manualApiAttestation(target),
+  ...attestation,
 };
+
+// /status is readable by any local client, so the continuation internals stay in the private
+// state file only: a spend grant, the source snapshot, a quota observation or its conflict
+// tombstone become presence booleans, and a grant-bearing lease loses its lease ID (the ID is
+// what /lease/verify attests, so publishing it would hand out the paid route). Ordinary leases
+// keep every field, including leaseID -- the gateway's startup sweep reads only the lease keys.
+const CONTINUATION_LEASE_FIELDS = Object.freeze({
+  spendGrant: "hasSpendGrant",
+  apiContinuationSource: "hasApiContinuationSource",
+  quotaObservation: "hasQuotaObservation",
+  quotaObservationConflict: "hasQuotaObservationConflict",
+});
+const publicLease = (lease) => {
+  if (!lease || typeof lease !== "object" || Array.isArray(lease)) return lease;
+  const out = { ...lease };
+  for (const [field, flag] of Object.entries(CONTINUATION_LEASE_FIELDS)) {
+    if (!Object.hasOwn(out, field)) continue;
+    const present = out[field] !== undefined && out[field] !== null;
+    delete out[field];
+    if (present) out[flag] = true;
+  }
+  if (out.hasSpendGrant === true) delete out.leaseID;
+  return out;
+};
+
+// The assignment records the same lease ID, so it is dropped there too for exactly the
+// grant-bearing leases -- those still held, and (by the assignment's grantLease mark) those that
+// have already ended; every other assignment field (and every ordinary assignment) is kept.
+const grantLeaseIDs = (leases) => new Set(Object.values(leases ?? {})
+  .filter((lease) => lease?.spendGrant !== undefined && lease?.spendGrant !== null && typeof lease.leaseID === "string")
+  .map((lease) => lease.leaseID));
+const publicAssignments = (assignments, hidden) => Object.fromEntries(Object.entries(assignments ?? {})
+  .map(([sessionID, assignment]) => {
+    if (!assignment || typeof assignment !== "object" ||
+      (!hidden.has(assignment.leaseID) && assignment.grantLease !== true)) return [sessionID, assignment];
+    const { leaseID: _hidden, ...rest } = assignment;
+    return [sessionID, rest];
+  }));
 
 const publicState = (state, resolverProcesses = null) => ({
   ...state,
+  leases: Object.fromEntries(Object.entries(state.leases ?? {}).map(([sessionID, lease]) => [sessionID, publicLease(lease)])),
+  assignments: publicAssignments(state.assignments, grantLeaseIDs(state.leases)),
+  apiContinuations: Object.fromEntries(Object.keys(state.apiContinuations ?? {}).map((sessionID) => [sessionID, true])),
   turnEffortConfigError: TURN_EFFORT_CONFIG_ERROR,
+  // A boolean only: the key-only message is on stderr at startup. true means every registered
+  // manual API target is fail-closed until the apiContinuation block is fixed.
+  apiContinuationConfigError: API_CONTINUATION_CONFIG_ERROR !== null,
   ...(resolverProcesses ? { resolverProcesses: resolverProcesses.status() } : {}),
   circuits: Object.fromEntries(Object.entries(state.circuits).map(([key, circuit]) => [key, {
     ...circuit,
@@ -752,6 +826,330 @@ const dropOneShotAssignment = (state, sessionID, leaseID) => {
   }
 };
 
+// ── Subscription-quota continuation EVIDENCE (lib/api-continuation.js) ───────────────────────
+// This phase only captures and proves; nothing here routes to, grants or funds a paid target.
+//   1. A NEW eligible ordinary source lease carries a closed private snapshot of its source
+//      identity (apiContinuationSource). Held legacy leases are never retrofitted.
+//   2. /quota-evidence stores one broker-timestamped observation on that EXACT current lease. It
+//      settles nothing and creates no circuit, usage, proof or grant.
+//   3. The plugin's later exact /failure on that lease consumes the observation and, only for an
+//      uncontradicted quota failure with a matching (or lost) reset, persists a closed record in
+//      state.apiContinuations once continuationAuthorityCurrent re-proves it.
+//   4. sweep() prunes every record that is orphaned or no longer current authority.
+// The snapshot is not a paid attestation and no secret or raw provider body is ever stored.
+// Circuit kinds that are a real USAGE stop: mirrors lib/usage-limit.js activeUsageLimits exactly
+// (its `["plan-window", "quota"].includes(circuit.kind)`); keep the two lists in step.
+const USAGE_STOP_CIRCUIT_KINDS = Object.freeze(["plan-window", "quota"]);
+const SOURCE_SNAPSHOT_KEYS = Object.freeze(["version", "targetID", "providerID", "modelID", "authRevision", "policyRevision", "issuedAtMs"]);
+const QUOTA_OBSERVATION_KEYS = Object.freeze(["version", "observedAtMs", "policyRevision", "subscriptionQuota"]);
+const QUOTA_EVIDENCE_BODY_KEYS = Object.freeze(["sessionID", "leaseID", "targetID", "subscriptionQuota"]);
+const closedKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype && Object.keys(value).length === keys.length &&
+  keys.every((key) => Object.hasOwn(value, key));
+
+// Durable native session, auto profile, generation tier, never a one-shot or embeddings call.
+// Probes (gw-probe-*) and gateway one-shots fail the durable session ID check.
+const continuationGenerationLease = ({ sessionID, profile, tier, oneShot, api }) =>
+  continuationSessionEligible({ sessionID, profile, oneShot, api }) &&
+  ROUTE_TIER_NAMES.includes(tier) && !NON_GENERATION_TIERS.includes(tier);
+
+// A readable revision of the SOURCE provider's own auth.json entry (lib/routing.js
+// providerAuthRevision), or null when the file is unreadable or the provider has no entry. This,
+// not the whole-file revision, is what a source snapshot and a continuation record are fenced to:
+// an unrelated provider's OAuth refresh rewrites the file but must not revoke the record.
+const liveSourceAuthRevision = (providerID) => {
+  const revision = typeof providerID === "string" && providerID ? providerAuthRevision(providerID) : null;
+  return typeof revision === "string" && revision !== "absent" ? revision : null;
+};
+
+// The live source context for one target: the enabled policy, its published provider, ONE
+// whole-file auth snapshot whose non-null revision equals the published inventory revision, and
+// the source provider's own readable entry revision.
+const continuationSourceContext = (state, target) => {
+  const policy = CONFIG.apiContinuation;
+  if (policy?.enabled !== true || !target) return null;
+  const auth = authSnapshot();
+  if (!auth.revision || auth.revision !== state.inventory?.authRevision) return null;
+  const provider = state.inventory?.providers?.[target.providerID];
+  if (!sourceTargetEligible({ target, policy, provider, liveAuthType: auth.types?.[target.providerID],
+    manualApiTargets: CONFIG.manualApiTargets })) return null;
+  const sourceAuthRevision = liveSourceAuthRevision(target.providerID);
+  if (sourceAuthRevision === null) return null;
+  return { policy, auth, provider, sourceAuthRevision };
+};
+
+const issueContinuationSource = (state, request, target, now) => {
+  if (!continuationGenerationLease(request)) return null;
+  const context = continuationSourceContext(state, target);
+  if (!context) return null;
+  return {
+    version: 1,
+    targetID: target.id,
+    providerID: target.providerID,
+    modelID: target.modelID,
+    // The source provider's own entry revision, never the whole-file revision.
+    authRevision: context.sourceAuthRevision,
+    policyRevision: context.policy.revision,
+    issuedAtMs: now,
+  };
+};
+
+// Re-proves a held lease's snapshot wherever it is used: exact closed shape, an unexpired lease
+// still on the snapshot's target, and the CURRENT policy, source identity and auth revision.
+const currentContinuationSource = (state, lease, now) => {
+  const snapshot = lease?.apiContinuationSource;
+  if (!closedKeys(snapshot, SOURCE_SNAPSHOT_KEYS) || snapshot.version !== 1) return null;
+  if (!Number.isSafeInteger(snapshot.issuedAtMs) || snapshot.issuedAtMs > now) return null;
+  if (!Number.isFinite(lease.touchedAt) || now - lease.touchedAt > LEASE_TTL_MS) return null;
+  if (snapshot.targetID !== lease.targetID) return null;
+  if (!continuationGenerationLease({ sessionID: lease.sessionID, profile: lease.profile, tier: lease.tier })) return null;
+  const target = targetForID(snapshot.targetID, allTargets(state));
+  if (!target || target.providerID !== snapshot.providerID || target.modelID !== snapshot.modelID) return null;
+  const context = continuationSourceContext(state, target);
+  if (!context || context.policy.revision !== snapshot.policyRevision || context.sourceAuthRevision !== snapshot.authRevision) return null;
+  return { snapshot, target, ...context };
+};
+
+// A stored observation, still valid for this source at `now`, or null.
+const currentQuotaObservation = (observation, source, now) => {
+  if (!closedKeys(observation, QUOTA_OBSERVATION_KEYS) || observation.version !== 1) return null;
+  if (!Number.isSafeInteger(observation.observedAtMs) || observation.observedAtMs < source.snapshot.issuedAtMs ||
+    observation.observedAtMs > now) return null;
+  if (observation.policyRevision !== source.snapshot.policyRevision) return null;
+  const subscriptionQuota = normalizeSubscriptionQuota(observation.subscriptionQuota, { now });
+  return subscriptionQuota ? { observedAtMs: observation.observedAtMs, policyRevision: observation.policyRevision, subscriptionQuota } : null;
+};
+
+const sameSubscriptionQuota = (a, b) => a.version === b.version && a.kind === b.kind &&
+  a.window === b.window && a.resetAtMs === b.resetAtMs;
+
+// Whether a stored record is still authority, judged against a FRESH context every time: `auth` is
+// the caller's one whole-file snapshot, and the source provider's own entry revision is read here.
+const continuationRecordCurrent = (state, record, auth, now) => {
+  const sourceTarget = targetForID(record?.sourceTargetID, allTargets(state));
+  if (!sourceTarget) return false;
+  return continuationAuthorityCurrent({
+    record,
+    policy: CONFIG.apiContinuation,
+    sourceTarget,
+    provider: state.inventory?.providers?.[sourceTarget.providerID],
+    liveAuthType: auth.types?.[sourceTarget.providerID],
+    circuit: state.circuits[providerCircuitID(sourceTarget)],
+    liveSourceAuthRevision: providerAuthRevision(sourceTarget.providerID),
+    liveAuthRevision: auth.revision,
+    inventoryAuthRevision: state.inventory?.authRevision,
+    manualApiTargets: CONFIG.manualApiTargets,
+    now,
+  });
+};
+
+// Called by /failure right after it wrote the ordinary quota circuit. The record captures that
+// exact circuit and is persisted only if it is current authority as built.
+const recordContinuationProof = (state, sessionID, lease, { source, observed }, target) => {
+  const circuit = state.circuits[providerCircuitID(target)];
+  const now = Date.now();
+  // The snapshot carries the source provider's own entry revision; never record without one.
+  const sourceAuthRevision = source.snapshot.authRevision;
+  if (typeof sourceAuthRevision !== "string" || !sourceAuthRevision || sourceAuthRevision === "absent") return false;
+  const record = normalizeApiContinuationRecord({
+    sourceLeaseID: lease.leaseID,
+    sourceTargetID: source.snapshot.targetID,
+    sourceModelID: source.snapshot.modelID,
+    sourceProviderID: source.snapshot.providerID,
+    sourceAuthRevision,
+    observedAtMs: observed.observedAtMs,
+    circuitKind: circuit?.kind,
+    circuitUpdatedAtMs: circuit?.updatedAt,
+    circuitUntilMs: circuit?.until,
+    policyRevision: source.snapshot.policyRevision,
+    quotaEvidenceClosed: observed.subscriptionQuota,
+  }, { now });
+  if (!record || !continuationRecordCurrent(state, record, authSnapshot(), now)) return false;
+  state.apiContinuations ??= {};
+  state.apiContinuations[sessionID] = record;
+  return true;
+};
+
+// Run by sweep() after the lease, assignment and circuit janitors. A record outlives ordinary
+// lease settlement and fresh assignment replacement (the session's pin is retained), and goes
+// with the pin's own TTL/cap eviction, or once it can NEVER be authority again
+// (continuationRecordPermanentlyInvalid): source entry rewritten or removed, circuit cleared,
+// re-kinded, shortened or expired, routing policy drift, source identity drift. A merely
+// non-current record -- stale inventory, unreadable auth.json, a circuit that lost its known
+// reset -- is kept: every reader re-proves currency, so keeping it grants nothing.
+const pruneApiContinuations = (state, now) => {
+  const records = state.apiContinuations && typeof state.apiContinuations === "object" && !Array.isArray(state.apiContinuations)
+    ? state.apiContinuations : {};
+  const sessionIDs = Object.keys(records);
+  if (!sessionIDs.length) {
+    state.apiContinuations = {};
+    return;
+  }
+  const targets = allTargets(state);
+  // One auth.json read per distinct source provider for this sweep. The raw value (null when the
+  // file is unreadable, "absent" when the entry is gone) is passed through: only a readable
+  // differing revision is permanent.
+  const sourceRevisions = new Map();
+  const sourceRevision = (providerID) => {
+    if (typeof providerID !== "string" || !providerID) return undefined;
+    if (!sourceRevisions.has(providerID)) sourceRevisions.set(providerID, providerAuthRevision(providerID));
+    return sourceRevisions.get(providerID);
+  };
+  const kept = {};
+  for (const sessionID of sessionIDs) {
+    if (!durableOpenCodeSessionID(sessionID) || !(state.assignments[sessionID] || state.leases[sessionID])) continue;
+    const record = records[sessionID];
+    const sourceTarget = targetForID(record?.sourceTargetID, targets);
+    // A source target absent from the current view is UNKNOWN (inventory may republish it), not drift.
+    const identityOK = sourceTarget
+      ? sourceTarget.providerID === record?.sourceProviderID && sourceTarget.modelID === record?.sourceModelID
+      : undefined;
+    if (continuationRecordPermanentlyInvalid({
+      record,
+      circuit: state.circuits[providerCircuitID(record?.sourceProviderID)],
+      liveSourceAuthRevision: sourceRevision(record?.sourceProviderID),
+      policyRevision: CONFIG.apiContinuation?.revision,
+      now,
+      identityOK,
+    })) continue;
+    kept[sessionID] = record;
+  }
+  // Decoding still drops malformed records and bounds the map at the assignment cap.
+  state.apiContinuations = { ...normalizeApiContinuationRecords(kept, { now, max: MAX_ASSIGNMENTS }) };
+};
+
+// ── Paid lease AUTHORITY ─────────────────────────────────────────────────────────────────────────
+// A paid lease carries a broker-minted spendGrant (lib/api-continuation.js mintSpendGrant). It is
+// routing authority only: the gateway and ledger still own financial admission. Every reader --
+// held-lease reuse, the /lease reply and /lease/verify -- goes through currentLeaseAttestation,
+// which re-proves the grant against CURRENT config, registration, pin, admission and (for
+// continuation) the current exact source proof. Nothing here reads credentials, rates, wallets
+// or computes a financial hash: the pin is operator-copied config.
+
+// Exactly the immutable static manual registration: same ID, provider, model, cloud, no source.
+const registeredPaidTarget = (target) => {
+  const registration = typeof target?.id === "string" && Object.hasOwn(CONFIG.manualApiTargets, target.id)
+    ? CONFIG.manualApiTargets[target.id] : null;
+  return Boolean(registration) && target.kind === "cloud" && target.source === undefined &&
+    target.providerID === registration.providerID && target.modelID === registration.modelID;
+};
+
+// Invalid-config fail-closed rule: while a PRESENT apiContinuation block is invalid (lib/config.js API_CONTINUATION_CONFIG_ERROR)
+// its pins are unknown, so legacy unpinned manual leasing would be a fail-OPEN. Every target
+// registered in CONFIG.manualApiTargets is then unleasable, unverifiable and grantless. Keyed by
+// ID alone (not the exact registration match) so a drifted same-ID target is refused as well.
+const manualApiTargetConfigBlocked = (targetID) => API_CONTINUATION_CONFIG_ERROR !== null &&
+  typeof targetID === "string" && Object.hasOwn(CONFIG.manualApiTargets, targetID);
+const API_CONTINUATION_CONFIG_REFUSAL = Object.freeze({
+  code: "api-continuation-config-invalid",
+  reason: "manual API targets are disabled: the apiContinuation config block is invalid (see the broker log); fix it and restart the broker",
+});
+
+// The operator-configured financial pin for one paid target, or null (legacy unpartitioned).
+const financialPin = (targetID) => {
+  const pins = CONFIG.apiContinuation?.spendPolicyHashes;
+  return typeof targetID === "string" && pins && Object.hasOwn(pins, targetID) ? pins[targetID] : null;
+};
+
+// The paid context an ACTUAL lease may publish right now:
+//   {}                                  an ordinary (unpaid) lease;
+//   {requiresSpendBudget, billingClass:"manual-api"}
+//                                       a LEGACY unpinned manual lease, exactly as before;
+//   {requiresSpendBudget, billingClass, spendGrant}
+//                                       a grant that is current authority at `now`;
+//   null                                a paid lease whose authority cannot be proven NOW: any
+//                                       malformed/expired/rebound grant, a drifted pin, TTL,
+//                                       registration, admission or tier, a continuation whose
+//                                       exact source proof is gone, or a pinned paid target
+//                                       leased without a grant (minted before the pin existed).
+// Raw stored state is untrusted: only what normalizes and matches is ever attested. `leaseKey` is
+// the state.leases key the lease is stored under; a lease whose own sessionID is missing or names
+// another session (corrupted or hand-edited state) attests nothing, so a grant minted for one
+// session can never be reused or verified under another session's key.
+const currentLeaseAttestation = (state, leaseKey, lease, now = Date.now()) => {
+  if (typeof leaseKey !== "string" || typeof lease?.sessionID !== "string" || lease.sessionID !== leaseKey) return null;
+  const target = targetForID(lease?.targetID, allTargets(state));
+  if (!target) return null;
+  if (manualApiTargetConfigBlocked(target.id)) return null;
+  if (lease.spendGrant === undefined) {
+    const legacy = manualApiAttestation(target);
+    if (legacy.requiresSpendBudget === true && financialPin(target.id) !== null) return null;
+    return legacy;
+  }
+  if (!registeredPaidTarget(target) || typeof lease.leaseID !== "string" || !lease.leaseID) return null;
+  if (!Number.isFinite(lease.touchedAt) || now - lease.touchedAt > LEASE_TTL_MS) return null;
+  let grant;
+  try {
+    grant = normalizeApiSpendGrant(lease.spendGrant, {
+      now, sessionID: lease.sessionID, leaseID: lease.leaseID,
+      targetID: target.id, providerID: target.providerID, modelID: target.modelID,
+    });
+  } catch {
+    return null;
+  }
+  const policy = CONFIG.apiContinuation;
+  if (grant.profile !== lease.profile || grant.tier !== lease.tier) return null;
+  const pin = financialPin(target.id);
+  if (pin === null || grant.policyRevision !== pin) return null;
+  if (grant.expiresAtMs - grant.issuedAtMs > policy.grantTTLms) return null;
+  if (grant.purpose === "manual") {
+    if (grant.source !== null || manualApiAdmission(target, lease.profile, CONFIG.manualApiTargets) !== true) return null;
+    return { requiresSpendBudget: true, billingClass: "manual-api", spendGrant: grant };
+  }
+  // Continuation: the enabled role for this exact target and tier, a durable auto generation
+  // lease, and the CURRENT exact source proof the grant was minted from -- the same record, not
+  // whatever newer record the session may hold now.
+  if (policy.enabled !== true || !Object.hasOwn(policy.targets, target.id) || !policy.targets[target.id].includes(lease.tier)) return null;
+  if (!continuationGenerationLease({ sessionID: lease.sessionID, profile: lease.profile, tier: lease.tier })) return null;
+  const record = state.apiContinuations?.[lease.sessionID];
+  if (!record || !continuationRecordCurrent(state, record, authSnapshot(), now)) return null;
+  const source = grant.source;
+  if (source.providerID !== record.sourceProviderID || source.targetID !== record.sourceTargetID ||
+    source.leaseID !== record.sourceLeaseID || source.modelID !== record.sourceModelID ||
+    source.quotaObservedAtMs !== record.observedAtMs || source.quotaUntilMs !== record.circuitUntilMs) return null;
+  return { requiresSpendBudget: true, billingClass: "api-continuation", spendGrant: grant };
+};
+
+// The LATE paid continuation candidate, consulted only from acquire()'s final refusal branch once
+// ordinary selection, stickiness and context pressure have all produced nothing. It never widens
+// ordinary admission (cloudTargetAdmitted keeps quarantining manual targets for auto): it is a
+// separate strict predicate over the exact policy-listed static registrations, in the policy's
+// normalized (sorted target ID) order, honouring every request narrowing and target health fence.
+// Returns the first eligible target or null; it mutates nothing.
+const lateContinuationTarget = (state, {
+  tier, targets, excluded, providerAllowlist, resolvableModels, contextTokens, outageContext, outageEnabled, probationOnly,
+}) => {
+  const policy = CONFIG.apiContinuation;
+  if (policy?.enabled !== true) return null;
+  const now = Date.now();
+  const every = allTargets(state);
+  const active = activeCounts(state, every);
+  const providerActive = activeProviderCounts(state, every);
+  for (const targetID of Object.keys(policy.targets)) {
+    if (!policy.targets[targetID].includes(tier) || financialPin(targetID) === null) continue;
+    const target = Object.hasOwn(targets, targetID) ? targets[targetID] : null;
+    if (!target || !registeredPaidTarget(target) || target.embedding === true) continue;
+    if (policy.sourceProviders.includes(target.providerID)) continue;
+    const modelKey = `${target.providerID}/${target.modelID}`;
+    if (excluded.has(target.id)) continue;
+    if (providerAllowlist && !providerAllowlist.has(target.providerID)) continue;
+    if (resolvableModels && !resolvableModels.has(modelKey)) continue;
+    // Outage and model-policy gates: a managed/reserve target or any staged/active model-policy
+    // role on this identity is not provably safe to override, so it is skipped (fail closed).
+    if (outageEnabled && (policyReserveIDs(CONFIG.modelOutages).has(target.id) ||
+      (outageContext && !automaticAllowed(target, outageContext)))) continue;
+    if (probationOnly.has(modelKey) || modelPolicyRoleForTarget(state, target)) continue;
+    if ([state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((circuit) =>
+      circuit && (circuit.until === null || Number(circuit.until) > now))) continue;
+    if (!contextFits(targetContext(target, state.inventory?.modelContexts), contextTokens,
+      targetOutputReserve(target, state.inventory?.modelOutputs))) continue;
+    if (targetFull(target, active)) continue;
+    if (!providerEligible(state.health, target.providerID, providerActive[target.providerID] ?? 0)) continue;
+    return target;
+  }
+  return null;
+};
+
 const sweep = (state, now = Date.now()) => {
   // Expired policy avoids go first; then the cap drops the soonest-expiring (oldest) ones.
   if (state.policyAvoids) {
@@ -779,9 +1177,12 @@ const sweep = (state, now = Date.now()) => {
   // costing it its pinned model on its next selection. The lease loop above has already dropped
   // the expired leases, so what remains in state.leases is alive right now.
   for (const [sessionID, assignment] of Object.entries(state.assignments)) {
-    // Worker-tier (subagent) pins reclaim at the cache-cold mark; every other pin at the full TTL.
-    // A missing/unknown tier falls through to the long TTL, so an interactive pin is never cut short.
-    const idleTTL = assignment?.tier === "worker" ? WORKER_ASSIGNMENT_TTL_MS : ASSIGNMENT_TTL_MS;
+    // Only a caller's explicit SDK-derived subagent identity proves this is disposable. A worker
+    // tier describes the requested model lane, and generic primary workers are ordinary session
+    // pins; legacy, missing, and invalid identities therefore retain the full TTL.
+    const idleTTL = assignment?.tier === "worker" && assignment?.sessionKind === "subagent"
+      ? WORKER_ASSIGNMENT_TTL_MS
+      : ASSIGNMENT_TTL_MS;
     if (!state.leases[sessionID] && now - assignmentLastActive(assignment) > idleTTL) {
       removePolicyLeaseBinding(state, assignment);
       delete state.assignments[sessionID];
@@ -843,6 +1244,7 @@ const sweep = (state, now = Date.now()) => {
     if (circuit?.until !== null && Number(circuit?.until) <= now) delete state.circuits[targetID];
   }
   state.health = normalizeHealth(state.health, now);
+  pruneApiContinuations(state, now);
 };
 
 const activeProviderCounts = (state, targets = allTargets(state), excludeSessionID = null) => {
@@ -1026,7 +1428,10 @@ const prepareTarget = (target, { sessionID } = {}) => {
 // refusal above is the one such path today.
 // `usage-limit` is `no-eligible-target` with the cause known: every cloud provider in the lane is
 // held out by a plan window or quota stop, and the message names each one and when it returns.
-const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target", "usage-limit"]);
+// `api-continuation-config-invalid`: the lane names a registered manual API target that an invalid
+// apiContinuation block fails closed; terminal until the operator fixes the config.
+const REFUSAL_CODES = new Set(["target-preparing", "target-busy", "no-eligible-local-target", "no-eligible-target", "no-resolvable-target", "usage-limit",
+  "api-continuation-config-invalid"]);
 // ☠️ `refusalCode`, NOT `code`. This handler's catch sees EVERY error, and node puts
 // its own `code` on system errors (ENOENT from a state write, EPIPE from a socket) --
 // forwarding that field would publish "ENOENT" as a routing refusal code, outside the
@@ -1110,6 +1515,12 @@ const acquire = async (state, request, {
   if (!validSessionID(sessionID)) throw new Error("invalid session id");
   if (!isProfile(profile)) throw new Error("invalid routing profile");
   if (!ROUTE_TIER_NAMES.includes(tier)) throw new Error("invalid routing tier");
+  // Session identity comes from the router's SDK session.parentID. Never infer subagent status
+  // from tier: primary callers legitimately use worker. Once recorded, retain the known identity
+  // across gateway verification requests that omit it (or send conflicting traffic).
+  const knownSessionKind = normalizeSessionKind(state.leases[sessionID]?.sessionKind) ??
+    normalizeSessionKind(state.assignments[sessionID]?.sessionKind);
+  const sessionKind = knownSessionKind ?? normalizeSessionKind(request.sessionKind);
   const rawContext = Number(request.contextTokens);
   const contextTokens = Number.isFinite(rawContext) && rawContext >= 0 &&
     (typeof request.contextTokens === "number" || typeof request.contextTokens === "string")
@@ -1188,7 +1599,7 @@ const acquire = async (state, request, {
   if (api === "embeddings" && !requestedTargets.some((target) => target.embedding === true)) {
     throw new Error("api: embeddings requires an embedding target");
   }
-  request = { ...request, api, contextTokens, preferredModel, fallbackTargetID, releasePin, oneShot };
+  request = { ...request, api, contextTokens, preferredModel, fallbackTargetID, releasePin, oneShot, sessionKind };
   sweep(state);
   // The outage gate's working view: every target the reviewed role classification puts in a
   // managed role carries its mark, so a catalog sibling with missing or mismatched family/speed
@@ -1263,7 +1674,10 @@ const acquire = async (state, request, {
   // The host snapshot proves what is installed now, not what this OpenCode process loaded at
   // spawn. A caller catalog may only narrow that admission, never add a target the host denied.
   let admittedTargets = Object.fromEntries(Object.entries(admittedBeforeResolvableModels)
-    .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`)));
+    .filter(([, target]) => !resolvableModels || resolvableModels.has(`${target.providerID}/${target.modelID}`))
+    // An invalid apiContinuation block takes every registered manual target out of selection
+    // (fresh, held and sticky alike); the refusal below then names the static cause.
+    .filter(([targetID]) => !manualApiTargetConfigBlocked(targetID)));
   // Build heads before circuit, capacity, context, or policy filtering. An unavailable
   // head must never cause its older sibling to become the ordinary route.
   // ☆ Staged-policy admission is part of "admitted": a probation candidate the model policy
@@ -1406,10 +1820,21 @@ const acquire = async (state, request, {
       const heldAssertionCurrent = !heldReserve || Boolean(currentReserveGrant({
         policy: CONFIG.modelOutages, outages: state.outages, targetID: target.id, assertion: existing.outage, now: Date.now(),
       }));
-      if (target && !heldOutgrown && !excluded.has(target.id) && heldAssertionCurrent &&
+      // A held PAID lease: a continuation lease is never reused -- every reacquisition goes back
+      // through full ordinary selection, so an ordinary route that reopened always wins and a new
+      // grant is minted only after exhaustion is re-proven. A held manual or legacy lease is kept
+      // only while its own paid context is still current (grant, pin, TTL, admission).
+      const heldPaidCurrent = existing.spendGrant !== undefined && existing.spendGrant?.purpose !== "manual"
+        ? false
+        : currentLeaseAttestation(state, sessionID, existing) !== null;
+      if (target && !heldOutgrown && !excluded.has(target.id) && heldAssertionCurrent && heldPaidCurrent &&
         targetEligibleFor(target, { profile: existing.profile, tier: existing.tier, contextTokens }, state, availableModels, admittedTargets, sessionID, outageContext)) {
         ensureActive();
         state.leases[sessionID].touchedAt = Date.now();
+        if (sessionKind) {
+          state.leases[sessionID].sessionKind = sessionKind;
+          if (state.assignments[sessionID]) state.assignments[sessionID].sessionKind = sessionKind;
+        }
         recordLeaseDecision({
           at: Date.now(),
           sessionID,
@@ -1472,8 +1897,12 @@ const acquire = async (state, request, {
     .map((targetID) => targetForID(targetID, admittedTargets))
     .some((target) => target?.kind === "local");
   let availableModels;
+  // Set only when the residency probe itself failed or timed out. Ordinary selection still reads
+  // that as "nothing resident" (the empty set below), but the late paid branch must not: an
+  // UNKNOWN residency is not proof the local route is gone, while a probe that answered [] is.
+  let localResidencyUnknown = false;
   if (includesLocal) {
-    try { availableModels = await localModels(); } catch { availableModels = new Set(); }
+    try { availableModels = await localModels(); } catch { availableModels = new Set(); localResidencyUnknown = true; }
     ensureActive();
     // A prepare is finished the moment its model reports resident, and the in-flight mark has to
     // go THEN, not when its TTL expires. Otherwise a model that lands and is evicted again inside
@@ -1850,10 +2279,16 @@ const acquire = async (state, request, {
       (Number(contextTokens) > 0
         ? `, and no local model fits this session (${Math.round(Number(contextTokens) / 1000)}k tokens).`
         : ", and no local model can serve it.");
+    // Invalid-config fail-closed: this lane names a registered manual API target that the invalid apiContinuation block
+    // took out of selection above. Static code and reason; nothing from the config is echoed.
+    const manualConfigBlocked = API_CONTINUATION_CONFIG_ERROR !== null &&
+      targetEligibleIDsFor(profile, tier, targets).some((targetID) => manualApiTargetConfigBlocked(targetID));
     const reason = prepared
       ? `${absent[0].modelID} is not resident; ${prepared === "in-flight" ? "still preparing it" : "preparing it now"} -- resend the prompt in a moment`
       : busy.length
         ? formatBusyTargets(busy)
+        : manualConfigBlocked
+          ? API_CONTINUATION_CONFIG_REFUSAL.reason
         : noResolvableTarget
           ? `the calling OpenCode process cannot resolve any eligible model and must be restarted to load current provider config; dropped models: ${[...new Set(droppedResolvableLaneModelIDs)].slice(0, 5).join(", ")}`
         : localOnly
@@ -1869,39 +2304,151 @@ const acquire = async (state, request, {
     const code = prepared
       ? "target-preparing"
       : busy.length ? "target-busy"
+        : manualConfigBlocked ? API_CONTINUATION_CONFIG_REFUSAL.code
         : noResolvableTarget ? "no-resolvable-target"
         : localOnly ? "no-eligible-local-target"
         : usageLimits.length ? "usage-limit" : "no-eligible-target";
     const subject = prepared ? absent[0] : busy.length === 1 ? busy[0] : wanted.length === 1 ? wanted[0] : null;
-    // ☠️ A preparing target is NOT a refusal, and filing it as one makes the decision log
-    // lie about the router. A refusal is terminal -- nothing is eligible, and the caller
-    // must change something. `target-preparing` is transient and self-healing: a local
-    // model is loading and the same prompt will route on the retry. Sharing one policy
-    // meant `uncensored` read as a 43% failure rate (650 of 1500 decisions) when the
-    // router was doing its job and waiting out a GPU swap. The HTTP reply and the code
-    // are unchanged -- a client still has to resend -- only the classification differs.
-    const policy = prepared || busy.length ? "waiting" : "refused";
-    recordLeaseDecision({
-      at: Date.now(), sessionID, profile, tier, targetID: null,
-      // ☆ The same code on the DECISION, so /selection and decisions.jsonl are
-      // machine-readable too -- that log is where refusals get read after the fact, and
-      // until now that reading was done by eye. `targetID` stays null: on a decision it
-      // means the target that was LEASED, and neither a refusal nor a wait leased anything.
-      policy, code, reasons: [reason, ...(resolvableModelsReason ? [resolvableModelsReason] : [])],
-      contextTokens,
-      eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
-    });
-    throw refusal(reason, code, subject);
+    // LATE PAID CONTINUATION: the ONLY place a paid continuation target can be
+    // chosen, and only after everything above produced nothing. Every gate fails closed:
+    //   - only a terminal usage-limit / no-eligible-target code: preparing, busy, unresolvable
+    //     and local-only answers are never overridden;
+    //   - only an enabled policy, a durable native auto generation lease (no one-shot, probe,
+    //     embeddings, classifier, private/manual/named profile) and NO staged model-policy
+    //     candidate or blocked generation, which this branch cannot prove exhausted;
+    //   - only with the session's CURRENT exact source-quota proof -- generic unavailability,
+    //     caller flags, purpose fields or a paid target's own failures never qualify;
+    //   - only if no ordinary route could still open: the same selection re-run purely with
+    //     every delayed rung opened (waitedMs) and, separately, with every slot free, so a delayed
+    //     rung or a capacity wait always beats paid. These projections change nothing: no clock,
+    //     circuit, cursor, prepare or probe.
+    // A grant that cannot be minted leaves the original refusal standing.
+    let continuation = null;
+    const continuationRecord = state.apiContinuations?.[sessionID];
+    // The request-side gates are the pure lib predicate (table-tested there); residency the probe
+    // could not establish is never proof of exhaustion (a successful probe answering [] is, and is
+    // judged by the projection below like any other non-residency). Record CURRENCY needs live
+    // broker state and is judged here, only after every request gate passed.
+    if (lateContinuationRequestEligible({
+      refusalCode: code,
+      policy: CONFIG.apiContinuation,
+      probe: Boolean(probeAssignment),
+      localOnly: localOnlyRequest,
+      api,
+      sessionID,
+      profile,
+      tier,
+      oneShot,
+      policyTargetID: policyLane.policyTargetID,
+      blockedGeneration: policyLane.blockedGeneration,
+      includesLocal,
+      localResidencyUnknown,
+      tierNames: ROUTE_TIER_NAMES,
+    }) &&
+      continuationRecord && continuationRecordCurrent(state, continuationRecord, authSnapshot(), Date.now())) {
+      // The projection asks "could an ordinary route open WITHOUT a real usage stop?", so it is
+      // relaxed toward ordinary, never toward paid: only usage-stop circuits block in it (an auth
+      // fence, a rate/overload/connect fence or any other short circuit clears on its own); provider
+      // health quarantine is ignored for the same reason; and neither the caller's excludeTargetIDs
+      // nor policy avoids apply -- a route the CALLER fenced off is not exhaustion. Those exclusions
+      // still bind the paid target itself in lateContinuationTarget below.
+      // A provider held by a real usage stop is exhausted for ordinary routing: the kinds are
+      // exactly those lib/usage-limit.js activeUsageLimits treats as usage stops (plan-window and
+      // quota), so a plan-window stop on another ordinary provider is exhaustion here too.
+      const usageStopCircuits = Object.fromEntries(Object.entries(state.circuits ?? {})
+        .filter(([, circuit]) => USAGE_STOP_CIRCUIT_KINDS.includes(circuit?.kind)));
+      const ordinaryCouldOpen = [activeCounts(state, admittedTargets), {}].some((active) => Boolean(chooseTarget({
+        ...selection,
+        targets: admittedTargets,
+        circuits: usageStopCircuits,
+        health: {},
+        excludedTargetIDs: [],
+        active,
+        localModels: availableModels,
+        waitedMs: Number.MAX_SAFE_INTEGER,
+      })?.target));
+      const paidTarget = ordinaryCouldOpen ? null : lateContinuationTarget(state, {
+        tier,
+        targets,
+        excluded: new Set([...requestExcludedTargetIDs, ...policyAvoidIDs]),
+        providerAllowlist,
+        resolvableModels,
+        contextTokens,
+        outageContext,
+        outageEnabled,
+        probationOnly,
+      });
+      if (paidTarget) {
+        const paidLeaseID = randomUUID();
+        let spendGrant = null;
+        try {
+          spendGrant = mintSpendGrant({
+            purpose: "continuation",
+            sessionID,
+            leaseID: paidLeaseID,
+            target: paidTarget,
+            profile,
+            tier,
+            policy: CONFIG.apiContinuation,
+            manualApiTargets: CONFIG.manualApiTargets,
+            ttlMs: CONFIG.apiContinuation.grantTTLms,
+            now: Date.now(),
+            record: continuationRecord,
+          });
+        } catch {
+          spendGrant = null;
+        }
+        if (spendGrant) {
+          continuation = {
+            target: paidTarget,
+            cursorKey: null,
+            nextCursor: null,
+            paidLeaseID,
+            spendGrant,
+            continuation: true,
+            decision: {
+              policy: "api-continuation",
+              reasons: [`api-continuation-after-${code}`, reason],
+              eligibleTargetIDs: [paidTarget.id],
+              balancedTargetIDs: [paidTarget.id],
+              providerUtilization: {},
+            },
+          };
+        }
+      }
+    }
+    if (!continuation) {
+      // ☠️ A preparing target is NOT a refusal, and filing it as one makes the decision log
+      // lie about the router. A refusal is terminal -- nothing is eligible, and the caller
+      // must change something. `target-preparing` is transient and self-healing: a local
+      // model is loading and the same prompt will route on the retry. Sharing one policy
+      // meant `uncensored` read as a 43% failure rate (650 of 1500 decisions) when the
+      // router was doing its job and waiting out a GPU swap. The HTTP reply and the code
+      // are unchanged -- a client still has to resend -- only the classification differs.
+      const policy = prepared || busy.length ? "waiting" : "refused";
+      recordLeaseDecision({
+        at: Date.now(), sessionID, profile, tier, targetID: null,
+        // ☆ The same code on the DECISION, so /selection and decisions.jsonl are
+        // machine-readable too -- that log is where refusals get read after the fact, and
+        // until now that reading was done by eye. `targetID` stays null: on a decision it
+        // means the target that was LEASED, and neither a refusal nor a wait leased anything.
+        policy, code, reasons: [reason, ...(resolvableModelsReason ? [resolvableModelsReason] : [])],
+        contextTokens,
+        eligibleTargetIDs: [], balancedTargetIDs: [], providerUtilization: {},
+      });
+      throw refusal(reason, code, subject);
+    }
+    choice = continuation;
   }
 
-  if (choice.cursorKey) {
-    ensureActive();
-    state.cursors[choice.cursorKey] = choice.nextCursor;
-  }
-  if (resolvableModelsReason && choice.decision) {
-    choice.decision.reasons = [...(choice.decision.reasons ?? []), resolvableModelsReason];
-  }
+  // Everything that can still THROW for this selection -- the abandonment check, the reserve grant
+  // re-check and the manual grant mint below -- runs before the first state write (the round-robin
+  // cursor), so a refused selection leaves cursors, leases and assignments exactly as they were.
   ensureActive();
+  // Invalid-config backstop: selection already excludes these; a blocked manual target is never leased.
+  if (manualApiTargetConfigBlocked(choice.target?.id)) {
+    throw refusal(API_CONTINUATION_CONFIG_REFUSAL.reason, API_CONTINUATION_CONFIG_REFUSAL.code, choice.target);
+  }
   // An ACTUAL reserve grant: the chosen target is a policy reserve, so it must match one of this
   // request's authorized grants. That grant's credential instance and generation ride on the
   // lease (the proxy enforces them), and only here -- never on a preview, inventory, selection
@@ -1933,7 +2480,34 @@ const acquire = async (state, request, {
   }
   const outageAssertion = outageGrant ? outageLeaseAssertion(outageGrant) : null;
   leasedAt ??= Date.now();
-  const leaseID = randomUUID();
+  // A late continuation choice already minted its grant against the lease ID it will carry.
+  const leaseID = choice.paidLeaseID ?? randomUUID();
+  // An explicitly selected manual paid target with a configured financial pin carries a manual
+  // grant, minted only here from the actual manual admission (never from caller fields). It needs
+  // no enabled continuation. If it cannot be minted the request fails here, BEFORE the cursor
+  // write below and before any lease, assignment or model-policy change for this selection;
+  // a missing pin keeps the legacy unpartitioned manual lease exactly as before (no grant).
+  let spendGrant = choice.continuation === true ? choice.spendGrant : null;
+  if (!spendGrant && registeredPaidTarget(choice.target) && financialPin(choice.target.id) !== null) {
+    spendGrant = mintSpendGrant({
+      purpose: "manual",
+      sessionID,
+      leaseID,
+      target: choice.target,
+      profile,
+      tier,
+      policy: CONFIG.apiContinuation,
+      manualApiTargets: CONFIG.manualApiTargets,
+      ttlMs: CONFIG.apiContinuation.grantTTLms,
+      now: leasedAt,
+    });
+  }
+  // First state write for this selection: nothing above it can leave a half-applied lease.
+  ensureActive();
+  if (choice.cursorKey) state.cursors[choice.cursorKey] = choice.nextCursor;
+  if (resolvableModelsReason && choice.decision) {
+    choice.decision.reasons = [...(choice.decision.reasons ?? []), resolvableModelsReason];
+  }
   const candidateRole = modelPolicyRoleForTarget(state, choice.target);
   let policyLease = {};
   if (candidateRole) {
@@ -1958,6 +2532,9 @@ const acquire = async (state, request, {
       state.modelPolicy = opportunity.policy;
     }
   }
+  // Only a NEW lease can become a continuation source, judged on the actual choice and one auth
+  // snapshot taken now. Private to the lease: never on the assignment, never in the reply.
+  const continuationSource = issueContinuationSource(state, { sessionID, profile, tier, oneShot, api }, choice.target, leasedAt);
   state.leases[sessionID] = {
     targetID: choice.target.id,
     leaseID,
@@ -1965,8 +2542,12 @@ const acquire = async (state, request, {
     touchedAt: leasedAt,
     profile,
     tier,
+    ...(sessionKind ? { sessionKind } : {}),
     ...policyLease,
     ...(outageAssertion ? { outage: outageAssertion } : {}),
+    ...(continuationSource ? { apiContinuationSource: continuationSource } : {}),
+    // Routing authority only, re-proven by currentLeaseAttestation wherever it is read.
+    ...(spendGrant ? { spendGrant } : {}),
   };
   ensureActive();
   state.assignments[sessionID] = {
@@ -1975,15 +2556,21 @@ const acquire = async (state, request, {
     sessionID,
     profile,
     tier,
+    ...(sessionKind ? { sessionKind } : {}),
     updatedAt: leasedAt,
     ...policyLease,
     ...(outageAssertion ? { outage: outageAssertion } : {}),
     // A fallback rung is a degraded route, never a home: it must yield to the lane's
     // primary the moment one is eligible (fallback-stickiness above owns that), so it
     // is recorded but never pinned.
-    ...(choice.decision?.policy === "strict-fallback" ? { fallback: true } : {}),
+    // A paid continuation is never a home either: it must never become a normal pin.
+    ...(choice.decision?.policy === "strict-fallback" || choice.continuation === true ? { fallback: true } : {}),
     // Recorded, never acted on during selection -- see the sweep's tiered eviction.
     ...(oneShot ? { oneShot: true } : {}),
+    // The assignment keeps the lease ID (it binds later /failure and /usage replays), but a
+    // grant-bearing lease's ID is never published: publicAssignments drops it by this mark, so
+    // it stays hidden after the lease itself has ended. A later lease rebuilds the assignment.
+    ...(spendGrant ? { grantLease: true } : {}),
   };
   recordLeaseDecision({
     at: Date.now(),
@@ -2271,9 +2858,11 @@ const serve = async () => {
       sweep(state);
       const awaitPlanRefresh = request.url === "/lease" && body.localOnly !== true &&
         profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto");
-      const planRefresh = refreshPlanUsage(state, awaitPlanRefresh
-        ? (mutation) => { if (!run.expired) mutation(); }
-        : (mutation) => enqueueTransaction(() => { if (!run.expired) mutation(); }));
+      const planRefresh = request.url === "/quota-evidence"
+        ? Promise.resolve()
+        : refreshPlanUsage(state, awaitPlanRefresh
+          ? (mutation) => { if (!run.expired) mutation(); }
+          : (mutation) => enqueueTransaction(() => { if (!run.expired) mutation(); }));
       // The burn watch's all-sessions plan-rise signal was removed (see lib/burn-watch.js
       // for the fourteen-day numbers that retired it). The plan refresh still runs for the
       // budgets, HUD, and admission gate below -- only the burn-watch feed is gone.
@@ -2296,6 +2885,15 @@ const serve = async () => {
           probeAssignment,
         });
         if (run.expired) return;
+        // The reply's paid context comes ONLY from the actual lease just granted or revalidated.
+        // A paid lease that cannot attest itself is never handed out.
+        const grantedLease = state.leases[body.sessionID];
+        const attestation = grantedLease?.leaseID === lease.leaseID ? currentLeaseAttestation(state, body.sessionID, grantedLease) : null;
+        if (attestation === null) {
+          if (grantedLease?.leaseID === lease.leaseID) delete state.leases[body.sessionID];
+          writeState(state);
+          throw new Error("lease authority could not be attested");
+        }
         writeState(state);
         // The decision rides along so clients can SURFACE a degraded route --
         // policy "strict-fallback" means every primary was unavailable.
@@ -2305,7 +2903,7 @@ const serve = async () => {
           blockedGeneration = false,
           registration: decisionRegistration = registration,
         } = state.lastDecision ?? {};
-        const target = publicTarget(lease.target, body.tier, state.inventory?.modelVariants);
+        const target = publicTarget(lease.target, body.tier, state.inventory?.modelVariants, attestation);
         const modelKey = `${lease.target?.providerID}/${lease.target?.modelID}`;
         const effort = resolveTurnEffort({
           baseVariant: target?.model?.variant,
@@ -2324,7 +2922,8 @@ const serve = async () => {
           logTurnEffort({
             at: Date.now(),
             sessionID: typeof body.sessionID === "string" ? body.sessionID : null,
-            leaseID: lease.leaseID,
+            // A grant-bearing lease's ID is a spend credential binding: never written to a log.
+            ...(grantedLease?.spendGrant ? {} : { leaseID: lease.leaseID }),
             tier: body.tier ?? null,
             targetID: lease.target?.id ?? null,
             providerID: lease.target?.providerID ?? null,
@@ -2390,6 +2989,15 @@ const serve = async () => {
         if (!target || (reserve && !currentReserveGrant({
           policy: CONFIG.modelOutages, outages: state.outages, targetID: target.id, assertion: lease.outage, now: Date.now(),
         }))) return reply(response, 200, { held: false });
+        // A grant-bearing paid lease verifies ONLY by its exact nonempty lease ID -- an omitted,
+        // default or older ID never falls back to it -- and only while its paid context is
+        // current. Legacy unpinned manual and ordinary leases keep their prior behavior.
+        if (lease.spendGrant !== undefined && (lease.sessionID !== body.sessionID ||
+          typeof body.leaseID !== "string" || body.leaseID === "" || body.leaseID !== lease.leaseID)) {
+          return reply(response, 200, { held: false });
+        }
+        const attestation = currentLeaseAttestation(state, body.sessionID, lease);
+        if (attestation === null) return reply(response, 200, { held: false });
         return reply(response, 200, {
           held: true,
           leaseID: lease.leaseID,
@@ -2400,11 +3008,56 @@ const serve = async () => {
             id: target.id,
             kind: target.kind,
             model: { providerID: target.providerID, id: target.modelID },
-            ...manualApiAttestation(target),
+            ...attestation,
           },
           expectedCredentialInstance: reserve ? lease.outage.expectedCredentialInstance : null,
           generation: reserve ? lease.outage.generation : null,
         });
+      }
+      if (request.url === "/quota-evidence") {
+        // NON-SETTLING: the gateway's report that an actual bound 429 carried a closed positive
+        // subscription-quota signal. It only stores a broker-timestamped observation on the exact
+        // current source lease; the plugin's later /failure remains the sole settler. Refusals are
+        // static codes that never echo the body.
+        const refuse = (status, code) => reply(response, status, { error: "quota evidence refused", code });
+        if (!closedKeys(body, QUOTA_EVIDENCE_BODY_KEYS) || !validSessionID(body.sessionID) || !validSessionID(body.leaseID) ||
+          typeof body.targetID !== "string" || !body.targetID || body.targetID.length > 200) {
+          return refuse(400, "invalid-quota-evidence");
+        }
+        const now = Date.now();
+        const subscriptionQuota = normalizeSubscriptionQuota(body.subscriptionQuota, { now });
+        if (!subscriptionQuota) return refuse(400, "invalid-subscription-quota");
+        // Everything below the exact current binding is refused WITHOUT touching state, so a
+        // stale, forged or misbound report can never poison the legitimate current lease.
+        const lease = state.leases[body.sessionID];
+        if (!lease || lease.sessionID !== body.sessionID || lease.leaseID !== body.leaseID || lease.targetID !== body.targetID) {
+          return refuse(409, "unknown-or-stale-lease");
+        }
+        const source = currentContinuationSource(state, lease, now);
+        if (!source) return refuse(409, "not-a-continuation-source");
+        if (lease.quotaObservationConflict !== undefined) return refuse(409, "quota-evidence-conflict");
+        if (lease.quotaObservation !== undefined) {
+          const prior = currentQuotaObservation(lease.quotaObservation, source, now);
+          // Identical normalized repeat: idempotent, the original timestamp stands.
+          if (prior && sameSubscriptionQuota(prior.subscriptionQuota, subscriptionQuota)) {
+            return reply(response, 200, { ok: true, accepted: true });
+          }
+          // Two different answers for one exact binding: neither is trusted. The usable
+          // observation is erased and a closed tombstone stays until the lease is replaced, so a
+          // later replay of either value cannot restore authority.
+          delete lease.quotaObservation;
+          lease.quotaObservationConflict = { version: 1, conflictedAtMs: now };
+          writeState(state);
+          return refuse(409, "quota-evidence-conflict");
+        }
+        lease.quotaObservation = {
+          version: 1,
+          observedAtMs: now,
+          policyRevision: source.snapshot.policyRevision,
+          subscriptionQuota: { ...subscriptionQuota },
+        };
+        writeState(state);
+        return reply(response, 200, { ok: true, accepted: true });
       }
       if (request.url === "/failure") {
         const binding = settlementBinding(state, body);
@@ -2425,6 +3078,16 @@ const serve = async () => {
           return reply(response, 200, assignment.settledFailure.reply);
         }
         const targetID = bindingTargetID(binding, body);
+        // Only a failure on the exact CURRENT lease, named by its nonempty lease ID, can consume a
+        // quota observation, and it consumes it whatever kind the failure turns out to be. An
+        // assignment, historical or replayed binding, or a body flag, is never proof.
+        const sourceLease = lease && binding === lease && typeof body.leaseID === "string" &&
+          body.leaseID !== "" && body.leaseID === lease.leaseID ? lease : null;
+        const quotaObservation = sourceLease?.quotaObservation;
+        if (sourceLease) {
+          delete sourceLease.quotaObservation;
+          delete sourceLease.quotaObservationConflict;
+        }
         const error = normalizeProviderError(body.error);
         const target = targetForID(targetID, allTargets(state));
         // A legacy targetless binding must not borrow caller-supplied attribution.
@@ -2522,7 +3185,25 @@ const serve = async () => {
           // own usage report, then a bounded re-probe -- an unknown reset must
           // cost one probing request per window, never a provider held out of
           // the pool until state surgery.
-          circuitUntil = quotaRenewalAt(error);
+          const explicitReset = quotaRenewalAt(error);
+          // A lapsed plan has no reset coming: hold it until the background provider
+          // check sees the renewal (lib/provider-check.js), not for a fixed re-probe.
+          const lapsed = isPlanLapsed(error);
+          // Continuation proof candidate: the consumed observation, still valid for the current
+          // source, on an uncontradicted (not billing/credit/lapse/auth/burst/other-status)
+          // failure whose explicit reset, if any, is exactly the observed one.
+          const proofNow = Date.now();
+          const proofSource = sourceLease && quotaObservation !== undefined && !lapsed
+            ? currentContinuationSource(state, sourceLease, proofNow) : null;
+          const observed = proofSource && proofSource.target.id === target.id
+            ? currentQuotaObservation(quotaObservation, proofSource, proofNow) : null;
+          const proofCandidate = observed &&
+            !subscriptionQuotaFailureContradicted({ text: providerErrorText(body.error), statusCode: error.statusCode }) &&
+            (explicitReset === null || explicitReset === observed.subscriptionQuota.resetAtMs)
+            ? { source: proofSource, observed } : null;
+          // SDK normalization can lose the reset; a valid observed reset supplies it BEFORE any
+          // optional provider-usage fetch. An explicit different reset is kept as is (no proof).
+          circuitUntil = explicitReset ?? proofCandidate?.observed.subscriptionQuota.resetAtMs ?? null;
           if (!circuitUntil && planUsageConfigured(PROVIDER_BUDGETS[target.providerID])) {
             const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
             if (run.expired) return;
@@ -2531,9 +3212,6 @@ const serve = async () => {
           // Whether `until` is when the limit actually lifts or only when the broker next
           // probes: a usage-limit message must never present a re-probe time as the return day.
           resetKnown = Boolean(circuitUntil);
-          // A lapsed plan has no reset coming: hold it until the background provider
-          // check sees the renewal (lib/provider-check.js), not for a fixed re-probe.
-          const lapsed = isPlanLapsed(error);
           if (!circuitUntil) circuitUntil = Date.now() + (lapsed ? LAPSED_HOLD_MS : QUOTA_REPROBE_MS);
           state.circuits[providerCircuitID(target)] = {
             kind,
@@ -2542,6 +3220,8 @@ const serve = async () => {
             resetKnown,
             updatedAt: Date.now(),
           };
+          // Re-proven from a fresh context after the circuit write (and after any await above).
+          if (proofCandidate) recordContinuationProof(state, body.sessionID, sourceLease, proofCandidate, target);
         } else if (target && kind === "auth") {
           // Local credential staleness: fence the target for one minute so the
           // retry lands elsewhere, record NOTHING against provider health --
@@ -2858,8 +3538,11 @@ const serve = async () => {
         const targets = previewOutagesEnabled
           ? markManagedOutageScope(allTargets(state), { policy: CONFIG.modelOutages, modelRoles: CONFIG.modelRoles })
           : allTargets(state);
+        // A manual target fail-closed by an invalid apiContinuation block is never previewed,
+        // exactly as /lease never selects it.
         const admitted = Object.fromEntries(Object.entries(targets)
-          .filter(([, target]) => cloudTargetAdmitted(target, state.inventory?.providers, profile)));
+          .filter(([targetID, target]) => !manualApiTargetConfigBlocked(targetID) &&
+            cloudTargetAdmitted(target, state.inventory?.providers, profile)));
         // Match /lease's default resolver snapshot: preview has no caller-local
         // narrowing, so calculate heads from the complete admitted view once and
         // reuse that exact outage snapshot for every requested tier. Staged probation-only
@@ -3297,6 +3980,10 @@ const serve = async () => {
   outageService?.worker.start();
   process.stdout.write(`opencode-broker listening on ${socketPath}\n`);
   for (const note of DEPRECATIONS) process.stderr.write(`opencode-broker: deprecated: ${note}\n`);
+  // Once, at startup: target IDs only (registry keys), never pins or the rejected values.
+  if (API_CONTINUATION_CONFIG_ERROR !== null) {
+    process.stderr.write(`opencode-broker: apiContinuation config invalid -- manual API targets fail closed (unleasable, unverifiable, no grants): ${Object.keys(CONFIG.manualApiTargets).join(", ") || "(none registered)"}\n`);
+  }
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => {
       const finish = (code) => {

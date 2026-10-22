@@ -7,15 +7,15 @@ if a file is not here, the router does not own it.
 | Path | Writer | Readers | Content |
 |---|---|---|---|
 | `broker.sock` | broker | plugins, gateway, opencode-guard, CLIs | The API socket ([API.md](API.md)) |
-| `broker.json` | broker | broker | Version-5 leases and assignments carrying exact `leaseID`/`sessionID` bindings, plus circuits, cursors, inventory, health, budget ledger, and broker-owned runtime `modelPolicy` |
+| `broker.json` | broker | broker | Version-5 leases and assignments carrying exact `leaseID`/`sessionID` bindings, plus circuits, cursors, inventory, health, budget ledger, broker-owned runtime `modelPolicy`, and API continuation records (`apiContinuations`, see [below](#inside-brokerjson-api-continuation)) |
 | `pending-profile.json` | hud | router plugin | A profile armed for the NEXT root session `{ profile, updatedAt }`; consumed when that session is created, ignored after 30 min. (A `profile.json` left by an older build is deleted, never read.) |
 | `profiles/<sessionID>.json` | router plugin, hud | plugins, opencode-guard | Per-session profile `{ profile, explicit, updatedAt }`; pruned after 14 days |
 | `context-estimates/<sessionID>.json` | router plugin | router plugin | Last known context tokens `{ tokens, updatedAt }`; seeds resumed sessions without a full history fetch; 14-day prune |
 | `managed-switches/<sessionID>.json` | router plugin, hud | hud | Short-lived marker (5 min) distinguishing router-driven model switches from the user's own |
 | `pending-forgets/<sessionID>.json` | router plugin | router plugin | Queued exact `/forget` calls `{ leaseID?, completed, updatedAt }` to retry when the broker was unreachable; 14-day prune |
 | `decisions.jsonl` | broker | operator, tooling | Every routing decision — grants, revalidations, refusals, failures, and burn-watch stops (`policy: "burn-stop"`), with the gateway's `caller` on a gateway session's lines (bounded 4MB, truncating) |
-| `usage.jsonl` (+ `usage.jsonl.1`) | broker | `opencode-broker usage`, operator | One line per provider request: session, optional `rootSessionID` (only when the reporter named a parent that differs from the session itself, so tree-level burn thresholds can be calibrated from the log later), model, the lease's target/profile/tier, `prompt` (input + cache read + cache write), that total split into `input`, `cacheRead` and `cacheWrite` (always present, zeroes included, so a burn-watch stop can be audited afterwards), `output` tokens, and for gateway requests the `caller` (client address and requested model). For tuning local windows, because opencode deletes child sessions and their token history. Rotated at 8MB, one previous generation kept |
-| `fallbacks/<sessionID>.json` | router plugin | hud, router plugin | Fallback/displacement marker; `policy: "provider-displaced"` carries `restoreAt` -- stickiness is released once it passes, and a healthy lease clears every other kind |
+| `usage.jsonl` (+ `usage.jsonl.1`) | broker | `opencode-broker usage`, operator | One line per provider request: session, the reporter's `leaseID` when it sent one (grant-bearing paid leases included), optional `rootSessionID` (only when the reporter named a parent that differs from the session itself, so tree-level burn thresholds can be calibrated from the log later), model, the lease's target/profile/tier, `prompt` (input + cache read + cache write), that total split into `input`, `cacheRead` and `cacheWrite` (always present, zeroes included, so a burn-watch stop can be audited afterwards), `output` tokens, and for gateway requests the `caller` (client address and requested model). For tuning local windows, because opencode deletes child sessions and their token history. Rotated at 8MB, one previous generation kept |
+| `fallbacks/<sessionID>.json` | router plugin | hud, router plugin | Fallback/displacement marker; `policy: "provider-displaced"` carries `restoreAt` -- stickiness is released once it passes, and a healthy lease clears every other kind. A paid API continuation lease writes one with `policy: "api-continuation"` ([API-CONTINUATION.md](API-CONTINUATION.md)) |
 | `reviewed-models.json` | opencode-broker-watch | opencode-broker-watch | Catalog model ids already seen/assessed, so each new model notifies exactly once. `opencode-broker-reconcile` READS it and reports which keys a future import would cover; the import itself, and the deletion of this file, belong to a later package |
 | `model-reconciliation.json` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence`, operator tooling | Versioned provider-role candidate observations, the evidence request queue, and proposal presentation state. Those two commands are its ONLY writers; see the field inventory below |
 | `.model-reconciliation.lock/` | `opencode-broker-reconcile`, `opencode-broker-evidence` | `opencode-broker-reconcile`, `opencode-broker-evidence` | The ephemeral lock serializing every reconciliation-ledger mutation. Holds an `owner` identity record and an `instance.<pid>.<uuid>` file; see the protocol below. Removed when the writer exits |
@@ -265,6 +265,76 @@ to `enabled: false` with `overlayPath`, `generationsRoot`, and `currentLinkPath`
 all `null`. Enabling it requires all three to be non-empty absolute paths;
 otherwise it stays off and publishes `configError`.
 
+## Inside `broker.json`: API continuation
+
+The broker is the only writer. These fields exist for subscription-quota API continuation
+([API-CONTINUATION.md](API-CONTINUATION.md)); the schema version stays `5`, and a file without
+them reads as empty. None of them appears on `/status` as written: see the redaction rules in
+[API.md](API.md#status-redaction).
+
+### `state.apiContinuations`
+
+A map from a durable OpenCode session ID (`ses_` plus 1-124 letters/digits) to one closed record.
+Each record has exactly these 11 keys:
+
+| Key | Content |
+|---|---|
+| `sourceLeaseID` | The exact subscription lease whose failure produced the proof |
+| `sourceTargetID`, `sourceModelID`, `sourceProviderID` | The source target's static identity at proof time |
+| `sourceAuthRevision` | SHA-256 of the source provider's own `auth.json` entry (never `"absent"`) |
+| `observedAtMs` | Broker clock when `/quota-evidence` stored the observation |
+| `circuitKind` | Always `"quota"` |
+| `circuitUpdatedAtMs`, `circuitUntilMs` | The source provider's quota circuit as written by that `/failure`; `circuitUntilMs` equals the evidence's reset |
+| `policyRevision` | The routing revision of the `apiContinuation` block (not the financial pin) |
+| `quotaEvidenceClosed` | The normalized evidence `{ version: 1, kind, window, resetAtMs }` |
+
+A record is valid only if every identifier is a bounded string without control characters,
+`observedAtMs <= circuitUpdatedAtMs <= now < circuitUntilMs`, `policyRevision` is 64 lowercase
+hex, and `quotaEvidenceClosed` still normalizes at `now` with `resetAtMs === circuitUntilMs`.
+It is created only by `/failure`, after the quota circuit is written and the record re-proves as
+current authority. Validity is not authority: every reader also re-checks currency against the
+live policy, inventory, `auth.json` and circuit.
+
+### Lease and assignment fields
+
+| Where | Field | Content |
+|---|---|---|
+| lease | `apiContinuationSource` | `{ version: 1, targetID, providerID, modelID, authRevision, policyRevision, issuedAtMs }`. Put only on a NEW lease on an eligible source target while continuation is enabled; `authRevision` is the source provider's own entry revision. Never on an assignment, never in a reply. |
+| lease | `quotaObservation` | `{ version: 1, observedAtMs, policyRevision, subscriptionQuota: { version: 1, kind, window, resetAtMs } }`, written by `/quota-evidence`. |
+| lease | `quotaObservationConflict` | `{ version: 1, conflictedAtMs }`, the tombstone left when a second, different observation arrived for the same lease. |
+| lease | `spendGrant` | The broker-minted grant ([API.md](API.md#paid-lease-attestation)), for a pinned manual lease or a continuation lease. Routing authority only; re-proven on every read. |
+| lease, assignment | `sessionKind` | `"primary"` or `"subagent"` from the caller's SDK identity, when known. |
+| assignment | `grantLease` | `true` when the assignment's lease carried a grant, so `/status` keeps hiding that lease ID after the lease ends. |
+| assignment | `fallback` | `true` on a continuation assignment, as on a strict-fallback one: never a home pin. |
+
+### Lifecycle and pruning
+
+- **Lease fields** live and die with the lease: a replacement lease, release, `/forget`, or the
+  2 h lease TTL removes them. `/failure` on the exact current lease (non-empty matching
+  `leaseID`) deletes `quotaObservation` and `quotaObservationConflict` whatever the failure kind.
+- **Reload.** On startup `readState` decodes `apiContinuations` as untrusted: malformed records,
+  non-durable keys and records not valid at the current clock are dropped, never repaired; the
+  rest is bounded to 512 records (`MAX_ASSIGNMENTS`), newest `circuitUpdatedAtMs` first, then
+  newest `observedAtMs`, then session ID.
+- **Sweep** (every request) runs after the lease, assignment and circuit janitors. A record is
+  deleted when its session has neither a lease nor an assignment, or when it is **permanently**
+  invalid (`continuationRecordPermanentlyInvalid`):
+  - the source provider's entry revision is readable (including `"absent"`) and differs;
+  - the source provider's circuit is missing, is not `quota`, or ends before the record;
+  - the record's `circuitUntilMs` is at or before now;
+  - the routing `policyRevision` differs from the current block's;
+  - the source target is present but its provider or model differs.
+- **Transient** conditions keep the record, because every reader re-proves currency and keeping it
+  grants nothing: an unreadable `auth.json`, a circuit that lost its known reset, gained a reason
+  or was re-stamped later, a source target missing from the current view, or an inventory published
+  against a different whole-file auth revision.
+- **Retention.** A record survives ordinary lease settlement and fresh assignment replacement. It
+  is bounded by its session's assignment (4 h idle, 1 h for a `subagent` worker; cap 512), by the
+  source circuit's end, and by the 512-record cap. `/forget` alone does not remove it.
+- `applyPlanUsageCircuit` extends an exact `quota` circuit (`resetKnown: true`, no `reason`) in
+  place when a plan-usage lockout outlasts it, changing only `until` and `updatedAt`, so a later
+  lockout reading does not revoke the provider's records by re-kinding the circuit.
+
 ## The reconciliation ledger lock
 
 The lock is **published by renaming** a fully built private
@@ -316,5 +386,9 @@ Outside that directory:
 | `~/.local/share/opencode/model-default.json` | `tui/` plugin | model-default plugin, router plugin | The user's last manual model pick |
 | `~/.local/share/opencode/modes/<sessionID>`, `~/.config/opencode/mode`, `~/.config/opencode/autoclass` | hud (only when opencode-guard is present) | opencode-guard | The guard's permission mode per session, its default, and its floor level. These are the guard's files; the HUD writes them only as its user interface. |
 
-`~/.local/share/opencode/auth.json` is hashed (never parsed beyond auth types) for
-inventory admission, and the gateway reads the one entry each provider's `authRef` names.
+`~/.local/share/opencode/auth.json` is hashed whole for inventory admission (only auth types are
+read from it there), and the gateway reads the one entry each provider's `authRef` names. For API
+continuation the broker also parses it to hash ONE provider's own entry
+(`providerAuthRevision`: SHA-256 of that entry's canonical, key-sorted JSON; `"absent"` when the
+file parses but has no such entry; `null` when it is unreadable or not a JSON object). Only that
+digest is stored; no raw value is ever stored or logged.

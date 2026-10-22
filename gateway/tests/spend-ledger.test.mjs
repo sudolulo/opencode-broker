@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import * as realFS from 'node:fs/promises';
 import { registerHooks } from 'node:module';
@@ -921,6 +922,21 @@ test('reservation returns an immutable dispatch deadline from its validated epoc
     assert.equal(reserved.dispatchDeadlineMs, Date.parse('2026-10-21T11:00:00.000Z'));
     assert.equal(Object.isFrozen(reserved), true);
     assert.throws(() => { reserved.dispatchDeadlineMs = Number.MAX_SAFE_INTEGER; }, TypeError);
+  });
+});
+
+test('legacy schema1 DDL, user_version, status and reservation shapes are byte-for-byte unchanged', async () => {
+  await withLedgerDir(async ledgerPath => {
+    const args = await setup(ledgerPath, { reserve: false });
+    const reserved = await reserveAttempt({ ...args, prepared: preparedFor(args.policy), attemptID: ATTEMPT_A });
+    const status = await inspectStatus(args);
+    const ddl = sql(ledgerPath, db => db.prepare('SELECT type,name,sql FROM sqlite_schema ORDER BY name').all().map(row => `${row.type}|${row.name}|${row.sql}`).join('\n'));
+    // Captured from the unmodified schema1 implementation before allocation support.
+    assert.equal(createHash('sha256').update(ddl).digest('hex'), '381b01fec29bbe13fc0c4896904ee9d9bd7fe924d8fdaa77dfd1447aa363c5af');
+    assert.equal(sql(ledgerPath, db => db.prepare('PRAGMA user_version').get().user_version), 1);
+    assert.deepEqual(Object.keys(reserved), ['attemptID', 'epochID', 'requestDigest', 'bodyDigest', 'policyHash', 'providerID', 'origin', 'credentialFingerprint', 'model', 'maxInputTokens', 'maxOutputTokens', 'ratesNanoUSD', 'reserveNano', 'state', 'createdAtMs', 'dispatchDeadlineMs']);
+    assert.deepEqual(Object.keys(status), ['schemaVersion', 'policyHash', 'fundedNano', 'availableNano', 'heldNano', 'spentNano', 'observedCostNano', 'additionalLiabilityNano', 'frozen', 'expired', 'epochID', 'reference', 'attemptCounts']);
+    assert.equal(status.schemaVersion, 1);
   });
 });
 
