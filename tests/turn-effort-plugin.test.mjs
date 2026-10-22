@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ process.env.OPENCODE_MODEL_ROUTING_DIR = routingState;
 after(() => rmSync(routingState, { recursive: true, force: true }));
 
 const realTurnEffort = await import("../lib/turn-effort.js");
+const routing = await import("../lib/routing.js");
 let classifyCalls = [];
 let classifyFailure = false;
 
@@ -24,12 +26,21 @@ mock.module("../lib/turn-effort.js", {
   },
 });
 
+// Keep inventory publication inside this fixture boundary while preserving routing state helpers.
+const routingMock = mock.module("../lib/routing.js", {
+  namedExports: {
+    ...Object.fromEntries(Object.entries(routing).filter(([name]) => name !== "default")),
+    publishCachedSubscriptionInventory: async () => ({ accepted: true, changed: false }),
+  },
+});
+
 const { ModelRouter } = await import(`../plugin/router.js?turn-effort-plugin=${Date.now()}`);
-const routing = await import("../lib/routing.js");
+after(() => routingMock.restore());
 
 const withRouter = async (sessions, run, { staleLease = false, profile = "local" } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "turn-effort-plugin-"));
   const requests = [];
+  const unexpectedRequests = [];
   const logs = [];
   let stale = staleLease;
   const brokerRequest = async (path, body) => {
@@ -66,15 +77,21 @@ const withRouter = async (sessions, run, { staleLease = false, profile = "local"
     },
   };
   client.app.log = async (entry) => { logs.push(entry); };
-  const hooks = await ModelRouter({ client, directory: home }, { brokerRequest });
-  for (const [sessionID, session] of sessions) {
-    if (session instanceof Error) continue;
-    if (profile) routing.writeSessionProfile(sessionID, profile, { explicit: true });
-    else routing.removeSessionProfile(sessionID);
-  }
+  const requestMock = mock.method(http, "request", (options) => {
+    unexpectedRequests.push({ socketPath: options?.socketPath, path: options?.path });
+    throw new Error("turn-effort fixture attempted real broker transport");
+  });
   try {
+    const hooks = await ModelRouter({ client, directory: home }, { brokerRequest });
+    for (const [sessionID, session] of sessions) {
+      if (session instanceof Error) continue;
+      if (profile) routing.writeSessionProfile(sessionID, profile, { explicit: true });
+      else routing.removeSessionProfile(sessionID);
+    }
     await run({ hooks, requests, logs, client });
+    assert.deepEqual(unexpectedRequests, []);
   } finally {
+    requestMock.mock.restore();
     rmSync(home, { recursive: true, force: true });
   }
 };

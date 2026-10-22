@@ -3481,9 +3481,15 @@ test("a session-bound request rides the session's own lease and never re-leases"
   assert.deepEqual(failing.calls.map((call) => call.path), ["/lease/verify"],
     "the plugin reports the failure itself; the gateway must not file a second one");
 
-  for (const refused of [await scenario({ held: false }), await scenario({ held: true, model: "claude-haiku-4-5" })]) {
-    assert.equal(refused.status, 409);
+  // stale/wrong-model refusals deliberately use 400 (SDK nonretryable) while still authorizing zero upstream traffic;
+  for (const [refused, expectedVerifications] of [
+    [await scenario({ held: false }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }, { path: "/lease/verify", body: { sessionID: "ses_abc" } }]],
+    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }]],
+  ]) {
+    assert.equal(refused.status, 400, "deterministic lease refusal must not trigger provider SDK blind retries");
     assert.equal(refused.forwards.length, 0, "a session id alone never reaches an ungranted model");
+    assert.deepEqual(refused.calls, expectedVerifications,
+      "a refusal only verifies the session-owned lease and never re-leases or settles it");
   }
 });
 
@@ -3552,10 +3558,12 @@ test("a session-bound lease on a speed alias serves its base model, and nothing 
     ["claude-opus-5-5", "claude-opus-5-5-fast"],
   ]) {
     const refused = await scenario({ leasedModel, model });
-    assert.equal(refused.status, 409, `a ${leasedModel} lease must not authorize ${model}`);
+    assert.equal(refused.status, 400, `a ${leasedModel} lease must not authorize ${model}`);
     assert.equal(refused.forwards.length, 0);
     assert.equal(refused.payload.error.message,
       `[opencode-broker] route unavailable; resend the prompt (gateway: session holds no live lease for "${model}")`);
+    assert.deepEqual(refused.calls.map((call) => call.path), ["/lease/verify"],
+      "a refusal must neither re-lease nor settle the session-owned lease");
   }
 });
 
@@ -3615,12 +3623,15 @@ test("strict model names do not refuse a session-bound request; its lease decide
   assert.equal(ok.forwards.length, 1);
   assert.equal(ok.forwards[0].body.model, "claude-opus-5-5");
 
-  for (const refused of [
-    await scenario({ held: false, model: "claude-opus-5-5" }),
-    await scenario({ held: true, model: "claude-haiku-4-5" }),
+  // stale/wrong-model refusals deliberately use 400 (SDK nonretryable) while still authorizing zero upstream traffic;
+  for (const [refused, expectedVerifications] of [
+    [await scenario({ held: false, model: "claude-opus-5-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }, { path: "/lease/verify", body: { sessionID: "ses_abc" } }]],
+    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }]],
   ]) {
-    assert.equal(refused.status, 409, "the lease still refuses anything it did not grant");
+    assert.equal(refused.status, 400, "deterministic lease refusal must not trigger provider SDK blind retries");
     assert.equal(refused.forwards.length, 0);
+    assert.deepEqual(refused.calls, expectedVerifications,
+      "a refusal only verifies the session-owned lease and never re-leases or settles it");
   }
 
   const anonymous = await scenario({ held: true, model: "claude-opus-5-5", session: false });
