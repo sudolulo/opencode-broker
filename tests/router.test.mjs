@@ -2288,6 +2288,34 @@ test("a content-filter block that arrives WITH a ContentFilterError still cascad
   assert.deepEqual(result.first.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" });
 });
 
+test("a block that double-fires (error event AND completed-message event) re-prompts ONCE, not twice", () => {
+  // A streaming content-filter block surfaces via BOTH paths ~16 ms apart: the ContentFilterError
+  // error event AND the completed message.updated with finish "content-filter". Without dedup each
+  // schedules its own abort + re-prompt, so TWO cascade re-prompts run concurrently; each leases a
+  // DIFFERENT candidate, and because routes holds one lease id per session the in-flight request
+  // sends a lease id that no longer names its wire model -- the gateway then refuses every candidate
+  // "no live lease" and the cascade never advances (petsafe, 2026-10-22). It must re-prompt once.
+  const result = runCf({
+    cascadePlan: [
+      { body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } },
+      { body: { target: { id: "claude-opus-4-8", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-4-8" } }, decision: { policy: "content-filter-cascade" } } },
+    ],
+    body: `
+      await created("cf-dup", "standard");
+      await start("cf-dup", "standard");
+      // Same block, same message id, both shapes: the error-event shape then the clean completed shape.
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-dup", info: { id: "m-dup-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", error: { name: "ContentFilterError", data: { message: "blocked" } }, time: { completed: Date.now() } } } } });
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-dup", info: { id: "m-dup-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", time: { completed: Date.now() } } } } });
+      await flush();
+      await runNewTimers();
+      if (prompts.length) await feedReprompt("cf-dup");
+      console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.prompts, 1, "the double-fire yields exactly one synthetic re-prompt");
+  assert.equal(result.cascadeCount, 1, "exactly one cascade /lease -- the second fire is deduped, so no stomping concurrent lease");
+});
+
 test("the cascade re-prompt CARRIES the blocked turn's effort as PromptInput.variant", () => {
   // The re-prompt is synthetic, so without carrying the effort it arrives variant-less while the
   // broker leased the cascade candidate at the session's effort (/high) -> chat.params throws
@@ -2470,7 +2498,13 @@ test("manual, classifier and local (llamacpp) blocked turns never cascade", () =
 });
 
 test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
-  const cascadePlan = Array.from({ length: 6 }, (_, i) => ({
+  // Must match CF_MAX_ATTEMPTS in plugin/router.js. It is set high enough that the cascade can
+  // walk the whole trimmed order down to the uncensored floor (the floor sits last and must be
+  // reachable), so the cap is a storm backstop, not the everyday limiter -- the broker's own
+  // content-filter-exhausted ends a real descent first. This test exercises the backstop with a
+  // plan long enough never to exhaust, so the (CAP+1)-th block is what gives up.
+  const CAP = 20;
+  const cascadePlan = Array.from({ length: CAP }, (_, i) => ({
     body: { target: { id: "cand-" + i, kind: "cloud", model: { providerID: "openai", id: "cand-" + i } } },
   }));
   const result = runCf({
@@ -2478,7 +2512,7 @@ test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
     body: `
       await created("cf-g", "standard");
       await start("cf-g", "standard");
-      for (let i = 0; i < 7; i += 1) {
+      for (let i = 0; i < ${CAP + 1}; i += 1) {
         const before = prompts.length;
         await block("cf-g", "openai", "blk-" + i, "m-g-" + i);
         await runNewTimers();
@@ -2488,7 +2522,7 @@ test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
       console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: cascadeLeases().length, gaveUp }));
     `,
   });
-  assert.equal(result.prompts, 6, "the chain re-prompts exactly CF_MAX_ATTEMPTS times");
-  assert.equal(result.cascadeCount, 6, "one cascade /lease per re-prompt, and no more");
-  assert.equal(result.gaveUp, true, "the 7th block gives up instead of re-prompting");
+  assert.equal(result.prompts, CAP, "the chain re-prompts exactly CF_MAX_ATTEMPTS times");
+  assert.equal(result.cascadeCount, CAP, "one cascade /lease per re-prompt, and no more");
+  assert.equal(result.gaveUp, true, "the (CAP+1)-th block gives up instead of re-prompting");
 });

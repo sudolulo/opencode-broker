@@ -1314,7 +1314,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   // storm. CF_RETRY_TEXT is the sentinel that chat.message matches (with the minted part id)
   // to recognise its own re-prompt.
   const CF_RETRY_TEXT = "[opencode-broker] Please answer my previous request.";
-  const CF_MAX_ATTEMPTS = 6;
+  // The cap must let the cascade WALK ITS WHOLE ORDER down to the uncensored local floor, which
+  // the broker places LAST (contentFilterCascadeOrder, trimmed by maxPerFamily, is ~15 candidates
+  // for an opus block with the uncensored floor at the end). At 6 it gave up around the sixth tier
+  // -- before even the first local model, and far before the uncensored floor -- so a query every
+  // cloud model refuses was left blocked instead of failing over to the floor as intended
+  // ("uncensored is the last resort, automatically"). Set comfortably above the order length so
+  // the broker's own content-filter-exhausted (order walked out, floor included) is the real
+  // terminator and this stays a storm backstop. Each re-prompt is a fixed REENGAGE_DELAYS_MS[0]
+  // apart, so even a full descent is bounded well inside CF_WINDOW_MS; a candidate that ANSWERS
+  // ends the cascade at once, so the deep tail only runs for content every earlier tier refused.
+  const CF_MAX_ATTEMPTS = 20;
   const CF_WINDOW_MS = 10 * 60 * 1000;
   // sessionID -> { blocked: { providerID, modelID }, tried: Set<targetId>, agent, promptPartID, history: number[], timer }
   const cfFailover = new Map();
@@ -1343,6 +1353,18 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       cfFailover.set(sessionID, entry);
       trimTracker(cfFailover);
     }
+    // ☠️ DEDUP THE DOUBLE-FIRE. A streaming content-filter block surfaces via BOTH paths: the
+    // ContentFilterError error event (errorEvent handler) AND the completed-message record with
+    // finish "content-filter" (message.updated), ~16 ms apart -- so beginContentFilterFailover is
+    // called TWICE for one block. Each call aborts and schedules its own re-prompt, so two cascade
+    // re-prompts run concurrently; each leases a DIFFERENT candidate, and because routes holds ONE
+    // lease id per session (chat.message stamps x-opencode-lease-id from routes.get(sessionID)), an
+    // in-flight request carries a lease id that no longer names its wire model -- the gateway then
+    // refuses every candidate "no live lease" and the cascade never advances (petsafe, 2026-10-22,
+    // broker decisions showed two cascade leases 0 ms apart then a no-lease failure). While a
+    // re-prompt for THIS episode is already scheduled or in flight, ignore the duplicate; the next
+    // genuine step is driven by the re-prompt turn's OWN block, after reprompting clears at 1383.
+    if (entry.reprompting) return;
     entry.history = entry.history.filter((at) => now - at < CF_WINDOW_MS);
     if (entry.history.length >= CF_MAX_ATTEMPTS) {
       report("warn", `${sessionID}: content-filter failover gave up after ${entry.history.length} re-prompts within ${CF_WINDOW_MS / 60000} min -- leaving the refusal in place`);
