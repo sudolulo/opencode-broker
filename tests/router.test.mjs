@@ -2255,6 +2255,39 @@ test("a content-filter finish fails the turn over with a cascade /lease and a sy
   assert.ok(!("releasePin" in result.first) && !("fallbackTargetID" in result.first));
 });
 
+test("a content-filter block that arrives WITH a ContentFilterError still cascades (streaming shape)", () => {
+  // On a STREAMING turn the gateway does not buffer-and-strip the block, so OpenCode's completed
+  // message carries BOTH finish "content-filter" AND a ContentFilterError. That makes it register
+  // as an errorEvent, which used to take the generic /failure + re-engage path and re-lease the
+  // SAME model (petsafe, 2026-10-22: blocked repeatedly, 0 cascade leases). It must still cascade.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-e", "standard");
+      await start("cf-e", "standard");
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-e", info: { id: "m-e-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", error: { name: "ContentFilterError", data: { message: "The response was blocked by the provider's content filter" } }, time: { completed: Date.now() } } } } });
+      await flush();
+      await runNewTimers();
+      await feedReprompt("cf-e");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({
+        aborts: aborts.length,
+        prompts: prompts.length,
+        promptText: prompts[0] && prompts[0].body.parts[0].text,
+        failures: brokerCalls.filter((c) => c.path === "/failure").length,
+        cascadeCount: casc.length,
+        first: casc[0] && casc[0].body,
+      }));
+    `,
+  });
+  assert.ok(result.aborts >= 1, "the blocked turn is aborted even though the block arrived as an error");
+  assert.equal(result.prompts, 1, "exactly one synthetic re-prompt");
+  assert.equal(result.promptText, CF_RETRY_TEXT);
+  assert.equal(result.cascadeCount, 1, "the error-carrying content-filter block still drives a contentFilterCascade /lease");
+  assert.equal(result.first.contentFilterCascade, true);
+  assert.deepEqual(result.first.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" });
+});
+
 test("the failover's OWN abort event does not cancel the episode before its re-prompt", () => {
   // beginContentFilterFailover aborts the blocked turn before re-prompting (restoreAtStepBoundary's
   // shape). OpenCode surfaces that abort as an abort error event, which the handler's "any abort

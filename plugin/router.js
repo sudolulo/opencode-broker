@@ -1991,6 +1991,26 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         report("info", `${sessionID}: ignoring unattributable provider error after recovery supersession`);
         return;
       }
+      // ☠️ A CONTENT-FILTER BLOCK CAN ARRIVE AS AN ERROR, NOT A CLEAN FINISH. The gateway only
+      // strips a provider content-filter block to a clean `content-filter` finish (no error) on a
+      // BUFFERED lane; on a STREAMING turn OpenCode attaches a ContentFilterError and the completed
+      // message carries BOTH `finish: "content-filter"` AND that error. With the error present the
+      // event registers as an errorEvent, so the clean-finish failover below (gated on `!error`,
+      // message.updated branch) is never reached -- the turn would take the generic /failure +
+      // scheduleReengage path and re-lease the SAME model, which just re-blocks (petsafe, streaming
+      // Opus 5.5: blocked repeatedly, 0 cascade leases, 2026-10-22). Route it to the cascade here,
+      // mirroring the clean path's cancelRecovery(keepContentFilter) + beginContentFilterFailover.
+      // ☆ beginContentFilterFailover self-guards (manual/classifier/llamacpp/parked) and is bounded
+      // (CF_MAX_ATTEMPTS/CF_WINDOW_MS), so this widens no reach; it only changes WHICH recovery path
+      // a content-filter block takes. The abort and unattributable-error checks above already ran,
+      // so by here this is a block attributed to the active turn, never a user Stop. (recovery/
+      // generation are not yet in scope here -- they are defined inside the generic errorEvent
+      // block below -- and are not needed: attribution is already established.)
+      if (errorEvent && error?.name === "ContentFilterError") {
+        cancelRecovery(sessionID, { keepContentFilter: true });
+        beginContentFilterFailover(sessionID, messageRecordFrom(properties));
+        return;
+      }
       // ☠️ CHARGE THE FAILURE TO THE PROVIDER THAT ACTUALLY ANSWERED, OR TO NOBODY.
       // An assistant message carries the providerID that produced it, and when that
       // names a DIFFERENT provider than this session's lease, the error belongs to
