@@ -120,6 +120,21 @@ test('CLI split policy reports allocation buckets as exact decimal strings and r
   for (const args of [['status', '--policy', policyPath, '--target-id', 'other-target', '--model-id', MODEL], ['status', '--policy', policyPath, '--target-id', 'paid-anthropic-target']]) refusal(await run(args));
 }));
 
+// A split epoch no longer than its release window would open the protected reserve to
+// continuation from the first day, so the operator funding path refuses it statically.
+test('CLI split fund refuses an epoch no longer than the release window and funds a longer one', { timeout: 20000 }, async () => splitFixture(async ({ policyPath, identity }) => {
+  const init = success(await run(['init', '--policy', policyPath, ...identity]));
+  const confirmed = Date.now() - 60000; const window = 48 * 3600000;
+  const fundFor = expires => ['fund', '--policy', policyPath, ...identity, '--amount-usd', '180', '--reference', 'synthetic-short-epoch', '--confirmed-at', new Date(confirmed).toISOString(), '--expires-at', new Date(expires).toISOString(), '--provider-id', PROVIDER_ID, '--origin', ORIGIN, '--credential-sha256', FINGERPRINT, '--confirm-exclusive-promotional-allocation'];
+  for (const expires of [confirmed + window - 3600000, confirmed + window]) {
+    const value = refusal(await run(fundFor(expires)));
+    assert.deepEqual(value, { error: { code: 'epoch_shorter_than_release_window', message: 'epoch_shorter_than_release_window' } });
+    assert.deepEqual(success(await run(['status', '--policy', policyPath, ...identity])), init);
+  }
+  const funded = success(await run(fundFor(confirmed + window + 1000)));
+  assert.equal(funded.fundedNano, '180000000000');
+}));
+
 test('CLI legacy policies refuse split identity flags', { timeout: 10000 }, async () => fixture(async ({ policyPath }) => {
   const init = success(await run(['init', '--policy', policyPath]));
   assert.equal(Object.hasOwn(init, 'registeredIdentity'), false, 'legacy status keys are unchanged');

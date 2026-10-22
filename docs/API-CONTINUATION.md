@@ -272,7 +272,8 @@ Details, schema 2 and status fields: [SPEND-BUDGET.md](SPEND-BUDGET.md).
 | Broker `/lease` | `api-continuation-config-invalid` | The lane names a manual target that an invalid `apiContinuation` block fails closed. Terminal until the config is fixed and the broker restarted. |
 | Broker `/lease` | (no code) `lease authority could not be attested` | A just-granted paid lease could not attest itself; it was deleted. |
 | Broker `/quota-evidence` | `invalid-quota-evidence`, `invalid-subscription-quota` (400); `unknown-or-stale-lease`, `not-a-continuation-source`, `quota-evidence-conflict` (409) | See [API.md](API.md). |
-| Gateway (HTTP 402, `x-should-retry: false`) | `invalid_policy`, `missing_policy`, `binding_mismatch`, `expired`, `invalid_authorization`, `allocation_exhausted`, `unsupported_request`, plus the existing ledger codes | Terminal financial refusals; the code is passed through as itself. |
+| Gateway (HTTP 402, `x-should-retry: false`) | `invalid_policy`, `missing_policy`, `binding_mismatch`, `expired`, `invalid_authorization`, `allocation_exhausted`, `unsupported_request`, `paid_upstream_failed`, plus the existing ledger codes | Terminal financial refusals; the code is passed through as itself. `paid_upstream_failed` answers any paid send that failed upstream (any status, or transport); see [SPEND-BUDGET.md](SPEND-BUDGET.md#failed-paid-dispatch). |
+| Spend-budget CLI `fund` | `epoch_shorter_than_release_window` | A split policy's epoch is no longer than `releaseWindowHours`. Nothing is written. |
 | Plugin `chat.headers` | `paid route attestation is malformed or unbound; resend the prompt` | The route claims to be paid but its grant does not bind this session, lease, target and model. Thrown before the SDK sends anything. |
 
 ## The plugin warning
@@ -317,14 +318,22 @@ and unrelated-provider calls send nothing. No grant, purpose or billing header i
 - **Stripped Anthropic headers fail closed.** A proxy that strips the Anthropic unified headers
   only removes evidence. No continuation record can then be created from that response.
 - **Uncertain holds keep the full worst-case reservation.** When a ledger hold ends uncertain (a
-  non-2xx upstream reply, an abort, or a malformed usage receipt), the full worst-case reservation
-  stays charged. The spend-budget CLI has no operator release path for such a hold yet.
-- **A non-session-bound paid gateway request can make a second paid attempt.** On a retryable
-  upstream status (408, 409, 429 or 5xx) the gateway may retry such a request, and each attempt is
-  paid. Continuation traffic is always session-bound and does not retry this way.
-- **An epoch shorter than the release window opens the reserve immediately.** If a funded epoch is
-  shorter than `releaseWindowHours`, the final release window has already begun at funding, so
-  continuation can draw the protected reserve's available remainder from the start.
+  non-2xx upstream reply, a transport failure, an abort, a malformed usage receipt, or a settlement
+  still `locked` after one retry, `settle_locked`), the full worst-case reservation stays charged.
+  The spend-budget CLI has no operator release path for such a hold yet.
+- **A failed paid send is never retried, even a transient one.** After any paid send that fails
+  upstream (any status, or transport), the gateway makes no second attempt and answers a terminal
+  402 `paid_upstream_failed` that default clients do not retry. A transient 429 or 5xx therefore
+  ends the turn instead of being absorbed by a retry; resending is a deliberate new paid request.
+- **A short epoch is refused only by the CLI.** The spend-budget CLI refuses to fund a split epoch
+  no longer than `releaseWindowHours` (`epoch_shorter_than_release_window`). A ledger funded by
+  another path (an older CLI, or `fundLedger` called directly) with such an epoch has its release
+  window open from funding, so continuation can draw the protected reserve's available remainder
+  from the start.
+- **The content-filter cascade never uses paid targets.** A cascade lease carries no spend grant,
+  so the broker skips every manual API or registered paid target as a cascade candidate and
+  rejects a cascade floor that names one. A content-filter block on a session never moves it onto
+  paid capacity.
 - **A grant is not single-use within its TTL.** The same grant can admit more than one request
   until it expires. The ledger, not the grant, bounds total spend.
 - **`/forget` does not revoke a record.** A record is pruned when its session no longer has a lease

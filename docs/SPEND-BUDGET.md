@@ -126,6 +126,7 @@ The example is a synthetic temporary fixture only. Replace the placeholder with 
 
 - Every HTTP attempt gets a fresh UUID and a durable `DISPATCH_COMMITTED` record before fetch.
 - Errors, disconnects, and partial receipts retain the full hold as `UNCERTAIN`. A process crash or failed uncertainty write can leave `DISPATCH_COMMITTED`; that durable hold still reduces available funds and is never automatically refunded or replayed.
+- A settlement that finds the ledger `locked` (after SQLite's own 1000 ms busy timeout) is retried once after 200 ms. If it is still locked, the attempt is marked `UNCERTAIN` with reason `settle_locked`, keeping the full hold, and the client still receives the completed answer: a stream has already delivered every byte, and a buffered reply returns its validated body. Any other settlement failure, or a failed `settle_locked` write, is a terminal financial refusal.
 - A UUID is never replayed. Duplicate settlement is idempotent; conflicts deny further spending.
 - `SETTLED` burns the reservation by default. A verified, eligible refund is the only exception.
 - If observed usage exceeds a bound, freeze new egress and preserve the exact TEXT addition as additional liability; never clamp it.
@@ -145,6 +146,8 @@ Request-level enabled thinking does not admit `thinking` or `redacted_thinking` 
 Direct global Anthropic cannot verify the proxy's private `x-fleet-health-*` context. The paid path never invokes `healthReporter.begin` or generates private fleet/session headers. Requests requiring health attestation, outage-health or fast scope are refused before egress. Explicit unsupported provider/incoming controls are refused rather than stripped to make the guard pass. Ordinary subscription/proxy health remains unchanged.
 
 SSE accounting observation is bounded to 65,536 bytes per event, without an extra or unbounded tee. A single reader forwards bytes while awaiting downstream backpressure; invalid/oversized events make accounting permanently uncertain but do not buffer the full stream. Usage is cumulative, not summed; cache counters require explicit numeric values, with no zero assumption. EOF must be complete, including trailing bytes after message_stop. Uncertain streams are never refunded.
+
+Content-filter buffering never applies to a paid request. A lane's `bufferStreamingForContentFilter`, and the forced buffering of a content-filter cascade re-issue, are both skipped when the request has a spend policy, so a paid stream is always relayed live with its stall watchdog and idle abort, and the paid body keeps its `stream` field. The content-filter cascade itself never leases a paid target (see [API.md](API.md#content-filter-cascade-on-lease)).
 
 ### Receipt usage metadata
 
@@ -186,15 +189,21 @@ Before this change, refusals used HTTP 503. Both default clients retry a 503: th
 
 These predicates were checked against the published source of both SDKs. The tests emulate them over a real Node HTTP server. No installed SDK was run.
 
-### Deterministic paid 4xx
+### Failed paid dispatch
 
-A guarded upstream response of 400–499, other than 408, 409 or 429, is not retried. The identical prepared request would be refused again. On a profile-mapped route `excludeLane` is a no-op, so the inherited second attempt would only be a second paid send. The bounded body is still collected, the full hold is kept as UNCERTAIN, and the existing `/failure` report and attempt log are still written. The gateway then returns a terminal 402 `unsupported_request`, with no new lease, fetch or reservation. **Cost:** the hold is never released. Whether the provider charges for a 4xx is unverified, so that money stays unavailable. Responses of 408, 409, 429 and 5xx, and fetch failures, keep the existing behaviour: a fresh UUID and a full new reservation when funds allow, and a halt before egress when they do not.
+A paid request that was sent upstream and failed is never retried by the gateway, whatever the failure: any non-2xx upstream status (4xx, 408, 409, 429 and 5xx alike) or a transport failure after dispatch. A deterministic 4xx would be refused again, and a retryable status is exactly what default clients retry themselves; on a profile-mapped route `excludeLane` is a no-op, so a gateway retry would only be a second paid send of the same request. The bounded error body is still collected, the full hold is kept as UNCERTAIN (`http_error` or `fetch_failed`), and the existing `/failure` report and attempt log are still written. No new lease, fetch or reservation follows.
+
+The client then gets one terminal shape: HTTP 402, `x-should-retry: false`, code `paid_upstream_failed`, `retryable: false`. The message names only the upstream status or the word `transport`, for example `spend budget refused: paid_upstream_failed (upstream HTTP 503)`; upstream body text is never relayed. This applies to gateway-originated and session-bound requests alike. Before 1.27.1 a paid 408/409/429/5xx could be retried once by the gateway and then ended in a 502, which the Vercel AI SDK retries as a new paid request, and a paid deterministic 4xx returned 402 `unsupported_request`.
+
+Two failures keep their own code instead: a paid error body that overflows the 1,048,576-byte cap or cannot be collected returns that collection refusal, and a failure before dispatch returns its pre-dispatch refusal. `unsupported_request` is still used for other refusals, for example an unsupported request envelope, an abort between reservation and send, or a successful (2xx) reply whose body or receipt cannot be used.
+
+**Cost:** the hold is never released. Whether the provider charges for a failed request is unverified, so that money stays unavailable, and a transient upstream failure is not retried even when funds would allow it; the caller must send a new request deliberately.
 
 ### Dispatch-path audit
 
 The four API descriptors in [the gateway source](file:///home/dev/opencode-broker/gateway/lib/gateway.js) converge in `completions` → `completionsFor`. There is one actual upstream `fetchImpl` site. Normal leases, verified session leases and outage-bound leases all pass the policy/classification check before credential resolution. Policy alone protects the outage path even when it bypasses normal `/lease` construction. Guarded unsupported APIs/probes/health scopes are refused before that site.
 
-The existing two-attempt loop encloses final preparation and reservation, so HTTP/fetch retries cannot reuse a UUID or an earlier hold. Only 408, 409, 429, 5xx and fetch failures reach the second attempt on a paid lane; any other paid 4xx is terminal (see above). Financial errors return directly, never entering capacity failure/backoff/fallback. Only after reservation succeeds does the single fetch use prepared bytes/headers and `redirect: 'error'`. Guarded bodies are consumed by [the bounded transport helper](file:///home/dev/opencode-broker/gateway/lib/spend-transport.js); ordinary JSON/SSE and nonfinancial estimated usage retain their existing paths. The helper has no fetch, lease, policy bypass or independent production handler.
+The existing two-attempt loop encloses final preparation and reservation, so no attempt can reuse a UUID or an earlier hold. On a paid lane the loop ends at the first dispatched attempt that fails; no paid failure reaches a second attempt (see [Failed paid dispatch](#failed-paid-dispatch)). Financial errors return directly, never entering capacity failure/backoff/fallback. Only after reservation succeeds does the single fetch use prepared bytes/headers and `redirect: 'error'`. Guarded bodies are consumed by [the bounded transport helper](file:///home/dev/opencode-broker/gateway/lib/spend-transport.js); ordinary JSON/SSE and nonfinancial estimated usage retain their existing paths. The helper has no fetch, lease, policy bypass or independent production handler.
 
 ## Split allocations (schema 2)
 
@@ -231,7 +240,11 @@ design selected, not product defaults.
   any schema/policy mismatch is `invalid_ledger` or `binding_mismatch`.
 - **Funding.** With reserve R and ceiling C, a funded amount F must satisfy R <= F <= C. The reserve
   is funded first and in full, so continuation gets F - R: F = 200 gives 150/50, F = 180 gives
-  130/50, F below 50 is refused. Initialization still funds zero.
+  130/50, F below 50 is refused. Initialization still funds zero. The CLI's `fund` also refuses
+  an epoch no longer than the release window (`--expires-at` minus `--confirmed-at` at most
+  `releaseWindowHours`) with `epoch_shorter_than_release_window`, before the ledger is opened:
+  such an epoch would open the protected reserve to continuation from the moment it is funded.
+  The library `fundLedger` does not enforce this rule; only the operator CLI does.
 - **Draws.** Every reservation draws its complete worst-case cost atomically, or is refused with
   `allocation_exhausted`; it is never split into extra paid calls. Manual grants draw only from the
   reserve. Continuation draws only from its own allocation before the unlock instant
@@ -265,7 +278,9 @@ node gateway/bin/opencode-broker-spend-budget status --policy /absolute/path/spl
 
 New refusal codes, passed through by both the gateway's 402 envelope and the CLI:
 `invalid_authorization` (missing, malformed or misbound grant, or wrong registered target or
-model) and `allocation_exhausted` (no eligible funds in the grant's allocation). The gateway's own
+model) and `allocation_exhausted` (no eligible funds in the grant's allocation). The gateway alone
+adds `paid_upstream_failed` (see [Failed paid dispatch](#failed-paid-dispatch)); the CLI alone adds
+`epoch_shorter_than_release_window`. The gateway's own
 grant binding refuses with `invalid_policy`, `binding_mismatch` or `expired`; see
 [API-CONTINUATION.md](API-CONTINUATION.md#gateway-admission-and-ledger-allocations).
 

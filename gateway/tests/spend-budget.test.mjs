@@ -308,25 +308,23 @@ test('configured budget reports deferred registration validation only through th
   } finally { await h.close(); }
 }));
 
-test('retry uses fresh durable UUID and full reservation', async () => withLedgerDir(async ledgerPath => {
-  const policy = await fund(ledgerPath, policyFor(ledgerPath), '0.000000700'); let calls = 0;
+// A failed paid dispatch is never retried by the gateway (it would be another paid send);
+// the client gets the terminal 402 paid_upstream_failed instead (the AI SDK retries any >= 500).
+async function assertPaidUpstreamFailed(response, detail) {
+  assertFinancialHead(response);
+  assert.deepEqual(await response.json(), { type: 'error', error: { type: 'spend_budget_refusal', code: 'paid_upstream_failed',
+    message: `spend budget refused: paid_upstream_failed (${detail})`, retryable: false } });
+}
+for (const amount of ['0.000000700', '0.000000350']) test(`paid 503 is not retried with ${amount === '0.000000700' ? 'funds for a second send' : 'no retry funds'}: one durable attempt, full hold`, async () => withLedgerDir(async ledgerPath => {
+  const policy = await fund(ledgerPath, policyFor(ledgerPath), amount); let calls = 0;
   const h = await makeHarness({ ledgerPath, fetchImpl: async () => {
-    calls++; const s = await status(ledgerPath, policy); assert.equal(s.heldNano, 350n * BigInt(calls));
-    return calls === 1 ? new Response('unavailable', { status: 503 }) : new Response(JSON.stringify(messageFor()));
+    calls++; return calls === 1 ? new Response('unavailable', { status: 503 }) : new Response(JSON.stringify(messageFor()));
   } });
   try {
-    assert.equal((await h.send()).status, 200); assert.equal(calls, 2);
-    const attempts = rows(ledgerPath); assert.equal(attempts.length, 2); assert.notEqual(attempts[0].attempt_id, attempts[1].attempt_id);
-    assert.deepEqual(balances(await status(ledgerPath, policy)), [700n, 0n, 350n, 350n]);
-  } finally { await h.close(); }
-}));
-test('retry insufficient funds terminates all further paid egress', async () => withLedgerDir(async ledgerPath => {
-  const policy = await fund(ledgerPath);
-  const h = await makeHarness({ ledgerPath, fetchImpl: async () => new Response('unavailable', { status: 503 }) });
-  try {
-    const response = await h.send(); assertFinancialHead(response);
-    assert.equal((await response.json()).error.code, 'insufficient_funds'); assert.equal(h.upstreamCalls(), 1);
-    assert.equal(rows(ledgerPath).length, 1); assert.deepEqual(balances(await status(ledgerPath, policy)), [350n, 0n, 350n, 0n]);
+    const response = await h.send(); await assertPaidUpstreamFailed(response, 'upstream HTTP 503'); assert.equal(calls, 1);
+    const attempts = rows(ledgerPath); assert.equal(attempts.length, 1); assert.equal(attempts[0].state, 'UNCERTAIN');
+    const funded = amount === '0.000000700' ? 700n : 350n;
+    assert.deepEqual(balances(await status(ledgerPath, policy)), [funded, funded - 350n, 350n, 0n]);
   } finally { await h.close(); }
 }));
 test('concurrent handler requests have exactly one winner from one 350n wallet', async () => withLedgerDir(async ledgerPath => {
@@ -513,14 +511,15 @@ for (const usage of [{ ...messageFor().usage, output_tokens: 11 }, { ...messageF
 }));
 
 test('redirect error cannot escape, and fetch exception never leaks key or body', async () => withLedgerDir(async ledgerPath => {
-  const policy = await fund(ledgerPath); const h = await makeHarness({ ledgerPath, fetchImpl: async (_url, init) => {
+  // Funded for a second send: only the gateway's own rule, not the wallet, stops a retry.
+  const policy = await fund(ledgerPath, policyFor(ledgerPath), '0.000000700'); const h = await makeHarness({ ledgerPath, fetchImpl: async (_url, init) => {
     assert.equal(init.redirect, 'error'); throw new TypeError(`redirect to https://elsewhere.invalid: ${TEST_KEY}`);
   } });
   try {
-    const response = await h.send(); assertFinancialHead(response); assert.equal((await response.json()).error.code, 'insufficient_funds');
-    assert.equal(h.upstreamCalls(), 1); assert.equal(rows(ledgerPath)[0].state, 'UNCERTAIN');
+    const response = await h.send(); await assertPaidUpstreamFailed(response, 'transport');
+    assert.equal(h.upstreamCalls(), 1, 'exactly one paid fetch'); assert.equal(rows(ledgerPath).length, 1); assert.equal(rows(ledgerPath)[0].state, 'UNCERTAIN');
     assert.equal(JSON.stringify([...h.brokerCalls, ...h.logs]).includes(TEST_KEY), false);
-    assert.deepEqual(balances(await status(ledgerPath, policy)), [350n, 0n, 350n, 0n]);
+    assert.deepEqual(balances(await status(ledgerPath, policy)), [700n, 350n, 350n, 0n]);
   } finally { await h.close(); }
 }));
 
@@ -946,6 +945,11 @@ const wireCases = [
   ['post-dispatch JSON overflow', 'unsupported_request', 1, { fetchImpl: async () => streamResponse([new Uint8Array(1048577).fill(32)], { contentType: 'application/json' }) }],
   ['post-dispatch malformed JSON', 'unsupported_request', 1, { fetchImpl: async () => new Response('malformed') }],
   ['post-dispatch settlement storage error', 'invalid_ledger', 1, { storageFault: true }],
+  // A paid upstream 5xx or transport failure: a 502 here would be re-sent by the AI SDK loop.
+  ['post-dispatch upstream HTTP 503', 'paid_upstream_failed', 1, { detail: 'upstream HTTP 503',
+    fetchImpl: async () => new Response('synthetic unavailable', { status: 503 }) }],
+  ['post-dispatch transport failure', 'paid_upstream_failed', 1, { detail: 'transport',
+    fetchImpl: async () => { throw new TypeError('synthetic socket reset'); } }],
 ];
 for (const [name, code, sends, options] of wireCases) for (const client of Object.keys(CLIENT_PREDICATES)) {
   test(`real NodeHTTP ${name}: 402 native envelope, x-should-retry false, ${client} default loop sends once`, async t => withLedgerDir(async ledgerPath => {
@@ -973,7 +977,7 @@ for (const [name, code, sends, options] of wireCases) for (const client of Objec
       assert.equal(response.headers.get('x-should-retry'), 'false');
       assert.match(response.headers.get('content-type'), /^application\/json/);
       assert.deepEqual(response.body, { type: 'error', error: { type: 'spend_budget_refusal', code,
-        message: `spend budget refused: ${code}`, retryable: false } });
+        message: `spend budget refused: ${code}${options.detail ? ` (${options.detail})` : ''}`, retryable: false } });
       assert.equal(h.upstreamCalls(), sends);
       if (policy) {
         t.mock.restoreAll();
@@ -986,17 +990,17 @@ for (const [name, code, sends, options] of wireCases) for (const client of Objec
 
 // Important finding 3: a deterministic paid 4xx must not take the inherited
 // second attempt. The harness model is profile-mapped, so excludeLane is a
-// no-op and the broker would hand back the same paid lane.
+// no-op and the broker would hand back the same paid lane. The client gets the
+// terminal 402 paid_upstream_failed naming only the upstream status.
 const errorBody = status => JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `synthetic ${status}` } });
 for (const upstreamStatus of [400, 401, 402, 403, 404, 405, 413, 415, 422]) {
   test(`deterministic paid HTTP ${upstreamStatus} is terminal: one fetch, full hold, funds for a second send intact`, async () => withLedgerDir(async ledgerPath => {
     const policy = await fund(ledgerPath, policyFor(ledgerPath), '0.000000700');
     const h = await makeHarness({ ledgerPath, fetchImpl: async () => new Response(errorBody(upstreamStatus), { status: upstreamStatus, headers: { 'content-type': 'application/json' } }) });
     try {
-      const response = await h.send(); assertFinancialHead(response);
-      const value = await response.json();
-      assert.equal(value.type, 'error'); assert.equal(value.error.type, 'spend_budget_refusal');
-      assert.equal(value.error.code, 'unsupported_request'); assert.equal(value.error.retryable, false);
+      const response = await h.send();
+      // deepEqual of the whole envelope also proves the upstream body is never echoed.
+      await assertPaidUpstreamFailed(response, `upstream HTTP ${upstreamStatus}`);
       assert.equal(h.upstreamCalls(), 1);
       assert.equal(h.brokerCalls.filter(c => c.path === '/lease').length, 1, 'no second lease or fallback');
       assert.equal(h.brokerCalls.filter(c => c.path === '/failure').length, 1, 'existing upstream failure report retained once');
@@ -1005,24 +1009,26 @@ for (const upstreamStatus of [400, 401, 402, 403, 404, 405, 413, 415, 422]) {
     } finally { await h.close(); }
   }));
 }
+// Retryable upstream statuses are not retried by the gateway either: the client sees the
+// same terminal 402, and one fully held attempt, funded for more or not.
 for (const upstreamStatus of [408, 409, 429, 503]) {
-  test(`control: retryable paid HTTP ${upstreamStatus} takes a second fully reserved attempt when funded`, async () => withLedgerDir(async ledgerPath => {
+  test(`retryable paid HTTP ${upstreamStatus} is terminal when funded for a second send: one fetch, 402 paid_upstream_failed`, async () => withLedgerDir(async ledgerPath => {
     const policy = await fund(ledgerPath, policyFor(ledgerPath), '0.000000700');
     const h = await makeHarness({ ledgerPath, fetchImpl: async () => new Response(errorBody(upstreamStatus), { status: upstreamStatus, headers: { 'content-type': 'application/json' } }) });
     try {
-      const response = await h.send(); assert.equal(response.status, 502); assert.equal(response.headers.get('x-should-retry'), null);
-      await response.text();
-      assert.equal(h.upstreamCalls(), 2);
-      const attempts = rows(ledgerPath); assert.equal(attempts.length, 2); assert.notEqual(attempts[0].attempt_id, attempts[1].attempt_id);
-      assert.deepEqual(balances(await status(ledgerPath, policy)), [700n, 0n, 700n, 0n]);
+      const response = await h.send(); await assertPaidUpstreamFailed(response, `upstream HTTP ${upstreamStatus}`);
+      assert.equal(h.upstreamCalls(), 1);
+      assert.equal(h.brokerCalls.filter(c => c.path === '/lease').length, 1, 'no second lease');
+      const attempts = rows(ledgerPath); assert.equal(attempts.length, 1); assert.equal(attempts[0].state, 'UNCERTAIN');
+      assert.deepEqual(balances(await status(ledgerPath, policy)), [700n, 350n, 350n, 0n]);
     } finally { await h.close(); }
   }));
-  test(`control: retryable paid HTTP ${upstreamStatus} with insufficient retry funds halts before egress`, async () => withLedgerDir(async ledgerPath => {
+  test(`retryable paid HTTP ${upstreamStatus} without retry funds is the same terminal 402`, async () => withLedgerDir(async ledgerPath => {
     const policy = await fund(ledgerPath);
     const h = await makeHarness({ ledgerPath, fetchImpl: async () => new Response(errorBody(upstreamStatus), { status: upstreamStatus }) });
     try {
-      const response = await h.send(); assertFinancialHead(response);
-      assert.equal((await response.json()).error.code, 'insufficient_funds'); assert.equal(h.upstreamCalls(), 1);
+      const response = await h.send(); await assertPaidUpstreamFailed(response, `upstream HTTP ${upstreamStatus}`);
+      assert.equal(h.upstreamCalls(), 1);
       assert.deepEqual(balances(await status(ledgerPath, policy)), [350n, 0n, 350n, 0n]);
     } finally { await h.close(); }
   }));

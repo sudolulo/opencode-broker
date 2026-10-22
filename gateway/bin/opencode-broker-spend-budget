@@ -36,6 +36,13 @@ try {
   if (identity.some(key => (options[key] === undefined) === split)) error('invalid_flags');
   const policy = normalizeSpendPolicy(raw, split ? { targetID: options['--target-id'], providerID: raw.binding?.providerID, modelID: options['--model-id'] } : undefined);
   const now = Date.now();
+  // A split epoch no longer than its release window would leave the protected reserve open
+  // to continuation from the moment it is funded. Refused before the ledger is opened; an
+  // unparseable time is left to fundLedger's own validation (NaN never compares <=).
+  if (command === 'fund' && policy.allocations
+    && Date.parse(options['--expires-at']) - Date.parse(options['--confirmed-at']) <= policy.allocations.releaseWindowMs) {
+    error('epoch_shorter_than_release_window');
+  }
   let result;
   if (command === 'init') result = await initializeLedger({ ledgerPath: policy.ledgerPath, policy, now });
   else if (command === 'status') result = await inspectStatus({ ledgerPath: policy.ledgerPath, policy, now });
@@ -44,7 +51,7 @@ try {
 } catch (caught) {
   // JSON parse and filesystem errors can quote arbitrary policy bytes/paths.
   // Only our fixed refusal vocabulary crosses the CLI boundary.
-  const codes = new Set(['invalid_command', 'unknown_flag', 'invalid_flags', 'invalid_policy', 'unsupported_runtime', 'missing_ledger', 'invalid_ledger', 'binding_mismatch', 'expired', 'insufficient_funds', 'frozen', 'locked', 'invalid_authorization', 'allocation_exhausted']);
+  const codes = new Set(['invalid_command', 'unknown_flag', 'invalid_flags', 'invalid_policy', 'unsupported_runtime', 'missing_ledger', 'invalid_ledger', 'binding_mismatch', 'expired', 'insufficient_funds', 'frozen', 'locked', 'invalid_authorization', 'allocation_exhausted', 'epoch_shorter_than_release_window']);
   const code = codes.has(caught.code) ? caught.code : 'invalid_policy';
   process.stderr.write(`${stringify({ error: { code, message: code } })}\n`);
   process.exitCode = 1;

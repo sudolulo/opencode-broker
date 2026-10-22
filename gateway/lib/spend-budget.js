@@ -461,6 +461,7 @@ export async function initializeLedger(args) {
   return result;
 }
 
+// The epoch-vs-release-window rule is enforced by the operator CLI (bin/opencode-broker-spend-budget), not here: tests and internal callers fund short epochs deliberately.
 export async function fundLedger(args) {
   const { policy, allocation, now } = args;
   return connected(args, db => transaction(db, args, state => {

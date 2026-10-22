@@ -8,7 +8,8 @@
 // request (constrained to providers it can actually forward to -- OAuth-only
 // providers are not forwardable by a generic proxy), rewrites the model field,
 // forwards, reports usage and failures back to the broker, and retries once
-// on a fresh lease when a provider fails. Pinning becomes routing.
+// on a fresh lease when a non-paid provider fails (a paid, spend-budget lane is
+// never retried once sent: see paid_upstream_failed). Pinning becomes routing.
 //
 // Two response shapes, one routing path: buffered JSON, and a
 // real SSE passthrough for clients that hard-require token-by-token output.
@@ -500,7 +501,9 @@ const spendError = (code) => Object.assign(new Error(`spend budget refused: ${co
 const SPEND_CODES = new Set(["missing_policy", "invalid_policy", "unsupported_runtime", "missing_ledger",
   "invalid_ledger", "binding_mismatch", "expired", "insufficient_funds", "frozen", "locked", "unsupported_request",
   // Split-policy refusals: prepare (missing/mismatched authorization) and reserve (allocation draw).
-  "invalid_authorization", "allocation_exhausted"]);
+  "invalid_authorization", "allocation_exhausted",
+  // A paid request was sent upstream and failed (any upstream status, or transport).
+  "paid_upstream_failed"]);
 // A FINANCIAL REFUSAL MUST BE TERMINAL FOR DEFAULT CLIENTS, NOT MERELY LABELLED SO. A 503
 // is retried by both default clients (Vercel AI SDK: 408/409/429/>=500; Anthropic SDK: the same
 // unless x-should-retry says otherwise), and every retry is a NEW paid request: a post-dispatch
@@ -508,15 +511,13 @@ const SPEND_CODES = new Set(["missing_policy", "invalid_policy", "unsupported_ru
 // tells the Anthropic SDK explicitly, and the native `type:"error"` envelope keeps the AI SDK's
 // Anthropic error schema parsing. Only possible before the response head is committed; a
 // started stream ends with an owned SSE error frame instead (see refuseSpend).
-const spendRefusal = (error) => {
+// `detail` is a gateway-owned suffix only (an upstream status number or "transport"), never
+// upstream or caller text.
+const spendRefusal = (error, detail = null) => {
   const code = SPEND_CODES.has(error?.code) ? error.code : "invalid_ledger";
   return { status: 402, headers: { "x-should-retry": "false" }, payload: { type: "error", error: {
-    type: "spend_budget_refusal", code, message: `spend budget refused: ${code}`, retryable: false } } };
+    type: "spend_budget_refusal", code, message: `spend budget refused: ${code}${detail ? ` (${detail})` : ""}`, retryable: false } } };
 };
-// Upstream statuses the inherited loop may retry on a paid lane: request timeout, conflict,
-// rate limit and server errors (the same set default clients treat as transient). Any other
-// 4xx is deterministic for an identical request and must not buy a second paid send.
-const retryablePaidStatus = (status) => status === 408 || status === 409 || status === 429 || status >= 500;
 // Preserve presence and false/null values. Only broker-returned target objects
 // call this function; caller JSON/header metadata never supplies classification.
 const spendClassification = (target) => Object.fromEntries(["requiresSpendBudget", "billingClass"]
@@ -533,6 +534,9 @@ const SPEND_GRANT_PURPOSE = Object.freeze({ "manual-api": "manual", "api-continu
 // stranded as UNCERTAIN (retained, never refunded) for a request that was never sent. 2 s covers
 // a queued SQLite reservation with margin while costing a live grant (minutes) nothing.
 const SPEND_GRANT_MIN_REMAINING_MS = 2000;
+// Pause before the single settle retry after a `locked` ledger (see the settle site). Short:
+// the client response is held open for it, and SQLite's own busy_timeout already waited 1 s.
+const SETTLE_LOCKED_RETRY_MS = 200;
 const providerSpendPolicy = (providerID, provider, leased = {}) => {
   // A grant with no declared class is a declaration too: it fails closed below rather than
   // being silently ignored on an unclassified lease.
@@ -1976,6 +1980,10 @@ export const createGatewayHandler = ({
     };
     let acquiredLease = false;
     let lastLeased = null;
+    // Set once any attempt of this request has sent a PAID request upstream; the last paid
+    // upstream HTTP status (null for a transport failure). They decide the final reply's shape.
+    let paidDispatched = false;
+    let paidFailureStatus = null;
     const excluded = [];
     const excludedTargets = [];
     // ☠️ A PROFILE-MAPPED REQUEST MUST NOT EXCLUDE ITS OWN LANE. The exclusion
@@ -2124,7 +2132,11 @@ export const createGatewayHandler = ({
       // (forceBuffered) or a lane that opted into `bufferStreamingForContentFilter` reads the whole
       // reply so a refusal is caught before the first byte. relayBufferedReply dresses all three
       // dialects (bufferedMessagesFrames for MESSAGES), so the client still gets its stream.
-      const contentFilterBuffer = streaming
+      // TRAP: NEVER FOR A PAID REQUEST. A spend attempt's ledger owns settlement, and its relay
+      // (relaySpendSSE) arms the stall watchdog on every frame: buffering it would strip
+      // `stream` from the paid body, wear the buffered total deadline, and leave stallAbort null
+      // for a touch(idleMs) that still fires. Covers forceBuffered cascade re-issues too.
+      const contentFilterBuffer = streaming && !spendPolicy
         && (forceBuffered || (detectBlocks && providerConfig.bufferStreamingForContentFilter === true));
       const bufferingStream = streaming && (
         (providerConfig.bufferStreamingUpstream === true && (api === CHAT || api === RESPONSES))
@@ -2137,7 +2149,9 @@ export const createGatewayHandler = ({
         // ☆ A TimeoutError (not a bare Error) keeps a stall in the "our
         // impatience: release, do not indict" class the catch below already
         // sorts by name.
-        stallTimer = setTimeout(() => stallAbort.abort(new DOMException("upstream stalled", "TimeoutError")), ms);
+        // Null-safe: a buffered attempt has no stall controller, and a timer callback that
+        // threw here would be an uncaught exception, not a request failure.
+        stallTimer = setTimeout(() => stallAbort?.abort(new DOMException("upstream stalled", "TimeoutError")), ms);
         stallTimer.unref?.();
       };
       // Chat never assembles n > 1. Responses can opt in only when the lane explicitly serves
@@ -2423,6 +2437,7 @@ export const createGatewayHandler = ({
         // Only this site sends upstream. The immutable prepared snapshot is the
         // actual fetch input, not merely a digest of an earlier draft.
         spendDispatched = Boolean(spendPolicy);
+        if (spendDispatched) paidDispatched = true;
         response = await fetchImpl(prepared?.url ?? upstreamURL, {
           method: "POST",
           headers: prepared?.headers ?? forwardHeaders,
@@ -2439,6 +2454,7 @@ export const createGatewayHandler = ({
         if (spendPolicy) {
           if (!spendDispatched) return await refuseSpend(error);
           try { await uncertainSpend("fetch_failed"); } catch (storageError) { return await refuseSpend(storageError); }
+          paidFailureStatus = null;
           // Never let a transport exception echo credentials or request bytes.
           error = Object.assign(new Error("paid upstream fetch failed"), { name: isAbort(error) ? "AbortError" : "Error" });
         }
@@ -2460,6 +2476,9 @@ export const createGatewayHandler = ({
         noteAttempt(leased, thrownOutcome(error), thrownDetail(error));
         excludeLane(leased.providerID);
         rememberForwardError(error);
+        // A transport failure AFTER a paid send may still have been billed: no second paid
+        // attempt. The hold stays UNCERTAIN (marked above); the final reply is the terminal 402.
+        if (spendDispatched) break;
         continue;
       }
       // A proxy-authenticated scope refusal is distinct from any broker/control-plane 409.
@@ -2528,11 +2547,18 @@ export const createGatewayHandler = ({
             : `upstream ${leased.providerID} HTTP ${response.status}: ${text.slice(0, 120)}`);
         if (usageLimit) error.usageLimit = { providerID: leased.providerID, ...usageLimit };
         noteAttempt(leased, usageLimit ? "usage_limit" : `http_${response.status}`, spendPolicy ? `HTTP ${response.status}` : upstreamDetail(raw) || `HTTP ${response.status}`);
-        // A DETERMINISTIC PAID 4xx IS NOT RETRIED. The identical prepared request would be
-        // refused again, and on a profile-mapped route excludeLane is a no-op, so the inherited
-        // second attempt is just a second paid send. The full hold stays UNCERTAIN (provider
-        // charge treatment of a 4xx is unverified); no new lease, fetch or reservation follows.
-        if (spendReservation && !retryablePaidStatus(response.status)) return spendRefusal(spendError("unsupported_request"));
+        // A FAILED PAID DISPATCH IS NEVER RETRIED BY THE GATEWAY, whatever the status. A
+        // deterministic 4xx would be refused again, and a retryable 408/409/429/5xx is exactly
+        // what default clients retry themselves -- on a profile-mapped route excludeLane is a
+        // no-op, so the inherited second attempt is just another paid send of the same request.
+        // The full hold stays UNCERTAIN (provider charge treatment is unverified); no new lease,
+        // fetch or reservation follows. The final reply below is the terminal 402
+        // paid_upstream_failed for the client too (see paidFailureStatus there).
+        if (spendReservation) {
+          paidFailureStatus = response.status;
+          rememberForwardError(error);
+          break;
+        }
         rememberForwardError(error);
         excludeLane(leased.providerID);
         continue;
@@ -2559,13 +2585,38 @@ export const createGatewayHandler = ({
           try { await uncertainSpend(error?.spendReason ?? "response_error"); } catch (storageError) { return await refuseSpend(storageError); }
           return await refuseSpend(error);
         } finally { clearTimeout(stallTimer); }
+        let settleFailure = null;
         try {
           await settleAttempt({ ...spendReservation, evidence: receipt.evidence, now: now() });
-        } catch (error) {
+        } catch (error) { settleFailure = error; }
+        // A LOCKED LEDGER AT SETTLE IS CONTENTION, NOT A BROKEN WALLET. SQLite already waited
+        // its busy_timeout; one more try after a short pause clears an ordinary concurrent
+        // writer. If it is still locked the attempt must not stay DISPATCH_COMMITTED (a state
+        // that claims "sent, outcome pending" forever): it is marked UNCERTAIN, which retains
+        // the FULL hold -- conservative, never a refund, never a fabricated cost.
+        if (settleFailure?.code === "locked") {
+          await new Promise((resolve) => { setTimeout(resolve, SETTLE_LOCKED_RETRY_MS); });
+          try {
+            await settleAttempt({ ...spendReservation, evidence: receipt.evidence, now: now() });
+            settleFailure = null;
+          } catch (error) { settleFailure = error; }
+          if (settleFailure?.code === "locked") {
+            try { await uncertainSpend("settle_locked"); } catch (storageError) { return await refuseSpend(storageError); }
+            // The upstream answer is complete and the ledger now holds its full worst-case cost,
+            // so the client gets that answer on BOTH paths:
+            //   streaming -- every upstream byte, message_stop included, is already on the wire;
+            //     appending a refusal frame would contradict a delivered reply.
+            //   buffered -- the complete validated body is in hand; a 402 would discard an
+            //     answer that was paid for and invite a manual re-send (a second paid call).
+            // Only the settlement is unresolved, and that is the ledger's record, not the client's.
+            settleFailure = null;
+          }
+        }
+        if (settleFailure) {
           // Storage failure/bounds freeze is not a provider capacity failure.
           // Already-sent stream bytes cannot be recalled; signal the terminal
           // failure safely and retain the hold (no fabricated successful cost).
-          return await refuseSpend(error);
+          return await refuseSpend(settleFailure);
         }
         if (receipt.evidence.usage) await reportUsage(leased, readMessagesUsage(receipt.evidence.usage));
         await settle(leased, "/complete");
@@ -2848,6 +2899,17 @@ export const createGatewayHandler = ({
     const usageLead = boundUsageMessage ?? (lastError?.code === "usage-limit"
       ? String(lastError.message)
       : usageLimited.length ? `${usageLimitMessage(usageLimited, now())}.` : null);
+    // A FAILED PAID DISPATCH MUST BE TERMINAL FOR DEFAULT CLIENTS. OpenCode's Vercel AI SDK
+    // retries 408/409/429 and ANY status >= 500 whatever x-should-retry says, and every re-send
+    // is a NEW paid request on top of the hold this one left UNCERTAIN. So after any paid send
+    // that failed -- any upstream status, or a transport failure -- the client gets ONE shape:
+    // the 402 spend refusal (outside both SDKs' retry predicates, x-should-retry: false), code
+    // paid_upstream_failed, naming only the upstream status number or "transport" and never
+    // upstream body text. Gateway-originated and session-bound requests alike.
+    if (paidDispatched) {
+      return spendRefusal(spendError("paid_upstream_failed"),
+        paidFailureStatus !== null ? `upstream HTTP ${paidFailureStatus}` : "transport");
+    }
     return {
       status: 502,
       payload: { error: { message: usageLead
