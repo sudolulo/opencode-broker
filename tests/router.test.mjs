@@ -2288,33 +2288,30 @@ test("a content-filter block that arrives WITH a ContentFilterError still cascad
   assert.deepEqual(result.first.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" });
 });
 
-test("a content-filter cascade re-prompt CARRIES the blocked turn's effort (no variant mismatch)", () => {
-  // The re-prompt is synthetic, so the turn classifier is skipped and turnEffort would be null -->
-  // the lease omits turnClass, the engine applies no per-turn effort, and the variant-less turn
-  // mismatches the cascade candidate the broker leased at the session's static effort
-  // (petsafe 2026-10-22: block -> cascade -> "routed model mismatch"). The blocked turn's own
-  // effort must ride along so the cascade lease and the re-prompt turn apply the same variant.
+test("the cascade re-prompt CARRIES the blocked turn's effort as PromptInput.variant", () => {
+  // The re-prompt is synthetic, so without carrying the effort it arrives variant-less while the
+  // broker leased the cascade candidate at the session's effort (/high) -> chat.params throws
+  // "routed model mismatch; resend" and the cascade can never escape the block (petsafe 2026-10-22).
+  // Carry the blocked turn's own variant onto the re-prompt so the turn runs at the same effort.
   const result = runCf({
     cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
     body: `
-      await created("cf-eff", "standard");
-      await start("cf-eff", "standard");
-      await human("cf-eff", "standard", "Please carry out a substantial multi-step refactor across the package and verify the whole test suite afterwards.");
-      await block("cf-eff", "openai", "gpt-5.6-sol", "m-eff-1");
+      await created("cf-v", "standard");
+      await start("cf-v", "standard");
+      // The blocked turn ran at effort /high, so its message carries variant "high".
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-v", info: { id: "m-v-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", variant: "high", finish: "content-filter", time: { completed: Date.now() } } } } });
+      await flush();
       await runNewTimers();
-      await feedReprompt("cf-eff");
-      const casc = cascadeLeases();
-      const normal = brokerCalls.filter((c) => c.path === "/lease" && !c.body.contentFilterCascade);
       console.log(JSON.stringify({
-        cascadeCount: casc.length,
-        humanCarriedEffort: Boolean(normal.find((c) => c.body.turnClass)),
-        cascadeCarriedEffort: Boolean(casc[0] && casc[0].body && casc[0].body.turnClass),
+        prompts: prompts.length,
+        promptText: prompts[0] && prompts[0].body && prompts[0].body.parts && prompts[0].body.parts[0] && prompts[0].body.parts[0].text,
+        promptVariant: prompts[0] && prompts[0].body ? prompts[0].body.variant : undefined,
       }));
     `,
   });
-  assert.equal(result.cascadeCount, 1, "the block still drives a cascade /lease");
-  assert.ok(result.humanCarriedEffort, "sanity: the human turn classified an effort (turnClass on its lease)");
-  assert.ok(result.cascadeCarriedEffort, "the cascade re-prompt carries the blocked turn's effort onto its lease");
+  assert.equal(result.prompts, 1, "the block drives one synthetic re-prompt");
+  assert.equal(result.promptText, CF_RETRY_TEXT);
+  assert.equal(result.promptVariant, "high", "the re-prompt carries the blocked turn's effort (variant) so the turn matches the lease");
 });
 
 test("the failover's OWN abort event does not cancel the episode before its re-prompt", () => {

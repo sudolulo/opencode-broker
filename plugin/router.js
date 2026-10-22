@@ -149,7 +149,6 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   };
   const riskFloors = new Map(); // sessionID -> minimum tier for high-risk content
   const previousTurnClasses = new Map(); // sessionID -> last substantive normal or hard class
-  const lastTurnEffort = new Map(); // sessionID -> last applied turnEffort, carried onto a cascade re-prompt
   const engineEffortUpdates = new Map(); // sessionID -> whether this session's engine supports safe effort updates
   const sessions = new Map();
   const successCandidates = new Map();
@@ -1354,7 +1353,15 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // skips the head by provider+model and every already-tried candidate by target id, so the
     // order always advances. Overwriting the head with each chained block would stop excluding
     // the first refusing model, letting the broker re-lease it for one wasted re-prompt.
-    if (!entry.blocked) entry.blocked = { providerID: record.providerID, modelID: record.modelID };
+    if (!entry.blocked) {
+      entry.blocked = { providerID: record.providerID, modelID: record.modelID };
+      // Capture the effort the blocked turn was running at so the cascade re-prompt (below) runs at
+      // the SAME variant the broker leases the candidate at. The re-prompt is synthetic, so without
+      // this it arrives variant-less while the candidate is leased at the session's effort (e.g.
+      // /high), and chat.params throws "routed model mismatch; resend" -- the cascade then can never
+      // escape the block (petsafe, 2026-10-22). Carried via PromptInput.variant, not stripped.
+      entry.variant = typeof record.variant === "string" && record.variant ? record.variant : undefined;
+    }
     entry.agent = sessions.get(sessionID)?.agent;
     entry.history.push(now);
     entry.promptPartID = `prt_${randomUUID()}`;
@@ -1380,6 +1387,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             query: { directory },
             body: {
               ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+              // Carry the blocked turn's effort so this re-prompt runs at the same variant the broker
+              // leases the cascade candidate at; otherwise the synthetic turn is variant-less and
+              // chat.params rejects it as "routed model mismatch".
+              ...(typeof entry.variant === "string" && entry.variant ? { variant: entry.variant } : {}),
               parts: [{ id: entry.promptPartID, type: "text", text: CF_RETRY_TEXT, synthetic: true }],
             },
           });
@@ -1720,20 +1731,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         if (!isCompaction) {
           previousTurnClasses.set(sessionID, nextPrevious(previousTurnClasses.get(sessionID), turnEffort));
           trimTracker(previousTurnClasses);
-          // Remember the applied effort so a later content-filter cascade re-prompt (synthetic, so
-          // the classifier above is skipped) can CARRY it instead of re-leasing variant-less.
-          lastTurnEffort.set(sessionID, turnEffort);
-          trimTracker(lastTurnEffort);
         }
       }
-      // ☠️ CARRY THE EFFORT ONTO A CONTENT-FILTER CASCADE RE-PROMPT. It is synthetic, so turnEffort
-      // stayed null above -> the lease would omit turnClass, the engine would apply no per-turn
-      // effort to the re-prompt, and the variant-less turn would mismatch the cascade candidate the
-      // broker leased at the session's STATIC effort (e.g. /high): the "routed model mismatch; resend"
-      // the cascade death-looped on (petsafe, 2026-10-22: block -> cascade -> mismatch). Reuse the
-      // BLOCKED turn's own effort so the cascade lease and the re-prompt turn apply the SAME variant
-      // and chat.params's guard agrees -- carry the effort, never strip it.
-      if (cfReprompt && !turnEffort) turnEffort = lastTurnEffort.get(sessionID) ?? null;
       // ☠️ Ask what the profile can REACH, not what it is called. A profile granted
       // `profileCloudEgress` is still one of the restrictive four by name while holding
       // a cloud fallback rung, and skipping admission work on the name would leave that
