@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **An ordinary re-lease no longer fails the in-flight request with "no live lease".** The single-slot `state.leases[sessionID]` is overwritten on every re-decision, so a request already in flight when the slot flips (an oscillating tier with two near-equal siblings, a context-pressure re-pick, or any mid-turn re-lease) reached `/lease/verify` against the new slot and was 400'd "no live lease for <model>" — which STOPS the turn, not just a cosmetic flash. The cascade path already guarded this via `cascadeGrants` (verify honors a model the broker granted this session within the TTL, independent of the stomped slot); that grant is now recorded for EVERY lease, not only cascade leases. Only a model the broker itself just handed this session can match and the grant self-expires, so no session reaches an ungranted model. (Generalizes the c584a18 cascade-grant fix to ordinary re-leases.)
+
 ## [1.27.1] — 2026-10-22
 
 ### Fixed
