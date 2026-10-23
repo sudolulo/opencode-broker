@@ -2325,6 +2325,139 @@ test("a content-filter finish fails the turn over with a cascade /lease and a sy
   assert.ok(!("releasePin" in result.first) && !("fallbackTargetID" in result.first));
 });
 
+test("a content-filter block that arrives WITH a ContentFilterError still cascades (streaming shape)", () => {
+  // On a STREAMING turn the gateway does not buffer-and-strip the block, so OpenCode's completed
+  // message carries BOTH finish "content-filter" AND a ContentFilterError. That makes it register
+  // as an errorEvent, which used to take the generic /failure + re-engage path and re-lease the
+  // SAME model (petsafe, 2026-10-22: blocked repeatedly, 0 cascade leases). It must still cascade.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-e", "standard");
+      await start("cf-e", "standard");
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-e", info: { id: "m-e-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", error: { name: "ContentFilterError", data: { message: "The response was blocked by the provider's content filter" } }, time: { completed: Date.now() } } } } });
+      await flush();
+      await runNewTimers();
+      await feedReprompt("cf-e");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({
+        aborts: aborts.length,
+        prompts: prompts.length,
+        promptText: prompts[0] && prompts[0].body.parts[0].text,
+        failures: brokerCalls.filter((c) => c.path === "/failure").length,
+        cascadeCount: casc.length,
+        first: casc[0] && casc[0].body,
+      }));
+    `,
+  });
+  assert.ok(result.aborts >= 1, "the blocked turn is aborted even though the block arrived as an error");
+  assert.equal(result.prompts, 1, "exactly one synthetic re-prompt");
+  assert.equal(result.promptText, CF_RETRY_TEXT);
+  assert.equal(result.cascadeCount, 1, "the error-carrying content-filter block still drives a contentFilterCascade /lease");
+  assert.equal(result.first.contentFilterCascade, true);
+  assert.deepEqual(result.first.blockedModel, { providerID: "openai", id: "gpt-5.6-sol" });
+});
+
+test("a block that double-fires (error event AND completed-message event) re-prompts ONCE, not twice", () => {
+  // A streaming content-filter block surfaces via BOTH paths ~16 ms apart: the ContentFilterError
+  // error event AND the completed message.updated with finish "content-filter". Without dedup each
+  // schedules its own abort + re-prompt, so TWO cascade re-prompts run concurrently; each leases a
+  // DIFFERENT candidate, and because routes holds one lease id per session the in-flight request
+  // sends a lease id that no longer names its wire model -- the gateway then refuses every candidate
+  // "no live lease" and the cascade never advances (petsafe, 2026-10-22). It must re-prompt once.
+  const result = runCf({
+    cascadePlan: [
+      { body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } },
+      { body: { target: { id: "claude-opus-4-8", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-4-8" } }, decision: { policy: "content-filter-cascade" } } },
+    ],
+    body: `
+      await created("cf-dup", "standard");
+      await start("cf-dup", "standard");
+      // Same block, same message id, both shapes: the error-event shape then the clean completed shape.
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-dup", info: { id: "m-dup-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", error: { name: "ContentFilterError", data: { message: "blocked" } }, time: { completed: Date.now() } } } } });
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-dup", info: { id: "m-dup-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", finish: "content-filter", time: { completed: Date.now() } } } } });
+      await flush();
+      await runNewTimers();
+      if (prompts.length) await feedReprompt("cf-dup");
+      console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: cascadeLeases().length }));
+    `,
+  });
+  assert.equal(result.prompts, 1, "the double-fire yields exactly one synthetic re-prompt");
+  assert.equal(result.cascadeCount, 1, "exactly one cascade /lease -- the second fire is deduped, so no stomping concurrent lease");
+});
+
+test("the cascade re-prompt CARRIES the blocked turn's effort as PromptInput.variant", () => {
+  // The re-prompt is synthetic, so without carrying the effort it arrives variant-less while the
+  // broker leased the cascade candidate at the session's effort (/high) -> chat.params throws
+  // "routed model mismatch; resend" and the cascade can never escape the block (petsafe 2026-10-22).
+  // Carry the blocked turn's own variant onto the re-prompt so the turn runs at the same effort.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-v", "standard");
+      await start("cf-v", "standard");
+      // The blocked turn ran at effort /high, so its message carries variant "high".
+      await hooks.event({ event: { type: "message.updated", properties: { sessionID: "cf-v", info: { id: "m-v-1", role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", variant: "high", finish: "content-filter", time: { completed: Date.now() } } } } });
+      await flush();
+      await runNewTimers();
+      console.log(JSON.stringify({
+        prompts: prompts.length,
+        promptText: prompts[0] && prompts[0].body && prompts[0].body.parts && prompts[0].body.parts[0] && prompts[0].body.parts[0].text,
+        promptVariant: prompts[0] && prompts[0].body ? prompts[0].body.variant : undefined,
+      }));
+    `,
+  });
+  assert.equal(result.prompts, 1, "the block drives one synthetic re-prompt");
+  assert.equal(result.promptText, CF_RETRY_TEXT);
+  assert.equal(result.promptVariant, "high", "the re-prompt carries the blocked turn's effort (variant) so the turn matches the lease");
+});
+
+test("chat.params does NOT throw a model mismatch while a content-filter cascade episode is active", () => {
+  // The cascade walks the tiers, so a just-blocked candidate's turn can reach chat.params after the
+  // episode's re-prompt advanced the route. Throwing a mismatch there kills the descent and strands
+  // the session short of the uncensored floor (petsafe 2026-10-22: opus-5-5 blocked, opus-5 threw).
+  // While the episode is active the cascade owns the model sequence, so the guard must not throw.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-g", "standard");
+      await start("cf-g", "standard");
+      await block("cf-g", "openai", "gpt-5.6-sol", "m-g-1");
+      let mismatchDuring = false;
+      try {
+        await hooks["chat.params"]({ sessionID: "cf-g", agent: "standard", model: { providerID: "anthropic", id: "claude-opus-4-8" }, message: { model: { providerID: "anthropic", id: "claude-opus-4-8" } } });
+      } catch (e) { mismatchDuring = String((e && e.message) || e); }
+      console.log(JSON.stringify({ mismatchDuring }));
+    `,
+  });
+  assert.ok(result.mismatchDuring === false || !/routed model mismatch/.test(result.mismatchDuring),
+    "no 'routed model mismatch' is thrown while the cascade episode is active");
+});
+
+test("the failover's OWN abort event does not cancel the episode before its re-prompt", () => {
+  // beginContentFilterFailover aborts the blocked turn before re-prompting (restoreAtStepBoundary's
+  // shape). OpenCode surfaces that abort as an abort error event, which the handler's "any abort
+  // cancels" rule would treat like a user Stop -- tearing down the very episode the abort is part of
+  // so the re-prompt never fires. The abort the failover issued must not cancel its own episode.
+  const result = runCf({
+    cascadePlan: [{ body: { target: { id: "claude-opus-5", kind: "cloud", model: { providerID: "anthropic", id: "claude-opus-5" } }, decision: { policy: "content-filter-cascade" } } }],
+    body: `
+      await created("cf-ab", "standard");
+      await start("cf-ab", "standard");
+      await block("cf-ab", "anthropic", "claude-opus-5-5", "m-ab-1");
+      // The abort the failover just issued comes back as an abort error event mid-window.
+      await hooks.event({ event: { type: "session.error", properties: { sessionID: "cf-ab", error: { name: "MessageAbortedError", message: "aborted" } } } });
+      await flush();
+      await runNewTimers();
+      await feedReprompt("cf-ab");
+      const casc = cascadeLeases();
+      console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: casc.length }));
+    `,
+  });
+  assert.equal(result.prompts, 1, "the re-prompt still fires despite the failover's own abort event");
+  assert.equal(result.cascadeCount, 1, "and it drives a contentFilterCascade /lease");
+});
+
 test("a second block on the cascade candidate chains, excluding the model already tried", () => {
   const result = runCf({
     cascadePlan: [
@@ -2435,7 +2568,13 @@ test("manual, classifier and local (llamacpp) blocked turns never cascade", () =
 });
 
 test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
-  const cascadePlan = Array.from({ length: 6 }, (_, i) => ({
+  // Must match CF_MAX_ATTEMPTS in plugin/router.js. It is set high enough that the cascade can
+  // walk the whole trimmed order down to the uncensored floor (the floor sits last and must be
+  // reachable), so the cap is a storm backstop, not the everyday limiter -- the broker's own
+  // content-filter-exhausted ends a real descent first. This test exercises the backstop with a
+  // plan long enough never to exhaust, so the (CAP+1)-th block is what gives up.
+  const CAP = 20;
+  const cascadePlan = Array.from({ length: CAP }, (_, i) => ({
     body: { target: { id: "cand-" + i, kind: "cloud", model: { providerID: "openai", id: "cand-" + i } } },
   }));
   const result = runCf({
@@ -2443,7 +2582,7 @@ test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
     body: `
       await created("cf-g", "standard");
       await start("cf-g", "standard");
-      for (let i = 0; i < 7; i += 1) {
+      for (let i = 0; i < ${CAP + 1}; i += 1) {
         const before = prompts.length;
         await block("cf-g", "openai", "blk-" + i, "m-g-" + i);
         await runNewTimers();
@@ -2453,7 +2592,7 @@ test("the failover loop cap stops after CF_MAX_ATTEMPTS re-prompts", () => {
       console.log(JSON.stringify({ prompts: prompts.length, cascadeCount: cascadeLeases().length, gaveUp }));
     `,
   });
-  assert.equal(result.prompts, 6, "the chain re-prompts exactly CF_MAX_ATTEMPTS times");
-  assert.equal(result.cascadeCount, 6, "one cascade /lease per re-prompt, and no more");
-  assert.equal(result.gaveUp, true, "the 7th block gives up instead of re-prompting");
+  assert.equal(result.prompts, CAP, "the chain re-prompts exactly CF_MAX_ATTEMPTS times");
+  assert.equal(result.cascadeCount, CAP, "one cascade /lease per re-prompt, and no more");
+  assert.equal(result.gaveUp, true, "the (CAP+1)-th block gives up instead of re-prompting");
 });

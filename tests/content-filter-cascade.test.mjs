@@ -151,4 +151,38 @@ test("normalize is defensive: a malformed block never throws and collapses to di
   assert.equal(normalizeContentFilterCascade({ enabled: true, tierDescent: "nope" }).tierDescent, DEFAULT_TIER_DESCENT);
   assert.equal(normalizeContentFilterCascade({ enabled: true, maxAttempts: -3 }).maxAttempts, DEFAULT_MAX_ATTEMPTS);
   assert.equal(normalizeContentFilterCascade({ enabled: true, uncensoredFloorTargetID: 7 }).uncensoredFloorTargetID, null);
+  // maxPerFamily: a positive int is kept; anything else (absent, zero, negative, non-int) => null (keep all).
+  assert.equal(normalizeContentFilterCascade({ enabled: true, maxPerFamily: 2 }).maxPerFamily, 2);
+  assert.equal(normalizeContentFilterCascade({ enabled: true }).maxPerFamily, null);
+  assert.equal(normalizeContentFilterCascade({ enabled: true, maxPerFamily: 0 }).maxPerFamily, null);
+  assert.equal(normalizeContentFilterCascade({ enabled: true, maxPerFamily: 1.5 }).maxPerFamily, null);
+});
+
+test("maxPerFamily keeps every provider and family but trims extra VERSIONS per family (17 -> 15)", () => {
+  const cfg = (n) => ({ ...CONFIG, contentFilterCascade: { ...CONFIG.contentFilterCascade, maxPerFamily: n } });
+  const block = { providerID: "anthropic", modelID: "claude-opus-5-5" };
+  // Baseline (no cap) is the full 17-candidate walk.
+  assert.equal(ids(CONFIG, { tier: "smart", blockedModel: block }).length, 17);
+  // At 2: the four sonnet versions collapse to the newest two; opus/fable/sol already had two.
+  assert.deepEqual(ids(cfg(2), { tier: "smart", blockedModel: block }), [
+    "claude-opus-5", "claude-opus-4-8",
+    "gpt-6-1-sol", "gpt-flagship",
+    "claude-fable-5-1", "claude-fable-5", "gpt-astra",
+    "gpt-terra", "local-27b",
+    "claude-sonnet-5-5", "claude-sonnet-5", // was 5-5, 5, 4-6, 4-5-20250929
+    "haiku", "gpt-luna", "local-coder",
+    "uncensored-qwen",
+  ]);
+});
+
+test("maxPerFamily never drops the uncensored floor, even when its own group would be capped", () => {
+  // Give the floor a family already at the cap; it must still appear, last.
+  const withFloorFamily = {
+    ...CONFIG,
+    targets: { ...CONFIG.targets, "uncensored-qwen": { ...CONFIG.targets["uncensored-qwen"], family: "sonnet" } },
+    contentFilterCascade: { ...CONFIG.contentFilterCascade, maxPerFamily: 1 },
+  };
+  const order = ids(withFloorFamily, { tier: "smart", blockedModel: { providerID: "anthropic", modelID: "claude-opus-5-5" } });
+  assert.equal(order.at(-1), "uncensored-qwen", "the uncensored floor is always the last resort");
+  assert.equal(order.filter((id) => id === "uncensored-qwen").length, 1, "floor appears exactly once");
 });

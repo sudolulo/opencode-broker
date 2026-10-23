@@ -4961,6 +4961,38 @@ test("/lease/verify answers only for the exact live lease, and changes nothing",
   assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-verify", leaseID: lease.leaseID })).held, false);
 }));
 
+test("a content-filter cascade that lands on a local floor arms a hold that fast-paths the session's next ordinary turns to it", async () => withTempHome(async (home) => {
+  const authDirectory = join(home, ".local/share/opencode");
+  mkdirSync(authDirectory, { recursive: true });
+  writeFileSync(join(authDirectory, "auth.json"), JSON.stringify({ test: { type: "oauth" } }));
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8").replace(/^\s*\/\/.*$/gm, ""));
+  fixture.contentFilterCascade = { enabled: true, tierDescent: ["smart", "deep", "build", "review", "worker"], uncensoredFloorTargetID: "local-coder" };
+  const configPath = join(home, "broker-config.json");
+  writeFileSync(configPath, JSON.stringify(fixture));
+  const modelsServer = await startModelsServer(["qwen3.5-9b-coder"]); // makes the local floor local-coder resident
+  let child; let socketPath;
+  try {
+    ({ child, socketPath } = await startBroker(home, { OPENCODE_BROKER_CONFIG: configPath, OPENCODE_BROKER_LOCAL_MODELS_URL: modelsServer.url }));
+    // Only llamacpp is connected, so every cloud cascade candidate is unadmitted and the descent
+    // reaches the one eligible candidate: the resident local floor.
+    await request(socketPath, "/inventory", inventory({ llamacpp: { authType: "none", connected: true, classification: "local", models: 3 } }));
+    const cascade = await request(socketPath, "/lease", {
+      sessionID: "ses-floor", profile: "auto", tier: "worker", contextTokens: 100, replace: true,
+      contentFilterCascade: true, blockedModel: { providerID: "anthropic", id: "claude-opus-5" }, excludeTargetIDs: [],
+    });
+    assert.equal(cascade.target?.id, "local-coder", `cascade should land on the local floor (got ${JSON.stringify(cascade.target ?? cascade)})`);
+    // The hold is now armed: an ORDINARY lease (no contentFilterCascade) fast-paths to the warm floor.
+    const held = await request(socketPath, "/lease", { sessionID: "ses-floor", profile: "auto", tier: "worker", contextTokens: 100, replace: true });
+    assert.equal(held.target?.id, "local-coder", "a held session's ordinary turn fast-paths to the warm local floor");
+    // The hold is per-session: a different session never cascaded, so it holds no floor.
+    assert.equal((await request(socketPath, "/lease/verify", { sessionID: "ses-floor-other", wireModel: "qwen3.5-9b-coder" })).held, false,
+      "the floor hold does not leak to another session");
+  } finally {
+    await stopBroker(child);
+    await modelsServer.stop();
+  }
+}));
+
 // A provider guard steers only the session that drew it. These are the exact texts the
 // providers sent (OpenAI cyber_policy in-stream, 2026-10-13) and the reroute OpenAI reports
 // only in its `openai-model` header.

@@ -1356,7 +1356,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   // storm. CF_RETRY_TEXT is the sentinel that chat.message matches (with the minted part id)
   // to recognise its own re-prompt.
   const CF_RETRY_TEXT = "[opencode-broker] Please answer my previous request.";
-  const CF_MAX_ATTEMPTS = 6;
+  // The cap must let the cascade WALK ITS WHOLE ORDER down to the uncensored local floor, which
+  // the broker places LAST (contentFilterCascadeOrder, trimmed by maxPerFamily, is ~15 candidates
+  // for an opus block with the uncensored floor at the end). At 6 it gave up around the sixth tier
+  // -- before even the first local model, and far before the uncensored floor -- so a query every
+  // cloud model refuses was left blocked instead of failing over to the floor as intended
+  // ("uncensored is the last resort, automatically"). Set comfortably above the order length so
+  // the broker's own content-filter-exhausted (order walked out, floor included) is the real
+  // terminator and this stays a storm backstop. Each re-prompt is a fixed REENGAGE_DELAYS_MS[0]
+  // apart, so even a full descent is bounded well inside CF_WINDOW_MS; a candidate that ANSWERS
+  // ends the cascade at once, so the deep tail only runs for content every earlier tier refused.
+  const CF_MAX_ATTEMPTS = 20;
   const CF_WINDOW_MS = 10 * 60 * 1000;
   // sessionID -> { blocked: { providerID, modelID }, tried: Set<targetId>, agent, promptPartID, history: number[], timer }
   const cfFailover = new Map();
@@ -1381,10 +1391,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     const now = Date.now();
     let entry = cfFailover.get(sessionID);
     if (!entry) {
-      entry = { blocked: null, tried: new Set(), agent: undefined, promptPartID: null, history: [], timer: null };
+      entry = { blocked: null, tried: new Set(), agent: undefined, promptPartID: null, history: [], timer: null, reprompting: false };
       cfFailover.set(sessionID, entry);
       trimTracker(cfFailover);
     }
+    // ☠️ DEDUP THE DOUBLE-FIRE. A streaming content-filter block surfaces via BOTH paths: the
+    // ContentFilterError error event (errorEvent handler) AND the completed-message record with
+    // finish "content-filter" (message.updated), ~16 ms apart -- so beginContentFilterFailover is
+    // called TWICE for one block. Each call aborts and schedules its own re-prompt, so two cascade
+    // re-prompts run concurrently; each leases a DIFFERENT candidate, and because routes holds ONE
+    // lease id per session (chat.message stamps x-opencode-lease-id from routes.get(sessionID)), an
+    // in-flight request carries a lease id that no longer names its wire model -- the gateway then
+    // refuses every candidate "no live lease" and the cascade never advances (petsafe, 2026-10-22,
+    // broker decisions showed two cascade leases 0 ms apart then a no-lease failure). While a
+    // re-prompt for THIS episode is already scheduled or in flight, ignore the duplicate; the next
+    // genuine step is driven by the re-prompt turn's OWN block, after reprompting clears at 1383.
+    if (entry.reprompting) return;
     entry.history = entry.history.filter((at) => now - at < CF_WINDOW_MS);
     if (entry.history.length >= CF_MAX_ATTEMPTS) {
       report("warn", `${sessionID}: content-filter failover gave up after ${entry.history.length} re-prompts within ${CF_WINDOW_MS / 60000} min -- leaving the refusal in place`);
@@ -1395,25 +1417,44 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     // skips the head by provider+model and every already-tried candidate by target id, so the
     // order always advances. Overwriting the head with each chained block would stop excluding
     // the first refusing model, letting the broker re-lease it for one wasted re-prompt.
-    if (!entry.blocked) entry.blocked = { providerID: record.providerID, modelID: record.modelID };
+    if (!entry.blocked) {
+      entry.blocked = { providerID: record.providerID, modelID: record.modelID };
+      // Capture the effort the blocked turn was running at so the cascade re-prompt (below) runs at
+      // the SAME variant the broker leases the candidate at. The re-prompt is synthetic, so without
+      // this it arrives variant-less while the candidate is leased at the session's effort (e.g.
+      // /high), and chat.params throws "routed model mismatch; resend" -- the cascade then can never
+      // escape the block (petsafe, 2026-10-22). Carried via PromptInput.variant, not stripped.
+      entry.variant = typeof record.variant === "string" && record.variant ? record.variant : undefined;
+    }
     entry.agent = sessions.get(sessionID)?.agent;
     entry.history.push(now);
     entry.promptPartID = `prt_${randomUUID()}`;
     // A new cascade step supersedes any still-pending re-prompt timer for this session.
     if (entry.timer !== null && entry.timer !== undefined) { cancelTimeout(entry.timer); entry.timer = null; }
     report("info", `${sessionID}: content-filter block on ${record.providerID}/${record.modelID} -- failing this turn over to the next cascade model`);
+    // The abort below ends the blocked turn, and OpenCode surfaces it as an abort error event.
+    // The handler's "any abort cancels" rule would mistake that for a user Stop and tear down
+    // THIS episode before its re-prompt fires. Flag the episode as driving a re-prompt so the
+    // abort-cancel sites spare it; a genuine Stop outside this brief window still cancels.
+    entry.reprompting = true;
     Promise.resolve().then(async () => {
       try { await client.session.abort({ path: { id: sessionID }, query: { directory } }); } catch {}
       // Superseded or cancelled while the abort was in flight: do not re-prompt.
       if (cfFailover.get(sessionID) !== entry) return;
       const handle = scheduleTimeout(async () => {
         if (cfFailover.get(sessionID) !== entry) return;
+        // The re-prompt turn is starting: close the self-abort window so a later Stop cancels.
+        entry.reprompting = false;
         try {
           await client.session.prompt({
             path: { id: sessionID },
             query: { directory },
             body: {
               ...(typeof entry.agent === "string" && entry.agent ? { agent: entry.agent } : {}),
+              // Carry the blocked turn's effort so this re-prompt runs at the same variant the broker
+              // leases the cascade candidate at; otherwise the synthetic turn is variant-less and
+              // chat.params rejects it as "routed model mismatch".
+              ...(typeof entry.variant === "string" && entry.variant ? { variant: entry.variant } : {}),
               parts: [{ id: entry.promptPartID, type: "text", text: CF_RETRY_TEXT, synthetic: true }],
             },
           });
@@ -1867,6 +1908,17 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           input?.model?.providerID === displaced?.providerID &&
           input?.model?.id === displaced?.modelID &&
           actualVariant === (displaced?.variant ?? undefined)) return;
+        // ☠️ DO NOT BREAK A CONTENT-FILTER CASCADE MID-DESCENT. While an episode is active the model
+        // is INTENTIONALLY walking the tiers (blocked model -> next tier -> ... -> uncensored floor
+        // as last resort), and the just-blocked candidate's turn can finalize after the episode's
+        // re-prompt already advanced the route -- so chat.params sees route=next vs turn=prev and
+        // would throw "routed model mismatch", killing the descent and stranding the session short
+        // of the floor (petsafe, 2026-10-22: opus-5-5 blocked, then opus-5 threw mismatch and the
+        // cascade never continued). The cascade OWNS the model sequence for the life of its episode,
+        // so a mismatch here is expected, not a routing fault. Normal (non-cascade) turns are
+        // unaffected -- the episode exists only between a content-filter block and its clean finish,
+        // human turn, or exhaustion (cancelContentFilterFailover clears it).
+        if (cfFailover.get(sessionID)) return;
         throw new Error(`routed model mismatch: expected ${providerID}/${modelID}${variant ? `/${variant}` : ""}, got ${input?.model?.providerID}/${input?.model?.id}${actualVariant ? `/${actualVariant}` : ""}; resend the prompt`);
       }
     },
@@ -1955,10 +2007,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         successCandidates.delete(sessionID);
-        // The user stopped it on purpose: it must not come back on its own.
+        // The user stopped it on purpose: it must not come back on its own -- unless this abort
+        // is the content-filter failover's OWN (it ends the blocked turn before re-prompting),
+        // which keepContentFilter spares so the episode can still fire its next candidate.
         unpark(sessionID);
         unwatchFallback(sessionID);
-        cancelRecovery(sessionID);
+        cancelRecovery(sessionID, { keepContentFilter: cfFailover.get(sessionID)?.reprompting === true });
         return;
       }
       if (event?.type === "session.status") {
@@ -2036,12 +2090,34 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
         unpark(sessionID);
         unwatchFallback(sessionID);
         // There is no correlation ID distinguishing a router abort from Stop.
-        // Safety wins: ANY observable abort cancels, even a delayed internal one.
-        cancelRecovery(sessionID);
+        // Safety wins: ANY observable abort cancels, even a delayed internal one -- EXCEPT the
+        // content-filter failover's own abort (reprompting), which keepContentFilter spares so
+        // the episode can still fire its next candidate.
+        cancelRecovery(sessionID, { keepContentFilter: cfFailover.get(sessionID)?.reprompting === true });
         return;
       }
       if (errorEvent && unattributableToActiveTurn(sessionID, messageRecordFrom(properties))) {
         report("info", `${sessionID}: ignoring unattributable provider error after recovery supersession`);
+        return;
+      }
+      // ☠️ A CONTENT-FILTER BLOCK CAN ARRIVE AS AN ERROR, NOT A CLEAN FINISH. The gateway only
+      // strips a provider content-filter block to a clean `content-filter` finish (no error) on a
+      // BUFFERED lane; on a STREAMING turn OpenCode attaches a ContentFilterError and the completed
+      // message carries BOTH `finish: "content-filter"` AND that error. With the error present the
+      // event registers as an errorEvent, so the clean-finish failover below (gated on `!error`,
+      // message.updated branch) is never reached -- the turn would take the generic /failure +
+      // scheduleReengage path and re-lease the SAME model, which just re-blocks (petsafe, streaming
+      // Opus 5.5: blocked repeatedly, 0 cascade leases, 2026-10-22). Route it to the cascade here,
+      // mirroring the clean path's cancelRecovery(keepContentFilter) + beginContentFilterFailover.
+      // ☆ beginContentFilterFailover self-guards (manual/classifier/llamacpp/parked) and is bounded
+      // (CF_MAX_ATTEMPTS/CF_WINDOW_MS), so this widens no reach; it only changes WHICH recovery path
+      // a content-filter block takes. The abort and unattributable-error checks above already ran,
+      // so by here this is a block attributed to the active turn, never a user Stop. (recovery/
+      // generation are not yet in scope here -- they are defined inside the generic errorEvent
+      // block below -- and are not needed: attribution is already established.)
+      if (errorEvent && error?.name === "ContentFilterError") {
+        cancelRecovery(sessionID, { keepContentFilter: true });
+        beginContentFilterFailover(sessionID, messageRecordFrom(properties));
         return;
       }
       // ☠️ CHARGE THE FAILURE TO THE PROVIDER THAT ACTUALLY ANSWERED, OR TO NOBODY.
