@@ -507,23 +507,29 @@ test("typed source quota 429 -> gateway evidence -> plugin failure -> paid conti
 
 // ---- negative cases --------------------------------------------------------------------------
 
-test("(1) a request carrying the OLD source lease id after rotation to the paid lease is a no-live-lease 400", async (t) => {
+test("(1) an old source lease keeps ordinary wire-model stomp tolerance but cannot authorize the paid wire model", async (t) => {
   await withChain({}, async (chain) => {
     const gateway = await chain.gateway();
     const { source, paid } = await exhaustAndLeasePaid(chain, gateway);
-    for (const model of [PAID_MODEL, "src-model"]) {
-      const callsBefore = gateway.transport.calls.length;
-      const reply = await gateway.send({ leaseID: source.leaseID, model });
-      assert.equal(reply.status, 400, `${model}: ${reply.text}`);
-      assert.match(reply.json.error.message, NO_LIVE_LEASE);
-      const verifies = gateway.transport.calls.slice(callsBefore).map(({ path, body }) => [path, body]);
-      assert.deepEqual(verifies, [["/lease/verify", { sessionID: SESSION, leaseID: source.leaseID, wireModel: model }], ["/lease/verify", { sessionID: SESSION, wireModel: model }]],
-        `${model}: exact verify missed, session-only re-verify cannot adopt the grant-bearing lease`);
-      t.diagnostic(`old source lease id, model ${model}: HTTP ${reply.status}`);
-    }
+    const paidCallsBefore = gateway.transport.calls.length;
+    const paidReply = await gateway.send({ leaseID: source.leaseID, model: PAID_MODEL });
+    assert.equal(paidReply.status, 400, paidReply.text);
+    assert.match(paidReply.json.error.message, NO_LIVE_LEASE);
+    assert.deepEqual(gateway.transport.calls.slice(paidCallsBefore).map(({ path, body }) => [path, body]), [
+      ["/lease/verify", { sessionID: SESSION, leaseID: source.leaseID, wireModel: PAID_MODEL }],
+      ["/lease/verify", { sessionID: SESSION, wireModel: PAID_MODEL }],
+    ], "the paid wire model cannot adopt the current grant-bearing lease");
+
+    const sourceCallsBefore = gateway.transport.calls.length;
+    const sourceReply = await gateway.send({ leaseID: source.leaseID, model: "src-model" });
+    assert.equal(sourceReply.status, 502, sourceReply.text);
+    assert.deepEqual(gateway.transport.calls.slice(sourceCallsBefore).map(({ path }) => path), [
+      "/lease/verify", "/quota-evidence",
+    ], "the ordinary source grant remains valid while its request is in flight; its typed 429 still reports evidence");
     assertNoSpend(chain, gateway, "old source lease id");
-    assert.equal(gateway.sourceFetches().length, 1, "no second source fetch either");
+    assert.equal(gateway.sourceFetches().length, 2, "the in-flight ordinary source request reached its provider");
     assert.equal((await chain.broker.verify(SESSION, paid.leaseID)).body.held, true, "the paid lease itself is untouched");
+    t.diagnostic(`old source lease id: paid HTTP ${paidReply.status}; ordinary source HTTP ${sourceReply.status}`);
   });
 });
 

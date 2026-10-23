@@ -188,7 +188,7 @@ const startBroker = async (name, fault = "", { outage = false, skip = 0, armed =
   };
 };
 
-test("broker state fsyncs the private 0600 temp before rename and the directory after rename", async (context) => {
+test("ordinary broker state writes atomically without fsync", async (context) => {
   const fixture = await startBroker("ordering");
   context.after(() => fixture.close());
   fixture.resetTrace();
@@ -197,31 +197,27 @@ test("broker state fsyncs the private 0600 temp before rename and the directory 
   assert.deepEqual(fixture.trace(), [
     { operation: "open", target: "temp", flags: "wx", mode: 0o600 },
     { operation: "write", target: "temp", bytes: statSync(fixture.statePath).size },
-    { operation: "fsync", target: "temp" },
     { operation: "close", target: "temp" },
     { operation: "rename", target: "state" },
-    { operation: "open", target: "directory", flags: "r" },
-    { operation: "fsync", target: "directory" },
-    { operation: "close", target: "directory" },
   ]);
   assert.equal(statSync(fixture.statePath).mode & 0o777, 0o600);
 });
 
-test("a pre-rename fsync failure preserves the live broker state and removes its temp", async (context) => {
+test("an ordinary write does not reach a temp fsync fault", async (context) => {
   const fixture = await startBroker("pre-rename", "fsync-temp");
   context.after(() => fixture.close());
   fixture.resetTrace();
   const before = readFileSync(fixture.statePath);
   const response = await post(fixture.socketPath, "/touch", { sessionID: "durability-session" });
-  assert.equal(response.status, 400, response.body);
-  assert.deepEqual(readFileSync(fixture.statePath), before);
+  assert.equal(response.status, 200, response.body);
+  assert.notDeepEqual(readFileSync(fixture.statePath), before);
   assert.deepEqual(readdirSync(dirname(fixture.statePath)).filter((name) => name.endsWith(".tmp")), []);
   assert.deepEqual(fixture.trace().map(({ operation, target }) => `${operation}:${target}`), [
-    "open:temp", "write:temp", "fsync:temp", "close:temp", "unlink:temp",
+    "open:temp", "write:temp", "close:temp", "rename:state",
   ]);
 });
 
-test("a post-rename directory fsync failure keeps the commit and warns instead of reporting failure", async (context) => {
+test("an ordinary write does not reach a directory fsync fault", async (context) => {
   const fixture = await startBroker("post-rename", "fsync-directory");
   context.after(() => fixture.close());
   fixture.resetTrace();
@@ -229,11 +225,11 @@ test("a post-rename directory fsync failure keeps the commit and warns instead o
   const response = await post(fixture.socketPath, "/touch", { sessionID: "durability-session" });
   assert.equal(response.status, 200, response.body);
   assert.notDeepEqual(readFileSync(fixture.statePath), before);
-  assert.match(fixture.stderr(), /broker state .* was committed but its directory entry could not be made durable/);
-  assert.match(fixture.stderr(), /simulated broker directory fsync failure/);
+  assert.doesNotMatch(fixture.stderr(), /broker state .* was committed but its directory entry could not be made durable/);
+  assert.doesNotMatch(fixture.stderr(), /simulated broker directory fsync failure/);
   assert.equal(existsSync(fixture.statePath), true);
   assert.equal(fixture.trace().some((event) => event.operation === "rename"), true);
-  assert.equal(fixture.trace().some((event) => event.operation === "fsync" && event.target === "directory"), true);
+  assert.equal(fixture.trace().some((event) => event.operation === "fsync"), false);
 });
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -279,7 +275,7 @@ test("a strict outage commit whose directory fsync fails dispatches nothing and 
 });
 
 test("a strict outage commit whose temp fsync fails leaves the file unchanged, dispatches nothing, and a later write keeps the count", async (context) => {
-  const fixture = await startBroker("outage-temp", "fsync-temp", { outage: true, armed: true, skip: 1 });
+  const fixture = await startBroker("outage-temp", "fsync-temp", { outage: true, armed: true });
   context.after(() => fixture.close());
   assert.equal(await waitFor(() => /outage worker error/.test(fixture.stderr())), true, fixture.stderr());
   await settle(300);

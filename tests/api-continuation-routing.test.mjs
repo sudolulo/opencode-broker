@@ -286,6 +286,58 @@ test("a paid continuation lease is granted only after exact source exhaustion; c
   });
 });
 
+test("a paid continuation wire-model verify returns its spend attestation and rejects its stomped lease", async () => {
+  await withBroker(brokerConfig(ENABLED), async (fx) => {
+    await fx.publish();
+    const { lease: source, record } = await exhaustSource(fx);
+    const paid = await fx.leaseOK();
+    const grant = assertPaidContinuation(paid, { source, record });
+
+    const attested = await fx.call("/lease/verify", {
+      sessionID: SESSION, leaseID: paid.leaseID, wireModel: "paid-sonnet",
+    });
+    assert.equal(attested.status, 200, JSON.stringify(attested.body));
+    assert.equal(attested.body.held, true);
+    assert.deepEqual(attested.body.target.spendGrant, grant,
+      "wire-model verification keeps the broker-minted spend attestation");
+
+    await fx.publish({ targets: { [OTHER_SMART_ID]: { id: OTHER_SMART_ID, providerID: "othersub", modelID: "other-smart",
+      kind: "cloud", capacity: null, source: "subscription-oauth", tiers: ["smart"] } } });
+    const replacement = await fx.leaseOK(SESSION);
+    assert.equal(replacement.target.id, OTHER_SMART_ID);
+    const stale = await fx.call("/lease/verify", {
+      sessionID: SESSION, leaseID: paid.leaseID, wireModel: "paid-sonnet",
+    });
+    assert.equal(stale.status, 200, JSON.stringify(stale.body));
+    assert.equal(stale.body.held, false, "a paid lease cannot survive a slot stomp through the ordinary grant cache");
+  });
+});
+
+test("a pinned manual paid wire-model verify rejects its stomped lease", async () => {
+  await withBroker(brokerConfig({ enabled: false, spendPolicyHashes: { [PAID]: PIN } }), async (fx) => {
+    await fx.publish();
+    const manual = await fx.leaseOK(SESSION, { profile: "api-reserve", tier: "worker", providers: ["paid-api"] });
+    const grant = manual.target.spendGrant;
+
+    const attested = await fx.call("/lease/verify", {
+      sessionID: SESSION, leaseID: manual.leaseID, wireModel: "paid-sonnet",
+    });
+    assert.equal(attested.status, 200, JSON.stringify(attested.body));
+    assert.equal(attested.body.held, true);
+    assert.deepEqual(attested.body.target.spendGrant, grant,
+      "wire-model verification keeps the broker-minted manual spend attestation");
+
+    const replacement = await fx.leaseOK(SESSION);
+    assert.equal(replacement.target.id, SRC_ID);
+    const stale = await fx.call("/lease/verify", {
+      sessionID: SESSION, leaseID: manual.leaseID, wireModel: "paid-sonnet",
+    });
+    assert.equal(stale.status, 200, JSON.stringify(stale.body));
+    assert.equal(stale.body.held, false, "a pinned manual paid lease cannot survive a slot stomp through the ordinary grant cache");
+    assert.equal(Object.hasOwn(stale.body.target ?? {}, "spendGrant"), false);
+  });
+});
+
 test("ordinary cloud routes, local routes and busy waits all win over paid continuation", async () => {
   // A newly eligible ordinary cloud target in the lane wins, for replace:true and replace:false.
   await withBroker(brokerConfig(ENABLED), async (fx) => {

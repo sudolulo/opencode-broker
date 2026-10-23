@@ -384,7 +384,9 @@ test('only an actual reserve lease activates its grant and publishes the bound c
     const held = await post(broker.socketPath, '/lease', { sessionID: 's-reserve', profile: 'auto', tier: 'smart' });
     assert.equal(held.body.existing, true);
     assert.equal(held.body.expectedCredentialInstance, CI_A);
-    const verify = await post(broker.socketPath, '/lease/verify', { sessionID: 's-reserve', leaseID: lease.body.leaseID });
+    const verify = await post(broker.socketPath, '/lease/verify', {
+      sessionID: 's-reserve', leaseID: lease.body.leaseID, wireModel: 'claude-opus-5',
+    });
     assert.equal(verify.body.held, true);
     assert.equal(verify.body.expectedCredentialInstance, CI_A);
     assert.equal(verify.body.generation, generation);

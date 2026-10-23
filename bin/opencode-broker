@@ -2714,18 +2714,15 @@ const acquire = async (state, request, {
     // Routing authority only, re-proven by currentLeaseAttestation wherever it is read.
     ...(spendGrant ? { spendGrant } : {}),
   };
-  // Record this ordinary grant the same way a cascade grant is recorded, so /lease/verify can
-  // confirm an in-flight request whose WIRE MODEL matches a model this session was just granted
-  // EVEN AFTER a later re-decision STOMPS the single lease slot. The single-slot stomp is not
-  // cascade-specific: an oscillating tier (two near-equal siblings) or any mid-turn re-lease flips
-  // `state.leases[sessionID]`, and the request already in flight then 400s "no live lease for
-  // <model>" at verify and the turn DIES -- not a cosmetic flash. Only a model the broker itself
-  // just handed this session can match, and the grant self-expires (CASCADE_GRANT_TTL_MS), so a
-  // session still cannot reach an ungranted model and normal verification resumes once leasing settles.
-  recordCascadeGrant(sessionID, {
-    providerID: choice.target.providerID, modelID: choice.target.modelID, targetID: choice.target.id,
-    kind: choice.target.kind ?? "cloud", leaseID, at: leasedAt,
-  });
+  // An ordinary grant tolerates an in-flight request after a re-decision stomps the single lease
+  // slot. Financial and outage-bound leases instead require their specialized verification: their
+  // cached identity alone omits spend attestation or reserve credential/generation authority.
+  if (!spendGrant && !outageAssertion && !registeredPaidTarget(choice.target)) {
+    recordCascadeGrant(sessionID, {
+      providerID: choice.target.providerID, modelID: choice.target.modelID, targetID: choice.target.id,
+      kind: choice.target.kind ?? "cloud", leaseID, at: leasedAt,
+    });
+  }
   ensureActive();
   state.assignments[sessionID] = {
     targetID: choice.target.id,
