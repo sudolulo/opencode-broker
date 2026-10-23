@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.2] — 2026-10-23
+
+### Changed
+
+- **Content-filter and outage stand-ins share the configured reserve-chain walker.** Both paths use the same configured reserve ordering while preserving their existing eligibility checks, trigger conditions and durability behavior.
+
 ### Fixed
 
 - **The broker no longer fsyncs its whole state on every request.** `writeState` did two blocking `fsyncSync` calls (file + directory) on EVERY mutating request — 24 call sites — on a ZFS-backed state file, on the single-threaded daemon every session shares. Under the host's disk contention that made even `/status` ~1.4s and backed the request queue up, which the router saw as a "broker timeout" (now also `noop`-classified) and the HUD as "BROKER DOWN". The fsyncs are now gated on the existing `requireDurable` flag: broker state is EPHEMERAL routing (leases/assignments rebuilt as sessions re-lease on restart), so ordinary writes keep the atomic rename (a reader always sees a torn-free prior-or-new state; a crash loses at most seconds of lease state) but skip the fsync; only the outage commit (`requireDurable:true`) fsyncs. Steady-state `/status` drops to tens of ms. (A re-lease BURST — restart/reboot/mass-migration — still queues on the single-threaded selection path; that is a separate, rarer concern.)
