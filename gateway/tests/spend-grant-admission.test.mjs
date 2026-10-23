@@ -287,7 +287,7 @@ test('bound paid session whose exact and session-only verify both miss gets no-l
     assert.equal(response.status, 400);
     assert.match((await response.json()).error.message, /session holds no live lease/);
     const verifies = h.brokerCalls.filter(c => c.path === '/lease/verify').map(c => c.body);
-    assert.deepEqual(verifies, [{ sessionID: BOUND_SESSION, leaseID: LEASE_ID }, { sessionID: BOUND_SESSION }]);
+    assert.deepEqual(verifies, [{ sessionID: BOUND_SESSION, leaseID: LEASE_ID, wireModel: "claude-sonnet-4-5-20250929" }, { sessionID: BOUND_SESSION, wireModel: "claude-sonnet-4-5-20250929" }]);
     assert.equal(h.brokerCalls.some(c => c.path === '/lease'), false);
     assert.equal(h.upstreamCalls(), 0);
     assert.equal(rows(ledgerPath).length, 0);

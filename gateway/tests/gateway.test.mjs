@@ -3565,7 +3565,7 @@ test("a session-bound request rides the session's own lease and never re-leases"
   assert.equal(ok.status, 200);
   assert.deepEqual(ok.calls.map((call) => call.path), ["/lease/verify"],
     "no lease, usage, complete or release: the plugin owns this lease's accounting");
-  assert.deepEqual(ok.calls[0].body, { sessionID: "ses_abc", leaseID: "lease-1" });
+  assert.deepEqual(ok.calls[0].body, { sessionID: "ses_abc", leaseID: "lease-1", wireModel: "claude-opus-5-5" });
   assert.equal(ok.forwards.length, 1);
   assert.match(ok.forwards[0].url, /^http:\/\/anthropic\.example\/v1\//);
   assert.equal(ok.forwards[0].body.model, "claude-opus-5-5");
@@ -3577,8 +3577,8 @@ test("a session-bound request rides the session's own lease and never re-leases"
 
   // stale/wrong-model refusals deliberately use 400 (SDK nonretryable) while still authorizing zero upstream traffic;
   for (const [refused, expectedVerifications] of [
-    [await scenario({ held: false }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }, { path: "/lease/verify", body: { sessionID: "ses_abc" } }]],
-    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }]],
+    [await scenario({ held: false }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1", wireModel: "claude-opus-5-5" } }, { path: "/lease/verify", body: { sessionID: "ses_abc", wireModel: "claude-opus-5-5" } }]],
+    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1", wireModel: "claude-haiku-4-5" } }]],
   ]) {
     assert.equal(refused.status, 400, "deterministic lease refusal must not trigger provider SDK blind retries");
     assert.equal(refused.forwards.length, 0, "a session id alone never reaches an ungranted model");
@@ -3719,8 +3719,8 @@ test("strict model names do not refuse a session-bound request; its lease decide
 
   // stale/wrong-model refusals deliberately use 400 (SDK nonretryable) while still authorizing zero upstream traffic;
   for (const [refused, expectedVerifications] of [
-    [await scenario({ held: false, model: "claude-opus-5-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }, { path: "/lease/verify", body: { sessionID: "ses_abc" } }]],
-    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1" } }]],
+    [await scenario({ held: false, model: "claude-opus-5-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1", wireModel: "claude-opus-5-5" } }, { path: "/lease/verify", body: { sessionID: "ses_abc", wireModel: "claude-opus-5-5" } }]],
+    [await scenario({ held: true, model: "claude-haiku-4-5" }), [{ path: "/lease/verify", body: { sessionID: "ses_abc", leaseID: "lease-1", wireModel: "claude-haiku-4-5" } }]],
   ]) {
     assert.equal(refused.status, 400, "deterministic lease refusal must not trigger provider SDK blind retries");
     assert.equal(refused.forwards.length, 0);

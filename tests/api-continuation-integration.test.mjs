@@ -462,7 +462,7 @@ test("typed source quota 429 -> gateway evidence -> plugin failure -> paid conti
     assert.equal(new Headers(paidFetches[0].init.headers).get("x-api-key"), PAID_KEY);
     assert.equal(gateway.sourceFetches().length, 1, "no further source fetch");
     const paidBrokerCalls = gateway.transport.calls.slice(callsBefore);
-    assert.deepEqual(paidBrokerCalls.map(({ path, body }) => [path, body]), [["/lease/verify", { sessionID: SESSION, leaseID: paid.leaseID }]],
+    assert.deepEqual(paidBrokerCalls.map(({ path, body }) => [path, body]), [["/lease/verify", { sessionID: SESSION, leaseID: paid.leaseID, wireModel: PAID_MODEL }]],
       "the paid request only verifies its exact lease; the plugin owns settlement");
 
     // Ledger: one settled continuation attempt drawn wholly from the continuation allocation.
@@ -517,7 +517,7 @@ test("(1) a request carrying the OLD source lease id after rotation to the paid 
       assert.equal(reply.status, 400, `${model}: ${reply.text}`);
       assert.match(reply.json.error.message, NO_LIVE_LEASE);
       const verifies = gateway.transport.calls.slice(callsBefore).map(({ path, body }) => [path, body]);
-      assert.deepEqual(verifies, [["/lease/verify", { sessionID: SESSION, leaseID: source.leaseID }], ["/lease/verify", { sessionID: SESSION }]],
+      assert.deepEqual(verifies, [["/lease/verify", { sessionID: SESSION, leaseID: source.leaseID, wireModel: model }], ["/lease/verify", { sessionID: SESSION, wireModel: model }]],
         `${model}: exact verify missed, session-only re-verify cannot adopt the grant-bearing lease`);
       t.diagnostic(`old source lease id, model ${model}: HTTP ${reply.status}`);
     }
