@@ -462,8 +462,15 @@ const writeState = (state, { requireDurable = false } = {}) => {
     descriptor = openSync(temporary, "wx", 0o600);
     writeFileSync(descriptor, JSON.stringify(state) + "\n");
     fchmodSync(descriptor, 0o600);
-    // The complete bytes must reach stable storage before their name can replace the live state.
-    fsyncSync(descriptor);
+    // Atomic rename (below) is the CONSISTENCY boundary for every write -- a reader always sees a
+    // torn-free prior-or-new state. The blocking fsync-to-stable-storage is DURABILITY, and it is
+    // gated on requireDurable. Broker state is EPHEMERAL routing (leases/assignments the broker
+    // rebuilds as sessions re-lease on restart), so paying a per-request fsync -- on ZFS, under the
+    // host's disk contention, on the single-threaded daemon every session shares -- made even
+    // /status ~1.4s and backed the whole request queue up, which the router then saw as a "broker
+    // timeout" (2026-10-23). Ordinary writes now skip it (a crash loses at most seconds of lease
+    // state, re-leased on restart); only the outage commit (requireDurable:true) fsyncs.
+    if (requireDurable) fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(temporary, STATE_PATH);
@@ -494,7 +501,9 @@ const writeState = (state, { requireDurable = false } = {}) => {
   // Rename is the commit boundary. A parent-directory fsync failure means the new state is visible
   // but may not survive a crash; warning is accurate, while throwing would falsely tell the caller
   // that an already committed mutation failed and invite it to repeat the operation.
-  if (committed) {
+  // Directory fsync makes the renamed entry itself crash-durable -- durability, not consistency, so
+  // it is skipped for ordinary (non-requireDurable) writes along with the file fsync above.
+  if (committed && requireDurable) {
     let directoryDescriptor;
     let durabilityError = null;
     try {
