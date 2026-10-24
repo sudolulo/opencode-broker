@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
 const BROKER = new URL("../bin/opencode-broker", import.meta.url).pathname;
+const STATE_TRACE_HOOK = new URL("./fixtures/broker-state-fault.cjs", import.meta.url).pathname;
 
 const state = () => ({
   version: 5,
@@ -32,6 +33,7 @@ const post = (socketPath, path, body = {}) => new Promise((resolve, reject) => {
 const startBroker = async (name, initial = state(), {
   failNextRename = false, failNextPreparation = false, clock = null, collideNextTemp = false, base: existingBase = null,
   config: testConfig = null, auth: testAuth = null, resolvableModels = [],
+  warmPlanUsage = false, traceWrites = false,
 } = {}) => {
   const base = existingBase ?? mkdtempSync(join(tmpdir(), `broker-read-only-${name}-`));
   if (!existingBase) chmodSync(base, 0o700);
@@ -40,7 +42,8 @@ const startBroker = async (name, initial = state(), {
   const socketPath = join(base, "broker.sock");
   const configPath = join(base, "config.json");
   const faultArmPath = join(base, "fail-next-rename");
-   const clockPath = join(base, "clock-now");
+  const clockPath = join(base, "clock-now");
+  const tracePath = join(base, "state-writes.jsonl");
   const authPath = join(home, ".local/share/opencode/auth.json");
   if (!existingBase) {
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
@@ -110,6 +113,24 @@ const startBroker = async (name, initial = state(), {
     ].join("\n"), { mode: 0o600 });
     preload.push("--require", faultHookPath);
   }
+  if (traceWrites) {
+    writeFileSync(tracePath, "", { mode: 0o600 });
+    preload.push("--require", STATE_TRACE_HOOK);
+  }
+  if (warmPlanUsage) {
+    // Warm the real module cache through the configured loopback API, not a persisted seed.
+    // --require runs before --import, so this fetch uses the private clock too.
+    const warmPath = join(base, "warm-plan-usage.mjs");
+    writeFileSync(warmPath, [
+      `import { fetchPlanUsage } from ${JSON.stringify(new URL("../lib/plan-usage.js", import.meta.url).href)};`,
+      "import { readFileSync } from 'node:fs';",
+      "const config = JSON.parse(readFileSync(process.env.OPENCODE_BROKER_CONFIG, 'utf8'));",
+      "for (const [provider, budget] of Object.entries(config.budgets)) {",
+      "  if (!await fetchPlanUsage(provider, budget)) throw new Error('private usage fixture did not warm the cache');",
+      "}",
+    ].join("\n"), { mode: 0o600 });
+    preload.push("--import", warmPath);
+  }
   const child = spawn(process.execPath, [...preload, BROKER, "serve"], {
     env: {
       ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath,
@@ -126,6 +147,11 @@ const startBroker = async (name, initial = state(), {
         } : {}),
         ...(clock !== null ? { OPENCODE_BROKER_TEST_CLOCK: clockPath } : {}),
         ...(collideNextTemp ? { OPENCODE_BROKER_TEST_COLLIDE_ARM: faultArmPath } : {}),
+        ...(traceWrites ? {
+          OPENCODE_BROKER_STATE_FAULT_PATH: statePath,
+          OPENCODE_BROKER_STATE_FAULT_TRACE: tracePath,
+          OPENCODE_BROKER_STATE_FAULT_STEP: "",
+        } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -158,6 +184,9 @@ const startBroker = async (name, initial = state(), {
     armNextPreparationFailure: () => writeFileSync(faultArmPath, "armed\n", { mode: 0o600 }),
     setClock: (now) => writeFileSync(clockPath, `${now}\n`, { mode: 0o600 }),
     armNextTempCollision: () => writeFileSync(faultArmPath, "armed\n", { mode: 0o600 }),
+    writes: () => readFileSync(tracePath, "utf8").split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line)).filter((entry) => entry.operation === "rename" && entry.target === "state").length,
+    resetTrace: () => writeFileSync(tracePath, "", { mode: 0o600 }),
     stop: async () => {
       if (child.exitCode === null) {
         child.kill("SIGTERM");
@@ -390,6 +419,194 @@ const CAP_CONFIG = {
   profiles: { auto: ["fixture"] },
   tiers: { smart: ["fixture"], worker: ["fixture"] },
 };
+
+// The only credential here belongs to the loopback fixture; no provider or real auth is used.
+const PLAN_AUTH = { fixture: { type: "oauth" }, "fixture-usage": { type: "api", key: "private-fixture-only" } };
+const planConfig = (url) => ({
+  ...CAP_CONFIG,
+  budgets: { fixture: {
+    windows: [{ id: "wk", periodMs: 604800000, meter: "requests", capacity: 100 }],
+    planUsage: { type: "http", url, authRef: "fixture-usage" },
+  } },
+});
+
+const startUsageFixture = async (context, report) => {
+  let calls = 0;
+  let available = true;
+  const server = createServer((request, response) => {
+    calls += 1;
+    assert.equal(request.url, "/usage");
+    assert.equal(request.headers["x-api-key"], "private-fixture-only");
+    response.writeHead(available ? 200 : 503, { "content-type": "application/json" });
+    response.end(JSON.stringify(available ? report : { error: "private usage fixture unavailable" }));
+  });
+  context.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${server.address().port}/usage`,
+    calls: () => calls,
+    disable: () => { available = false; },
+  };
+};
+
+test("a cached lapsed report extends its durable hold without refetch or another transition, including a failed write retry", async (context) => {
+  const now = 1_700_000_000_000;
+  const oldUntil = now + 6 * 60 * 60_000;
+  const extendedAt = now + 1000;
+  const extendedUntil = oldUntil + 1000;
+  const usage = await startUsageFixture(context, {
+    plan: "free", windows: [{ percent: 0, resetsAt: null, durationSeconds: 604800 }],
+  });
+  let fixture = await startBroker("cached-lapsed", state(), {
+    clock: now, config: planConfig(usage.url), auth: PLAN_AUTH,
+    warmPlanUsage: true, traceWrites: true, failNextRename: true,
+  });
+  context.after(() => fixture.close());
+  const startup = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.equal(usage.calls(), 1, "the real cache was fetched once before startup");
+  assert.equal(startup.planUsage.fixture.fetchedAt, now);
+  assert.deepEqual(startup.circuits, {}, "startup did not apply the lapsed report");
+  const first = await post(fixture.socketPath, "/status");
+  assert.equal(first.status, 200, first.body);
+  const before = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(before.circuits["provider:fixture"], {
+    kind: "quota", reason: "plan-lapsed", until: oldUntil, updatedAt: now,
+  }, "the initial hold is valid and durable after startup, before the clock advance");
+  assert.deepEqual(before.planUsage, startup.planUsage);
+
+  fixture.setClock(extendedAt);
+  assert.ok(extendedAt - before.planUsage.fixture.fetchedAt < 60_000, "the report is inside its success cache TTL");
+  fixture.resetTrace();
+  fixture.armNextRenameFailure();
+  const failed = await post(fixture.socketPath, "/status");
+  assert.equal(failed.status, 400, failed.body);
+  assert.match(failed.body, /simulated ordinary broker rename failure/);
+  assert.deepEqual(JSON.parse(readFileSync(fixture.statePath, "utf8")), before, "the failed extension leaves the old persisted hold authoritative");
+  // Same clock and same report: the second apply is byte-for-byte unchanged. Only the
+  // failed write's retained intent can cause this selection read to persist the extension.
+  const retried = await post(fixture.socketPath, "/selection");
+  assert.equal(retried.status, 200, retried.body);
+  const after = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(after.circuits["provider:fixture"], {
+    kind: "quota", reason: "plan-lapsed", until: extendedUntil, updatedAt: extendedAt,
+  });
+  assert.deepEqual({ ...after, circuits: before.circuits }, before, "neither fetchedAt/snapshot nor any other state mutator can mask the circuit-only change");
+  assert.equal(usage.calls(), 1, "both post-startup reads reuse the unchanged report");
+  const transitions = JSON.parse((await post(fixture.socketPath, "/decisions")).body).decisions
+    .filter((entry) => entry.policy.startsWith("provider-check-"));
+  assert.deepEqual(transitions.map((entry) => entry.policy), ["provider-check-lapsed"]);
+  fixture.resetTrace();
+  assert.equal((await post(fixture.socketPath, "/status")).status, 200);
+  assert.equal(fixture.writes(), 0, "the stable cached lapsed report must not write again");
+
+  const base = fixture.base;
+  await fixture.stop();
+  assert.equal((fixture.stderr().match(/fixture plan lapsed:/g) ?? []).length, 1, "only the initial lapse emits an alert; extensions and retries never spam");
+  usage.disable();
+  const restartedAt = oldUntil + 1;
+  assert.ok(restartedAt > oldUntil && restartedAt < extendedUntil);
+  fixture = await startBroker("cached-lapsed", state(), { base, clock: restartedAt, traceWrites: true });
+  const restarted = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(restarted.circuits, after.circuits, "restart after the OLD expiry must retain the extended block");
+  assert.deepEqual(restarted.planUsage, before.planUsage);
+  const refused = await post(fixture.socketPath, "/lease", { sessionID: "must-stay-blocked", profile: "auto", tier: "smart" });
+  assert.equal(refused.status, 400, refused.body);
+  assert.equal(JSON.parse(refused.body).code, "usage-limit", "the persisted hold, not an unrelated admission failure, refuses the provider");
+  assert.equal(usage.calls(), 2, "restart attempted the unavailable usage API rather than obtaining a new report");
+  const finalImage = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(finalImage.circuits, after.circuits);
+  assert.deepEqual(finalImage.planUsage, before.planUsage);
+  assert.deepEqual(finalImage.leases, {});
+});
+
+test("one status read atomically persists both an expired sweep record and a cached future plan lockout, then writes nothing", async (context) => {
+  const now = 1_700_000_000_000;
+  const triggeredAt = now + 20_000;
+  const lockedUntil = now + 600_000;
+  const usage = await startUsageFixture(context, {
+    plan: "pro", windows: [{ percent: 100, resetsAt: lockedUntil / 1000, durationSeconds: 604800 }],
+  });
+  const initial = state();
+  initial.circuits = {
+    expired: { kind: "quota", until: now + 10_000 },
+    // Extending an exact quota circuit retains its kind. Once extended, the cached
+    // report is a true no-op instead of rebuilding a plan-window object each time.
+    "provider:fixture": { kind: "quota", resetKnown: true, until: now + 300_000, updatedAt: now },
+  };
+  const fixture = await startBroker("cached-plan-and-sweep", initial, {
+    clock: now, config: planConfig(usage.url), auth: PLAN_AUTH, warmPlanUsage: true, traceWrites: true,
+  });
+  context.after(() => fixture.close());
+  const startup = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(startup.circuits, initial.circuits, "both records survive startup; neither tested mutation happened yet");
+  assert.equal(startup.planUsage.fixture.fetchedAt, now);
+  assert.equal(startup.planUsage.fixture.lockedUntil, lockedUntil);
+  assert.equal(usage.calls(), 1);
+  fixture.setClock(triggeredAt);
+  assert.ok(triggeredAt - startup.planUsage.fixture.fetchedAt < 60_000);
+  fixture.resetTrace();
+
+  const first = await post(fixture.socketPath, "/status");
+  assert.equal(first.status, 200, first.body);
+  const after = JSON.parse(readFileSync(fixture.statePath, "utf8"));
+  assert.deepEqual(after.circuits, {
+    "provider:fixture": { kind: "quota", resetKnown: true, until: lockedUntil, updatedAt: triggeredAt },
+  }, "the same request prunes the expired record and extends the provider hold");
+  assert.deepEqual({ ...after, circuits: startup.circuits }, startup, "the snapshot and all other state are unchanged");
+  assert.equal(fixture.writes(), 1, "count actual atomic renames: a refresh write plus a second sweep write would be two");
+  fixture.resetTrace();
+  for (const path of ["/selection", "/status"]) {
+    const stable = await post(fixture.socketPath, path);
+    assert.equal(stable.status, 200, stable.body);
+  }
+  assert.equal(fixture.writes(), 0, "stable follow-up reads must perform zero atomic writes");
+  assert.equal(usage.calls(), 1, "no new fetch or fetchedAt change supplies a second mutation");
+  assert.deepEqual(JSON.parse(readFileSync(fixture.statePath, "utf8")), after);
+});
+
+test("a deferred provider-check mutation records persistence intent without weakening a strict pending write", () => {
+  const base = mkdtempSync(join(tmpdir(), "broker-read-only-check-intent-"));
+  const source = readFileSync(BROKER, "utf8");
+  const mainAt = source.lastIndexOf("\nmain().catch(");
+  assert.ok(mainAt > 0, "private entrypoint must omit only the CLI invocation");
+  const entrypoint = join(base, "check-intent.mjs");
+  const configPath = join(base, "config.json");
+  try {
+    writeFileSync(configPath, JSON.stringify({ burnWatch: { enabled: false }, slotWatch: { enabled: false } }), { mode: 0o600 });
+    // Private copy, real functions: expose the nonpersisting producer/consumer boundary
+    // without adding production exports or rolling the production checkout backward.
+    writeFileSync(entrypoint, source.slice(0, mainAt).replace(/from "(\.\.\/[^"]+)"/g,
+      (_match, path) => `from ${JSON.stringify(new URL(path, new URL("../bin/opencode-broker", import.meta.url)).href)}`) + `
+import assert from "node:assert/strict";
+let now = 1700000001000;
+Date.now = () => now;
+const image = ${JSON.stringify(state())};
+image.circuits["provider:fixture"] = { kind: "quota", reason: "plan-lapsed", until: 1700021600000, updatedAt: now - 1000 };
+assert.equal(applyCheckResult(image, "fixture", { entitlement: "lapsed" }, { persist: false }), true);
+assert.equal(pendingPersistence(image), 1, "a deferred provider-check mutation must publish ordinary persistence intent");
+writeState(image);
+assert.equal(pendingPersistence(image), 0);
+assert.equal(JSON.parse(readFileSync(STATE_PATH, "utf8")).circuits["provider:fixture"].until, 1700021601000);
+notePendingPersistence(image, true);
+now += 1000;
+assert.equal(applyCheckResult(image, "fixture", { entitlement: "lapsed" }, { persist: false }), true);
+assert.equal(pendingPersistence(image), 2, "ordinary provider mutation never downgrades strict intent");
+writeState(image);
+assert.equal(pendingPersistence(image), 2, "ordinary success does not acknowledge a strict pending write");
+writeState(image, { requireDurable: true });
+assert.equal(pendingPersistence(image), 0);
+assert.equal(applyCheckResult(image, "fixture", { entitlement: "lapsed" }, { persist: false }), false);
+assert.equal(pendingPersistence(image), 0, "an unchanged result must not create new intent");
+`, { mode: 0o600 });
+    const child = spawnSync(process.execPath, [entrypoint], {
+      env: { ...process.env, HOME: base, OPENCODE_BROKER_CONFIG: configPath,
+        OPENCODE_MODEL_ROUTING_DIR: join(base, "state") }, encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 
 test("a status read cap-evicts the oldest settled durable assignment and persists it once", async (context) => {
   let fixture = await startBroker("assignment-cap", state(), {

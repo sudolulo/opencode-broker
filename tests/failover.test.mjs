@@ -2310,33 +2310,85 @@ for (const [label, response, removed] of [
   assert.equal(result.pending, 0, "settlement must cancel the deadline callback");
 });
 
-test("raw deletion lookups cap underlying hung SDK operations and recover one permit only after settlement", () => {
+test("raw deletion lookups retain all sixteen permits after hook deadlines and recover one only on late SDK settlement", () => {
   const result = runLifecycleFixture(`
+    const { writePendingProfile, readSessionProfile, resolveProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    // Keep a real private profile and route at the oldest ID, whose verification entry
+    // will be trimmed by the synchronous burst. No replacement creation fences cleanup.
+    writePendingProfile("private");
+    await created("hung-0"); await routeBusy("hung-0");
+    const profileBefore = readSessionProfile("hung-0");
+    assert.equal(profileBefore.profile, "private");
+    assert.equal(calls.find((call) => call.path === "/lease").body.profile, "private");
     const pending = new Map(); let getCalls = 0;
+    let unresolved = 0;
     client.session.get = ({ path }) => {
       getCalls += 1;
+      unresolved += 1;
       const lookup = deferred(); pending.set(path.id, lookup);
-      return lookup.promise;
+      return lookup.promise.finally(() => { unresolved -= 1; });
     };
+    const deleting = (id) => hooks.event({ event: { type: "session.deleted", properties: { sessionID: id } } });
     const deletes = [];
+    // Raw events need only IDs, not 3000 unrelated profile files. Keep this burst
+    // synchronous so the tracker trims its oldest entries before rejected hooks settle.
     for (let index = 0; index < 3001; index += 1) {
-      const id = "hung-" + index;
-      await created(id);
-      deletes.push(hooks.event({ event: { type: "session.deleted", properties: { sessionID: id } } }));
+      deletes.push(deleting("hung-" + index));
     }
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(getCalls, 16, "only sixteen underlying SDK lookups may be outstanding");
     assert.equal(timerRecords.filter((timer) => timer.ms === 1500).length, 16, "rejected events must not allocate deadlines");
 
-    pending.get("hung-0").resolve({ data: { id: "hung-0" } });
-    await deletes[0];
-    const recovered = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "hung-3001" } } });
+    for (let index = 0; index < 16; index += 1) {
+      assert.equal(await runNextTimer(1500), true, "every hung lookup must reach its hook deadline");
+    }
+    const hooksSettled = await Promise.race([
+      Promise.all(deletes).then(() => true), new Promise((resolve) => setImmediate(() => resolve(false))),
+    ]);
+    assert.equal(hooksSettled, true, "all deletion hooks finish while all SDK operations are still unresolved");
+    assert.equal(unresolved, 16);
+    assert.equal(timers.filter((timer) => timer.ms === 1500).length, 0);
+    assert.ok(timerRecords.filter((timer) => timer.ms === 1500).every((timer) => timer.cleared && timer.unrefed));
+
+    const saturated = [deleting("hung-0"), deleting("new-distinct")];
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getCalls, 16, "timeouts and tracker eviction must not release SDK permits, even for the oldest ID or a new ID");
+    assert.equal(timerRecords.filter((timer) => timer.ms === 1500).length, 16, "saturated retries allocate no new deadline");
+    await Promise.all(saturated);
+    const headersBeforeLate = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "hung-0", model: target.model }, headersBeforeLate);
+    assert.equal(headersBeforeLate.headers["x-opencode-lease-id"], "Lhung-01");
+    assert.deepEqual(readSessionProfile("hung-0"), profileBefore);
+    assert.equal(resolveProfile({ sessionID: "hung-0" }).profile, "private");
+    assert.deepEqual(calls.filter((call) => call.path === "/forget"), []);
+
+    pending.get("hung-0").resolve(missing("hung-0"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unresolved, 15, "late settlement releases capacity only, not deletion authority");
+    assert.deepEqual(readSessionProfile("hung-0"), profileBefore, "late exact 404 cannot erase the private profile");
+    const headersAfterLate = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "hung-0", model: target.model }, headersAfterLate);
+    assert.equal(headersAfterLate.headers["x-opencode-lease-id"], "Lhung-01", "late exact 404 cannot erase the route");
+    assert.deepEqual(calls.filter((call) => call.path === "/forget"), []);
+    await runNextTimer(60000);
+    assert.equal(prompts.length, 1, "the private session's heartbeat remains eligible");
+
+    await created("recovered");
+    const recovered = deleting("recovered");
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(getCalls, 17, "one settled SDK operation releases exactly one permit");
-    pending.get("hung-3001").resolve({ data: { id: "hung-3001" } });
+    assert.equal(unresolved, 16);
+    await deleting("still-saturated");
+    assert.equal(getCalls, 17, "the seventeenth operation consumes the only released permit");
+    pending.get("recovered").resolve(missing("recovered"));
     await recovered;
-    console.log(JSON.stringify({ getCalls, deadlines: timerRecords.filter((timer) => timer.ms === 1500).length }));
+    assert.equal(readSessionProfile("recovered"), null, "a fresh in-deadline exact 404 still authorizes local cleanup");
+    assert.deepEqual(calls.filter((call) => call.path === "/forget"), [], "the new unleased session must never emit an ID-only forget");
+    assert.equal(timers.filter((timer) => timer.ms === 1500).length, 0);
+    console.log(JSON.stringify({ getCalls, deadlines: timerRecords.filter((timer) => timer.ms === 1500).length, unresolved, profile: readSessionProfile("hung-0").profile }));
   `);
   assert.equal(result.getCalls, 17);
   assert.equal(result.deadlines, 17);
+  assert.equal(result.unresolved, 15);
+  assert.equal(result.profile, "private");
 });

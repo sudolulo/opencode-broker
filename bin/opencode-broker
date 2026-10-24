@@ -722,6 +722,7 @@ const applyCheckResult = (state, providerID, result, { persist = true } = {}) =>
   // transition. Persist that real mutation, but only log and notify actual transitions.
   const mutated = !boundedEqual(before, state.circuits[circuitID]);
   if (!mutated) return false;
+  notePendingPersistence(state);
   if (persist) writeState(state);
   if (!change) return true;
   logDecision({ at: now, sessionID: null, targetID: null, policy: `provider-check-${change}`, reasons: [providerID] });
