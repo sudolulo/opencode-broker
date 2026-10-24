@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.4] — 2026-10-24
+
+### Fixed
+
+- **Default `POST /lease` and `/failure` share one absolute 32.5s transport budget, including retry delay, matching the broker's 30s arrival deadline and bounded quota refresh.** Ordinary 2500ms-per-attempt requests, explicit caller timeouts (including 0), structured refusals (their message and fields) and private one-shot transports are unchanged. HTTP refusals are no longer retried merely because their message resembles a socket failure; ordinary response errors now settle and clean up the request rather than leaving it pending. This fix does not establish the historical backlog cause.
+
 ## [1.27.3] — 2026-10-23
 
 ### Fixed

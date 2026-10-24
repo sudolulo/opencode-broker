@@ -36,7 +36,7 @@ const before = (promise, timeoutMs, message) => new Promise((resolve, reject) =>
   });
 });
 
-const startBroker = async ({ usageURL, handlerDeadlineMs = 5_000, modelsHandler = null }) => {
+const startBroker = async ({ usageURL, handlerDeadlineMs = 30_000, modelsHandler = null, planUsage = null, setupHome = null }) => {
   const models = http.createServer((request, response) => {
     if (modelsHandler) return modelsHandler(request, response);
     response.writeHead(200, { "content-type": "application/json" });
@@ -51,15 +51,17 @@ const startBroker = async ({ usageURL, handlerDeadlineMs = 5_000, modelsHandler 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   writeFileSync(keyPath, "fixture-plan-reader-key\n", { mode: 0o600 });
   chmodSync(keyPath, 0o600);
+  setupHome?.(home);
+  const providerID = planUsage?.providerID ?? "fixture";
   writeFileSync(configPath, JSON.stringify({
     targets: {
       local: { providerID: "llamacpp", modelID: "local-model", kind: "local", capacity: 2, context: 32768 },
-      cloud: { providerID: "fixture", modelID: "cloud-model", kind: "cloud", context: 32768 },
+      cloud: { providerID, modelID: "cloud-model", kind: "cloud", context: 32768 },
     },
     tiers: { worker: ["local"], smart: ["cloud"] },
     profiles: { local: ["local"], auto: ["cloud"] },
-    budgets: { fixture: { windows: [{ id: "wk", periodMs: 604800000, meter: "requests", capacity: 100 }],
-      planUsage: { type: "http", url: usageURL, keyFile: keyPath } } },
+    budgets: { [providerID]: { windows: [{ id: "wk", periodMs: 604800000, meter: "requests", capacity: 100 }],
+      planUsage: planUsage ?? { type: "http", url: usageURL, keyFile: keyPath } } },
     slotWatch: { enabled: false }, burnWatch: { enabled: false },
   }));
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(OPENCODE_|XDG_)/.test(name)));
@@ -88,6 +90,18 @@ const startBroker = async ({ usageURL, handlerDeadlineMs = 5_000, modelsHandler 
       rmSync(home, { recursive: true, force: true });
     },
   };
+};
+
+let clientGeneration = 0;
+const brokerClientFor = async (socketPath) => {
+  const previous = process.env.OPENCODE_MODEL_BROKER_SOCKET;
+  process.env.OPENCODE_MODEL_BROKER_SOCKET = socketPath;
+  try {
+    return await import(`../lib/client.js?planUsageQueue=${++clientGeneration}`);
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_MODEL_BROKER_SOCKET;
+    else process.env.OPENCODE_MODEL_BROKER_SOCKET = previous;
+  }
 };
 
 const openPartialPost = (socketPath, path) => {
@@ -247,6 +261,38 @@ test("preflight admission refuses excess unfinished lease bodies without delayin
     assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
   } finally {
     for (const request of partials) request.destroy();
+    await broker.stop();
+    await new Promise((resolve, reject) => usage.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("a legal six-second Bailian quota refresh still leases to the ordinary client", { timeout: 20_000 }, async () => {
+  const usage = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ windows: [] }));
+  });
+  await new Promise((resolve) => usage.listen(0, "127.0.0.1", resolve));
+  let fakeCliCountPath;
+  const broker = await startBroker({
+    usageURL: `http://127.0.0.1:${usage.address().port}/unused`,
+    planUsage: { providerID: "bailian", type: "bailian-cli" },
+    setupHome(home) {
+      const bin = join(home, ".local/bin");
+      mkdirSync(bin, { recursive: true, mode: 0o700 });
+      fakeCliCountPath = join(home, "fake-bl-count");
+      writeFileSync(join(home, ".local/share/opencode/auth.json"), JSON.stringify({ bailian: { type: "oauth" } }) + "\n", { mode: 0o600 });
+      writeFileSync(join(bin, "bl"), `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(fakeCliCountPath)}, "1\\n");\nsetTimeout(() => process.stdout.write(JSON.stringify({ per5HourPercentage: 0.25, per5HourResetTime: Math.floor(Date.now() / 1000) + 3600, per1WeekPercentage: 0.5, per1WeekResetTime: Math.floor(Date.now() / 1000) + 86400 })), 6000);\n`, { mode: 0o700 });
+      chmodSync(join(bin, "bl"), 0o700);
+    },
+  });
+  try {
+    const client = await brokerClientFor(broker.socketPath);
+    const ordinary = await client.brokerRequest("/lease", {
+      sessionID: "ordinary-timeout", profile: "auto", tier: "smart", contextTokens: 100,
+    });
+    assert.equal(readFileSync(fakeCliCountPath, "utf8").trim().split("\n").length, 1, "both client attempts must share the in-flight quota refresh");
+    assert.equal(ordinary.target.id, "cloud", JSON.stringify(ordinary));
+  } finally {
     await broker.stop();
     await new Promise((resolve, reject) => usage.close((error) => error ? reject(error) : resolve()));
   }
