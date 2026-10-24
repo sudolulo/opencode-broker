@@ -70,6 +70,17 @@ const withTempHome = async (fn) => {
 
 const freshRouting = async () => import(`${new URL("../lib/routing.js", import.meta.url).href}?v=${Date.now()}-${Math.random()}`);
 
+test("otherwise-unclassified normalized HTTP 400 errors are payloads after named classifications", () => {
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "unknown request shape" }), "payload");
+  assert.equal(R.classifyRoutingFailure({
+    name: "AI_APICallError",
+    data: { statusCode: 400, message: "Anthropic upstream HTTP 400" },
+  }), "payload");
+
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "Usage credits are required for fast mode." }), "model");
+  assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "invalid_request_error: malformed tool_use" }), "payload");
+});
+
 const publishTrustedApiInventoryInChild = (home, publisher) => {
   const configPath = join(home, "config.json");
   const cachePath = join(home, "models.json");

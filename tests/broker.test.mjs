@@ -267,6 +267,37 @@ const inventory = (providers) => {
   };
 };
 
+test("a generic upstream HTTP 400 releases only its session without fencing a healthy flagship", async () => withBroker(async ({ socketPath }) => {
+  await request(socketPath, "/inventory", inventory({
+    openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+  }));
+  const resolvableModels = ["openai/gpt-5.6-sol"];
+  const lease = await request(socketPath, "/lease", {
+    sessionID: "ses-generic-400", profile: "auto", tier: "smart", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-sol" }, resolvableModels,
+  });
+  assert.equal(lease.target.id, "gpt-flagship");
+  const before = await request(socketPath, "/status");
+
+  const failure = await rawRequest(socketPath, "/failure", { body: {
+    sessionID: "ses-generic-400", leaseID: lease.leaseID, targetID: lease.target.id,
+    error: { name: "AI_APICallError", data: { statusCode: 400, message: "Anthropic upstream HTTP 400" } },
+  } });
+  assert.equal(failure.status, 200, JSON.stringify(failure.body));
+  assert.deepEqual(failure.body, { ok: true, kind: "payload" });
+
+  const after = await request(socketPath, "/status");
+  assert.deepEqual(after.circuits, before.circuits, "a generic 400 opens no circuit");
+  assert.deepEqual(after.health, before.health, "a generic 400 records no health evidence");
+  assert.equal(after.leases["ses-generic-400"], undefined, "the failed session is released");
+
+  const unrelated = await request(socketPath, "/lease", {
+    sessionID: "ses-generic-400-unrelated", profile: "auto", tier: "smart", replace: true,
+    preferredModel: { providerID: "openai", id: "gpt-5.6-sol" }, resolvableModels,
+  });
+  assert.equal(unrelated.target.id, "gpt-flagship", "the healthy flagship remains leasable");
+}, { resolvableModels: ["openai/gpt-5.6-sol"] }));
+
 test("resolvableModels narrows leases, held leases, and session pins without changing legacy callers", async () => withBroker(async ({ socketPath }) => {
   await request(socketPath, "/inventory", inventory({
     openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },

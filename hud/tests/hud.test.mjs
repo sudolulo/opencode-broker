@@ -307,7 +307,7 @@ const LEASED_TARGET = {
 //   sessionModel  what api.state.session.get(id).model reports, i.e. the live chat-bar model
 //   startAt       the virtual clock's starting epoch ms (default: the real time at open)
 const withTuiHarness = async ({ questionState, questionError, permissionState, sessionRows = [], initialMode = "manual",
-  listSessions, sessionModel, messages, rendererWidth, sessionStatuses, startAt } = {}) => {
+  listSessions, sessionModel, messages, projectedMessages, rendererWidth, sessionStatuses, startAt } = {}) => {
   let releaseHarness;
   const previousHarness = harnessQueue;
   harnessQueue = new Promise((resolve) => { releaseHarness = resolve; });
@@ -353,10 +353,11 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       session: {
         // The second argument is the SDK's per-request options (where an AbortSignal travels).
         list: (input, options) => (listSessions ? listSessions(input, options) : Promise.resolve({ data: sessionRows })),
+        messages: (input, options) => (messages ? messages(input, options) : Promise.resolve({ data: [] })),
       },
       v2: {
         session: {
-          messages: (input, options) => (messages ? messages(input, options) : Promise.resolve({ data: [] })),
+          messages: (input, options) => (projectedMessages ? projectedMessages(input, options) : Promise.resolve({ data: { data: [], cursor: {} } })),
           switchAgent: async (input) => { switches.push(input); return { data: true }; },
           switchModel: async (input) => { switchedModels.push(input); return { data: true }; },
         },
@@ -939,6 +940,36 @@ test("a real subagent still reaches the roster beside a classifier child", async
     await h.key()({ event: { name: "return" }, consume: () => h.consumes.push("return") });
     assert.deepEqual(h.consumes, ["down", "return"]);
     assert.deepEqual(h.navigations, [{ name: "session", params: { sessionID: "child-scout" } }]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("assistant hydration uses the legacy message endpoint, not projected v2 messages", async () => {
+  requireJsxRuntime();
+  const calls = [];
+  const h = await withTuiHarness({
+    messages: async ({ sessionID }) => {
+      calls.push("legacy");
+      return { data: [{ info: {
+        id: "legacy-turn", sessionID, role: "assistant", providerID: "openai", modelID: "actual-legacy",
+        time: { created: 20 },
+      }, parts: [] }] };
+    },
+    projectedMessages: async () => {
+      calls.push("projected");
+      return { data: { data: [{
+        id: "projected-turn", type: "assistant", time: { created: 20 },
+        model: { providerID: "openai", id: "projected-model" }, content: [],
+      }], cursor: {} } };
+    },
+  });
+  try {
+    const last = h.lastAssistantBody();
+    await h.runRefresh();
+    await flushReal();
+    assert.equal(contentOf(last), " openai/actual-legacy");
+    assert.deepEqual(calls, ["legacy"]);
   } finally {
     await h.cleanup();
   }

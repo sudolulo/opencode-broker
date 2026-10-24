@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.5] — 2026-10-24
+
+### Fixed
+
+- **Generic upstream HTTP 400 failures stay isolated to the calling session.** Otherwise-unclassified normalized 400 responses are treated as malformed request payloads after all named classifications, preserving visible failure telemetry without opening model or provider circuits or recording provider-health evidence.
+- **The HUD reads actual assistant turns from the legacy session-message contract.** Assistant hydration no longer reads the projected v2 message shape, so the roster and sidebar display the model from the actual assistant turn.
+
 ## [1.27.4] — 2026-10-24
 
 ### Fixed

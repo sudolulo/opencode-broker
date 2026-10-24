@@ -378,7 +378,7 @@ export default {
     };
     const hydrateAssistant = (id) => {
       if (!id || !assistantRelevant.has(id) || assistantLoads.has(id) || assistantTurns.has(id)) return;
-      if (typeof api.client?.v2?.session?.messages !== "function") {
+      if (typeof api.client?.session?.messages !== "function") {
         assistantTurns.set(id, { state: "unavailable" });
         return;
       }
@@ -399,7 +399,7 @@ export default {
       assistantLoads.set(id, entry);
       assistantTurns.set(id, { state: "pending" });
       const request = Promise.resolve()
-        .then(() => api.client.v2.session.messages({ sessionID: id, limit: 20 }, { signal: controller.signal }))
+        .then(() => api.client.session.messages({ sessionID: id, limit: 20 }, { signal: controller.signal }))
         .then((res) => {
           if (!owns()) return;
           if (res?.error) { finish("unavailable"); return; }
