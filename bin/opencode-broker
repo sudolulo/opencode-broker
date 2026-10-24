@@ -513,8 +513,8 @@ const writeState = (state, { requireDurable = false } = {}) => {
     // rebuilds as sessions re-lease on restart), so paying a per-request fsync -- on ZFS, under the
     // host's disk contention, on the single-threaded daemon every session shares -- made even
     // /status ~1.4s and backed the whole request queue up, which the router then saw as a "broker
-    // timeout" (2026-10-23). Ordinary writes now skip it (a crash loses at most seconds of lease
-    // state, re-leased on restart); only the outage commit (requireDurable:true) fsyncs.
+    // timeout" (2026-10-23). Ordinary writes atomically replace the visible state but make no
+    // crash-durability or bounded-loss guarantee; only the outage commit (requireDurable:true) fsyncs.
     if (requireDurable) fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
@@ -3665,14 +3665,30 @@ const serve = async () => {
         return reply(response, 200, { ok: true });
       }
       if (request.url === "/forget") {
-        const binding = settlementBinding(state, body);
+        let binding = settlementBinding(state, body);
+        let policyEvent = null;
+        const currentLease = state.leases[body.sessionID];
+        // A supplied id that is not the session's exact live lease can only settle an archived
+        // policy candidate. Ordinary retained assignment pins are not a second settlement
+        // authority. Settle the historical record first so its replay cannot reach health or
+        // release a replacement live lease.
+        if (body.leaseID !== undefined && currentLease?.leaseID !== body.leaseID) {
+          const historical = policyLeaseBinding(state, body.leaseID, body.sessionID);
+          if (!historical) throw new Error("unknown or stale lease id for session");
+          policyEvent = settlePolicyLease(state, historical, {
+            outcome: body.completed === true ? "success" : "abandoned",
+            source: "forget",
+          });
+          if (policyEvent?.replayed) return reply(response, 200, { ok: true });
+          binding = historical;
+        }
         const completed = body.completed === true;
         if (completed) {
           const targetID = bindingTargetID(binding, body);
           const target = targetForID(targetID, allTargets(state));
           if (target) state.health = markProbationSuccessHealthy(state.health, target.providerID);
         }
-        settlePolicyLease(state, binding, {
+        if (!policyEvent) settlePolicyLease(state, binding, {
           outcome: completed ? "success" : "abandoned",
           source: "forget",
         });

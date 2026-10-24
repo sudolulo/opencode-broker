@@ -43,6 +43,47 @@ test("async store migrates legacy records, preserves their age, and removes only
   });
 });
 
+test("one async scan yields a legacy migration claim once when opendir rediscovers it", async () => withDirectory(async (directory) => {
+  const now = Date.now();
+  writeFileSync(join(directory, "legacy.json"), content("legacy", "L1", false, now));
+  await mockedStore({ opendir: async (path) => {
+    if (path !== directory) return fs.opendir(path);
+    return (async function* () {
+      yield { name: "legacy.json" };
+      yield { name: readdirSync(directory).find((name) => name.startsWith("claim.")) };
+    })();
+  } }, async (create) => {
+    const store = create({ directory, validSessionID });
+    const handles = await Array.fromAsync(store.records({ now }));
+    assert.equal(handles.length, 1, "the migrated claim must not be yielded again in its creating scan");
+
+    const forgets = [], removals = [], timers = [];
+    const retry = createPendingForgetRetry({
+      records: () => store.records({ now }),
+      forget: async (handle) => forgets.push(handle.recordID),
+      remove: async (sessionID, handle) => {
+        removals.push(handle.recordID);
+        return store.remove(sessionID, handle);
+      },
+      setTimer: (_callback, delay) => { timers.push(delay); return { unref() {} }; },
+      clearTimer: () => {}, warn: () => {},
+    });
+    await retry.kick();
+    assert.equal(forgets.length, 1);
+    assert.equal(removals.length, 1);
+    assert.deepEqual(timers, [], "a duplicate removal refusal must not arm backoff");
+  });
+}));
+
+test("async store yields distinct immutable publications for one session and lease", async () => withDirectory(async (directory) => {
+  const now = Date.now();
+  const first = recordName("same", "L1"), second = recordName("same", "L1");
+  writeFileSync(join(directory, first), content("same", "L1", false, now));
+  writeFileSync(join(directory, second), content("same", "L1", true, now));
+  const records = await Array.fromAsync(createAsyncPendingForgetStore({ directory, validSessionID }).records({ now }));
+  assert.deepEqual(new Set(records.map((record) => record.recordID)), new Set([first, second]));
+}));
+
 test("async store retains unknown and oversized files, prunes only expired owned records, and yields in large directories", async () => {
   await withDirectory(async (directory) => {
     const now = Date.now();

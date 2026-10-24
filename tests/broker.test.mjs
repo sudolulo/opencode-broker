@@ -2396,7 +2396,9 @@ const publishProbationCandidate = async (socketPath, configPath) => {
 
 // `extraEnv` reaches the daemon's spawn environment untouched (a models-server URL, a test
 // clock); the config path this helper writes always wins over it.
-const startLiveProbationCandidate = async (home, { offerEvery = 1, extraEnv = {} } = {}) => {
+const startLiveProbationCandidate = async (home, {
+  offerEvery = 1, extraEnv = {}, oneShot = false, sessionID = "probation-live-candidate",
+} = {}) => {
   writeAuth(home);
   const generation = await createProbeGeneration(home);
   const configPath = applyConfigPath(home);
@@ -2428,11 +2430,12 @@ const startLiveProbationCandidate = async (home, { offerEvery = 1, extraEnv = {}
     const candidateID = await publishProbationCandidate(broker.socketPath, configPath);
     const first = await rawRequest(broker.socketPath, "/lease", {
       body: {
-        sessionID: "probation-live-candidate",
+        sessionID,
         profile: "auto",
         tier: "smart",
         providers: ["openai"],
         replace: true,
+        oneShot,
         contextTokens: 0,
         resolverToken: registration.body.resolverToken,
       },
@@ -2445,6 +2448,7 @@ const startLiveProbationCandidate = async (home, { offerEvery = 1, extraEnv = {}
       configPath,
       resolverToken: registration.body.resolverToken,
       firstLeaseID: first.body.leaseID,
+      sessionID,
     };
   } catch (error) {
     await stopBroker(broker.child);
@@ -3270,6 +3274,163 @@ test("an archived candidate lease replays canonical gateway 502 without affectin
       assert.deepEqual(afterRole, beforeRole, `${label}: the whole role record is unchanged`);
       assertUntouched(after, label);
     }
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a settled ordinary forget rejects a contradictory completion without mutating its retained pin", async () => withTempHome(async (home) => {
+  writeAuth(home);
+  const broker = await startBroker(home);
+  try {
+    await request(broker.socketPath, "/inventory", inventory({
+      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
+    }));
+    const sessionID = "settled-ordinary-forget";
+    const lease = await request(broker.socketPath, "/lease", {
+      sessionID, profile: "auto", tier: "worker", replace: true,
+      preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+    });
+    const first = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID: lease.leaseID, completed: false },
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const before = JSON.parse(readFileSync(statePath, "utf8"));
+    const replay = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID: lease.leaseID, completed: true },
+    });
+    assert.equal(replay.status, 400, JSON.stringify(replay.body));
+    assert.match(replay.body.error, /unknown or stale lease id for session/);
+
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(after.health, before.health, "the stale completion cannot alter provider health");
+    assert.deepEqual(after.assignments[sessionID], before.assignments[sessionID],
+      "the retained assignment pin and activeAt remain unchanged");
+    assert.equal(after.leases[sessionID], undefined, "the settled lease stays absent");
+    const next = await request(broker.socketPath, "/lease", {
+      sessionID, profile: "auto", tier: "worker", replace: true,
+      preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
+    });
+    assert.equal(next.target.id, before.assignments[sessionID].targetID,
+      "the next turn reuses the preserved assignment pin");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a settled candidate forget replays before health or first-outcome mutation", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const sessionID = "probation-live-candidate";
+    const leaseID = broker.firstLeaseID;
+    const quarantined = await rawRequest(broker.socketPath, "/quarantine", {
+      body: { scope: "provider", kind: "compatibility", providerID: "openai" },
+    });
+    assert.equal(quarantined.status, 200, JSON.stringify(quarantined.body));
+    const rearmed = await rawRequest(broker.socketPath, "/rearm", { body: { targetID: "provider:openai" } });
+    assert.equal(rearmed.status, 200, JSON.stringify(rearmed.body));
+
+    const first = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID, completed: false },
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const before = JSON.parse(readFileSync(statePath, "utf8"));
+    const beforeSettlement = structuredClone(before.modelPolicy.roles["openai:gpt-sol"].probation.leases[leaseID].settlement);
+    assert.equal(before.health.providers.openai.state, "probation", "the replay would visibly clear health in the buggy order");
+
+    const replay = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID, completed: true },
+    });
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(after.health, before.health, "candidate replay leaves health byte-for-structure unchanged");
+    assert.deepEqual(after.modelPolicy.roles["openai:gpt-sol"].probation.leases[leaseID].settlement, beforeSettlement,
+      "candidate replay retains the first abandoned outcome");
+    assert.deepEqual(after.assignments[sessionID], before.assignments[sessionID], "candidate replay leaves its retained pin unchanged");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a one-shot candidate's retained historical forget replay cannot clear probation health", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home, { oneShot: true, sessionID: "gw-candidate-historical-forget" });
+  try {
+    const { sessionID } = broker;
+    const leaseID = broker.firstLeaseID;
+    const quarantined = await rawRequest(broker.socketPath, "/quarantine", {
+      body: { scope: "provider", kind: "compatibility", providerID: "openai" },
+    });
+    assert.equal(quarantined.status, 200, JSON.stringify(quarantined.body));
+    const rearmed = await rawRequest(broker.socketPath, "/rearm", { body: { targetID: "provider:openai" } });
+    assert.equal(rearmed.status, 200, JSON.stringify(rearmed.body));
+
+    const first = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID, completed: false },
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const before = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(before.assignments[sessionID], undefined, "one-shot forget removes its assignment");
+    assert.equal(before.health.providers.openai.state, "probation");
+    const beforeSettlement = structuredClone(before.modelPolicy.roles["openai:gpt-sol"].probation.leases[leaseID].settlement);
+
+    const replay = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID, completed: true },
+    });
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(after.health, before.health, "a retained one-shot candidate replay cannot clear probation health");
+    assert.deepEqual(after.modelPolicy.roles["openai:gpt-sol"].probation.leases[leaseID].settlement, beforeSettlement,
+      "the first abandoned outcome remains canonical");
+  } finally {
+    await stopBroker(broker.child);
+  }
+}));
+
+test("a retained L1 candidate forget replay cannot settle or release live L2", async () => withTempHome(async (home) => {
+  const broker = await startLiveProbationCandidate(home);
+  try {
+    const sessionID = "probation-live-candidate";
+    const first = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID: broker.firstLeaseID, completed: false },
+    });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+
+    const second = await leaseCompatibleSmartSession(broker.socketPath, broker.resolverToken, sessionID);
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    assert.notEqual(second.body.leaseID, broker.firstLeaseID);
+
+    const quarantined = await rawRequest(broker.socketPath, "/quarantine", {
+      body: { scope: "provider", kind: "compatibility", providerID: "openai" },
+    });
+    assert.equal(quarantined.status, 200, JSON.stringify(quarantined.body));
+    const rearmed = await rawRequest(broker.socketPath, "/rearm", { body: { targetID: "provider:openai" } });
+    assert.equal(rearmed.status, 200, JSON.stringify(rearmed.body));
+
+    const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
+    const before = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(before.health.providers.openai.state, "probation", "the replay would visibly clear health in the buggy order");
+    assert.equal(before.leases[sessionID].leaseID, second.body.leaseID);
+    assert.equal(before.assignments[sessionID].leaseID, second.body.leaseID);
+    assert.equal(before.modelPolicy.roles["openai:gpt-sol"].probation.leases[second.body.leaseID].settlement, null);
+
+    const replay = await rawRequest(broker.socketPath, "/forget", {
+      body: { sessionID, leaseID: broker.firstLeaseID, completed: true },
+    });
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+
+    const after = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(after.health, before.health, "historical L1 completion cannot clear L2-era probation health");
+    assert.equal(after.leases[sessionID].leaseID, second.body.leaseID, "L1 replay cannot release L2");
+    assert.deepEqual(after.assignments[sessionID], before.assignments[sessionID], "L1 replay cannot disturb L2's pin");
+    assert.equal(after.modelPolicy.roles["openai:gpt-sol"].probation.leases[second.body.leaseID].settlement, null,
+      "L1 replay cannot settle L2");
   } finally {
     await stopBroker(broker.child);
   }

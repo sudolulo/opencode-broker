@@ -18,6 +18,7 @@ All notable changes to this project are documented here. The format is based on
 - Authoritative session deletion refreshes completion for the same binding and coalesces duplicate lifecycle cleanup by ownership.
 - Pending-forget recovery uses incremental asynchronous filesystem work, fair round-robin scheduling across four groups, exact immutable handles, completion ordering, and finite backoff.
 - The enabled resolver preserves transport deadlines and options.
+- A contradictory `/forget` completion after an ordinary lease was already settled now refuses before changing provider health or the retained assignment; governed-candidate replays remain side-effect-free.
 
 ## [1.27.5] — 2026-10-24
 
