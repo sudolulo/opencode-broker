@@ -20,6 +20,7 @@ import {
 import { createServer, request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   CONFIG,
   admitResolvableInventory,
@@ -470,15 +471,16 @@ const noteSuccessfulPersistence = (state, requireDurable) => {
   if (requireDurable || pendingPersistence(state) < 2) persistenceIntents.delete(state);
 };
 
-// Avoid a full state serialization merely to decide whether a read needs persistence. Any
-// unexpected large control-plane shape is treated as changed, preserving the old safe behavior.
+// Health and plan snapshots use bounded comparison so unexpectedly large control-plane data is
+// conservatively treated as changed. Model-policy is strict, valid, and unbounded by size: use
+// exact structural comparison so its complete acknowledgement histories never cause spurious I/O.
 const prepareStateForPersistence = (state) => {
   let changed = false;
   if (state.version !== 5) { state.version = 5; changed = true; }
   const health = normalizeHealth(state.health);
   if (!boundedEqual(state.health, health)) { state.health = health; changed = true; }
   const modelPolicy = normalizeModelPolicy(state.modelPolicy, { modelRoles: CONFIG.modelRoles, staticTargets: TARGETS });
-  if (!boundedEqual(state.modelPolicy, modelPolicy)) { state.modelPolicy = modelPolicy; changed = true; }
+  if (!isDeepStrictEqual(state.modelPolicy, modelPolicy)) { state.modelPolicy = modelPolicy; changed = true; }
   const planUsage = planUsageSnapshot();
   if (Object.keys(planUsage).length && !boundedEqual(state.planUsage, planUsage)) {
     state.planUsage = planUsage;

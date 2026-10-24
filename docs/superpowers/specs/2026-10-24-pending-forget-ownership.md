@@ -34,8 +34,8 @@ try {
   fchmodSync(fd, 0o600);
 } finally {
   closeSync(fd);
-  linkSync(temp, destination);
 }
+linkSync(temp, destination);
 ```
 Enclosing `finally` unlinks ONLY temp this call created; final `EEXIST` retry fresh UUID up to 3, all other errors explicit.
 

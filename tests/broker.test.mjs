@@ -3280,12 +3280,17 @@ test("an archived candidate lease replays canonical gateway 502 without affectin
 }));
 
 test("a settled ordinary forget rejects a contradictory completion without mutating its retained pin", async () => withTempHome(async (home) => {
-  writeAuth(home);
-  const broker = await startBroker(home);
+  // Start a live candidate to install the OpenAI probation policy, then rearm its
+  // provider into probation. A stale ordinary completion must be refused before it
+  // can mark that provider healthy.
+  const broker = await startLiveProbationCandidate(home);
   try {
-    await request(broker.socketPath, "/inventory", inventory({
-      openai: { authType: "oauth", connected: true, classification: "subscription", models: 1 },
-    }));
+    const quarantined = await rawRequest(broker.socketPath, "/quarantine", {
+      body: { scope: "provider", kind: "compatibility", providerID: "openai" },
+    });
+    assert.equal(quarantined.status, 200, JSON.stringify(quarantined.body));
+    const rearmed = await rawRequest(broker.socketPath, "/rearm", { body: { targetID: "provider:openai" } });
+    assert.equal(rearmed.status, 200, JSON.stringify(rearmed.body));
     const sessionID = "settled-ordinary-forget";
     const lease = await request(broker.socketPath, "/lease", {
       sessionID, profile: "auto", tier: "worker", replace: true,
@@ -3298,6 +3303,8 @@ test("a settled ordinary forget rejects a contradictory completion without mutat
 
     const statePath = join(home, ".local/share/opencode/model-routing/broker.json");
     const before = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(before.health.providers.openai.state, "probation",
+      "the stale completion must not promote OpenAI out of seeded probation");
     const replay = await rawRequest(broker.socketPath, "/forget", {
       body: { sessionID, leaseID: lease.leaseID, completed: true },
     });
@@ -3313,6 +3320,9 @@ test("a settled ordinary forget rejects a contradictory completion without mutat
       sessionID, profile: "auto", tier: "worker", replace: true,
       preferredModel: { providerID: "openai", id: "gpt-5.6-luna" },
     });
+    const afterNext = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(afterNext.health, before.health,
+      "a later ordinary write cannot persist a premature stale-completion health mutation");
     assert.equal(next.target.id, before.assignments[sessionID].targetID,
       "the next turn reuses the preserved assignment pin");
   } finally {

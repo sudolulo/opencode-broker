@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
+import { compareAndSwapModelPolicy, emptyModelPolicy } from "../lib/model-policy.js";
+
 const BROKER = new URL("../bin/opencode-broker", import.meta.url).pathname;
 const STATE_TRACE_HOOK = new URL("./fixtures/broker-state-fault.cjs", import.meta.url).pathname;
 
@@ -219,6 +221,67 @@ test("stable status and selection reads do not rewrite broker state", async (con
   }
 
   assert.deepEqual(fileIdentity(fixture.statePath), before);
+});
+
+test("large valid model-policy histories stay read-only after normalization", async (context) => {
+  let modelPolicy = emptyModelPolicy();
+  for (let index = 0; index < 260; index += 1) {
+    modelPolicy = compareAndSwapModelPolicy(modelPolicy, {
+      transitionID: `transition-openai-sol-${index}`,
+      revision: `revision-${index}`,
+      roleKey: "openai:gpt-sol",
+      expectedIncumbentModelID: "gpt-5.6-sol",
+      generation: 4,
+      manifestHash: "a".repeat(64),
+      desired: {
+        activeModelID: "gpt-5.6-sol",
+        probationModelID: "gpt-6-sol",
+        rollbackModelID: "gpt-5.6-sol",
+        routingIntent: { tiers: ["smart"], fit: { smart: 1.25 }, effortCeiling: "high", requiredReasoningMode: null },
+        probation: {
+          phase: "staged-probing", offerEvery: 5, opportunityCursor: 0, opportunityMs: 0,
+          opportunityCursorAt: null, opportunityEligibleUntil: null, successes: [], failures: [], leases: {},
+        },
+      },
+    }, { now: () => 1_700_000_000_000 + index }).policy;
+  }
+  assert.ok(modelPolicy.history.length * 2 * 8 > 4096, "the valid global and role histories exceed bounded comparison capacity");
+
+  const initial = state();
+  initial.modelPolicy = modelPolicy;
+  const config = {
+    targets: { "gpt-flagship": { providerID: "openai", modelID: "gpt-5.6-sol", kind: "cloud" } },
+    profiles: {}, tiers: {},
+  };
+  let fixture = await startBroker("large-model-policy-history", initial, { config, traceWrites: true });
+  context.after(() => fixture.close());
+  const normalized = JSON.parse(readFileSync(fixture.statePath, "utf8")).modelPolicy;
+  assert.equal(normalized.history.length, 260);
+  assert.equal(normalized.roles["openai:gpt-sol"].history.length, 260);
+  fixture.resetTrace();
+  const before = fileIdentity(fixture.statePath);
+
+  for (const path of ["/status", "/selection"]) {
+    const response = await post(fixture.socketPath, path);
+    assert.equal(response.status, 200, response.body);
+  }
+  assert.equal(fixture.writes(), 0, "stable normalized policy must not atomically rename state");
+  assert.deepEqual(fileIdentity(fixture.statePath), before);
+
+  const base = fixture.base;
+  await fixture.stop();
+  fixture = await startBroker("large-model-policy-history", state(), { base, config, traceWrites: true });
+  const restarted = JSON.parse(readFileSync(fixture.statePath, "utf8")).modelPolicy;
+  assert.equal(restarted.history.length, 260, "restart preserves every valid global acknowledgement");
+  assert.equal(restarted.roles["openai:gpt-sol"].history.length, 260, "restart preserves every valid role acknowledgement");
+  fixture.resetTrace();
+  const stable = fileIdentity(fixture.statePath);
+  for (const path of ["/status", "/selection"]) {
+    const response = await post(fixture.socketPath, path);
+    assert.equal(response.status, 200, response.body);
+  }
+  assert.equal(fixture.writes(), 0, "restart keeps the already-normalized policy read-only");
+  assert.deepEqual(fileIdentity(fixture.statePath), stable);
 });
 
 test("a status sweep persists expired policy and circuit records", async (context) => {
