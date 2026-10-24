@@ -2009,6 +2009,31 @@ test("an authoritative 404 deletes the current lease once even when raw deletion
   assert.equal(result.timers, 0, "the drained poll schedules no future work without a heartbeat");
 });
 
+test("concurrent raw deletion and wrap-up missing evidence coalesce L1 cleanup without retiring L2", () => {
+  // Replacing binding-content cleanup coalescing with wrapper identity issues two L1 forgets.
+  const result = runLifecycleFixture(`
+    await created("same", { id: "same", agent: "standard", time: { created: 1 } }); await routeBusy("same");
+    live.delete("same");
+    const lookupStarted = deferred();
+    const lookup = deferred();
+    client.session.get = async () => { lookupStarted.resolve(); return lookup.promise; };
+    const rawDeletion = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "same" } } });
+    await lookupStarted.promise;
+    client.session.promptAsync = async (input) => { prompts.push(input); return missing("same"); };
+    const wrapUp = runNextTimer();
+    await Promise.resolve(); await Promise.resolve();
+    lookup.resolve(missing("same"));
+    await Promise.all([rawDeletion, wrapUp]);
+    client.session.promptAsync = async (input) => { prompts.push(input); return { data: true }; };
+    await created("same", { id: "same", agent: "standard", time: { created: 2 } }); await routeBusy("same");
+    await runNextTimer();
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.map((x) => x.path.id), leases: calls.filter((x) => x.path === "/lease").map((x) => x.body.sessionID) }));
+  `);
+  assert.deepEqual(result.forgets, [{ sessionID: "same", leaseID: "Lsame1" }], "the two L1 deletion paths share exactly one cleanup");
+  assert.deepEqual(result.leases, ["same", "same"], "the same ID was replaced with L2");
+  assert.deepEqual(result.prompts, ["same", "same"], "L2 remains heartbeat-eligible after L1 cleanup");
+});
+
 for (const [label, lookup] of [
   ["transport throw", `throw new Error("socket reset");`],
   ["unknown envelope", `return { error: { name: "NotFoundError", data: { message: "Model catalog not found" } }, response: { status: 404 } };`],
@@ -2082,7 +2107,7 @@ for (const [oldOutcome, finishOld] of [
     await idleL1;
     console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), pending: readPendingForgetRecord("pending") }));
   `);
-  assert.deepEqual(result.forgets.map((call) => call.leaseID), ["Lpending1", "Lpending1", "Lpending2"], "the retry sees the published L1; L2 deletion must not coalesce with it");
+  assert.deepEqual(result.forgets.map((call) => call.leaseID), ["Lpending1", "Lpending2"], "the asynchronous retry does not make a synchronous duplicate; L2 deletion remains independent");
   assert.equal(result.pending?.leaseID, "Lpending2", "the replacement's pending record remains bound to L2");
 });
 

@@ -100,15 +100,16 @@ test("enabled resolver binding reads one exact generation and wraps every broker
       if (path === join(generationDirectory, "manifest.json")) return manifestBytes;
       throw new Error(`unexpected read ${path}`);
     },
-    brokerRequest: async (path, body) => {
-      calls.push({ path, body });
+    brokerRequest: async (path, body, options) => {
+      calls.push({ path, body, options });
       return path === "/resolver-process/register"
         ? { resolverToken: "process-token", scope: "ordinary" }
         : { ok: true };
     },
   });
 
-  await bound("/lease", { sessionID: "session-1" });
+  const requestOptions = { deadline: 1_800_000_001_000, timeout: 1_000, method: "POST" };
+  await bound("/lease", { sessionID: "session-1" }, requestOptions);
   await bound("/touch", { sessionID: "session-1" });
 
   assert.equal(realpathCalls, 1);
@@ -124,9 +125,14 @@ test("enabled resolver binding reads one exact generation and wraps every broker
         manifestHash: createHash("sha256").update(manifestBytes).digest("hex"),
         modelKeys: ["openai/gpt-5.6-sol", "openai/gpt-6-sol"],
       },
+      options: undefined,
     },
-    { path: "/lease", body: { sessionID: "session-1", resolverToken: "process-token" } },
-    { path: "/touch", body: { sessionID: "session-1", resolverToken: "process-token" } },
+    {
+      path: "/lease",
+      body: { sessionID: "session-1", resolverToken: "process-token" },
+      options: requestOptions,
+    },
+    { path: "/touch", body: { sessionID: "session-1", resolverToken: "process-token" }, options: undefined },
   ]);
 });
 
@@ -929,11 +935,18 @@ test("lease-bound pending forget records retain after a failed retry and clear a
   writeFileSync(pendingPath, JSON.stringify({ leaseID: "lease-original", completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
 
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
-    import { createRequire } from "node:module";
+    import { createRequire, syncBuiltinESMExports } from "node:module";
     import { EventEmitter } from "node:events";
     import { existsSync, mkdirSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
     const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const readdirSync = fs.readdirSync;
+    fs.readdirSync = (path, ...args) => {
+      if (String(path).includes("/pending-forgets")) throw Error("retry must not synchronously list pending forgets");
+      return readdirSync(path, ...args);
+    };
+    syncBuiltinESMExports();
     const http = require("node:http");
     const requests = [];
     let forgetCount = 0;
@@ -975,16 +988,26 @@ test("lease-bound pending forget records retain after a failed retry and clear a
       },
     };
     const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
-    const hooks = await ModelRouter({ client, directory: process.env.HOME });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
-    const pendingAfterStartup = Boolean(readPendingForgetRecord("session-pending"));
+    let retryTimer, timerReady;
+    const armed = new Promise((resolve) => { timerReady = resolve; });
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      setTimeout: (fn, delay) => {
+        if (delay !== 5000) return setTimeout(fn, delay);
+        retryTimer = { fn, unref() {} }; timerReady(); return retryTimer;
+      },
+      clearTimeout: (timer) => { if (timer !== retryTimer) clearTimeout(timer); },
+    });
+    await armed;
+    const { createAsyncPendingForgetStore } = await import(${JSON.stringify(new URL('../lib/pending-forgets.js', import.meta.url).href)});
+    const pendingStore = createAsyncPendingForgetStore({ directory: join(process.env.HOME, ".local/share/opencode/model-routing/pending-forgets"), validSessionID: (value) => typeof value === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value) });
+    const pendingAfterStartup = (await Array.fromAsync(pendingStore.records())).some((record) => record.sessionID === "session-pending");
     await hooks["chat.message"]({ sessionID: "session-pending", agent: "standard" }, {
       message: { model: { providerID: "old", modelID: "old" } }, parts: [],
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const pendingAfterMessage = Boolean(readPendingForgetRecord("session-pending"));
-    process.stdout.write(JSON.stringify({ forgetCount, pendingAfterStartup, pendingAfterMessage, requests }));
+    const pendingAfterMessage = (await Array.fromAsync(pendingStore.records())).some((record) => record.sessionID === "session-pending");
+    await retryTimer.fn();
+    const pendingAfterTimer = (await Array.fromAsync(pendingStore.records())).some((record) => record.sessionID === "session-pending");
+    process.stdout.write(JSON.stringify({ forgetCount, pendingAfterStartup, pendingAfterMessage, pendingAfterTimer, requests }));
     http.request = originalRequest;
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
 
@@ -992,12 +1015,98 @@ test("lease-bound pending forget records retain after a failed retry and clear a
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.forgetCount, 2);
   assert.equal(result.pendingAfterStartup, true);
-  assert.equal(result.pendingAfterMessage, false);
+  assert.equal(result.pendingAfterMessage, true, "chat respects the already armed backoff");
+  assert.equal(result.pendingAfterTimer, false);
   assert.deepEqual(result.requests.filter((request) => request.path === "/forget").map((request) => request.body), [
     { sessionID: "session-pending", leaseID: "lease-original", completed: true },
     { sessionID: "session-pending", leaseID: "lease-original", completed: true },
   ]);
 }));
+
+test("pending retry uses injected timers and an absolute five-second broker deadline", async () => withTempHome(async (home) => {
+  const child = spawnSync(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import { mock } from "node:test";
+    const routingURL = ${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)};
+    const routing = await import(routingURL);
+    let pending = true;
+    const record = { recordID: "owned", sessionID: "retry-deadline", leaseID: "exact", completed: true, updatedAt: Date.now() };
+    mock.module(routingURL, { namedExports: { ...routing,
+      listPendingForgetRecordsAsync: async function* () { if (pending) yield record; },
+      removePendingForgetRecordAsync: async () => true,
+    } });
+    const { ModelRouter } = await import(${JSON.stringify(new URL("../plugin/router.js", import.meta.url).href)});
+    const timers = [], requests = [], cleared = [];
+    const before = Date.now();
+    await ModelRouter({ client: {}, directory: process.env.HOME }, {
+      apply: { enabled: false },
+      setTimeout: (fn, delay) => { const timer = { fn, delay, unrefed: false, unref() { this.unrefed = true; } }; timers.push(timer); return timer; },
+      clearTimeout: (timer) => cleared.push(timer),
+      brokerRequest: async (path, body, options) => {
+        if (path === "/forget") { requests.push({ body, options }); throw Error("private lease/path"); }
+        return { changed: false };
+      },
+    });
+    for (let turn = 0; turn < 5; turn++) await new Promise(setImmediate);
+    assert.equal(requests.length, 1);
+    assert.ok(requests[0].options.deadline >= before + 5000);
+    assert.ok(requests[0].options.deadline <= Date.now() + 5000);
+    assert.deepEqual(Object.keys(requests[0].options), ["deadline"]);
+    assert.deepEqual(requests[0].body, { sessionID: "retry-deadline", leaseID: "exact", completed: true });
+    assert.equal(timers.length, 1); assert.equal(timers[0].delay, 5000); assert.equal(timers[0].unrefed, true);
+    pending = false;
+    const completion = timers[0].fn(); assert.equal(typeof completion?.then, "function"); await completion;
+    assert.equal(timers.length, 1, "empty sweep leaves no new timer");
+    assert.equal(requests.length, 1);
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 15000 });
+  assert.equal(child.status, 0, child.stderr);
+}));
+
+for (const mode of ["manual", "deleted"]) {
+  test(`${mode} cleanup does not kick between publication and direct RPC, but does kick on failure`, async () => withTempHome(async (home) => {
+    const child = spawnSync(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
+      import assert from "node:assert/strict";
+      import { mock } from "node:test";
+      const events = [];
+      const routingURL = ${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)};
+      const routing = await import(routingURL);
+      mock.module(routingURL, { namedExports: { ...routing,
+        publishPendingForgetRecord: (...args) => { const handle = routing.publishPendingForgetRecord(...args); events.push("published"); return handle; },
+      } });
+      mock.module(${JSON.stringify(new URL("../lib/pending-forget-retry.js", import.meta.url).href)}, { namedExports: {
+        createPendingForgetRetry: () => ({ kick: () => { events.push("kick"); return Promise.resolve(); } }),
+      } });
+      const { ModelRouter } = await import(${JSON.stringify(new URL("../plugin/router.js", import.meta.url).href)});
+      const session = { id: "direct-${mode}", agent: "standard" };
+      let rejectForget, deleted = false;
+      const held = new Promise((_, reject) => { rejectForget = reject; });
+      routing.writeSessionProfile(session.id, "local", { explicit: true });
+      const hooks = await ModelRouter({ client: { session: {
+        get: async () => deleted ? { response: { status: 404 }, error: { name: "NotFoundError", data: { message: "Session not found: " + session.id } } } : session,
+        messages: async () => ({ data: [] }),
+      } }, directory: process.env.HOME }, { apply: { enabled: false }, brokerRequest: async (path) => {
+        if (path === "/lease") return { leaseID: "L1", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+        if (path === "/forget") { events.push("direct"); return held; }
+        return { changed: false };
+      } });
+      await hooks.event({ event: { type: "session.created", properties: { info: session } } });
+      await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+      events.length = 0;
+      let action;
+      if (${JSON.stringify(mode)} === "manual") {
+        routing.writeSessionProfile(session.id, "manual", { explicit: true });
+        action = hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+      } else { deleted = true; action = hooks.event({ event: { type: "session.deleted", properties: { info: session } } }); }
+      for (let turn = 0; turn < 5; turn++) await new Promise(setImmediate);
+      const publication = events.indexOf("published");
+      assert.ok(publication >= 0); assert.deepEqual(events.slice(publication), ["published", "direct"]);
+      rejectForget(Error("unavailable")); await action;
+      for (let turn = 0; turn < 5; turn++) await new Promise(setImmediate);
+      assert.deepEqual(events.slice(publication), ["published", "direct", "kick"]);
+    `], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 15000 });
+    assert.equal(child.status, 0, child.stderr);
+  }));
+}
 
 test("an ID-only pending forget is discarded and cannot target a later lease for the same session", async () => withTempHome(async (home) => {
   const pendingDir = join(home, ".local/share/opencode/model-routing/pending-forgets");
@@ -1250,7 +1359,9 @@ test("a late L1 Manual cleanup cannot erase the newer L2 retry record", async ()
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
-  assert.deepEqual(result.calls.filter((call) => call.path === "/forget").map((call) => call.body.leaseID), ["manual-L1", "manual-L1", "manual-L2"]);
+  // The controller may discover after the direct L1 request settles; either way its
+  // exact-handle removal must leave the independently published L2 retry intact.
+  assert.deepEqual(result.calls.filter((call) => call.path === "/forget").map((call) => call.body.leaseID), ["manual-L1", "manual-L2"]);
   assert.equal(result.pending.leaseID, "manual-L2");
 }));
 
@@ -1803,6 +1914,48 @@ test("raw deletion verification coalesces an identical binding but retries after
   lookups[1]({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session.id}` } } });
   await Promise.all([second, duplicateSecond]);
   assert.deepEqual(forgets, [{ sessionID: session.id, leaseID: "L1" }]);
+}));
+
+test("a delayed authoritative deletion refreshes completion before publishing its exact forget", async () => withTempHome(async (home) => {
+  // Removing the post-404 completion refresh makes this publish an incomplete L1 forget.
+  const { ModelRouter } = await import("../plugin/router.js");
+  const { readPendingForgetRecord } = await import("../lib/routing.js");
+  let resolveLookup;
+  let pendingDuringForget;
+  const forgets = [];
+  const session = { id: "deleted-after-completion", agent: "standard" };
+  const hooks = await ModelRouter({ client: {
+    config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+    session: {
+      get: async () => new Promise((resolve) => { resolveLookup = resolve; }),
+      messages: async () => ({ data: [] }),
+    },
+  }, directory: home }, {
+    brokerRequest: async (path, body) => {
+      if (path === "/lease") return { leaseID: "L1", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+      if (path === "/forget") {
+        forgets.push(body);
+        pendingDuringForget = readPendingForgetRecord(session.id);
+        return { ok: true };
+      }
+      return { changed: false };
+    },
+  });
+  await hooks.event({ event: { type: "session.created", properties: { info: session } } });
+  await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+  const deleting = hooks.event({ event: { type: "session.deleted", properties: { sessionID: session.id } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  await hooks.event({ event: { type: "message.updated", properties: {
+    sessionID: session.id,
+    info: { id: "finished-turn", role: "assistant", providerID: "openai", modelID: "gpt-5.6-luna", finish: "stop", time: { completed: true } },
+  } } });
+  resolveLookup({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session.id}` } } });
+  await deleting;
+  const exactForgets = forgets.filter((body) => body.sessionID === session.id);
+  assert.ok(exactForgets.length > 0, "the authoritative deletion forgets L1");
+  assert.ok(exactForgets.some((body) => body.leaseID === "L1" && body.completed === true), "the authoritative cleanup forget carries completion");
+  assert.equal(pendingDuringForget?.leaseID, "L1");
+  assert.equal(pendingDuringForget?.completed, true);
 }));
 
 test("a non-authoritative deletion verification retires only its in-flight entry", async () => withTempHome(async (home) => {

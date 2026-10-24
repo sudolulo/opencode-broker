@@ -438,11 +438,10 @@ const allTargets = (state) => ({
   })),
 });
 
-// `requireDurable` is the outage commit mode (lib/model-outage-worker.js commit contract: a
-// resolved commit means the bytes AND their directory entry are on stable storage). Ordinary
-// callers keep the default, where a post-rename directory fsync failure is a visible commit
-// with a warning. A strict caller gets that same warning and then the error, so a probe
-// reservation whose durability is uncertain is never followed by a gateway dispatch.
+// Ordinary writes atomically rename the replacement without fsync, so they provide a visible,
+// torn-free state but no crash-durability guarantee. `requireDurable` is the outage commit mode:
+// it fsyncs both the replacement file and its directory; a directory-fsync failure stays visible
+// and throws for the strict caller, so uncertain probe reservations never reach gateway dispatch.
 const boundedEqual = (left, right, limit = 4096) => {
   let remaining = limit;
   const equal = (a, b) => {

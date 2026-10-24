@@ -10,7 +10,7 @@ import {
   isClassifierAgent,
   modelIsLocalTarget,
   isOfflineProfile,
-  listPendingForgetRecords,
+  listPendingForgetRecordsAsync,
   profileConfinesToLan,
   profileReachesCloud,
   publishCachedSubscriptionInventory,
@@ -21,6 +21,7 @@ import {
   removeSessionProfile,
   removeSessionContextEstimate,
   removePendingForgetRecord,
+  removePendingForgetRecordAsync,
   publishPendingForgetRecord,
   resolveProfile,
   toolAllowedForProfile,
@@ -31,6 +32,7 @@ import {
   raiseTier,
   classifyRoutingFailure,
 } from "../lib/routing.js";
+import { createPendingForgetRetry } from "../lib/pending-forget-retry.js";
 import {
   applyMessageModel,
   applyOutputModel,
@@ -410,7 +412,6 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     return value;
   };
   let inventoryTask = null;
-  let pendingForgetTask = null;
   const refreshInventory = async () => {
     if (inventoryTask) return inventoryTask;
     inventoryTask = (async () => {
@@ -428,33 +429,19 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     })();
     return inventoryTask;
   };
-  const retryPendingForgets = async () => {
-    if (pendingForgetTask) return pendingForgetTask;
-    pendingForgetTask = (async () => {
-      try {
-        for (const record of listPendingForgetRecords()) {
-          try {
-            await brokerRequest("/forget", {
-              sessionID: record.sessionID,
-              leaseID: record.leaseID,
-              ...(record.completed ? { completed: true } : {}),
-            });
-            removePendingForgetRecord(record.sessionID, record);
-          } catch {
-            // The immutable publication remains unchanged for a later retry.
-            report("warn", "pending broker forget or exact cleanup failed; retaining original intent");
-          }
-        }
-      } catch {
-        report("warn", "could not list durable pending cleanup; keeping existing intent");
-      }
-    })();
-    try {
-      await pendingForgetTask;
-    } finally {
-      pendingForgetTask = null;
-    }
-  };
+  const pendingForgetRetry = createPendingForgetRetry({
+    records: listPendingForgetRecordsAsync,
+    forget: (record) => brokerRequest("/forget", {
+      sessionID: record.sessionID,
+      leaseID: record.leaseID,
+      ...(record.completed ? { completed: true } : {}),
+    }, { deadline: Date.now() + 5000 }),
+    remove: removePendingForgetRecordAsync,
+    warn: (message) => report("warn", message),
+    setTimer: scheduleTimeout,
+    clearTimer: cancelTimeout,
+  });
+  const retryPendingForgets = () => pendingForgetRetry.kick();
   void retryPendingForgets();
   const getSession = async (sessionID) => {
     const result = await client.session.get({
@@ -715,6 +702,7 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // The record (when written) remains for the next startup/turn retry. This never
       // throws into the Manual route, which must preserve the user's selected model.
       report("warn", "deferred broker forget failed for manual cleanup");
+      void retryPendingForgets();
     });
   };
 
@@ -1519,10 +1507,11 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   });
   // Raw session.deleted events capture a fresh wrapper every time. Deduplicate only when
   // the captured ownership values are still the same; a shallow-copied session.created
-  // record, a replacement route, heartbeat, or completion state is a new incarnation.
+  // record, replacement route, or heartbeat is a new incarnation. Completion is a
+  // terminal outcome of that binding, not a new session incarnation.
   const sameSessionBinding = (left, right) => Boolean(left && right) &&
     left.route === right.route && left.session === right.session &&
-    left.heartbeat === right.heartbeat && left.completed === right.completed;
+    left.heartbeat === right.heartbeat;
   const bindingWasReplaced = (sessionID, binding) =>
     (routes.has(sessionID) && routes.get(sessionID) !== binding.route) ||
     (sessions.has(sessionID) && sessions.get(sessionID) !== binding.session) ||
@@ -1545,11 +1534,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     } catch {
       // The exact publication remains for retry; do not replace it after failure.
       report("warn", "deferred broker forget or exact cleanup failed for deleted session");
+      void retryPendingForgets();
     }
   };
   const retireDeletedSession = async (sessionID, binding = captureSessionBinding(sessionID)) => {
     const existing = deletedSessionCleanups.get(sessionID);
-    if (existing?.binding === binding) return existing.cleanup;
+    if (sameSessionBinding(existing?.binding, binding)) return existing.cleanup;
     const cleanup = (async () => {
       if (!bindingWasReplaced(sessionID, binding)) {
         const owns = () => bindingIsCurrent(sessionID, binding);
@@ -1635,7 +1625,10 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // A raw event names only an ID. A replacement during the lookup means it
       // is not identity proof for either generation, so fail closed.
       if (!bindingIsCurrent(sessionID, binding)) return;
-      await retireDeletedSession(sessionID, binding);
+      // Completion can arrive while the authoritative lookup is in flight. It does
+      // not replace this route/session/heartbeat generation, so preserve cleanup
+      // authority while publishing the final completion state for this exact lease.
+      await retireDeletedSession(sessionID, { ...binding, completed: successCandidates.get(sessionID) === true });
     })().finally(() => {
       // A late old lookup must never erase a newer replacement's verification.
       if (deletedSessionVerifications.get(sessionID) === entry) deletedSessionVerifications.delete(sessionID);

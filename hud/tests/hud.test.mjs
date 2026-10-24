@@ -56,6 +56,7 @@ const mockedRouter = {
   brokerRequest: shim("brokerRequest"),
   resolveProfile: shim("resolveProfile"),
   publishPendingForgetRecord: shim("publishPendingForgetRecord"),
+  removePendingForgetRecord: shim("removePendingForgetRecord"),
   // ☠️ Stubbable because the real ones WRITE into ~/.local/share/opencode/model-routing. A test must not leave managed-switch records behind for the running TUI to read.
   markManagedModelSwitch: shim("markManagedModelSwitch"),
   clearManagedModelSwitch: shim("clearManagedModelSwitch"),
@@ -711,6 +712,89 @@ test("HUD allocation releases the exact broker-minted lease", async () => {
       leaseID: LEASED_TARGET.leaseID,
     });
   } finally {
+    resetRouterHooks();
+    await h.cleanup();
+    resetSwapBackCalls();
+  }
+});
+
+test("a failed HUD release retains the exact immutable cleanup record published before its RPC", async () => {
+  const sessionID = "hud-release-failure";
+  const leaseID = "hud-release-failure-L1";
+  const publishedWhenReleaseStarted = [];
+  clearPending(sessionID);
+  routerHooks.resolveProfile = () => ({ profile: "local" });
+  routerHooks.brokerRequest = async (path) => {
+    if (path === "/lease") return { ...LEASED_TARGET, leaseID };
+    if (path === "/release") {
+      publishedWhenReleaseStarted.push(...realRouter.listPendingForgetRecords());
+      throw new Error("release unavailable");
+    }
+    return { ok: true };
+  };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: sessionID, agent: "build" } });
+    await waitFor(() => publishedWhenReleaseStarted.length > 0);
+    const published = publishedWhenReleaseStarted.find((record) => record.sessionID === sessionID && record.leaseID === leaseID);
+    assert.ok(published, "the release RPC begins only after its exact cleanup record is published");
+    assert.deepEqual(realRouter.listPendingForgetRecords().find((record) => record.recordID === published.recordID), published);
+  } finally {
+    clearPending(sessionID);
+    resetRouterHooks();
+    await h.cleanup();
+    resetSwapBackCalls();
+  }
+});
+
+test("a successful HUD release keeps its original retryable intent when exact-record removal fails", async () => {
+  const sessionID = "hud-release-remove-failure";
+  const leaseID = "hud-release-remove-failure-L1";
+  clearPending(sessionID);
+  routerHooks.resolveProfile = () => ({ profile: "local" });
+  routerHooks.brokerRequest = async (path) => path === "/lease" ? { ...LEASED_TARGET, leaseID } : { ok: true };
+  routerHooks.removePendingForgetRecord = () => { throw new Error("store unavailable"); };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: sessionID, agent: "build" } });
+    await waitFor(() => realRouter.listPendingForgetRecords().some((record) => record.sessionID === sessionID));
+    assert.deepEqual(realRouter.listPendingForgetRecords().filter((record) => record.sessionID === sessionID)
+      .map(({ sessionID: id, leaseID: lease, completed }) => ({ sessionID: id, leaseID: lease, completed })),
+    [{ sessionID, leaseID, completed: false }]);
+  } finally {
+    clearPending(sessionID);
+    resetRouterHooks();
+    await h.cleanup();
+    resetSwapBackCalls();
+  }
+});
+
+test("a successful HUD release removes only its submitted handle and preserves a concurrent publication", async () => {
+  const sessionID = "hud-release-concurrent";
+  const leaseID = "hud-release-concurrent-L1";
+  const concurrentLeaseID = "hud-release-concurrent-L2";
+  clearPending(sessionID);
+  routerHooks.resolveProfile = () => ({ profile: "local" });
+  routerHooks.brokerRequest = async (path) => path === "/lease" ? { ...LEASED_TARGET, leaseID } : { ok: true };
+  routerHooks.removePendingForgetRecord = (id, handle) => {
+    realRouter.publishPendingForgetRecord(id, { leaseID: concurrentLeaseID });
+    return realRouter.removePendingForgetRecord(id, handle);
+  };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: sessionID, agent: "build" } });
+    await waitFor(() => realRouter.listPendingForgetRecords().some((record) => record.leaseID === concurrentLeaseID));
+    assert.deepEqual(realRouter.listPendingForgetRecords().filter((record) => record.sessionID === sessionID)
+      .map(({ sessionID: id, leaseID: lease, completed }) => ({ sessionID: id, leaseID: lease, completed })),
+    [{ sessionID, leaseID: concurrentLeaseID, completed: false }]);
+  } finally {
+    clearPending(sessionID);
     resetRouterHooks();
     await h.cleanup();
     resetSwapBackCalls();

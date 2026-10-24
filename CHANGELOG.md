@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format is based on
 - Avoid whole-state rewrites for unchanged /status and /selection reads while continuing to persist sweep and normalization changes.
 - Retain failed-write retry intent, including pre-open failures and strict durability requirements, until the corresponding persistence succeeds.
 - Manual profile switches retain lease-bound cleanup without requiring broker availability, preserving replacement-safe pending forget retries.
+- Authoritative session deletion refreshes completion for the same binding and coalesces duplicate lifecycle cleanup by ownership.
+- Pending-forget recovery uses incremental asynchronous filesystem work, fair round-robin scheduling across four groups, exact immutable handles, completion ordering, and finite backoff.
+- The enabled resolver preserves transport deadlines and options.
 
 ## [1.27.5] — 2026-10-24
 
