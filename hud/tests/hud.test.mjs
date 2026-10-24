@@ -40,6 +40,11 @@ const realRouter = await import(routerUrl);
 const routerHooks = {};
 const shim = (name) => (...args) => (routerHooks[name] ?? realRouter[name])(...args);
 const resetRouterHooks = () => { for (const key of Object.keys(routerHooks)) delete routerHooks[key]; };
+const clearPending = (sessionID) => {
+  for (const handle of realRouter.listPendingForgetRecords()) {
+    if (handle.sessionID === sessionID) realRouter.removePendingForgetRecord(sessionID, handle);
+  }
+};
 // The background-shell store the HUD imports from `CONFIG.hud.backgroundShells` at plugin init.
 // It is null (no store, no shells) unless a test points it at the fake below, so every other
 // test sees the same shell-less HUD it always did. CONFIG itself is frozen, so the mocked
@@ -50,6 +55,7 @@ const mockedRouter = {
   CONFIG: { ...realRouter.CONFIG, hud: { ...realRouter.CONFIG.hud, get backgroundShells() { return fakeBgStorePath; } } },
   brokerRequest: shim("brokerRequest"),
   resolveProfile: shim("resolveProfile"),
+  publishPendingForgetRecord: shim("publishPendingForgetRecord"),
   // ☠️ Stubbable because the real ones WRITE into ~/.local/share/opencode/model-routing. A test must not leave managed-switch records behind for the running TUI to read.
   markManagedModelSwitch: shim("markManagedModelSwitch"),
   clearManagedModelSwitch: shim("clearManagedModelSwitch"),
@@ -307,7 +313,7 @@ const LEASED_TARGET = {
 //   sessionModel  what api.state.session.get(id).model reports, i.e. the live chat-bar model
 //   startAt       the virtual clock's starting epoch ms (default: the real time at open)
 const withTuiHarness = async ({ questionState, questionError, permissionState, sessionRows = [], initialMode = "manual",
-  listSessions, sessionModel, messages, projectedMessages, rendererWidth, sessionStatuses, startAt } = {}) => {
+  listSessions, sessionModel, messages, projectedMessages, rendererWidth, sessionStatuses, startAt, createSessionID } = {}) => {
   let releaseHarness;
   const previousHarness = harnessQueue;
   harnessQueue = new Promise((resolve) => { releaseHarness = resolve; });
@@ -358,6 +364,7 @@ const withTuiHarness = async ({ questionState, questionError, permissionState, s
       v2: {
         session: {
           messages: (input, options) => (projectedMessages ? projectedMessages(input, options) : Promise.resolve({ data: { data: [], cursor: {} } })),
+          create: async () => ({ data: { id: createSessionID ?? "hud-created-session" } }),
           switchAgent: async (input) => { switches.push(input); return { data: true }; },
           switchModel: async (input) => { switchedModels.push(input); return { data: true }; },
         },
@@ -771,6 +778,114 @@ test("explicitly leaving a swapped profile still launches the awaited restore", 
 
     assert.deepEqual(swapBackCalls, [{ kind: "awaited", command: "true", args: ["default"] }]);
   } finally {
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("Manual queues only the exact lease this HUD observed, even while the broker is down", async () => {
+  const sessionID = "hud-manual-exact";
+  clearPending(sessionID);
+  let profile = "auto";
+  let statusCalls = 0;
+  routerHooks.resolveProfile = () => ({ profile });
+  routerHooks.brokerRequest = async (path) => {
+    if (path === "/lease") return { ...LEASED_TARGET, leaseID: "hud-owned-L1" };
+    if (path === "/status") {
+      statusCalls += 1;
+      if (statusCalls > 1) throw new Error("broker down");
+      return { leases: { [sessionID]: { leaseID: "hud-owned-L1" } }, assignments: {} };
+    }
+    throw new Error("broker down");
+  };
+  routerHooks.markManagedModelSwitch = () => {};
+  routerHooks.clearManagedModelSwitch = () => {};
+  const h = await withTuiHarness();
+  try {
+    await h.emit("session.created", { info: { id: sessionID, agent: "build" } });
+    await h.clock.advance(25);
+    h.navigate(sessionID);
+    profile = "auto";
+    const chooseProfile = h.layer.commands.find((command) => command.name === "hud.routing.profile");
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "manual" });
+    h.dialog.onSelect({ value: "switch" });
+    assert.deepEqual(realRouter.readPendingForgetRecord(sessionID), { leaseID: "hud-owned-L1", completed: false, updatedAt: h.clock.now() });
+  } finally {
+    clearPending(sessionID);
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("Manual never invents forget authority and preserves an existing exact record", async () => {
+  const sessionID = "hud-manual-redacted";
+  realRouter.writePendingForgetRecord(sessionID, { leaseID: "existing-L1" });
+  routerHooks.resolveProfile = () => ({ profile: "auto" });
+  routerHooks.brokerRequest = async (path) => {
+    if (path === "/status") return {
+      leases: { [sessionID]: { hasSpendGrant: true } },
+      assignments: { [sessionID]: { grantLease: true } },
+    };
+    throw new Error("broker down");
+  };
+  const h = await withTuiHarness();
+  try {
+    const chooseProfile = h.layer.commands.find((command) => command.name === "hud.routing.profile");
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "manual" });
+    h.dialog.onSelect({ value: "switch" });
+    const pending = realRouter.readPendingForgetRecord(sessionID);
+    assert.equal(pending.leaseID, "existing-L1");
+    assert.equal(pending.completed, false);
+    assert.equal(h.toasts.some((toast) => toast.variant === "error"), false);
+  } finally {
+    clearPending(sessionID);
+    resetRouterHooks();
+    await h.cleanup();
+  }
+});
+
+test("a new Manual session creates no ID-only pending forget", async () => {
+  const createdID = "hud-new-manual";
+  clearPending(createdID);
+  const h = await withTuiHarness({ createSessionID: createdID });
+  try {
+    const chooseProfile = h.layer.commands.find((command) => command.name === "hud.routing.profile");
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "manual" });
+    h.dialog.onSelect({ value: "new" });
+    await settle();
+    assert.equal(realRouter.readPendingForgetRecord(createdID), null);
+  } finally {
+    clearPending(createdID);
+    realRouter.removeSessionProfile(createdID);
+    await h.cleanup();
+  }
+});
+
+test("offline Manual preserves its prior exact intent and queues the newer observed lease", async () => {
+  const sessionID = "ses-1";
+  clearPending(sessionID);
+  routerHooks.resolveProfile = () => ({ profile: "auto" });
+  routerHooks.brokerRequest = async (path) => {
+    if (path === "/status") return { leases: { [sessionID]: { leaseID: "status-owned-L2" } }, assignments: {} };
+    throw new Error("broker down");
+  };
+  const h = await withTuiHarness();
+  try {
+    const l1 = realRouter.publishPendingForgetRecord(sessionID, { leaseID: "prior-L1" });
+    const chooseProfile = h.layer.commands.find((command) => command.name === "hud.routing.profile");
+    chooseProfile.run();
+    h.dialog.onSelect({ value: "manual" });
+    h.dialog.onSelect({ value: "switch" });
+    const records = realRouter.listPendingForgetRecords();
+    assert.ok(records.some((record) => record.recordID === l1.recordID));
+    assert.ok(records.some((record) => record.leaseID === "status-owned-L2"));
+    assert.equal(h.switchedModels.length, 0, "offline Manual retains the user's current model");
+    assert.equal(h.toasts.some((toast) => toast.variant === "error"), false);
+  } finally {
+    clearPending(sessionID);
     resetRouterHooks();
     await h.cleanup();
   }

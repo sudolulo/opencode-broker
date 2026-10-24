@@ -284,6 +284,8 @@ test("deleted sessions with a success candidate forget the exact lease once with
   const blocked = new Map([["session-a", "blocked"]]);
   const successCandidates = new Map([["session-a", true]]);
   const removed = [];
+  const handle = { recordID: "owned" };
+  const published = [];
 
   await cleanupDeletedSession({
     sessionID: "session-a",
@@ -294,11 +296,10 @@ test("deleted sessions with a success candidate forget the exact lease once with
     stopHeartbeat: () => {},
     removeSessionProfile: () => {},
     removeSessionContextEstimate: (sessionID) => removed.push(sessionID),
-    writePendingForgetRecord: (...args) => {
-      throw new Error(`unexpected pending record write: ${JSON.stringify(args)}`);
-    },
-    removePendingForgetRecord: (sessionID) => removed.push(`forget:${sessionID}`),
+    publishPendingForgetRecord: (...args) => { published.push(args); return handle; },
+    removePendingForgetRecord: (sessionID, owned) => { assert.equal(owned, handle); removed.push(`forget:${sessionID}`); },
     brokerRequest: async (path, body) => {
+      assert.deepEqual(published, [["session-a", { leaseID: "lease-session-a", completed: true }]]);
       calls.push([path, body]);
     },
   });
@@ -315,7 +316,7 @@ test("deleted sessions with a success candidate forget the exact lease once with
   assert.deepEqual(removed, ["session-a", "forget:session-a"]);
 });
 
-test("deleted sessions without a success candidate forget only", async () => {
+test("deleted sessions without an exact lease perform no broker forget", async () => {
   const calls = [];
   const successCandidates = new Map();
 
@@ -328,7 +329,7 @@ test("deleted sessions without a success candidate forget only", async () => {
     stopHeartbeat: () => {},
     removeSessionProfile: () => {},
     removeSessionContextEstimate: () => {},
-    writePendingForgetRecord: (...args) => {
+    publishPendingForgetRecord: (...args) => {
       throw new Error(`unexpected pending record write: ${JSON.stringify(args)}`);
     },
     removePendingForgetRecord: () => {},
@@ -337,7 +338,7 @@ test("deleted sessions without a success candidate forget only", async () => {
     },
   });
 
-  assert.deepEqual(calls, [["/forget", { sessionID: "session-b" }]]);
+  assert.deepEqual(calls, []);
   assert.equal(successCandidates.has("session-b"), false);
 });
 
@@ -346,23 +347,24 @@ test("deleted sessions queue a pending forget when the broker is unavailable", a
 
   await cleanupDeletedSession({
     sessionID: "session-c",
-    routes: new Map(),
+    routes: new Map([["session-c", { leaseID: "L1" }]]),
     sessions: new Map(),
     blocked: new Map(),
     successCandidates: new Map([["session-c", true]]),
     stopHeartbeat: () => {},
     removeSessionProfile: () => {},
     removeSessionContextEstimate: () => {},
-    writePendingForgetRecord: (sessionID, record) => writes.push([sessionID, record]),
+    publishPendingForgetRecord: (sessionID, record) => { writes.push([sessionID, record]); return { recordID: "owned" }; },
     removePendingForgetRecord: () => {
       throw new Error("unexpected remove");
     },
     brokerRequest: async () => {
+      assert.equal(writes.length, 1, "publication precedes broker I/O");
       throw new Error("broker offline");
     },
   });
 
-  assert.deepEqual(writes, [["session-c", { completed: true }]]);
+  assert.deepEqual(writes, [["session-c", { leaseID: "L1", completed: true }]]);
 });
 
 test("reviewer tier resolution always selects review despite the parent route tier", async () => {
@@ -919,12 +921,12 @@ test("chat.message retries a cached inventory auth race once and succeeds", asyn
   assert.deepEqual(result.model, { providerID: "openai", modelID: "gpt-5.6-luna" });
 }));
 
-test("pending forget records retry on startup and later chat.message", async () => withTempHome(async (home) => {
+test("lease-bound pending forget records retain after a failed retry and clear after a later successful retry", async () => withTempHome(async (home) => {
   const pendingDir = join(home, ".local/share/opencode/model-routing/pending-forgets");
   mkdirSync(pendingDir, { recursive: true });
   const pendingPath = join(pendingDir, "session-pending.json");
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  writeFileSync(pendingPath, JSON.stringify({ completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
+  writeFileSync(pendingPath, JSON.stringify({ leaseID: "lease-original", completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
 
   const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
@@ -975,13 +977,13 @@ test("pending forget records retry on startup and later chat.message", async () 
     const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
     const hooks = await ModelRouter({ client, directory: process.env.HOME });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const pendingPath = join(process.env.HOME, ".local/share/opencode/model-routing/pending-forgets/session-pending.json");
-    const pendingAfterStartup = existsSync(pendingPath);
+    const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
+    const pendingAfterStartup = Boolean(readPendingForgetRecord("session-pending"));
     await hooks["chat.message"]({ sessionID: "session-pending", agent: "standard" }, {
       message: { model: { providerID: "old", modelID: "old" } }, parts: [],
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const pendingAfterMessage = existsSync(pendingPath);
+    const pendingAfterMessage = Boolean(readPendingForgetRecord("session-pending"));
     process.stdout.write(JSON.stringify({ forgetCount, pendingAfterStartup, pendingAfterMessage, requests }));
     http.request = originalRequest;
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
@@ -992,9 +994,264 @@ test("pending forget records retry on startup and later chat.message", async () 
   assert.equal(result.pendingAfterStartup, true);
   assert.equal(result.pendingAfterMessage, false);
   assert.deepEqual(result.requests.filter((request) => request.path === "/forget").map((request) => request.body), [
-    { sessionID: "session-pending", completed: true },
-    { sessionID: "session-pending", completed: true },
+    { sessionID: "session-pending", leaseID: "lease-original", completed: true },
+    { sessionID: "session-pending", leaseID: "lease-original", completed: true },
   ]);
+}));
+
+test("an ID-only pending forget is discarded and cannot target a later lease for the same session", async () => withTempHome(async (home) => {
+  const pendingDir = join(home, ".local/share/opencode/model-routing/pending-forgets");
+  const pendingPath = join(pendingDir, "reused-session.json");
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  mkdirSync(pendingDir, { recursive: true });
+  writeFileSync(pendingPath, JSON.stringify({ completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
+
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { leaseID: "lease-reused", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+          : { changed: false };
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client: { session: {
+      get: async () => ({ id: "reused-session", agent: "standard" }),
+      messages: async () => ({ data: [] }),
+    } }, directory: process.env.HOME });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const discardedAtStartup = !existsSync(${JSON.stringify(pendingPath)});
+    await hooks["chat.message"]({ sessionID: "reused-session", agent: "standard" }, { message: { model: {} }, parts: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    process.stdout.write(JSON.stringify({ discardedAtStartup, pendingAfterLease: existsSync(${JSON.stringify(pendingPath)}), requests }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.equal(result.discardedAtStartup, true);
+  assert.equal(result.pendingAfterLease, false);
+  assert.equal(result.requests.filter((request) => request.path === "/forget").length, 0);
+  assert.deepEqual(result.requests.filter((request) => request.path === "/lease").map((request) => request.body.leaseID), [undefined]);
+}));
+
+test("transitioning an L1 route to Manual forgets only L1 and preserves the manual model after failure", async () => withTempHome(async (home) => {
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  import assert from 'node:assert/strict';
+  import { mkdirSync, writeFileSync } from 'node:fs';
+  import { join } from 'node:path';
+  mkdirSync(join(process.env.HOME, '.local/share/opencode'), { recursive: true });
+  writeFileSync(join(process.env.HOME, '.local/share/opencode/auth.json'), JSON.stringify({ openai: { type: 'oauth' } }) + '\\n');
+  const { ModelRouter } = await import(${JSON.stringify(new URL('../plugin/router.js', import.meta.url).href)});
+  const { readPendingForgetRecord, publishPendingForgetRecord, listPendingForgetRecords, removePendingForgetRecord, removeSessionProfile, writeSessionProfile } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
+  const foreign = publishPendingForgetRecord('foreign-pending', { leaseID: 'foreign-lease' });
+  const session = { id: "manual-transition", agent: "standard" };
+  const calls = [];
+  const hooks = await ModelRouter({ client: {
+    config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+    session: {
+      get: async () => session,
+      messages: async () => ({ data: [] }),
+    },
+  } }, {
+    brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/lease") return {
+        leaseID: "L1",
+        target: { id: "l1", kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } },
+      };
+      if (path === "/forget") throw new Error("broker unavailable");
+      return { changed: false };
+    },
+  });
+  try {
+    removeSessionProfile(session.id);
+    writeSessionProfile(session.id, "local", { explicit: true });
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+    assert.equal(calls.filter((call) => call.path === "/lease").length, 1, "the initial route owns L1");
+    writeSessionProfile(session.id, "manual", { explicit: true });
+    const manualOutput = { message: { model: { providerID: "openai", modelID: "same-id-L2" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, manualOutput);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(calls.filter((call) => call.path === "/forget" && call.body.sessionID === session.id).map((call) => call.body), [
+      { sessionID: session.id, leaseID: "L1" },
+    ]);
+    assert.deepEqual(readPendingForgetRecord(session.id), {
+      leaseID: "L1",
+      completed: false,
+      updatedAt: readPendingForgetRecord(session.id).updatedAt,
+    });
+    assert.deepEqual(manualOutput.message.model, { providerID: "openai", modelID: "same-id-L2" });
+    assert.ok(listPendingForgetRecords().some(record => record.recordID === foreign.recordID));
+  } finally {
+    for (const record of listPendingForgetRecords()) removePendingForgetRecord(record.sessionID, record);
+    removeSessionProfile(session.id);
+  }
+  `], { env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000 });
+  assert.equal(child.status, 0, child.stderr);
+}));
+
+test("Manual retires the cached exact lease before locking the route without asking for another lease", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const calls = [];
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const { writeSessionProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    writeSessionProfile("manual-route", "local", { explicit: true });
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client: { session: {
+      get: async () => ({ id: "manual-route", agent: "standard" }),
+      messages: async () => ({ data: [] }),
+    } }, directory: process.env.HOME }, { brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/lease") return { leaseID: "manual-L1", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+      if (path === "/forget") throw new Error("broker unavailable");
+      return { changed: false };
+    } });
+    await hooks["chat.message"]({ sessionID: "manual-route", agent: "standard" }, { message: { model: {} }, parts: [] });
+    writeSessionProfile("manual-route", "manual", { explicit: true });
+    const output = { message: { model: { providerID: "openai", modelID: "gpt-5.6-luna" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: "manual-route", agent: "standard" }, output);
+    const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
+    process.stdout.write(JSON.stringify({ calls, pending: readPendingForgetRecord('manual-route'), model: output.message.model }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.deepEqual(result.calls.filter((call) => call.path === "/forget").map((call) => call.body), [{ sessionID: "manual-route", leaseID: "manual-L1" }]);
+  assert.equal(result.calls.filter((call) => call.path === "/lease").length, 1);
+  assert.equal(result.pending.leaseID, "manual-L1");
+  assert.equal(result.pending.completed, false);
+  assert.deepEqual(result.model, { providerID: "openai", modelID: "gpt-5.6-luna" });
+}));
+
+test("Manual preserves the model and warns when durable cleanup and broker forget both fail", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const http = require("node:http");
+    const originalOpenSync = fs.openSync;
+    fs.openSync = (path, ...args) => {
+      if (String(path).includes("/pending-forgets/")) throw new Error("synthetic pending-forget disk failure");
+      return originalOpenSync(path, ...args);
+    };
+    syncBuiltinESMExports();
+    http.request = (_options, callback) => {
+      const request = new EventEmitter();
+      request.end = () => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        response.emit("data", JSON.stringify({ changed: false }));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const { writeSessionProfile } = await import(${JSON.stringify(routingUrl)});
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const logs = [];
+    const session = { id: "manual-warning", agent: "standard" };
+    const hooks = await ModelRouter({ client: {
+      app: { log: async (entry) => { logs.push(entry); } },
+      config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+      session: { get: async () => session, messages: async () => ({ data: [] }) },
+    }, directory: process.env.HOME }, {
+      brokerRequest: async (path) => {
+        if (path === "/lease") return { leaseID: "L1", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+        if (path === "/forget") throw new Error("synthetic broker unavailable");
+        return { changed: false };
+      },
+    });
+    writeSessionProfile(session.id, "auto", { explicit: true });
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+    writeSessionProfile(session.id, "manual", { explicit: true });
+    const output = { message: { model: { providerID: "openai", modelID: "same-model" } }, parts: [] };
+    await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, output);
+    await new Promise((resolve) => setImmediate(resolve));
+    process.stdout.write(JSON.stringify({ model: output.message.model, logs }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.deepEqual(result.model, { providerID: "openai", modelID: "same-model" });
+  const warnings = result.logs.filter((entry) => entry.body.level === "warn").map((entry) => entry.body.message);
+  assert.ok(warnings.some((message) => /durable.*cleanup/i.test(message)), "failed durable queue creation is visible");
+  assert.ok(warnings.some((message) => /broker.*forget/i.test(message)), "failed deferred broker forget is visible");
+}));
+
+test("a late L1 Manual cleanup cannot erase the newer L2 retry record", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    let resolveL1;
+    const l1 = new Promise((resolve) => { resolveL1 = resolve; });
+    const calls = [];
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const { writeSessionProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    writeSessionProfile("manual-fence", "local", { explicit: true });
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client: { session: {
+      get: async () => ({ id: "manual-fence", agent: "standard" }), messages: async () => ({ data: [] }),
+    } }, directory: process.env.HOME }, { brokerRequest: async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/lease") return { leaseID: calls.filter((call) => call.path === "/lease").length === 1 ? "manual-L1" : "manual-L2", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+      if (path === "/forget" && body.leaseID === "manual-L1") return l1;
+      if (path === "/forget" && body.leaseID === "manual-L2") throw new Error("broker unavailable");
+      return { changed: false };
+    } });
+    const output = () => ({ message: { model: { providerID: "openai", modelID: "gpt-5.6-luna" } }, parts: [] });
+    await hooks["chat.message"]({ sessionID: "manual-fence", agent: "standard" }, output());
+    writeSessionProfile("manual-fence", "manual", { explicit: true });
+    await hooks["chat.message"]({ sessionID: "manual-fence", agent: "standard" }, output());
+    writeSessionProfile("manual-fence", "local", { explicit: true });
+    await hooks["chat.message"]({ sessionID: "manual-fence", agent: "standard" }, output());
+    writeSessionProfile("manual-fence", "manual", { explicit: true });
+    await hooks["chat.message"]({ sessionID: "manual-fence", agent: "standard" }, output());
+    resolveL1({ ok: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
+    const pending = readPendingForgetRecord('manual-fence');
+    process.stdout.write(JSON.stringify({ calls, pending }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.deepEqual(result.calls.filter((call) => call.path === "/forget").map((call) => call.body.leaseID), ["manual-L1", "manual-L1", "manual-L2"]);
+  assert.equal(result.pending.leaseID, "manual-L2");
 }));
 
 test("idle cleanup queues a completed forget when the broker is unavailable", async () => withTempHome(async (home) => {
@@ -1019,7 +1276,7 @@ test("idle cleanup queues a completed forget when the broker is unavailable", as
         response.setEncoding = () => {};
         callback(response);
         const body = options.path === "/lease"
-          ? { target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+          ? { leaseID: "lease-idle", target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } }
           : { changed: false };
         response.emit("data", JSON.stringify(body));
         response.emit("end");
@@ -1042,14 +1299,16 @@ test("idle cleanup queues a completed forget when the broker is unavailable", as
     await hooks["chat.params"]({ sessionID: "session-idle", agent: "standard", model: { providerID: output.message.model.providerID, id: output.message.model.modelID } });
     await hooks.event({ event: { type: "message.updated", properties: { sessionID: "session-idle", info: { role: "assistant", time: { completed: Date.now() } } } } });
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-idle" } } });
-    const pending = join(process.env.HOME, ".local/share/opencode/model-routing/pending-forgets/session-idle.json");
-    process.stdout.write(JSON.stringify({ exists: existsSync(pending), record: JSON.parse(readFileSync(pending, "utf8")) }));
+    const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
+    const record = readPendingForgetRecord('session-idle');
+    process.stdout.write(JSON.stringify({ exists: Boolean(record), record }));
     http.request = originalRequest;
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.exists, true);
   assert.equal(result.record.completed, true);
+  assert.equal(result.record.leaseID, "lease-idle");
 }));
 
 test("local-only dispatch does not require cloud inventory", async () => withTempHome(async (home) => {
@@ -1392,9 +1651,12 @@ test("only local children arm inactivity watchdogs, and idle or deletion clears 
       ["local-idle", { id: "local-idle", parentID: "parent", agent: "scout" }],
       ["local-deleted", { id: "local-deleted", parentID: "parent", agent: "scout" }],
     ]);
+    let deletingLocalSession = false;
     for (const sessionID of sessions.keys()) writeSessionProfile(sessionID, "local", { explicit: true });
     const hooks = await ModelRouter({ client: { session: {
-      get: async ({ path }) => sessions.get(path.id),
+      get: async ({ path }) => deletingLocalSession && path.id === "local-deleted"
+        ? { response: { status: 404 }, error: { name: "NotFoundError", data: { message: "Session not found: local-deleted" } } }
+        : sessions.get(path.id),
       messages: async () => ({ data: [] }),
       abort: async (request) => { aborts.push(request); },
     } }, directory: process.env.HOME }, {
@@ -1409,16 +1671,193 @@ test("only local children arm inactivity watchdogs, and idle or deletion clears 
       await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
     }
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: "local-idle" } } });
+    deletingLocalSession = true;
     await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "local-deleted" } } });
     await Promise.all(timers.map((timer) => timer.callback()));
     process.stdout.write(JSON.stringify({ timers, aborts, requests }));
   `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
-  assert.equal(result.timers.length, 2);
+  // The deletion race fence now adds one bounded SDK-verification timeout; it is
+  // cleared after the authoritative 404, alongside both local watchdogs.
+  assert.equal(result.timers.length, 3);
   assert.equal(result.timers.every((timer) => timer.cleared), true);
   assert.deepEqual(result.aborts, []);
   assert.equal(result.requests.some((request) => request.path === "/release"), false);
+}));
+
+test("only the exact SDK missing-session envelope retires a deleted route", async () => withTempHome(async (home) => {
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const http = createRequire(import.meta.url)("node:http");
+    const requests = [];
+    const sessions = new Map(["unknown", "live", "malformed"].map((id) => [id, { id, agent: "standard" }]));
+    let verifyingDeletion = false;
+    http.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.end = (payload = "") => {
+        const body = payload ? JSON.parse(payload) : {};
+        requests.push({ path: options.path, body });
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.setEncoding = () => {};
+        callback(response);
+        const reply = options.path === "/lease"
+          ? { leaseID: "lease-" + body.sessionID, target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } }
+          : { changed: false };
+        response.emit("data", JSON.stringify(reply));
+        response.emit("end");
+      };
+      request.destroy = () => {};
+      request.setTimeout = () => {};
+      request.on = EventEmitter.prototype.on;
+      return request;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client: { session: {
+      get: async ({ path }) => {
+        if (!verifyingDeletion) return sessions.get(path.id);
+        if (path.id === "unknown") return { response: { status: 404 }, error: { name: "APIError", data: { message: "Session not found: unknown" } } };
+        if (path.id === "live") return { data: sessions.get(path.id) };
+        return { response: { status: 404 }, error: { name: "NotFoundError", data: { message: "Session not found: malformed " } } };
+      },
+      messages: async () => ({ data: [] }),
+    } }, directory: process.env.HOME });
+    for (const id of sessions.keys()) {
+      const output = { message: { model: {} }, parts: [] };
+      await hooks["chat.message"]({ sessionID: id, agent: "standard" }, output);
+    }
+    verifyingDeletion = true;
+    for (const id of sessions.keys()) {
+      await hooks.event({ event: { type: "session.deleted", properties: { sessionID: id } } });
+    }
+    const routeErrors = [];
+    for (const id of sessions.keys()) {
+      try { await hooks["chat.params"]({ sessionID: id, model: { providerID: "openai", id: "gpt-5.6-luna" } }); routeErrors.push(null); }
+      catch (error) { routeErrors.push(String(error.message ?? error)); }
+    }
+    process.stdout.write(JSON.stringify({ requests, routeErrors }));
+  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout.trim());
+  assert.equal(result.requests.filter((request) => request.path === "/forget").length, 0);
+  assert.deepEqual(result.routeErrors, [null, null, null], "unknown, live, and non-exact missing responses retain their captured leases");
+}));
+
+test("raw deletion verification coalesces an identical binding but retries after replacement", async () => withTempHome(async (home) => {
+  // Removing binding-content coalescing makes this issue 25 concurrent SDK reads.
+  // Removing the identity fence makes the late L1 result discard L2's in-flight lookup.
+  const { ModelRouter } = await import("../plugin/router.js");
+  const lookups = [];
+  const getCalls = [];
+  const forgets = [];
+  const deferredLookup = () => new Promise((resolve) => lookups.push(resolve));
+  const session = { id: "delete-coalesce", agent: "standard" };
+  const client = {
+    config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+    session: {
+      get: async ({ path }) => {
+        getCalls.push(path.id);
+        return deferredLookup();
+      },
+      messages: async () => ({ data: [] }),
+    },
+  };
+  const hooks = await ModelRouter({ client, directory: home }, {
+    brokerRequest: async (path, body) => {
+      if (path === "/lease") return {
+        leaseID: "L1",
+        target: { id: "target", kind: "cloud", model: { providerID: "openai", id: "gpt-5.6-luna" } },
+      };
+      if (path === "/forget") forgets.push(body);
+      return { changed: false };
+    },
+  });
+  await hooks.event({ event: { type: "session.created", properties: { info: session } } });
+  await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
+
+  const deleted = () => hooks.event({ event: { type: "session.deleted", properties: { sessionID: session.id } } });
+  const firstBurst = Array.from({ length: 25 }, deleted);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getCalls.length, 1, "duplicate raw deletes share the L1 verification");
+
+  // session.created intentionally shallow-copies metadata; it is a new incarnation even
+  // though its visible fields match L1's. It therefore needs a separate verification.
+  await hooks.event({ event: { type: "session.created", properties: { info: { ...session } } } });
+  const second = deleted();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getCalls.length, 2, "a replacement session starts its own lookup");
+
+  lookups[0]({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session.id}` } } });
+  await Promise.all(firstBurst);
+  const duplicateSecond = deleted();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getCalls.length, 2, "a late L1 settlement cannot erase L2's in-flight lookup");
+
+  lookups[1]({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session.id}` } } });
+  await Promise.all([second, duplicateSecond]);
+  assert.deepEqual(forgets, [{ sessionID: session.id, leaseID: "L1" }]);
+}));
+
+test("a non-authoritative deletion verification retires only its in-flight entry", async () => withTempHome(async (home) => {
+  // Keeping a settled timeout, unknown response, or live response in the in-flight map
+  // prevents a later authoritative 404 from ever rechecking the same binding.
+  const { ModelRouter } = await import("../plugin/router.js");
+  const timers = [];
+  const replies = new Map();
+  const getCalls = new Map();
+  const forgets = [];
+  const ids = ["delete-timeout", "delete-unknown", "delete-live"];
+  const hooks = await ModelRouter({ client: {
+    config: { providers: async () => ({ data: { providers: [{ id: "openai", models: { "gpt-5.6-luna": {} } }] } }) },
+    session: {
+      get: async ({ path }) => {
+        getCalls.set(path.id, (getCalls.get(path.id) ?? 0) + 1);
+        return new Promise((resolve) => replies.set(path.id, resolve));
+      },
+      messages: async () => ({ data: [] }),
+    },
+  }, directory: home }, {
+    rootResolveTimeoutMs: 10,
+    setTimeout: (callback, delay) => {
+      const timer = { callback, delay, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => { timer.cleared = true; },
+    brokerRequest: async (path, body) => {
+      if (path === "/lease") return { leaseID: `L-${body.sessionID}`, target: { model: { providerID: "openai", id: "gpt-5.6-luna" } } };
+      if (path === "/forget") forgets.push(body);
+      return { changed: false };
+    },
+  });
+  for (const id of ids) {
+    await hooks.event({ event: { type: "session.created", properties: { info: { id, agent: "standard" } } } });
+    await hooks["chat.message"]({ sessionID: id, agent: "standard" }, { message: {}, parts: [] });
+  }
+  const deleted = (id) => hooks.event({ event: { type: "session.deleted", properties: { sessionID: id } } });
+  const timeout = deleted("delete-timeout");
+  const unknown = deleted("delete-unknown");
+  const live = deleted("delete-live");
+  await new Promise((resolve) => setImmediate(resolve));
+  timers.find((timer) => timer.delay === 10).callback();
+  replies.get("delete-unknown")({ response: { status: 404 }, error: { name: "APIError", data: { message: "Session not found: delete-unknown" } } });
+  replies.get("delete-live")({ id: "delete-live", agent: "standard" });
+  await Promise.all([timeout, unknown, live]);
+  assert.equal(timers.every((timer) => timer.cleared), true, "every settled verification clears its timeout");
+
+  const retries = ids.map(deleted);
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const id of ids) assert.equal(getCalls.get(id), 2, `${id} retries after its non-authoritative result`);
+  for (const id of ids) replies.get(id)({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${id}` } } });
+  await Promise.all(retries);
+  assert.deepEqual(forgets.map(({ sessionID, leaseID }) => ({ sessionID, leaseID })), ids.map((id) => ({ sessionID: id, leaseID: `L-${id}` })));
 }));
 
 test("a progress event during idle settlement cannot leave a watchdog armed without a route", async () => withTempHome(async (home) => {

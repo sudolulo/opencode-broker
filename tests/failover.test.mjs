@@ -937,6 +937,153 @@ test("working sessions are told once to wrap up when their lane is nearly out", 
   }
 });
 
+for (const [delivery, stalePrompt] of [
+  ["returned", `return { error: missing };`],
+  ["thrown", `throw missing;`],
+]) test(`a ${delivery} missing-session error retires only the stale heartbeat and preserves live warnings`, async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-wrapup-missing-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url);
+    const http = require("node:http");
+    const requests = [];
+    http.request = (options, callback) => {
+      const req = new EventEmitter();
+      req.end = (payload = "") => {
+        requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} });
+        const response = new EventEmitter(); response.setEncoding = () => {}; response.statusCode = 200;
+        const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+        const reply = options.path === "/lease" ? { target, leaseID: "L", decision: { policy: "weighted-depletion", reasons: [] } }
+          : options.path === "/headroom" ? { nearlyOut: true, threshold: 97, localFits: false, providers: [{ providerID: "openai", held: false, percent: 98, window: "wk", resetsAt: null, room: false }] }
+          : { ok: true };
+        callback(response); response.emit("data", JSON.stringify(reply)); response.emit("end");
+      };
+      req.destroy = () => {}; req.setTimeout = () => {}; req.on = EventEmitter.prototype.on; return req;
+    };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true });
+    mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({}));
+    writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = [];
+    const infos = { stale: { id: "stale", agent: "standard" }, live: { id: "live", agent: "standard" } };
+    const client = {
+      provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) },
+      session: {
+        get: async (input) => ({ data: infos[input.path.id] }), messages: async () => ({ data: [] }), abort: async () => ({ data: true }), prompt: async () => ({ data: true }),
+        promptAsync: async (input) => { prompts.push(input.path.id); const missing = { name: "NotFoundError", data: { message: "Session not found: stale" } }; if (input.path.id === "stale") { ${stalePrompt} } return { data: true }; },
+      }, tui: { showToast: async () => ({}) },
+    };
+    const timers = []; const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, { setTimeout: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimeout: () => {} });
+    for (const id of ["stale", "live"]) {
+      await hooks.event({ event: { type: "session.created", properties: { info: infos[id] } } });
+      await hooks["chat.message"]({ sessionID: id, agent: "standard" }, { message: { model: {} } });
+      await hooks.event({ event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } } });
+    }
+    await runTimers(); await runTimers(); await runTimers();
+    console.log(JSON.stringify({ prompts, forgets: requests.filter((request) => request.path === "/forget").map((request) => request.body.sessionID) }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8" });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.deepEqual(result.prompts, ["stale", "live"], "the stale prompt is attempted first and the later live session is still warned");
+    assert.equal(result.prompts.filter((sessionID) => sessionID === "stale").length, 1, "the stale heartbeat is retired across later polls");
+    assert.deepEqual(result.forgets, ["stale"], "the stale session is forgotten exactly once");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+for (const [failureName, promptFailure] of [
+  ["non-session NotFoundError", `return { error: { name: "NotFoundError", data: { message: "Model catalog not found" } } };`],
+  ["transport failure", `throw new Error("socket hang up");`],
+]) test(`${failureName} is reported and retried without retiring the live session`, async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-wrapup-retry-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module"; import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path";
+    const require = createRequire(import.meta.url); const http = require("node:http"); const requests = [];
+    http.request = (options, callback) => { const req = new EventEmitter(); req.end = (payload = "") => {
+      requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} }); const response = new EventEmitter(); response.setEncoding = () => {}; response.statusCode = 200;
+      const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+      const reply = options.path === "/lease" ? { target, leaseID: "L", decision: { policy: "weighted-depletion", reasons: [] } }
+        : options.path === "/headroom" ? { nearlyOut: true, threshold: 97, localFits: false, providers: [{ providerID: "openai", held: false, percent: 98, window: "wk", resetsAt: null, room: false }] } : { ok: true };
+      callback(response); response.emit("data", JSON.stringify(reply)); response.emit("end");
+    }; req.destroy = () => {}; req.setTimeout = () => {}; req.on = EventEmitter.prototype.on; return req; };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true }); mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({})); writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const prompts = []; const logs = [];
+    const client = { provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) }, app: { log: async (entry) => { logs.push(entry); } }, session: {
+      get: async () => ({ data: { id: "live", agent: "standard" } }), messages: async () => ({ data: [] }), abort: async () => ({ data: true }), prompt: async () => ({ data: true }),
+      promptAsync: async (input) => { prompts.push(input.path.id); ${promptFailure} },
+    }, tui: { showToast: async () => ({}) } };
+    const timers = []; const runTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, { setTimeout: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimeout: () => {} });
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "live", agent: "standard" } } } });
+    await hooks["chat.message"]({ sessionID: "live", agent: "standard" }, { message: { model: {} } });
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "live", status: { type: "busy" } } } });
+    await runTimers(); await runTimers();
+    console.log(JSON.stringify({ prompts, forgets: requests.filter((request) => request.path === "/forget").map((request) => request.body.sessionID), errors: logs.filter((entry) => entry.body.level === "error").map((entry) => entry.body.message) }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8" });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.deepEqual(result.prompts, ["live", "live"], "a failed warning remains retryable on the next poll");
+    assert.deepEqual(result.forgets, [], "a live session is never forgotten for an unrelated failure");
+    assert.equal(result.errors.length, 2, "each failed warning is reported");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+for (const lifecycleEvent of ["session.idle", "session.deleted"]) test(`${lifecycleEvent} prevents a warning after deferred headroom lookup`, async () => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-wrapup-idle-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import { createRequire } from "node:module"; import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path";
+    const require = createRequire(import.meta.url); const http = require("node:http"); const requests = [];
+    let deferHeadroom = false; let releaseHeadroom; let headroomReached;
+    const headroom = new Promise((resolve) => { releaseHeadroom = resolve; }); const headroomStarted = new Promise((resolve) => { headroomReached = resolve; });
+    http.request = (options, callback) => { const req = new EventEmitter(); req.end = async (payload = "") => {
+      requests.push({ path: options.path, body: payload ? JSON.parse(payload) : {} }); if (options.path === "/headroom" && deferHeadroom) { headroomReached(); await headroom; }
+      const response = new EventEmitter(); response.setEncoding = () => {}; response.statusCode = 200; const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+      const reply = options.path === "/lease" ? { target, leaseID: "L", decision: { policy: "weighted-depletion", reasons: [] } }
+        : options.path === "/headroom" ? { nearlyOut: true, threshold: 97, localFits: false, providers: [{ providerID: "openai", held: false, percent: 98, window: "wk", resetsAt: null, room: false }] } : { ok: true };
+      callback(response); response.emit("data", JSON.stringify(reply)); response.emit("end");
+    }; req.destroy = () => {}; req.setTimeout = () => {}; req.on = EventEmitter.prototype.on; return req; };
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true }); mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({})); writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    let deleted = false; const prompts = []; const client = { provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) }, session: {
+      get: async () => deleted ? { error: { name: "NotFoundError", data: { message: "Session not found: idle" } }, response: { status: 404 } } : ({ data: { id: "idle", agent: "standard" } }), messages: async () => ({ data: [] }), abort: async () => ({ data: true }), prompt: async () => ({ data: true }), promptAsync: async () => { prompts.push("idle"); return { data: true }; },
+    }, tui: { showToast: async () => ({}) } };
+    const timers = []; const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, { setTimeout: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimeout: () => {} });
+    await hooks.event({ event: { type: "session.created", properties: { info: { id: "idle", agent: "standard" } } } });
+    await hooks["chat.message"]({ sessionID: "idle", messageID: "turn", agent: "standard" }, { parts: [{ type: "text", text: "continue" }], message: { id: "turn", model: {} } });
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "idle", status: { type: "busy" } } } });
+    await hooks.event({ event: { type: "message.updated", properties: { sessionID: "idle", message: { id: "assistant", role: "assistant", parentID: "turn", time: { completed: 1 } } } } });
+    deferHeadroom = true; const poll = timers.shift()(); await headroomStarted;
+    if (${JSON.stringify(lifecycleEvent)} === "session.deleted") deleted = true; await hooks.event({ event: { type: ${JSON.stringify(lifecycleEvent)}, properties: { sessionID: "idle" } } }); releaseHeadroom(); await poll;
+    console.log(JSON.stringify({ prompts, forgets: requests.filter((request) => request.path === "/forget").map((request) => request.body) }));
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8" });
+  try {
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.deepEqual(result.prompts, []);
+    assert.deepEqual(result.forgets, [{ sessionID: "idle", leaseID: "L", completed: true }]);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 const runContextOverflow = (leaseTarget, connected) => {
   const home = mkdtempSync(join(tmpdir(), "fleet-context-home-"));
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
@@ -1759,4 +1906,437 @@ test("HTTP plan usage reads a keyFile and the proxy's OpenAI window shape", asyn
   });
   assert.equal(loose, null);
   assert.equal(called, false);
+});
+
+// These lifecycle fixtures run the public plugin hooks in a fresh HOME and replace only
+// node:http in the child.  They never contact a broker or a provider; explicit deferred
+// promises control each interleaving rather than elapsed time.
+const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {}) => {
+  const home = mkdtempSync(join(tmpdir(), "fleet-lifecycle-home-"));
+  const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
+  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const script = `
+    import assert from "node:assert/strict";
+    import { createRequire } from "node:module";
+    import { EventEmitter } from "node:events";
+    import { mkdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const require = createRequire(import.meta.url); const http = require("node:http");
+    const calls = []; const timers = []; const timerRecords = []; const prompts = []; const logs = []; let brokerReply = null;
+    const missing = (id) => ({ error: { name: "NotFoundError", data: { message: "Session not found: " + id } }, response: { status: 404 } });
+    const deferred = () => { let resolve, reject; const promise = new Promise((ok, no) => { resolve = ok; reject = no; }); return { promise, resolve, reject }; };
+    const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
+    http.request = (options, callback) => { const req = new EventEmitter(); req.end = (payload = "") => {
+      const body = payload ? JSON.parse(payload) : {}; calls.push({ path: options.path, body });
+      const response = new EventEmitter(); response.statusCode = 200; response.setEncoding = () => {}; callback(response);
+      if (brokerReply?.(options.path, body, (reply) => { response.emit("data", JSON.stringify(reply)); response.emit("end"); }, req)) return;
+      const reply = options.path === "/lease" ? { leaseID: "L" + body.sessionID + ((leases.get(body.sessionID) ?? 0) + 1), target, decision: { policy: "weighted-depletion", reasons: [] } }
+        : options.path === "/headroom" ? { nearlyOut: true, threshold: 97, localFits: false, providers: [{ providerID: "openai", held: false, percent: 98, window: "wk", resetsAt: null, room: false }] } : { ok: true };
+      if (options.path === "/lease") leases.set(body.sessionID, (leases.get(body.sessionID) ?? 0) + 1);
+      response.emit("data", JSON.stringify(reply)); response.emit("end");
+    }; req.destroy = () => {}; req.setTimeout = () => {}; req.on = EventEmitter.prototype.on; return req; };
+    const leases = new Map();
+    mkdirSync(join(process.env.HOME, ".local/share/opencode"), { recursive: true }); mkdirSync(join(process.env.HOME, ".cache/opencode"), { recursive: true });
+    writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({})); writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
+    const live = new Map();
+    const client = { provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) }, app: { log: async (entry) => logs.push(entry) }, tui: { showToast: async () => ({}) }, session: {
+      get: async (input) => live.get(input.path.id) ?? missing(input.path.id), messages: async () => ({ data: [] }), abort: async () => ({ data: true }), prompt: async () => ({ data: true }),
+      promptAsync: async (input) => { prompts.push(input); return { data: true }; },
+    } };
+    ${beforeInit}
+    const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
+      ...${JSON.stringify(routerOptions)},
+      setTimeout: (fn, ms) => {
+        const timer = { fn, ms, unrefed: false, cleared: false, unref() { this.unrefed = true; } };
+        timers.push(timer); timerRecords.push(timer); return timer;
+      },
+      clearTimeout: (timer) => {
+        timer.cleared = true;
+        const index = timers.indexOf(timer); if (index !== -1) timers.splice(index, 1);
+      },
+    });
+    const created = async (id, info = { id, agent: "standard" }) => { live.set(id, { data: info }); await hooks.event({ event: { type: "session.created", properties: { info } } }); };
+    const routeBusy = async (id) => { await hooks["chat.message"]({ sessionID: id, agent: "standard" }, { message: { model: {} } }); await hooks.event({ event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } } }); };
+    const runNextTimer = async (ms) => {
+      const index = ms === undefined ? 0 : timers.findIndex((timer) => timer.ms === ms);
+      if (index < 0 || index >= timers.length) return false;
+      const [timer] = timers.splice(index, 1); await timer.fn(); return true;
+    };
+    ${body}
+  `;
+  const child = spawnSync(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8",
+  });
+  try {
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+    return JSON.parse(child.stdout.trim().split("\n").at(-1));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+};
+
+for (const [metadata, rawProperties] of [
+  ["without creation metadata", `{ sessionID: "same" }`],
+  ["with stale creation metadata", `{ sessionID: "same", info: { id: "same", time: { created: 1 } } }`],
+]) test(`a late raw deletion of L1 ${metadata} cannot retire a same-ID L2 route, heartbeat, or warning episode`, () => {
+  const result = runLifecycleFixture(`
+    await created("same", { id: "same", agent: "standard", time: { created: 1 } }); await routeBusy("same");
+    // Retire L1 through the real missing-session warning path before its ID is reused.
+    client.session.promptAsync = async (input) => { prompts.push(input); return missing("same"); };
+    await runNextTimer();
+    client.session.promptAsync = async (input) => { prompts.push(input); return { data: true }; };
+    await created("same", { id: "same", agent: "standard", time: { created: 2 } }); await routeBusy("same");
+    // The raw event has no usable generation metadata; the authoritative lookup says L2 exists.
+    await hooks.event({ event: { type: "session.deleted", properties: ${rawProperties} } });
+    await runNextTimer();
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.map((x) => x.path.id), leases: calls.filter((x) => x.path === "/lease").map((x) => x.body.sessionID) }));
+  `);
+  assert.deepEqual(result.forgets, [{ sessionID: "same", leaseID: "Lsame1" }], "retirement is bound to L1 exactly once");
+  assert.deepEqual(result.prompts, ["same", "same"], "L2 remains heartbeat-eligible and receives its own warning");
+  assert.deepEqual(result.leases, ["same", "same"], "the replacement owns a distinct lease rather than synthetic prompt metadata");
+});
+
+test("an authoritative 404 deletes the current lease once even when raw deletion is duplicated", () => {
+  const result = runLifecycleFixture(`
+    await created("gone"); await routeBusy("gone"); live.delete("gone");
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "gone" } } });
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "gone" } } });
+    const drained = await runNextTimer();
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.length, drained, timers: timers.length }));
+  `);
+  assert.deepEqual(result.forgets, [{ sessionID: "gone", leaseID: "Lgone1" }]);
+  assert.equal(result.drained, true, "the already-scheduled wrap-up poll may fire harmlessly after heartbeat removal");
+  assert.equal(result.prompts, 0, "the drained poll cannot warn a deleted session");
+  assert.equal(result.timers, 0, "the drained poll schedules no future work without a heartbeat");
+});
+
+for (const [label, lookup] of [
+  ["transport throw", `throw new Error("socket reset");`],
+  ["unknown envelope", `return { error: { name: "NotFoundError", data: { message: "Model catalog not found" } }, response: { status: 404 } };`],
+  ["non-404 envelope", `return { error: { name: "NotFoundError", data: { message: "Session not found: guarded" } }, response: { status: 503 } };`],
+]) test(`a ${label} during deletion leaves the cached route eligible`, () => {
+  const result = runLifecycleFixture(`
+    await created("guarded"); await routeBusy("guarded"); client.session.get = async () => { ${lookup} };
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "guarded" } } }); const ran = await runNextTimer();
+    console.log(JSON.stringify({ ran, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.map((x) => x.path.id) }));
+  `);
+  assert.equal(result.ran, true);
+  assert.deepEqual(result.forgets, [], "uncertain lookup evidence cannot release a lease");
+  assert.deepEqual(result.prompts, ["guarded"], "uncertain lookup evidence cannot erase the heartbeat cache");
+});
+
+test("a deferred authoritative 404 cannot erase a replacement created during the lookup", () => {
+  const result = runLifecycleFixture(`
+    await created("race", { id: "race", agent: "standard", time: { created: 1 } }); await routeBusy("race");
+    const lookup = deferred(); let entered = false; client.session.get = async () => { entered = true; return lookup.promise; };
+    const deleting = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "race" } } });
+    await Promise.resolve(); await Promise.resolve();
+    await created("race", { id: "race", agent: "standard", time: { created: 2 } }); await routeBusy("race"); lookup.resolve(missing("race")); await deleting;
+    const ran = await runNextTimer(); console.log(JSON.stringify({ entered, ran, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.map((x) => x.path.id) }));
+  `);
+  assert.equal(result.entered, true, "raw deletion must await the authoritative lookup before acting");
+  assert.equal(result.ran, true);
+  assert.deepEqual(result.forgets, [], "the old 404 is fenced by the replacement and cannot forget L2");
+  assert.deepEqual(result.prompts, ["race"]);
+});
+
+for (const [delivery, settle] of [
+  ["returned missing", `old.resolve(missing("stale"));`],
+  ["thrown missing", `old.reject(missing("stale").error);`],
+  ["unrelated failure", `old.reject(new Error("socket reset"));`],
+]) test(`a deferred ${delivery} warning cannot retire or report against its same-ID replacement`, () => {
+  const result = runLifecycleFixture(`
+    await created("stale", { id: "stale", agent: "standard", time: { created: 1 } }); await routeBusy("stale");
+    const old = deferred(); const promptStarted = deferred(); client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { promptStarted.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(); await promptStarted.promise;
+    await created("stale", { id: "stale", agent: "standard", time: { created: 2 } }); await routeBusy("stale");
+    ${settle} await first; const second = await runNextTimer();
+    console.log(JSON.stringify({ second, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.length, warns: logs.filter((x) => x.body?.level === "warn" && /asked it to wrap up/.test(x.body?.message ?? "")).length, errors: logs.filter((x) => x.body?.level === "error").length }));
+  `);
+  assert.equal(result.second, true, "the replacement owns the next deterministic poll");
+  assert.deepEqual(result.forgets, delivery === "unrelated failure" ? [] : [{ sessionID: "stale", leaseID: "Lstale1" }], "only the captured L1 lease may be forgotten; L2 is fenced");
+  assert.equal(result.prompts, 2, "L2 receives its own warning exactly once");
+  assert.equal(result.warns, 1, "only the replacement warning is reported as sent");
+  assert.equal(result.errors, 0, "a stale warning failure is not reported against its replacement");
+});
+
+for (const [oldOutcome, finishOld] of [
+  ["success", `oldSend({ ok: true });`],
+  ["failure", `oldRequest.emit("error", new Error("old forget failed"));`],
+]) test(`an L1 pending forget ${oldOutcome} cannot remove or rewrite L2's pending record`, () => {
+  const result = runLifecycleFixture(`
+    const { readPendingForgetRecord } = await import(new URL("../lib/routing.js", ${JSON.stringify(new URL("../plugin/router.js", import.meta.url).href)}).href);
+    const oldSends = []; const oldRequests = [];
+    const oldStarted = deferred();
+    brokerReply = (path, body, send, req) => {
+      if (path !== "/forget") return false;
+      if (body.leaseID === "Lpending1") { oldSends.push(send); oldRequests.push(req); oldStarted.resolve(); return true; }
+      if (body.leaseID === "Lpending2") { queueMicrotask(() => req.emit("error", new Error("L2 forget failed"))); return true; }
+      return false;
+    };
+    await created("pending", { id: "pending", agent: "standard", time: { created: 1 } }); await routeBusy("pending");
+    const idleL1 = hooks.event({ event: { type: "session.idle", properties: { sessionID: "pending" } } });
+    await oldStarted.promise;
+    await created("pending", { id: "pending", agent: "standard", time: { created: 2 } }); await routeBusy("pending");
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "pending" } } });
+    for (let i = 0; i < oldSends.length; i++) { const oldSend = oldSends[i]; const oldRequest = oldRequests[i]; ${finishOld} }
+    await idleL1;
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), pending: readPendingForgetRecord("pending") }));
+  `);
+  assert.deepEqual(result.forgets.map((call) => call.leaseID), ["Lpending1", "Lpending1", "Lpending2"], "the retry sees the published L1; L2 deletion must not coalesce with it");
+  assert.equal(result.pending?.leaseID, "Lpending2", "the replacement's pending record remains bound to L2");
+});
+
+test("startup retry never emits an unbound ID-only forget", () => {
+  const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
+  const result = runLifecycleFixture(`
+    await Promise.resolve(); await Promise.resolve();
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body) }));
+  `, { beforeInit: `
+    const { writePendingForgetRecord } = await import(${JSON.stringify(routingUrl)});
+    assert.equal(writePendingForgetRecord("orphan", {}), false);
+  ` });
+  assert.deepEqual(result.forgets, [], "a persisted record without a lease is local cleanup, not broker-wide session deletion");
+});
+
+test("deleting a cached but unleased session performs local cleanup without an ID-only forget", () => {
+  const result = runLifecycleFixture(`
+    await created("unleased");
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "unleased" } } });
+    console.log(JSON.stringify({ forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body) }));
+  `);
+  assert.deepEqual(result.forgets, [], "no lease means no authoritative broker ownership to release");
+});
+
+for (const [delivery, malformed] of [
+  ["returned", (message) => `return { error: { name: "NotFoundError", data: { message: ${JSON.stringify(message)} } }, response: { status: 404 } };`],
+  ["thrown", (message) => `throw { name: "NotFoundError", data: { message: ${JSON.stringify(message)} } };`],
+]) for (const [label, message] of [
+  ["wrong id", "Session not found: other"], ["leading space", " Session not found: warn"], ["trailing space", "Session not found: warn "],
+  ["LF", "Session not found: warn\n"], ["CRLF", "Session not found: warn\r\n"], ["CR", "Session not found: warn\r"],
+  ["case", "session not found: warn"], ["near match", "Session not found: warn!"],
+]) test(`${delivery} malformed missing-session warning (${label}) is reported and retried without forget`, () => {
+  const result = runLifecycleFixture(`
+    client.session.promptAsync = async (input) => { prompts.push(input); ${malformed(message)} };
+    await created("warn"); await routeBusy("warn"); const first = await runNextTimer(); const second = await runNextTimer();
+    console.log(JSON.stringify({ first, second, prompts: prompts.length, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), errors: logs.filter((x) => x.body?.level === "error").length }));
+  `);
+  assert.deepEqual([result.first, result.second], [true, true], "both deterministic heartbeat passes must remain scheduled");
+  assert.equal(result.prompts, 2, "non-exact evidence leaves the warning retryable");
+  assert.deepEqual(result.forgets, [], "non-exact evidence never releases a lease");
+  assert.equal(result.errors, 2, "each unsuccessful warning is observable");
+});
+
+for (const [label, properties] of [
+  ["without info", `{ sessionID: "incarnation" }`],
+  ["with the exact original info object", `{ info: original }`],
+]) test(`creation incarnation ${label} preserves an armed private profile after a stale 404`, () => {
+  const result = runLifecycleFixture(`
+    const { writePendingProfile, readPendingProfile, readSessionProfile, resolveProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    const original = { id: "incarnation", agent: "standard", time: { created: 1 } };
+    await created("incarnation", original);
+    const lookup = deferred(); const entered = deferred();
+    client.session.get = async () => { entered.resolve(); return lookup.promise; };
+    const deleting = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "incarnation" } } });
+    await entered.promise;
+    writePendingProfile("private");
+    await hooks.event({ event: { type: "session.created", properties: ${properties} } });
+    const before = readSessionProfile("incarnation"); const pending = readPendingProfile();
+    // No routing or metadata refresh may provide an accidental identity fence.
+    lookup.resolve(missing("incarnation")); await deleting;
+    const after = readSessionProfile("incarnation");
+    await created("unarmed-next");
+    console.log(JSON.stringify({ before, after, pending, resolved: resolveProfile({ sessionID: "incarnation" }), next: readSessionProfile("unarmed-next"), forgets: calls.filter((x) => x.path === "/forget"), leases: calls.filter((x) => x.path === "/lease") }));
+  `);
+  assert.equal(result.before?.profile, "private", "the replacement consumes the armed profile");
+  assert.equal(result.before?.explicit, true);
+  assert.equal(result.pending, null, "creation consumes the arming record exactly once");
+  assert.deepEqual(result.after, result.before, "the stale lookup cannot erase the replacement's profile");
+  assert.equal(result.resolved.profile, "private", "routing must not fall back to auto");
+  assert.equal(result.next?.profile, "auto", "the following session does not inherit the consumed arming record");
+  assert.deepEqual(result.forgets, [], "an unleased incarnation never sends an ID-only forget");
+  assert.deepEqual(result.leases, [], "no lease change masks the session-cache identity regression");
+});
+
+test("creation incarnation: a metadata update is not a replacement fence", () => {
+  const result = runLifecycleFixture(`
+    const { writePendingProfile, readSessionProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    writePendingProfile("private"); await created("metadata");
+    const lookup = deferred(); const entered = deferred();
+    client.session.get = async () => { entered.resolve(); return lookup.promise; };
+    const deleting = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "metadata" } } });
+    await entered.promise;
+    await hooks.event({ event: { type: "session.updated", properties: { info: { id: "metadata", title: "renamed" } } } });
+    lookup.resolve(missing("metadata")); await deleting;
+    console.log(JSON.stringify({ profile: readSessionProfile("metadata"), forgets: calls.filter((x) => x.path === "/forget") }));
+  `);
+  assert.equal(result.profile, null, "a metadata-only event cannot prevent authoritative deletion");
+  assert.deepEqual(result.forgets, []);
+});
+
+test("creation incarnation preserves the existing route and cached parent metadata", () => {
+  const result = runLifecycleFixture(`
+    await created("parent"); await created("child", { id: "child", parentID: "parent", agent: "standard" });
+    await routeBusy("child");
+    await hooks.event({ event: { type: "session.created", properties: { sessionID: "child" } } });
+    const output = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "child", model: target.model }, output);
+    await runNextTimer();
+    console.log(JSON.stringify({ headers: output.headers, prompts: prompts.length, forgets: calls.filter((x) => x.path === "/forget"), leases: calls.filter((x) => x.path === "/lease").length }));
+  `);
+  assert.equal(result.headers["x-opencode-lease-id"], "Lchild1", "a creation fence does not discard the existing route");
+  assert.equal(result.headers["x-opencode-session-kind"], "subagent", "fallback metadata retains the parent identity");
+  assert.equal(result.prompts, 1, "the existing heartbeat remains eligible");
+  assert.equal(result.leases, 1);
+  assert.deepEqual(result.forgets, []);
+});
+
+for (const [label, settle] of [
+  ["network rejection", `old.reject(new Error("socket reset"));`],
+  ["returned error", `old.resolve({ error: { name: "TransportError", message: "socket reset" } });`],
+  ["returned missing", `old.resolve(missing("warning"));`],
+  ["thrown missing", `old.reject(missing("warning").error);`],
+]) test(`warning attempt: an old ${label} remains retryable across leases of the same session`, () => {
+  const result = runLifecycleFixture(`
+    await created("warning"); await routeBusy("warning");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(); await entered.promise;
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "warning" } } });
+    // Same actual session, not a replacement creation: only the lease changes.
+    await routeBusy("warning");
+    ${settle} await first;
+    const polls = []; for (let i = 0; i < 3; i++) polls.push(await runNextTimer());
+    console.log(JSON.stringify({ polls, prompts: prompts.length, leases: leases.get("warning"), forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), errors: logs.filter((x) => x.body?.level === "error").length }));
+  `);
+  assert.equal(result.leases, 2, "the fixture must exercise L1 -> idle -> L2");
+  assert.deepEqual(result.polls, [true, true, true]);
+  assert.equal(result.prompts, 2, "an unsuccessful L1 warning must not suppress L2's warning");
+  assert.ok(result.forgets.every((x) => x.sessionID === "warning" && x.leaseID === "Lwarning1"), "late missing evidence may forget only the captured lease");
+  assert.equal(result.errors, 0, "the old failure is not attributed to L2");
+});
+
+test("warning attempt: a successful pending warning stays once-per-episode across same-session leases", () => {
+  const result = runLifecycleFixture(`
+    await created("success"); await routeBusy("success");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); entered.resolve(); return old.promise; };
+    const first = runNextTimer(); await entered.promise;
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "success" } } });
+    await routeBusy("success"); old.resolve({ data: true }); await first;
+    const polls = []; for (let i = 0; i < 3; i++) polls.push(await runNextTimer());
+    console.log(JSON.stringify({ polls, prompts: prompts.length, leases: leases.get("success") }));
+  `);
+  assert.equal(result.leases, 2);
+  assert.deepEqual(result.polls, [true, true, true]);
+  assert.equal(result.prompts, 1, "a successful warning covers the episode, not merely one lease");
+});
+
+for (const episode of ["room reset", "replacement creation"]) test(`warning attempt: an old failure cannot clear a newer marker after ${episode}`, () => {
+  const result = runLifecycleFixture(`
+    await created("new-marker"); await routeBusy("new-marker");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(); await entered.promise;
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "new-marker" } } });
+    ${episode === "replacement creation" ? `await created("new-marker");` : ""}
+    await routeBusy("new-marker");
+    ${episode === "room reset" ? `
+      brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false }); return true; };
+      await runNextTimer(); brokerReply = null;
+    ` : ""}
+    await runNextTimer(); const beforeFailure = prompts.length;
+    old.reject(new Error("old socket reset")); await first;
+    const polls = []; for (let i = 0; i < 3; i++) polls.push(await runNextTimer());
+    console.log(JSON.stringify({ beforeFailure, prompts: prompts.length, polls }));
+  `, { beforeInit: `Date.now = () => 1700000000000;` });
+  assert.equal(result.beforeFailure, 2, "a new warning must actually be delivered before the old rejection");
+  assert.deepEqual(result.polls, [true, true, true]);
+  assert.equal(result.prompts, 2, "distinct attempts in the same millisecond cannot erase each other's marker");
+});
+
+for (const [label, settle, routerOptions, deadlineMs] of [
+  ["never resolves", "", {}, 1500],
+  ["returns a late exact 404", `lookup.resolve(missing("deadline"));`, {}, 1500],
+  ["rejects late", `lookup.reject(new Error("late socket reset"));`, { rootResolveTimeoutMs: 37 }, 37],
+]) test(`deletion deadline: a lookup that ${label} cannot strand the hook or retire its binding`, () => {
+  const result = runLifecycleFixture(`
+    const { readSessionProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    await created("deadline"); await routeBusy("deadline");
+    const profileBefore = readSessionProfile("deadline");
+    const lookup = deferred(); const entered = deferred();
+    client.session.get = async (input) => {
+      assert.deepEqual(input, { path: { id: "deadline" }, query: { directory: process.env.HOME } });
+      entered.resolve(); return lookup.promise;
+    };
+    const timerStart = timerRecords.length;
+    const deleting = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "deadline" } } });
+    await entered.promise;
+    assert.equal(await runNextTimer(${deadlineMs}), true, "raw deletion must schedule its bounded lookup deadline");
+    const settled = await Promise.race([deleting.then(() => true), new Promise((resolve) => setImmediate(() => resolve(false)))]);
+    assert.equal(settled, true, "the deadline must settle the hook without the SDK lookup resolving");
+    ${settle}
+    // Drain promise reactions and the unhandled-rejection checkpoint, not wall time.
+    await new Promise((resolve) => setImmediate(resolve));
+    const output = { headers: {} };
+    await hooks["chat.headers"]({ sessionID: "deadline", model: target.model }, output);
+    await runNextTimer(60000);
+    console.log(JSON.stringify({ profileBefore, profileAfter: readSessionProfile("deadline"), headers: output.headers, prompts: prompts.length, forgets: calls.filter((x) => x.path === "/forget"), deadlines: timerRecords.slice(timerStart).filter((timer) => timer.ms === ${deadlineMs}).map(({ ms, unrefed, cleared }) => ({ ms, unrefed, cleared })), pendingDeadlines: timers.filter((timer) => timer.ms === ${deadlineMs}).length, warnings: logs.filter((x) => x.body?.level === "warn" && /could not verify session deletion/.test(x.body?.message ?? "")).length }));
+  `, { routerOptions });
+  assert.deepEqual(result.profileAfter, result.profileBefore, "timeout and late evidence cannot erase session state");
+  assert.equal(result.headers["x-opencode-lease-id"], "Ldeadline1");
+  assert.equal(result.prompts, 1, "the cached heartbeat remains eligible after timeout");
+  assert.deepEqual(result.forgets, [], "a timed-out lookup has no authority to forget a lease");
+  assert.deepEqual(result.deadlines, [{ ms: deadlineMs, unrefed: true, cleared: true }]);
+  assert.equal(result.pendingDeadlines, 0, "the lookup timer is always cleared");
+  assert.equal(result.warnings, 1, "timeout is observable once; late settlement adds no cleanup or warning");
+});
+
+for (const [label, response, removed] of [
+  ["live response", `return { data: { id: "settled" } };`, false],
+  ["authoritative 404", `return missing("settled");`, true],
+  ["transport rejection", `throw new Error("socket reset");`, false],
+  ["synchronous throw", `throw new Error("sync socket reset");`, false],
+]) test(`deletion deadline: a ${label} clears its timer before the deadline`, () => {
+  const result = runLifecycleFixture(`
+    const { readSessionProfile } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    await created("settled");
+    client.session.get = ${label === "synchronous throw" ? "" : "async "}() => { ${response} };
+    const timerStart = timerRecords.length;
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "settled" } } });
+    console.log(JSON.stringify({ removed: readSessionProfile("settled") === null, deadlines: timerRecords.slice(timerStart).map(({ ms, unrefed, cleared }) => ({ ms, unrefed, cleared })), pending: timers.length }));
+  `);
+  assert.equal(result.removed, removed, "only exact authoritative evidence permits cleanup");
+  assert.deepEqual(result.deadlines, [{ ms: 1500, unrefed: true, cleared: true }]);
+  assert.equal(result.pending, 0, "settlement must cancel the deadline callback");
+});
+
+test("raw deletion lookups cap underlying hung SDK operations and recover one permit only after settlement", () => {
+  const result = runLifecycleFixture(`
+    const pending = new Map(); let getCalls = 0;
+    client.session.get = ({ path }) => {
+      getCalls += 1;
+      const lookup = deferred(); pending.set(path.id, lookup);
+      return lookup.promise;
+    };
+    const deletes = [];
+    for (let index = 0; index < 3001; index += 1) {
+      const id = "hung-" + index;
+      await created(id);
+      deletes.push(hooks.event({ event: { type: "session.deleted", properties: { sessionID: id } } }));
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getCalls, 16, "only sixteen underlying SDK lookups may be outstanding");
+    assert.equal(timerRecords.filter((timer) => timer.ms === 1500).length, 16, "rejected events must not allocate deadlines");
+
+    pending.get("hung-0").resolve({ data: { id: "hung-0" } });
+    await deletes[0];
+    const recovered = hooks.event({ event: { type: "session.deleted", properties: { sessionID: "hung-3001" } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getCalls, 17, "one settled SDK operation releases exactly one permit");
+    pending.get("hung-3001").resolve({ data: { id: "hung-3001" } });
+    await recovered;
+    console.log(JSON.stringify({ getCalls, deadlines: timerRecords.filter((timer) => timer.ms === 1500).length }));
+  `);
+  assert.equal(result.getCalls, 17);
+  assert.equal(result.deadlines, 17);
 });

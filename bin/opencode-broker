@@ -443,23 +443,69 @@ const allTargets = (state) => ({
 // callers keep the default, where a post-rename directory fsync failure is a visible commit
 // with a warning. A strict caller gets that same warning and then the error, so a probe
 // reservation whose durability is uncertain is never followed by a gateway dispatch.
-const writeState = (state, { requireDurable = false } = {}) => {
-  ensureRoutingStateDir();
-  state.version = 5;
-  state.health = normalizeHealth(state.health);
-  state.modelPolicy = normalizeModelPolicy(state.modelPolicy, { modelRoles: CONFIG.modelRoles, staticTargets: TARGETS });
-  // Carry the plan readings across restarts; see seedPlanUsageCache. Written
-  // from the live cache rather than held on `state`, so it cannot go stale
-  // relative to what the process actually knows.
+const boundedEqual = (left, right, limit = 4096) => {
+  let remaining = limit;
+  const equal = (a, b) => {
+    if (--remaining < 0) return false;
+    if (Object.is(a, b)) return true;
+    if (!a || !b || typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b)) return false;
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) return false;
+    for (const key of aKeys) if (!Object.hasOwn(b, key) || !equal(a[key], b[key])) return false;
+    return true;
+  };
+  return equal(left, right);
+};
+
+// State mutations happen before their atomic replacement write. Retain that intent when a sweep
+// or a failed write changes the in-memory image, so a later read cannot treat it as durably
+// acknowledged. A strict outage write keeps its stronger requirement until a later strict write
+// fsyncs the directory.
+const persistenceIntents = new WeakMap();
+const pendingPersistence = (state) => persistenceIntents.get(state) ?? 0;
+const notePendingPersistence = (state, requireDurable) => {
+  persistenceIntents.set(state, Math.max(pendingPersistence(state), requireDurable ? 2 : 1));
+};
+const noteSuccessfulPersistence = (state, requireDurable) => {
+  if (requireDurable || pendingPersistence(state) < 2) persistenceIntents.delete(state);
+};
+
+// Avoid a full state serialization merely to decide whether a read needs persistence. Any
+// unexpected large control-plane shape is treated as changed, preserving the old safe behavior.
+const prepareStateForPersistence = (state) => {
+  let changed = false;
+  if (state.version !== 5) { state.version = 5; changed = true; }
+  const health = normalizeHealth(state.health);
+  if (!boundedEqual(state.health, health)) { state.health = health; changed = true; }
+  const modelPolicy = normalizeModelPolicy(state.modelPolicy, { modelRoles: CONFIG.modelRoles, staticTargets: TARGETS });
+  if (!boundedEqual(state.modelPolicy, modelPolicy)) { state.modelPolicy = modelPolicy; changed = true; }
   const planUsage = planUsageSnapshot();
-  if (Object.keys(planUsage).length) state.planUsage = planUsage;
-  const temporary = `${STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  if (Object.keys(planUsage).length && !boundedEqual(state.planUsage, planUsage)) {
+    state.planUsage = planUsage;
+    changed = true;
+  }
+  return changed;
+};
+
+const writeState = (state, { requireDurable = false } = {}) => {
+  let temporary;
+  let temporaryCreated = false;
   let descriptor;
   let committed = false;
   try {
+    // Directory validation and normalization may mutate the in-memory image. Keep them in this
+    // tracked region so their failures retain the caller's pending persistence intent too.
+    ensureRoutingStateDir();
+    prepareStateForPersistence(state);
+    // Carry the plan readings across restarts; see seedPlanUsageCache. Written
+    // from the live cache rather than held on `state`, so it cannot go stale
+    // relative to what the process actually knows.
+    temporary = `${STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
     // Build the replacement privately. "wx" refuses a collision rather than truncating another
     // writer's temp; fchmod enforces the exact mode despite the caller's umask.
     descriptor = openSync(temporary, "wx", 0o600);
+    temporaryCreated = true;
     writeFileSync(descriptor, JSON.stringify(state) + "\n");
     fchmodSync(descriptor, 0o600);
     // Atomic rename (below) is the CONSISTENCY boundary for every write -- a reader always sees a
@@ -487,14 +533,17 @@ const writeState = (state, { requireDurable = false } = {}) => {
         } catch {}
       }
     }
-    try { unlinkSync(temporary); }
-    catch (cleanupError) {
-      if (cleanupError?.code !== "ENOENT") {
-        try {
-          console.error(`[opencode-broker] unable to remove failed broker state temp ${temporary}: ${cleanupError?.message ?? cleanupError}`);
-        } catch {}
+    if (temporaryCreated) {
+      try { unlinkSync(temporary); }
+      catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") {
+          try {
+            console.error(`[opencode-broker] unable to remove failed broker state temp ${temporary}: ${cleanupError?.message ?? cleanupError}`);
+          } catch {}
+        }
       }
     }
+    notePendingPersistence(state, requireDurable);
     throw error;
   }
 
@@ -527,9 +576,11 @@ const writeState = (state, { requireDurable = false } = {}) => {
     // Visible but not durable. The strict caller must not treat this as committed; it also must
     // not roll the visible file back (the in-memory image it carries is the conservative one).
     if (durabilityError && requireDurable) {
+      notePendingPersistence(state, requireDurable);
       throw new Error(`broker state directory fsync failed after rename (visible, not durable): ${durabilityError?.message ?? durabilityError}`);
     }
   }
+  noteSuccessfulPersistence(state, requireDurable);
 };
 
 const validSessionID = (sessionID) => typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(sessionID);
@@ -645,27 +696,39 @@ const fetchPlanUsageReports = () => Promise.all(Object.entries(PROVIDER_BUDGETS)
 }));
 
 const refreshPlanUsage = (state) => {
+  let changed = false;
   for (const [providerID, providerConfig] of Object.entries(PROVIDER_BUDGETS)) {
     if (!planUsageConfigured(providerConfig)) continue;
     const report = cachedPlanUsage(providerID);
     if (!report) continue;
+    const circuitID = providerCircuitID(providerID);
+    const beforeCircuit = state.circuits[circuitID];
     applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
-    applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
-    writeState(state);
+    if (beforeCircuit !== state.circuits[circuitID]) changed = true;
+    if (applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)), { persist: false })) changed = true;
   }
+  if (prepareStateForPersistence(state)) changed = true;
+  if (changed) writeState(state);
 };
 
 // One provider-check result onto the provider circuit, with the transition logged and
 // pushed. Shared by the usage refresh above and the timer for providers without one.
-const applyCheckResult = (state, providerID, result) => {
+const applyCheckResult = (state, providerID, result, { persist = true } = {}) => {
   const now = Date.now();
-  const change = applyProviderCheck(state.circuits, providerCircuitID(providerID), result, now);
-  if (!change) return;
-  writeState(state);
+  const circuitID = providerCircuitID(providerID);
+  const before = state.circuits[circuitID];
+  const change = applyProviderCheck(state.circuits, circuitID, result, now);
+  // A repeated plan-lapsed result extends its expiry without being a new user-visible
+  // transition. Persist that real mutation, but only log and notify actual transitions.
+  const mutated = !boundedEqual(before, state.circuits[circuitID]);
+  if (!mutated) return false;
+  if (persist) writeState(state);
+  if (!change) return true;
   logDecision({ at: now, sessionID: null, targetID: null, policy: `provider-check-${change}`, reasons: [providerID] });
   notifyBurn(change === "lapsed"
     ? { title: `${providerID} plan lapsed`, body: "Held out of routing; it returns on its own once the plan is renewed." }
     : { title: `${providerID} is usable again`, body: "The provider check lifted its hold; it is back in routing." });
+  return true;
 };
 
 // A one-shot assignment belongs to a session id that is minted per REQUEST and never reused,
@@ -991,8 +1054,9 @@ const pruneApiContinuations = (state, now) => {
     ? state.apiContinuations : {};
   const sessionIDs = Object.keys(records);
   if (!sessionIDs.length) {
+    if (state.apiContinuations && typeof state.apiContinuations === "object" && !Array.isArray(state.apiContinuations)) return false;
     state.apiContinuations = {};
-    return;
+    return true;
   }
   const targets = allTargets(state);
   // One auth.json read per distinct source provider for this sweep. The raw value (null when the
@@ -1024,7 +1088,10 @@ const pruneApiContinuations = (state, now) => {
     kept[sessionID] = record;
   }
   // Decoding still drops malformed records and bounds the map at the assignment cap.
-  state.apiContinuations = { ...normalizeApiContinuationRecords(kept, { now, max: MAX_ASSIGNMENTS }) };
+  const normalized = { ...normalizeApiContinuationRecords(kept, { now, max: MAX_ASSIGNMENTS }) };
+  if (boundedEqual(records, normalized)) return false;
+  state.apiContinuations = normalized;
+  return true;
 };
 
 // ── Paid lease AUTHORITY ─────────────────────────────────────────────────────────────────────────
@@ -1160,16 +1227,17 @@ const lateContinuationTarget = (state, {
 };
 
 const sweep = (state, now = Date.now()) => {
+  let changed = false;
   // Expired policy avoids go first; then the cap drops the soonest-expiring (oldest) ones.
   if (state.policyAvoids) {
     for (const [sessionID, entry] of Object.entries(state.policyAvoids)) {
-      if (!(entry?.until > now)) delete state.policyAvoids[sessionID];
+      if (!(entry?.until > now)) { delete state.policyAvoids[sessionID]; changed = true; }
     }
     const avoidIDs = Object.keys(state.policyAvoids);
     if (avoidIDs.length > MAX_POLICY_AVOIDS) {
       avoidIDs.sort((a, b) => state.policyAvoids[a].until - state.policyAvoids[b].until)
         .slice(0, avoidIDs.length - MAX_POLICY_AVOIDS)
-        .forEach((sessionID) => delete state.policyAvoids[sessionID]);
+        .forEach((sessionID) => { delete state.policyAvoids[sessionID]; changed = true; });
     }
   }
   for (const [sessionID, lease] of Object.entries(state.leases)) {
@@ -1177,6 +1245,7 @@ const sweep = (state, now = Date.now()) => {
       settlePolicyLease(state, lease, { outcome: "abandoned", source: "expiry", now });
       delete state.leases[sessionID];
       stampPinActivity(state, sessionID, Number(lease?.touchedAt) || 0);
+      changed = true;
     }
   }
   // A LIVE LEASE IS NEVER EVICTED -- by age here, or by the cap below. `updatedAt` moves only
@@ -1195,6 +1264,7 @@ const sweep = (state, now = Date.now()) => {
     if (!state.leases[sessionID] && now - assignmentLastActive(assignment) > idleTTL) {
       removePolicyLeaseBinding(state, assignment);
       delete state.assignments[sessionID];
+      changed = true;
     }
   }
   // Then the cap. Eviction is TIERED, because "oldest" and "safe to lose" are different
@@ -1232,6 +1302,7 @@ const sweep = (state, now = Date.now()) => {
     for (const sessionID of evicted) {
       removePolicyLeaseBinding(state, state.assignments[sessionID]);
       delete state.assignments[sessionID];
+      changed = true;
     }
     if (evictedPins > 0) {
       // Never silent: losing a pin costs a live session its model mid-task. Reaching here
@@ -1246,14 +1317,17 @@ const sweep = (state, now = Date.now()) => {
   if (state.rebalances && typeof state.rebalances === "object") {
     const cooldownMs = Number(CONFIG.sessionRebalance?.cooldownMs ?? 1800000);
     for (const [sessionID, at] of Object.entries(state.rebalances)) {
-      if (!Number.isFinite(Number(at)) || now - Number(at) >= cooldownMs) delete state.rebalances[sessionID];
+      if (!Number.isFinite(Number(at)) || now - Number(at) >= cooldownMs) { delete state.rebalances[sessionID]; changed = true; }
     }
   }
   for (const [targetID, circuit] of Object.entries(state.circuits)) {
-    if (circuit?.until !== null && Number(circuit?.until) <= now) delete state.circuits[targetID];
+    if (circuit?.until !== null && Number(circuit?.until) <= now) { delete state.circuits[targetID]; changed = true; }
   }
-  state.health = normalizeHealth(state.health, now);
-  pruneApiContinuations(state, now);
+  const health = normalizeHealth(state.health, now);
+  if (!boundedEqual(state.health, health)) { state.health = health; changed = true; }
+  if (pruneApiContinuations(state, now)) changed = true;
+  if (changed) notePendingPersistence(state, false);
+  return changed;
 };
 
 const activeProviderCounts = (state, targets = allTargets(state), excludeSessionID = null) => {
@@ -1945,11 +2019,13 @@ const acquire = async (state, request, {
     ensureActive();
     settlePolicyLease(state, existing, { outcome: "abandoned", source: "lease" });
     delete state.leases[sessionID];
+    notePendingPersistence(state, false);
   }
   if (existing && replace) {
     ensureActive();
     settlePolicyLease(state, existing, { outcome: "abandoned", source: "lease" });
     delete state.leases[sessionID];
+    notePendingPersistence(state, false);
   }
   const selection = {
     profile,
@@ -3685,7 +3761,10 @@ const serve = async () => {
         return reply(response, 200, { ok: true, utilization: effectiveUtilization(state.budgets, providerID), ...(burn ? { burn } : {}) });
       }
       if (request.url === "/status") {
-        writeState(state);
+        const persistence = pendingPersistence(state);
+        if (persistence || prepareStateForPersistence(state)) {
+          writeState(state, { requireDurable: persistence === 2 });
+        }
         return reply(response, 200, { ...publicState(state, resolverProcesses), queue: { ...queueStats } });
       }
       if (request.url === "/preview") {
@@ -3804,7 +3883,10 @@ const serve = async () => {
         return reply(response, 200, { decisions });
       }
       if (request.url === "/selection") {
-        writeState(state);
+        const persistence = pendingPersistence(state);
+        if (persistence || prepareStateForPersistence(state)) {
+          writeState(state, { requireDurable: persistence === 2 });
+        }
         return reply(response, 200, { lastDecision: publicState(state, resolverProcesses).lastDecision });
       }
       if (request.url === "/inventory") {

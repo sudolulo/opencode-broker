@@ -36,13 +36,14 @@ import {
   publishAuthInventory,
   profileConfinesToLan,
   profileTitle,
+  publishPendingForgetRecord,
+  removePendingForgetRecord,
   readPendingProfile,
   readSessionContextEstimate,
   resolveProfile,
   sessionsOnProfiles,
   tierForAgent,
   writePendingProfile,
-  writePendingForgetRecord,
   writeSessionProfile,
 } from "../lib/routing.js";
 import { PLAN_LAPSED_REASON } from "../lib/provider-check.js";
@@ -1178,6 +1179,30 @@ export default {
     let budgetPolling = false;
     // Set on dispose. A poll already in flight must not write into a disposed HUD.
     let budgetDisposed = false;
+    // Cleanup authority is deliberately narrow: only a lease ID this HUD received from its own
+    // /lease response, or an unredacted ordinary lease/assignment in /status, can be retried.
+    // Paid routes omit their IDs from public status, so a missing ID is not evidence to forget.
+    const knownLeaseIDs = new Map();
+    const KNOWN_LEASE_LIMIT = 512;
+    const rememberLeaseID = (id, leaseID) => {
+      if (typeof id !== "string" || !id || typeof leaseID !== "string" || !leaseID) return;
+      knownLeaseIDs.delete(id);
+      knownLeaseIDs.set(id, leaseID);
+      while (knownLeaseIDs.size > KNOWN_LEASE_LIMIT) knownLeaseIDs.delete(knownLeaseIDs.keys().next().value);
+    };
+    const rememberStatusLeaseIDs = (status) => {
+      for (const source of [status?.leases, status?.assignments]) {
+        for (const [id, record] of Object.entries(source ?? {})) rememberLeaseID(id, record?.leaseID);
+      }
+    };
+    const queueKnownPendingForget = (id) => {
+      const leaseID = knownLeaseIDs.get(id);
+      if (!leaseID) return;
+      try { publishPendingForgetRecord(id, { leaseID }); }
+      catch {
+        api.ui?.toast?.({ variant: "warning", message: "Could not queue durable Manual cleanup; broker cleanup may remain pending." });
+      }
+    };
     const pollBudgets = async () => {
       if (budgetPolling) return;
       budgetPolling = true;
@@ -1186,6 +1211,7 @@ export default {
         const status = await brokerRequest("/status", {}, { timeout: 1500 });
         if (budgetDisposed) return;
         brokerFailingSince = null;
+        rememberStatusLeaseIDs(status);
         // A provider whose SUBSCRIPTION has lapsed is not a provider in use: /status keeps
         // reporting its budget for diagnostics, so without this the sidebar showed a
         // percentage and a circuit note for a plan nobody holds. Computed before anything is
@@ -1714,7 +1740,9 @@ export default {
       if (profile === "auto") await publishAuthInventory();
       let contextTokens = 0;
       try { contextTokens = Number(readSessionContextEstimate(id)) || 0; } catch {}
-      return brokerRequest("/lease", { sessionID: id, profile, tier: tierForAgent(agent), replace, contextTokens });
+      const lease = await brokerRequest("/lease", { sessionID: id, profile, tier: tierForAgent(agent), replace, contextTokens });
+      rememberLeaseID(id, lease?.leaseID);
+      return lease;
     };
     // ☠️ ASK EVERY TIME, including when the session is already sitting on this profile. A
     // session whose model went away underneath it -- an idle timer reclaiming the GPU, a swap run
@@ -1781,13 +1809,21 @@ export default {
       pendingAllocations.clear();
     });
     const releaseLease = async (id, lease, forget = false) => {
+      let handle = null;
+      if (!lease?.leaseID) return;
+      // A failed release also needs exact eventual retirement, without re-enqueueing on failure.
+      try { handle = publishPendingForgetRecord(id, { leaseID: lease.leaseID }); }
+      catch {
+        api.ui?.toast?.({ variant: "warning", message: "Could not queue durable lease cleanup; attempting broker cleanup only." });
+      }
       try {
         await brokerRequest(forget ? "/forget" : "/release", {
           sessionID: id,
           ...(lease?.leaseID ? { leaseID: lease.leaseID } : {}),
         });
+        if (handle) removePendingForgetRecord(id, handle);
       } catch {
-        writePendingForgetRecord(id, { leaseID: lease?.leaseID });
+        api.ui?.toast?.({ variant: "warning", message: "Broker lease cleanup or exact record removal failed; cleanup remains pending." });
       }
     };
     const validateHomeProfile = async (profile) => {
@@ -1840,7 +1876,7 @@ export default {
         if (profile === "manual") {
           // F11 must remain usable while the broker is restarting or unavailable.
           // The server router retries this durable cleanup before the next dispatch.
-          writePendingForgetRecord(id);
+          queueKnownPendingForget(id);
           writeSessionProfile(id, profile, { explicit: true });
           restoreDefaultModel(id, previous, profile);
           refresh();
@@ -1903,7 +1939,6 @@ export default {
         if (!createdID) throw new Error("OpenCode did not create a session");
         if (profile === "manual") {
           writeSessionProfile(createdID, profile, { explicit: true });
-          writePendingForgetRecord(createdID);
           refresh();
           api.route.navigate("session", { sessionID: createdID });
           return;

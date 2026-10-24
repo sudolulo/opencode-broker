@@ -1738,13 +1738,16 @@ test("pending forget records persist their exact lease, reload, and delete clean
   assert.equal(record.completed, true);
   assert.equal(record.leaseID, "lease-pending-forget");
   assert.equal(typeof record.updatedAt, "number");
+  const [handle] = routing.listPendingForgetRecords();
   assert.deepEqual(routing.listPendingForgetRecords(), [{
+    recordID: handle.recordID,
     sessionID: "ses_forget",
     leaseID: "lease-pending-forget",
     completed: true,
     updatedAt: record.updatedAt,
   }]);
-  routing.removePendingForgetRecord("ses_forget");
+  assert.equal(routing.removePendingForgetRecord("ses_forget"), false);
+  assert.equal(routing.removePendingForgetRecord("ses_forget", handle), true);
   assert.equal(routing.readPendingForgetRecord("ses_forget"), null);
   assert.deepEqual(routing.listPendingForgetRecords(), []);
 }));

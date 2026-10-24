@@ -93,7 +93,7 @@ const startGateway = async (statePath) => {
   return { url: `http://127.0.0.1:${server.address().port}`, dispatches, close: () => new Promise((resolve) => server.close(resolve)) };
 };
 
-const startBroker = async (name, fault = "", { outage = false, skip = 0, armed = false } = {}) => {
+const startBroker = async (name, fault = "", { outage = false, outageLease = false, skip = 0, armed = false } = {}) => {
   const base = mkdtempSync(join(tmpdir(), `broker-state-${name}-`));
   chmodSync(base, 0o700);
   const home = join(base, "home");
@@ -108,6 +108,7 @@ const startBroker = async (name, fault = "", { outage = false, skip = 0, armed =
     ? { ...emptyState(), leases: {}, outages: outageEpisode(Date.now()),
       inventory: { ...emptyState().inventory, providers: { anthropic: { connected: true, authType: "oauth" }, openai: { connected: true, authType: "oauth" } } } }
     : emptyState();
+  if (outageLease) initial.leases["durability-session"] = emptyState().leases["durability-session"];
   writeFileSync(statePath, `${JSON.stringify(initial)}\n`, { mode: 0o600 });
   writeFileSync(tracePath, "", { mode: 0o600 });
   if (armed) writeFileSync(armPath, "armed\n", { mode: 0o600 });
@@ -153,16 +154,28 @@ const startBroker = async (name, fault = "", { outage = false, skip = 0, armed =
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += String(chunk); });
   child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-  await new Promise((resolve, reject) => {
-    const deadline = setTimeout(() => reject(new Error(`broker did not listen: ${stdout}\n${stderr}`)), 3000);
-    child.stdout.on("data", (chunk) => {
-      if (!String(chunk).includes("listening on ")) return;
-      clearTimeout(deadline);
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      const rejectStartup = (error) => {
+        clearTimeout(deadline);
+        reject(error);
+      };
+      const deadline = setTimeout(() => rejectStartup(new Error(`broker did not listen: ${stdout}\n${stderr}`)), 3000);
+      child.stdout.on("data", (chunk) => {
+        if (!String(chunk).includes("listening on ")) return;
+        clearTimeout(deadline);
+        resolve();
+      });
+      child.once("error", rejectStartup);
+      child.once("exit", (code, signal) => rejectStartup(new Error(`broker exited before listen (${code ?? signal}): ${stderr}`)));
     });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => reject(new Error(`broker exited before listen (${code ?? signal}): ${stderr}`)));
-  });
+  } catch (error) {
+    if (child.exitCode === null) child.kill("SIGTERM");
+    if (child.exitCode === null) await new Promise((resolve) => child.once("exit", resolve));
+    await gateway?.close();
+    rmSync(base, { recursive: true, force: true });
+    throw error;
+  }
   return {
     base,
     child,
@@ -256,10 +269,10 @@ test("an outage probe leaves only after its reservation is fsynced, renamed and 
   assert.equal(fixture.gateway.dispatches.length, 1, "one in-flight probe per provider");
 });
 
-test("a strict outage commit whose directory fsync fails dispatches nothing and never refunds the count", async (context) => {
+test("a strict outage fsync failure survives an ordinary write until a stable read retries it strictly", async (context) => {
   // Armed from spawn: the ordinary startup write keeps its warn-and-continue behavior; the first
   // outage reservation write is strict and must refuse.
-  const fixture = await startBroker("outage-directory", "fsync-directory", { outage: true, armed: true });
+  const fixture = await startBroker("outage-directory", "fsync-directory", { outage: true, outageLease: true, armed: true });
   context.after(() => fixture.close());
   assert.equal(await waitFor(() => /outage worker error/.test(fixture.stderr())), true, fixture.stderr());
   await settle(300);
@@ -268,9 +281,13 @@ test("a strict outage commit whose directory fsync fails dispatches nothing and 
   // Visible but not durable: the renamed file already carries the advanced count.
   assert.equal(episodeOf(fixture.state()).probeCounts.primary, 1);
   fixture.disarm();
+  const ordinary = await post(fixture.socketPath, "/touch", { sessionID: "durability-session" });
+  assert.equal(ordinary.status, 200, ordinary.body);
+  assert.equal(fixture.trace().filter((event) => event.operation === "fsync" && event.target === "directory").length, 1, "the ordinary write must not clear or fsync the strict intent");
   const response = await post(fixture.socketPath, "/status", {});
   assert.equal(response.status, 200, response.body);
   assert.equal(episodeOf(fixture.state()).probeCounts.primary, 1, "a later ordinary write keeps the advanced count");
+  assert.equal(fixture.trace().filter((event) => event.operation === "fsync" && event.target === "directory").length, 2, "the stable read must retry the pending strict directory fsync before clearing intent");
   assert.equal(fixture.gateway.dispatches.length, 0);
 });
 

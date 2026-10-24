@@ -21,10 +21,10 @@ import {
   removeSessionProfile,
   removeSessionContextEstimate,
   removePendingForgetRecord,
+  publishPendingForgetRecord,
   resolveProfile,
   toolAllowedForProfile,
   wrapOfflineCommand,
-  writePendingForgetRecord,
   writeSessionProfile,
   writeSessionContextEstimate,
   highRiskTier,
@@ -34,7 +34,6 @@ import {
 import {
   applyMessageModel,
   applyOutputModel,
-  cleanupDeletedSession,
   createResolverProcessBrokerRequest,
   extractSessionID,
   routeTierForSession,
@@ -437,18 +436,18 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           try {
             await brokerRequest("/forget", {
               sessionID: record.sessionID,
-              ...(record.leaseID ? { leaseID: record.leaseID } : {}),
+              leaseID: record.leaseID,
               ...(record.completed ? { completed: true } : {}),
             });
-            removePendingForgetRecord(record.sessionID);
+            removePendingForgetRecord(record.sessionID, record);
           } catch {
-            try { writePendingForgetRecord(record.sessionID, {
-              leaseID: record.leaseID,
-              completed: record.completed,
-            }); } catch {}
+            // The immutable publication remains unchanged for a later retry.
+            report("warn", "pending broker forget or exact cleanup failed; retaining original intent");
           }
         }
-      } catch {}
+      } catch {
+        report("warn", "could not list durable pending cleanup; keeping existing intent");
+      }
     })();
     try {
       await pendingForgetTask;
@@ -695,9 +694,36 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     heartbeats.set(sessionID, timer);
     scheduleWrapUpCheck();
   };
+  const retireRouteForManual = (sessionID, route) => {
+    const leaseID = route?.leaseID;
+    if (!leaseID) return;
+    // Write before the route is replaced: this is the router's own exact /lease binding, so it
+    // remains safe even if the broker has already assigned this session ID to a later incarnation.
+    let handle = null;
+    try {
+      handle = publishPendingForgetRecord(sessionID, { leaseID });
+    } catch {
+      // Manual remains non-blocking, but losing the durable retry must be visible.
+      // Do not include the lease or broker error here: either can be sensitive telemetry.
+      report("warn", "could not create durable manual cleanup retry record");
+    }
+    void brokerRequest("/forget", { sessionID, leaseID }).then(() => {
+      // A replacement route may have queued L2 while L1's request was in flight. L1 may settle
+      // itself, but it must never erase L2's durable retry record.
+      if (handle) removePendingForgetRecord(sessionID, handle);
+    }).catch(() => {
+      // The record (when written) remains for the next startup/turn retry. This never
+      // throws into the Manual route, which must preserve the user's selected model.
+      report("warn", "deferred broker forget failed for manual cleanup");
+    });
+  };
 
   const route = async (session, preferredModel = null, turnEffort = null, checkContinuation = null, cfReprompt = false) => {
     if (!session?.id) return null;
+    // Capture the authoritative route before any tier/session lookup can yield.
+    // A later same-ID route is a different lease and must never become this
+    // Manual transition's cleanup target.
+    const priorRoute = routes.get(session.id);
     const classifier = isClassifierAgent(session.agent);
     if (classifier) {
       // Old builds persisted the parent's profile onto the child. Remove it before reading
@@ -734,6 +760,8 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     if (!classifier) tier = CONFIG.tierAliases[tier] ?? tier;
     if (!classifier) writeSessionProfile(session.id, resolved.profile, { explicit: resolved.explicit });
     if (resolved.profile === "manual") {
+      retireRouteForManual(session.id, priorRoute);
+      stopHeartbeat(session.id);
       // A child continues the parent model selected by the user. A root keeps its
       // current model; neither case asks the broker to make a model decision.
       if (session.parentID) {
@@ -1476,14 +1504,154 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
   // told -- once per limit window -- to finish or checkpoint its step and write a handoff
   // (a subagent returns what it has instead). The handoff is what the resumed session reads.
   const WRAP_UP_POLL_MS = 60 * 1000;
-  const wrapUpSent = new Map(); // sessionID -> when it was told, for the current nearly-out episode
+  const wrapUpSent = new Map(); // sessionID -> warning attempt marker for the current nearly-out episode
+  const deletedSessionCleanups = new Map(); // sessionID -> cleanup for one exact binding
+  const deletedSessionVerifications = new Map();
+  // A deletion hook deadline bounds only the hook; the SDK request can still be hung after it
+  // settles. Bound those underlying requests separately, and release a permit only when the SDK
+  // promise itself settles so timed-out lookups cannot accumulate without limit.
+  const MAX_DELETED_SESSION_LOOKUPS = 16;
+  let deletedSessionLookupOperations = 0;
   let wrapUpTimer = null;
+  const captureSessionBinding = (sessionID) => ({
+    route: routes.get(sessionID), session: sessions.get(sessionID), heartbeat: heartbeats.get(sessionID),
+    completed: successCandidates.get(sessionID) === true,
+  });
+  // Raw session.deleted events capture a fresh wrapper every time. Deduplicate only when
+  // the captured ownership values are still the same; a shallow-copied session.created
+  // record, a replacement route, heartbeat, or completion state is a new incarnation.
+  const sameSessionBinding = (left, right) => Boolean(left && right) &&
+    left.route === right.route && left.session === right.session &&
+    left.heartbeat === right.heartbeat && left.completed === right.completed;
+  const bindingWasReplaced = (sessionID, binding) =>
+    (routes.has(sessionID) && routes.get(sessionID) !== binding.route) ||
+    (sessions.has(sessionID) && sessions.get(sessionID) !== binding.session) ||
+    (heartbeats.has(sessionID) && heartbeats.get(sessionID) !== binding.heartbeat);
+  const bindingIsCurrent = (sessionID, binding) => !bindingWasReplaced(sessionID, binding) &&
+    routes.get(sessionID) === binding.route && sessions.get(sessionID) === binding.session &&
+    heartbeats.get(sessionID) === binding.heartbeat;
+  const forgetBinding = async (sessionID, binding) => {
+    const leaseID = binding.route?.leaseID;
+    if (!leaseID) return;
+    let handle = null;
+    try {
+      handle = publishPendingForgetRecord(sessionID, { leaseID, completed: binding.completed });
+    } catch {
+      report("warn", "could not create durable deleted-session cleanup retry record");
+    }
+    try {
+      await brokerRequest("/forget", { sessionID, leaseID, ...(binding.completed ? { completed: true } : {}) });
+      if (handle) removePendingForgetRecord(sessionID, handle);
+    } catch {
+      // The exact publication remains for retry; do not replace it after failure.
+      report("warn", "deferred broker forget or exact cleanup failed for deleted session");
+    }
+  };
+  const retireDeletedSession = async (sessionID, binding = captureSessionBinding(sessionID)) => {
+    const existing = deletedSessionCleanups.get(sessionID);
+    if (existing?.binding === binding) return existing.cleanup;
+    const cleanup = (async () => {
+      if (!bindingWasReplaced(sessionID, binding)) {
+        const owns = () => bindingIsCurrent(sessionID, binding);
+        if (!owns()) return;
+        clearLocalChildInactivityWatchdog(sessionID);
+        clearLocalChildInFlightTools(sessionID);
+        unpark(sessionID);
+        unwatchFallback(sessionID);
+        cancelRecovery(sessionID);
+        recoveryAttribution.delete(sessionID);
+        displacedModels.delete(sessionID);
+        wrapUpSent.delete(sessionID);
+        try { removeFallbackMarker(sessionID); } catch {}
+        if (!owns()) return;
+        stopHeartbeat(sessionID);
+        routes.delete(sessionID);
+        sessions.delete(sessionID);
+        successCandidates.delete(sessionID);
+        contextSizes.delete(sessionID);
+        removeSessionProfile(sessionID);
+        removeSessionContextEstimate(sessionID);
+      }
+      await forgetBinding(sessionID, binding);
+    })();
+    deletedSessionCleanups.set(sessionID, { binding, cleanup });
+    trimTracker(deletedSessionCleanups);
+    return cleanup;
+  };
+  const isConfirmedMissingSession = (error, sessionID) => {
+    if (!error || typeof error !== "object" || error.name !== "NotFoundError") return false;
+    const message = error.data?.message ?? error.message;
+    return typeof message === "string" && message === `Session not found: ${sessionID}`;
+  };
+  const verifyAndRetireDeletedSession = async (sessionID, binding) => {
+    const existing = deletedSessionVerifications.get(sessionID);
+    if (sameSessionBinding(existing?.binding, binding)) return existing.verification;
+    const entry = { binding, verification: null };
+    const verification = (async () => {
+      let timer;
+      try {
+        if (deletedSessionLookupOperations >= MAX_DELETED_SESSION_LOOKUPS) {
+          report("warn", `${sessionID}: could not verify session deletion; lookup capacity exhausted; keeping cached route`);
+          return;
+        }
+        deletedSessionLookupOperations += 1;
+        let released = false;
+        const releaseLookup = () => {
+          if (released) return;
+          released = true;
+          deletedSessionLookupOperations -= 1;
+        };
+        // Convert synchronous SDK throws into a handled promise rejection. Its settlement handler
+        // owns the permit even if the hook deadline wins the race below.
+        const lookup = Promise.resolve().then(() => client.session.get({ path: { id: sessionID }, query: { directory } }));
+        lookup.then(releaseLookup, releaseLookup);
+        const timedOut = Symbol("deletedSessionLookupTimeout");
+        const timeout = new Promise((resolve) => {
+          timer = scheduleTimeout(() => resolve(timedOut), rootResolveTimeoutMs);
+          timer?.unref?.();
+        });
+        // Bound this hook, not the SDK transport: no cancellation API is assumed.
+        // Only the race winner may authorize cleanup; a late 404 has no side effects.
+        const response = await Promise.race([
+          lookup,
+          timeout,
+        ]);
+        if (response === timedOut) {
+          report("warn", `${sessionID}: could not verify session deletion; lookup timed out after ${rootResolveTimeoutMs}ms; keeping cached route`);
+          return;
+        }
+        const live = response?.data ?? response;
+        if (live?.id === sessionID) return;
+        if (response?.response?.status !== 404 || !isConfirmedMissingSession(response?.error, sessionID)) {
+          report("warn", `${sessionID}: could not verify session deletion; keeping cached route`);
+          return;
+        }
+      } catch (error) {
+        report("warn", `${sessionID}: could not verify session deletion; keeping cached route`, error);
+        return;
+      } finally {
+        if (timer !== undefined) cancelTimeout(timer);
+      }
+      // A raw event names only an ID. A replacement during the lookup means it
+      // is not identity proof for either generation, so fail closed.
+      if (!bindingIsCurrent(sessionID, binding)) return;
+      await retireDeletedSession(sessionID, binding);
+    })().finally(() => {
+      // A late old lookup must never erase a newer replacement's verification.
+      if (deletedSessionVerifications.get(sessionID) === entry) deletedSessionVerifications.delete(sessionID);
+    });
+    entry.verification = verification;
+    deletedSessionVerifications.set(sessionID, entry);
+    trimTracker(deletedSessionVerifications);
+    return verification;
+  };
   const checkWrapUp = async () => {
     const asked = new Map(); // one /headroom per lane and context size per pass
     const told = [];
     for (const sessionID of [...heartbeats.keys()]) {
       const routed = routes.get(sessionID);
       const session = sessions.get(sessionID);
+      const heartbeat = heartbeats.get(sessionID);
       if (!routed?.target || !routed.tier || isClassifierAgent(session?.agent)) continue;
       let contextTokens = null;
       try { contextTokens = await sessionContextTokens(sessionID); } catch {}
@@ -1499,9 +1667,12 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       // Once per episode: the mark clears when the lane has room again (a reset, a provider
       // back). Not keyed on reset times -- providers report them with sub-second jitter
       // (03:19:59.594, then 03:20:00.046 for the same reset), which would repeat the message.
-      if (!headroom.nearlyOut) { wrapUpSent.delete(sessionID); continue; }
+      const binding = { route: routed, session, heartbeat, completed: successCandidates.get(sessionID) === true };
+      if (!headroom.nearlyOut) { if (bindingIsCurrent(sessionID, binding)) wrapUpSent.delete(sessionID); continue; }
       if (wrapUpSent.has(sessionID)) continue;
-      wrapUpSent.set(sessionID, Date.now());
+      if (!bindingIsCurrent(sessionID, binding)) continue;
+      const warningMarker = {};
+      wrapUpSent.set(sessionID, warningMarker);
       trimTracker(wrapUpSent);
       try {
         const response = await client.session.promptAsync({
@@ -1512,11 +1683,26 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
             parts: [{ type: "text", text: wrapUpMessage(headroom, { subagent: Boolean(session?.parentID) }), synthetic: true }],
           },
         });
-        if (response?.error) throw new Error(JSON.stringify(response.error));
+        if (response?.error) {
+          if (wrapUpSent.get(sessionID) === warningMarker) wrapUpSent.delete(sessionID);
+          if (isConfirmedMissingSession(response.error, sessionID)) {
+            await retireDeletedSession(sessionID, binding);
+            continue;
+          }
+          throw new Error(JSON.stringify(response.error));
+        }
+        if (!bindingIsCurrent(sessionID, binding)) continue;
         told.push(sessionID);
         report("warn", `${sessionID}: usage nearly out on ${routed.profile}/${routed.tier} -- asked it to wrap up${session?.parentID ? "" : " and write a handoff"}`);
       } catch (error) {
-        wrapUpSent.delete(sessionID);
+        // A failed send stays retryable across leases, but must not clear a newer
+        // episode's marker. Do this before the stale-binding reporting fence.
+        if (wrapUpSent.get(sessionID) === warningMarker) wrapUpSent.delete(sessionID);
+        if (isConfirmedMissingSession(error, sessionID)) {
+          await retireDeletedSession(sessionID, binding);
+          continue;
+        }
+        if (!bindingIsCurrent(sessionID, binding)) continue;
         report("error", `${sessionID}: could not ask it to wrap up`, error);
       }
     }
@@ -1928,8 +2114,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       if (event?.type === "session.created") {
         const info = properties.info ?? sessions.get(sessionID) ?? (sessionID ? await getSession(sessionID) : null);
         if (info?.id) {
+          // A creation event starts a new warning episode. In particular, a
+          // same-ID replacement must not inherit L1's one-warning marker.
+          wrapUpSent.delete(info.id);
           const knownSession = sessions.has(info.id);
-          sessions.set(info.id, info);
+          // Creation is a new incarnation even without info or when the emitter
+          // reuses its info object. Keep metadata and the route, but fence old awaits.
+          sessions.set(info.id, { ...info });
           // Repeated metadata notifications must not erase current ownership.
           if (!recoveryAttribution.has(info.id)) {
             setRecoveryAttribution(info.id, newRecoveryAttribution(knownSession));
@@ -1965,27 +2156,9 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       if (!sessionID) return;
       if (event?.type === "session.deleted") {
-        clearLocalChildInactivityWatchdog(sessionID);
-        clearLocalChildInFlightTools(sessionID);
-        unpark(sessionID);
-        unwatchFallback(sessionID);
-        cancelRecovery(sessionID);
-        recoveryAttribution.delete(sessionID);
-        displacedModels.delete(sessionID);
-        try { removeFallbackMarker(sessionID); } catch {}
-        await cleanupDeletedSession({
-          sessionID,
-          routes,
-          sessions,
-          successCandidates,
-          contextSizes,
-          stopHeartbeat,
-          removeSessionProfile,
-          removeSessionContextEstimate,
-          writePendingForgetRecord,
-          removePendingForgetRecord,
-          brokerRequest,
-        });
+        // Capture before the authoritative lookup; getSession() is deliberately
+        // not used because it mutates the routing cache as a side effect.
+        await verifyAndRetireDeletedSession(sessionID, captureSessionBinding(sessionID));
         return;
       }
       // A long provider retry wait is a stop in everything but name: the host
@@ -2366,27 +2539,22 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
           report("info", `${sessionID}: ignoring unattributable session idle after recovery supersession`);
           return;
         }
-        const leaseID = routes.get(sessionID)?.leaseID;
+        const binding = captureSessionBinding(sessionID);
         clearLocalChildInactivityWatchdog(sessionID);
         clearLocalChildInFlightTools(sessionID);
         stopHeartbeat(sessionID);
         // The turn is over: the next prompt re-leases, and the fallback marker makes that
         // lease drop its preference for the fallback model.
         unwatchFallback(sessionID);
-        const completed = successCandidates.get(sessionID) === true;
-        try { await brokerRequest("/forget", {
-          sessionID,
-          ...(leaseID ? { leaseID } : {}),
-          ...(completed ? { completed: true } : {}),
-        }); } catch {
-          try { writePendingForgetRecord(sessionID, { leaseID, completed }); } catch {}
-        } finally {
+        try { await forgetBinding(sessionID, binding); } finally {
           // A progress event delivered while /forget was in flight re-armed the watchdog against
           // the route that is deleted here.
           clearLocalChildInactivityWatchdog(sessionID);
-          routes.delete(sessionID);
-          successCandidates.delete(sessionID);
-          retryWaits.delete(sessionID);
+          if (!bindingWasReplaced(sessionID, binding)) {
+            routes.delete(sessionID);
+            successCandidates.delete(sessionID);
+            retryWaits.delete(sessionID);
+          }
         }
         return;
       }

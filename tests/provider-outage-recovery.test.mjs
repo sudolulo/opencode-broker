@@ -52,7 +52,12 @@ const harness = `
   const create = async ({ profile = "auto", agent = "worker", target = cloud, served = true } = {}) => {
     const id = "ses-recovery";
     const timers = [], prompts = [], calls = [], aborts = [], logs = [];
-    const state = { target, served, prompt: async () => ({ data: true }), preview: null, failure: null, abort: null, lease: null };
+    const liveSession = () => ({ id, agent });
+    const missingSession = () => ({
+      response: { status: 404 },
+      error: { name: "NotFoundError", data: { message: "Session not found: " + id } },
+    });
+    const state = { target, served, prompt: async () => ({ data: true }), preview: null, failure: null, abort: null, lease: null, sessionGet: liveSession };
     let clock = Date.now();
     Date.now = () => clock;
     const live = () => timers.filter((timer) => !timer.cancelled && !timer.fired);
@@ -77,7 +82,7 @@ const harness = `
     const client = {
       app: { log: async (input) => { logs.push(input); return {}; } },
       session: {
-        get: async () => ({ id, agent }),
+        get: async () => state.sessionGet(),
         messages: async () => ({ data: [] }),
         prompt: async (input) => { prompts.push(input); return state.prompt(input); },
         abort: async (input) => { aborts.push(input); return state.abort?.(input); },
@@ -132,7 +137,9 @@ const harness = `
       assert.equal(calls.filter((call) => call.path === "/lease").length, leaseCount, "chat.params must not acquire another lease");
       return model;
     };
-    return { id, state, hooks, live, fire, timers, prompts, calls, aborts, logs, chat, synthetic, event, error, abort, assistantError, complete, currentMessageID: () => currentMessageID, checkCurrentRoute };
+    const confirmDeleted = () => { state.sessionGet = missingSession; };
+    const restoreLive = () => { state.sessionGet = liveSession; };
+    return { id, state, hooks, live, fire, timers, prompts, calls, aborts, logs, chat, synthetic, event, error, abort, assistantError, complete, confirmDeleted, restoreLive, currentMessageID: () => currentMessageID, checkCurrentRoute };
   };
 `;
 
@@ -316,6 +323,16 @@ scenario("a broker noop verdict overrides an otherwise retryable network signal"
   assert.equal(h.live().length, 0);
 });
 
+scenario("a live lookup prevents a raw deletion event from cancelling recovery", async () => {
+  const h = await create();
+  await h.chat();
+  await h.error();
+  await h.event("session.deleted");
+  assert.deepEqual(h.live().map((timer) => timer.delay), [2500]);
+  await h.fire();
+  assert.equal(h.prompts.length, 1);
+});
+
 for (const cancellation of ["user", "file", "mixed-file", "abort", "delete"]) {
   for (const outcome of ["error-result", "rejection"]) {
     scenario(`${cancellation} cancels a deferred continuation before ${outcome}`, async ({ cancellation, outcome }) => {
@@ -333,7 +350,7 @@ for (const cancellation of ["user", "file", "mixed-file", "abort", "delete"]) {
         { type: "file", mime: "image/png", url: "file:///attachment.png" },
       ]);
       if (cancellation === "abort") await h.abort();
-      if (cancellation === "delete") await h.event("session.deleted");
+      if (cancellation === "delete") { h.confirmDeleted(); await h.event("session.deleted"); }
       if (outcome === "error-result") pending.resolve({ error: overload });
       else pending.reject(new TypeError("fetch failed"));
       await running;
@@ -464,7 +481,7 @@ for (const cancellation of ["user", "abort", "delete", "nonretryable", "cloud-co
     h.state.served = true;
     if (cancellation === "user") await h.chat();
     if (cancellation === "abort") await h.abort();
-    if (cancellation === "delete") await h.event("session.deleted");
+    if (cancellation === "delete") { h.confirmDeleted(); await h.event("session.deleted"); }
     if (cancellation === "nonretryable") await h.error({ message: "permission denied" });
     if (cancellation === "cloud-context") await h.error(context);
     pending.resolve({ preview: { worker: cloud } });
@@ -605,7 +622,7 @@ for (const cancellation of ["user", "abort", "delete"]) {
     h.state.lease = null;
     if (cancellation === "user") await h.chat();
     if (cancellation === "abort") await h.abort();
-    if (cancellation === "delete") await h.event("session.deleted");
+    if (cancellation === "delete") { h.confirmDeleted(); await h.event("session.deleted"); }
     lease.reject(Object.assign(new Error("no eligible target"), { code: "no-eligible-target" }));
     await running;
     assert.equal(h.live().length, 0);
@@ -790,7 +807,9 @@ scenario("session deletion clears fenced attribution state for a genuinely new s
   await h.error({ message: "fetch failed" });
   await h.fire();
   await h.chat(undefined, "user-c");
+  h.confirmDeleted();
   await h.event("session.deleted");
+  h.restoreLive();
   await h.event("session.created", { info: { id: h.id, agent: "worker" } });
   await h.chat(undefined, "user-new");
   await h.error({ message: "fetch failed" });

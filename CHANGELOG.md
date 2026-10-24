@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.6] — 2026-10-24
+
+### Fixed
+
+- Bind session retirement, pending forget retries, and warning cleanup to the original lease so delayed work cannot remove a same-ID replacement session.
+- Require an authoritative SDK 404 before acting on a raw session-deleted event; live sessions and unknown or failed lookups retain their routing state.
+- Avoid whole-state rewrites for unchanged /status and /selection reads while continuing to persist sweep and normalization changes.
+- Retain failed-write retry intent, including pre-open failures and strict durability requirements, until the corresponding persistence succeeds.
+- Manual profile switches retain lease-bound cleanup without requiring broker availability, preserving replacement-safe pending forget retries.
+
 ## [1.27.5] — 2026-10-24
 
 ### Fixed
