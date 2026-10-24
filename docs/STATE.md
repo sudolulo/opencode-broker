@@ -1,8 +1,9 @@
 # On-disk state contract
 
 Everything lives under `~/.local/share/opencode/model-routing/` (0700; files
-0600, written atomically via rename). This inventory is the complete list —
-if a file is not here, the router does not own it.
+0600, using the writer-specific atomic publication protocol documented below).
+This inventory is the complete list — if a file is not here, the router does
+not own it.
 
 | Path | Writer | Readers | Content |
 |---|---|---|---|
@@ -12,7 +13,9 @@ if a file is not here, the router does not own it.
 | `profiles/<sessionID>.json` | router plugin, hud | plugins, opencode-guard | Per-session profile `{ profile, explicit, updatedAt }`; pruned after 14 days |
 | `context-estimates/<sessionID>.json` | router plugin | router plugin | Last known context tokens `{ tokens, updatedAt }`; seeds resumed sessions without a full history fetch; 14-day prune |
 | `managed-switches/<sessionID>.json` | router plugin, hud | hud | Short-lived marker (5 min) distinguishing router-driven model switches from the user's own |
-| `pending-forgets/<sessionID>.json` | router plugin, hud | router plugin | Queued exact `/forget` calls `{ leaseID, completed, updatedAt }`, bound to one lease and pruned after 14 days. Legacy ID-only records are discarded without a broker RPC because they cannot safely target a lease after the same ID is reused. HUD Manual queues only an exact last-observed lease binding when available; on the next Manual dispatch, the router captures its own cached lease. Cleanup is not guaranteed immediately while the broker is unavailable or when no exact binding is known. |
+| `pending-forgets/v1.<sha256(sessionID,leaseID)>.<uuid>.json` | router plugin, hud | router plugin | Immutable version-1 exact `/forget` intent `{ version: 1, sessionID, leaseID, completed, updatedAt }`. A writer fully writes a private mode-0600 temp file, then publishes this mode-0600 record with a create-only hard link; it never replaces another intent. The opaque filename plus matching record fields is the cleanup handle, so an RPC success removes only its own record. Records retain their original `updatedAt` for 14 days; for identical session/lease intents, completed versions are processed first. |
+| `pending-forgets/.v1.<sha256(sessionID,leaseID)>.<uuid>.json.<pid>.<uuid>.tmp` | router plugin, hud | none | Private mode-0600 publication temporary. The creating writer removes only its own temporary; stale recognized temporaries age out after 14 days. It is never an executable cleanup intent. |
+| `pending-forgets/claim.<uuid>/` | router plugin | router plugin | Private mode-0700 recovery claim for a legacy mutable `pending-forgets/<sessionID>.json`. The router atomically renames the legacy file to `record.json` inside a newly exclusive claim directory, with its validated session ID in `session.json`, then parses the moved bytes and preserves the original age. Crash recovery resumes recognized claims; an ID-only or malformed claimed record is discarded locally with a warning and no broker RPC. Unknown claim contents are retained. |
 | `decisions.jsonl` | broker | operator, tooling | Every routing decision — grants, revalidations, refusals, failures, and burn-watch stops (`policy: "burn-stop"`), with the gateway's `caller` on a gateway session's lines (bounded 4MB, truncating) |
 | `usage.jsonl` (+ `usage.jsonl.1`) | broker | `opencode-broker usage`, operator | One line per provider request: session, the reporter's `leaseID` when it sent one (grant-bearing paid leases included), optional `rootSessionID` (only when the reporter named a parent that differs from the session itself, so tree-level burn thresholds can be calibrated from the log later), model, the lease's target/profile/tier, `prompt` (input + cache read + cache write), that total split into `input`, `cacheRead` and `cacheWrite` (always present, zeroes included, so a burn-watch stop can be audited afterwards), `output` tokens, and for gateway requests the `caller` (client address and requested model). For tuning local windows, because opencode deletes child sessions and their token history. Rotated at 8MB, one previous generation kept |
 | `fallbacks/<sessionID>.json` | router plugin | hud, router plugin | Fallback/displacement marker; `policy: "provider-displaced"` carries `restoreAt` -- stickiness is released once it passes, and a healthy lease clears every other kind. A paid API continuation lease writes one with `policy: "api-continuation"` ([API-CONTINUATION.md](API-CONTINUATION.md)) |
