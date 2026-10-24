@@ -637,23 +637,23 @@ const publicState = (state, resolverProcesses = null) => ({
   ...(DEPRECATIONS.length ? { deprecations: [...DEPRECATIONS] } : {}),
 });
 
-// Non-admission handlers start this without awaiting it. A due /lease awaits it so the
-// first request after a plan window closes cannot enter on stale usage; because every
-// handler shares the serial queue, later requests can still wait behind that /lease.
-// The module cache throttles the underlying provider request to once a minute.
-const refreshPlanUsage = (state, apply = (mutation) => mutation()) => Promise.all(Object.entries(PROVIDER_BUDGETS).map(async ([providerID, providerConfig]) => {
+// Remote usage reads never occupy the mutation queue. This function only applies reports that
+// a preflight or background refresh has already placed in the plan-usage cache.
+const fetchPlanUsageReports = () => Promise.all(Object.entries(PROVIDER_BUDGETS).map(async ([providerID, providerConfig]) => {
   if (!planUsageConfigured(providerConfig)) return;
-  try {
-    const report = await fetchPlanUsage(providerID, providerConfig);
-    if (!report) return;
-    await apply(() => {
-      applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
-      // The same reading also settles a failure-reported quota stop or a lapse.
-      applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
-      writeState(state);
-    });
-  } catch {}
+  try { await fetchPlanUsage(providerID, providerConfig); } catch {}
 }));
+
+const refreshPlanUsage = (state) => {
+  for (const [providerID, providerConfig] of Object.entries(PROVIDER_BUDGETS)) {
+    if (!planUsageConfigured(providerConfig)) continue;
+    const report = cachedPlanUsage(providerID);
+    if (!report) continue;
+    applyPlanUsageCircuit(state.circuits, providerCircuitID(providerID), report);
+    applyCheckResult(state, providerID, planUsageResult(freshPlanUsage(providerID)));
+    writeState(state);
+  }
+};
 
 // One provider-check result onto the provider circuit, with the transition logged and
 // pushed. Shared by the usage refresh above and the timer for providers without one.
@@ -3017,7 +3017,7 @@ const serve = async () => {
         }
       }
       if (request.method !== "POST") return reply(response, 405, { error: "POST required" });
-      const body = await parseBody(request);
+      const body = preparsed ?? await parseBody(request);
       if (run.expired) return;
       const probeAssignment = request.url === "/lease" && typeof body.sessionID === "string"
         ? probeState.assignmentForLease(body.sessionID)
@@ -3030,27 +3030,13 @@ const serve = async () => {
         reason: null,
       } : resolverProcesses.authorize({ resolverToken: body.resolverToken });
       sweep(state);
-      const awaitPlanRefresh = request.url === "/lease" && body.localOnly !== true &&
-        profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto");
-      const planRefresh = request.url === "/quota-evidence"
-        ? Promise.resolve()
-        : refreshPlanUsage(state, awaitPlanRefresh
-          ? (mutation) => { if (!run.expired) mutation(); }
-          : (mutation) => enqueueTransaction(() => { if (!run.expired) mutation(); }));
+      // A cloud lease waited for its report before it joined the queue. Applying it is
+      // synchronous, so local admissions and releases never wait behind remote I/O.
+      if (request.url !== "/quota-evidence" && !run.expired) refreshPlanUsage(state);
       // The burn watch's all-sessions plan-rise signal was removed (see lib/burn-watch.js
       // for the fourteen-day numbers that retired it). The plan refresh still runs for the
       // budgets, HUD, and admission gate below -- only the burn-watch feed is gone.
       if (request.url === "/lease") {
-        // Admission must see the provider's latest plan window. A background refresh let
-        // the first request after Anthropic reached 100% lease Opus before its circuit opened.
-        // ☠️ ONLY WHERE A PLAN CAN MATTER. A lane that can never reach a cloud target has no plan
-        // window to admit against, and a due refresh can take seconds (one provider's usage API
-        // is allowed 20 s) -- time a latency-critical local caller, such as a command classifier
-        // with a 25 s budget that fails closed, cannot spare. LAN-only leases go straight on.
-        if (awaitPlanRefresh) {
-          await planRefresh;
-          if (run.expired) return;
-        }
         const caller = sanitizeCaller(body.caller);
         const lease = await acquire(state, body, {
           isAbandoned: () => run.expired || abandoned(request, response),
@@ -3396,9 +3382,7 @@ const serve = async () => {
           // optional provider-usage fetch. An explicit different reset is kept as is (no proof).
           circuitUntil = explicitReset ?? proofCandidate?.observed.subscriptionQuota.resetAtMs ?? null;
           if (!circuitUntil && planUsageConfigured(PROVIDER_BUDGETS[target.providerID])) {
-            const report = await fetchPlanUsage(target.providerID, PROVIDER_BUDGETS[target.providerID]);
-            if (run.expired) return;
-            circuitUntil = planUsageResetAt(report);
+            circuitUntil = planUsageResetAt(freshPlanUsage(target.providerID));
           }
           // Whether `until` is when the limit actually lifts or only when the broker next
           // probes: a usage-limit message must never present a re-probe time as the return day.
@@ -3944,11 +3928,12 @@ const serve = async () => {
     queueStats.lastAlertAt = now;
     notifyBurn({ title, body, kind: "broker-stall" });
   };
-  const guarded = (request, response, enqueuedAt, preparsed = undefined) => {
+  const guarded = (request, response, enqueuedAt, preparsed = undefined, run = { expired: false, deadlineAt: null }, releaseArrivalDeadline = () => {}) => {
     queueStats.depth -= 1;
     const waitedMs = Date.now() - enqueuedAt;
-    if (abandoned(request, response)) {
+    if (run.expired || abandoned(request, response)) {
       queueStats.abandoned += 1;
+      releaseArrivalDeadline();
       return Promise.resolve();
     }
     if (waitedMs >= QUEUE_WAIT_ALERT_MS) {
@@ -3956,36 +3941,45 @@ const serve = async () => {
       alertStall("opencode-broker queue backed up",
         `${request.url} waited ${Math.round(waitedMs / 1000)} s in the request queue (${queueStats.depth} still queued)`);
     }
-    const run = { expired: false };
+    const remainingMs = Number.isFinite(run.deadlineAt)
+      ? Math.max(0, run.deadlineAt - Date.now())
+      : HANDLER_DEADLINE_MS;
+    if (remainingMs <= 0) {
+      if (typeof run.expire === "function") run.expire();
+      else run.expired = true;
+      releaseArrivalDeadline();
+      return Promise.resolve();
+    }
     let timer = null;
     const finished = new Promise((resolve) => {
       timer = setTimeout(() => {
-        run.expired = true;
-        queueStats.deadlineHits += 1;
-        queueStats.lastDeadlineAt = Date.now();
-        alertStall("opencode-broker handler deadline exceeded",
-          `${request.url} did not finish within ${HANDLER_DEADLINE_MS / 1000} s; answered 503 (${queueStats.depth} queued behind it)`);
-        try {
-          if (!response.writableEnded) {
-            response.statusCode = 503;
-            response.setHeader("content-type", "application/json");
-            response.end(JSON.stringify({ error: "broker handler deadline exceeded" }));
-          }
-        } catch {}
+        if (typeof run.expire === "function") run.expire();
+        else {
+          run.expired = true;
+          queueStats.deadlineHits += 1;
+          queueStats.lastDeadlineAt = Date.now();
+          alertStall("opencode-broker handler deadline exceeded",
+            `${request.url} did not finish within ${HANDLER_DEADLINE_MS / 1000} s; answered 503 (${queueStats.depth} queued behind it)`);
+          try { if (!response.writableEnded) reply(response, 503, { error: "broker handler deadline exceeded" }); } catch {}
+          try { request.destroy(); } catch {}
+        }
         resolve();
-      }, HANDLER_DEADLINE_MS);
+      }, remainingMs);
       if (typeof timer?.unref === "function") timer.unref();
     });
     let running;
     try { running = Promise.resolve(handle(request, response, preparsed, run)); }
     catch (error) { running = Promise.reject(error); }
-    return Promise.race([running.catch(() => {}), finished]).finally(() => clearTimeout(timer));
+    // The serial queue is released at the deadline, but a preflight slot remains held until
+    // the real handler settles. This prevents an expired body/parser from escaping the cap.
+    running.then(releaseArrivalDeadline, releaseArrivalDeadline).finally(() => clearTimeout(timer));
+    return Promise.race([running.catch(() => {}), finished]);
   };
-  const enqueueRequest = (request, response, preparsed = undefined) => {
+  const enqueueRequest = (request, response, preparsed = undefined, run = undefined, releaseArrivalDeadline = undefined) => {
     const enqueuedAt = Date.now();
     queueStats.depth += 1;
-    const run = () => guarded(request, response, enqueuedAt, preparsed);
-    serial = serial.then(run, run);
+    const queued = () => guarded(request, response, enqueuedAt, preparsed, run, releaseArrivalDeadline);
+    serial = serial.then(queued, queued);
   };
 
   // ONE queue for every broker state mutation. The outage worker's transactions ride the same
@@ -4111,6 +4105,97 @@ const serve = async () => {
       return reply(response, 400, { error: String(error?.message ?? error), code: "outage-health-refused" });
     }
   };
+  // Every ordinary request shares one original-arrival fence. Probe prereads keep private
+  // ownership until their purpose is known, then hand over only the remaining arrival budget.
+  // Lease/failure preflights additionally reserve bounded external-I/O capacity; /release and
+  // all other ordinary routes share the fence but deliberately bypass that capacity admission.
+  const PREFLIGHT_LIMIT = 64;
+  let preflightActive = 0;
+  const startPreflight = (request, response, reserveCapacity = true, arrivedAt = Date.now()) => {
+    if (reserveCapacity && preflightActive >= PREFLIGHT_LIMIT) {
+      reply(response, 503, { error: "broker preflight capacity exceeded" });
+      return null;
+    }
+    if (reserveCapacity) preflightActive += 1;
+    const run = { expired: false, deadlineAt: arrivedAt + HANDLER_DEADLINE_MS };
+    let references = 1;
+    let closed = false;
+    const release = () => {
+      if (closed || --references !== 0) return;
+      closed = true;
+      clearTimeout(timer);
+      response.off("close", abandon);
+      if (reserveCapacity) preflightActive -= 1;
+    };
+    const retain = () => { if (!closed) references += 1; return release; };
+    const abandon = () => { run.expired = true; try { request.destroy(); } catch {} };
+    const expire = () => {
+      if (run.expired) return;
+      run.expired = true;
+      queueStats.deadlineHits += 1;
+      queueStats.lastDeadlineAt = Date.now();
+      alertStall("opencode-broker handler deadline exceeded",
+        `${request.url} did not finish within ${HANDLER_DEADLINE_MS / 1000} s; answered 503 (${queueStats.depth} queued behind it)`);
+      try { if (!response.writableEnded) reply(response, 503, { error: "broker handler deadline exceeded" }); } catch {}
+      try { request.destroy(); } catch {}
+    };
+    run.expire = expire;
+    const timer = setTimeout(expire, Math.max(0, run.deadlineAt - Date.now()));
+    if (typeof timer?.unref === "function") timer.unref();
+    response.once("close", abandon);
+    return { run, retain, release };
+  };
+  const preflightLease = (request, response) => {
+    const preflight = startPreflight(request, response);
+    if (!preflight) return;
+    const { run, retain, release } = preflight;
+    parseBody(request).then(async (body) => {
+      if (run.expired || abandoned(request, response)) return;
+      const reachesCloud = body?.localOnly !== true && profileReachesCloud(isProfile(body?.profile) ? body.profile : "auto");
+      const fetched = fetchPlanUsageReports();
+      if (!reachesCloud) {
+        // Local admission joins immediately and shares the original arrival fence. It
+        // still shares `run` with its detached report apply, so an expired local request cannot
+        // later write a quota circuit.
+        const releaseFetch = retain();
+        const releaseHandler = retain();
+        enqueueRequest(request, response, body, run, releaseHandler);
+        fetched.then(() => {
+          if (run.expired || abandoned(request, response)) return;
+          enqueueTransaction(() => {
+            if (!run.expired && !abandoned(request, response)) refreshPlanUsage(state);
+          }).catch(() => {});
+        }, () => {}).finally(releaseFetch);
+        return;
+      }
+      await fetched;
+      if (run.expired || abandoned(request, response)) return;
+      enqueueRequest(request, response, body, run, retain());
+    }, (error) => {
+      if (!run.expired && !abandoned(request, response)) reply(response, 400, { error: String(error?.message ?? error) });
+    }).catch(() => {}).finally(release);
+  };
+  const refreshOutsideQueue = (request, response, run) => {
+    if (request.method !== "POST" || request.url === "/quota-evidence") return;
+    fetchPlanUsageReports().then(() => {
+      if (run.expired || abandoned(request, response)) return;
+      enqueueTransaction(() => {
+        if (!run.expired && !abandoned(request, response)) refreshPlanUsage(state);
+      }).catch(() => {});
+    }, () => {});
+  };
+  // A quota failure needs the same fresh report to derive its reset, but its remote wait must
+  // remain outside the mutation queue. The arrival fence prevents a late report from settling
+  // the failed lease or writing a circuit after the caller has received its deadline response.
+  const preflightFailure = (request, response) => {
+    const preflight = startPreflight(request, response);
+    if (!preflight) return;
+    const { run, retain, release } = preflight;
+    fetchPlanUsageReports().then(() => {
+      if (run.expired || abandoned(request, response)) return;
+      enqueueRequest(request, response, undefined, run, retain());
+    }, () => {}).finally(release);
+  };
   const server = createServer((request, response) => {
     if (outageService && OUTAGE_PRIVATE_PATHS.has(request.url)) {
       trackPrivate(request, response);
@@ -4118,13 +4203,18 @@ const serve = async () => {
       return;
     }
     if (outageService && OUTAGE_PROBE_PATHS.has(request.url) && request.method === "POST") {
+      const arrivedAt = Date.now();
       const release = trackPrivate(request, response);
       // The purpose decides the owner, so the bounded body is read here, once.
       parseBody(request).then((body) => {
-        if (body && typeof body === "object" && body.purpose === "outage-health") return handleOutage(request, response, body);
-        // From here the ordinary queue owns it, with its own deadline and abandon accounting.
+        if (abandoned(request, response)) return;
+        if (body && typeof body === "object" && body.purpose === "outage-health") {
+          return handleOutage(request, response, body);
+        }
+        // Transfer ownership, not a fresh budget: preread time counts against ordinary work.
         release();
-        enqueueRequest(request, response, body);
+        const ordinary = startPreflight(request, response, false, arrivedAt);
+        enqueueRequest(request, response, body, ordinary.run, ordinary.release);
         return undefined;
       }, (error) => {
         if (abandoned(request, response)) { response.destroy(); return; }
@@ -4132,7 +4222,11 @@ const serve = async () => {
       }).catch(() => {});
       return;
     }
-    enqueueRequest(request, response);
+    if (request.url === "/lease" && request.method === "POST") return preflightLease(request, response);
+    if (request.url === "/failure" && request.method === "POST") return preflightFailure(request, response);
+    const ordinary = startPreflight(request, response, false);
+    refreshOutsideQueue(request, response, ordinary.run);
+    enqueueRequest(request, response, undefined, ordinary.run, ordinary.release);
   });
   const removeSocket = () => { try { unlinkSync(socketPath); } catch {} };
   server.on("close", removeSocket);
@@ -4161,9 +4255,7 @@ const serve = async () => {
   // HUD showed that number as current. Fetched outside the queue (warming the cache), applied
   // inside it, where refreshPlanUsage finds the warm reading and only applies it.
   const refreshPlanUsageTick = async () => {
-    await Promise.all(Object.entries(PROVIDER_BUDGETS)
-      .filter(([, providerConfig]) => planUsageConfigured(providerConfig))
-      .map(([providerID, providerConfig]) => fetchPlanUsage(providerID, providerConfig).catch(() => null)));
+    await fetchPlanUsageReports();
     serial = serial.then(() => refreshPlanUsage(state)).catch(() => {});
   };
   setInterval(() => { refreshPlanUsageTick().catch(() => {}); }, 30_000).unref();

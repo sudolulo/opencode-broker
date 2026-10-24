@@ -3283,6 +3283,7 @@ export const createGatewayHandler = ({
       const rawBoundLease = request.headers["x-opencode-lease-id"];
       const boundLeaseID = Array.isArray(rawBoundLease) ? rawBoundLease[0] : rawBoundLease;
       let held = null;
+      let leaseVerificationTransportFailure = false;
       try {
         held = await brokerRequest("/lease/verify", {
           sessionID: boundSessionID,
@@ -3306,7 +3307,18 @@ export const createGatewayHandler = ({
         if (!held?.held && typeof boundLeaseID === "string" && boundLeaseID) {
           held = await brokerRequest("/lease/verify", { sessionID: boundSessionID, wireModel: requestedModel });
         }
-      } catch { held = null; }
+      } catch {
+        leaseVerificationTransportFailure = true;
+      }
+      if (leaseVerificationTransportFailure) {
+        return respondJson(response, 503, {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "[opencode-broker] route unavailable; broker lease verification unavailable (gateway: lease verification transport failure)",
+          },
+        });
+      }
       const model = held?.target?.model;
       // ☠️ PAID LEASES NEVER INHERIT THE ROTATION ABOVE. A grant-bearing held lease is spend
       // authority for exactly one lease, so the request must name that exact lease; a session-

@@ -42,6 +42,7 @@ const run = async ({ onVerifyWithId, onVerifyNoId, wireModel = "claude-opus-5-5"
     },
   });
   let status;
+  let payload;
   await withServer(handler, async (base) => {
     const response = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
@@ -54,9 +55,9 @@ const run = async ({ onVerifyWithId, onVerifyNoId, wireModel = "claude-opus-5-5"
       body: JSON.stringify({ model: wireModel, messages: [{ role: "user", content: "ping" }] }),
     });
     status = response.status;
-    await response.arrayBuffer();
+    payload = await response.json();
   });
-  return { status, calls, forwards };
+  return { status, payload, calls, forwards };
 };
 
 const opus = { held: true, leaseID: "lease-NEW", target: { id: "claude-opus-5-5", model: { providerID: "anthropic", id: "claude-opus-5-5" } } };
@@ -87,7 +88,42 @@ test("an exact-id match still forwards with a single verify (no re-verify)", asy
 
 test("a session with no live lease at all is refused", async () => {
   const r = await run({ onVerifyWithId: () => noLease, onVerifyNoId: () => noLease });
-  assert.notEqual(r.status, 200);
+  assert.equal(r.status, 400);
+  assert.match(r.payload.error.message, /session holds no live lease/);
   assert.equal(r.forwards.length, 0);
   assert.deepEqual(r.calls.map((c) => c.hasLeaseID), [true, false]);
+});
+
+test("a failed exact-id verification is retryable routing infrastructure failure", async () => {
+  const r = await run({
+    onVerifyWithId: () => { throw new Error("broker unavailable"); },
+    onVerifyNoId: () => { throw new Error("must not retry after transport failure"); },
+  });
+  assert.equal(r.status, 503);
+  assert.deepEqual(r.payload, {
+    type: "error",
+    error: {
+      type: "api_error",
+      message: "[opencode-broker] route unavailable; broker lease verification unavailable (gateway: lease verification transport failure)",
+    },
+  });
+  assert.equal(r.forwards.length, 0, "must not contact the provider");
+  assert.deepEqual(r.calls.map((c) => c.path), ["/lease/verify"], "must not settle or reserve spend");
+});
+
+test("a failed session-only fallback verification is retryable routing infrastructure failure", async () => {
+  const r = await run({
+    onVerifyWithId: () => noLease,
+    onVerifyNoId: () => { throw new Error("broker unavailable"); },
+  });
+  assert.equal(r.status, 503);
+  assert.deepEqual(r.payload, {
+    type: "error",
+    error: {
+      type: "api_error",
+      message: "[opencode-broker] route unavailable; broker lease verification unavailable (gateway: lease verification transport failure)",
+    },
+  });
+  assert.equal(r.forwards.length, 0, "must not contact the provider");
+  assert.deepEqual(r.calls.map((c) => c.path), ["/lease/verify", "/lease/verify"], "must not settle or reserve spend");
 });

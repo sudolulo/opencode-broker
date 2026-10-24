@@ -312,6 +312,7 @@ test('shutdown aborts a hung status poll and exits cleanly, removing the socket'
 // broker (or anything else) tears the connection down.
 const stalledPost = (socketPath, path) => new Promise((resolve, reject) => {
   const socket = net.connect(socketPath);
+  socket.resume();
   const closed = new Promise((settle) => socket.once('close', () => settle(Date.now())));
   socket.on('error', () => {});
   socket.once('connect', () => {
@@ -342,18 +343,31 @@ test('SIGTERM with a stalled private request still exits promptly and removes th
 });
 
 test('a stalled private or pre-read probe request is destroyed by the private request deadline', async () => {
-  // Test-only knob, read once at startup: the production deadline is the 30 s handler deadline.
-  const broker = await spawnDaemon({ envOverrides: { OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS: '300' } });
+  // Equal deadlines reproduce production ownership: preread must not arm the ordinary alert.
+  const broker = await spawnDaemon({ envOverrides: {
+    OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS: '300', OPENCODE_BROKER_TEST_HANDLER_DEADLINE_MS: '300',
+  } });
   const stalled = [];
   try {
-    for (const path of ['/model-health/begin', '/model-health/outcome', '/probe/consume']) {
+    const before = await post(broker.socketPath, '/status', {});
+    for (const path of ['/model-health/begin', '/model-health/outcome', '/probe/consume', '/probe/release']) {
       stalled.push({ path, ...(await stalledPost(broker.socketPath, path)) });
     }
     for (const { path, closed } of stalled) {
       assert.ok(await within(closed, 3000), `${path}: stalled request still open after 3 s`);
     }
     // The broker itself is unaffected and still answers.
-    assert.equal((await post(broker.socketPath, '/status', {})).status, 200);
+    const after = await post(broker.socketPath, '/status', {});
+    assert.equal(after.status, 200);
+    assert.equal(after.body.queue.deadlineHits, before.body.queue.deadlineHits,
+      'private preread stalls must not be counted as ordinary handler deadlines');
+    assert.equal(after.body.queue.lastDeadlineAt, before.body.queue.lastDeadlineAt);
+    assert.equal(after.body.queue.lastAlertAt, before.body.queue.lastAlertAt,
+      'private preread stalls must not invoke the ordinary stall notification path');
+    for (const { path } of stalled) {
+      assert.ok(broker.stderr().includes(`private request deadline exceeded: ${path} `), broker.stderr());
+    }
+    assert.doesNotMatch(broker.stderr(), /opencode-broker handler deadline exceeded/);
     assert.equal(broker.child.exitCode, null);
   } finally {
     for (const { socket } of stalled) socket.destroy();

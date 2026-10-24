@@ -252,14 +252,19 @@ test("the child registry persists the durable ownership schema", () => {
 test("the registry capacity is lock-protected across processes", async () => {
   const root = mkdtempSync(join(tmpdir(), "janitor-capacity-"));
   const moduleURL = new URL("../lib/session-janitor.js", import.meta.url).href;
-  const worker = (workerID) => new Promise((resolve, reject) => {
+  const worker = (workerID) => new Promise((resolve) => {
     const code = `import { createChildRegistry } from ${JSON.stringify(moduleURL)}; const registry = createChildRegistry({ root: process.argv[1] }); for (let i = 0; i < 256; i++) registry.register({ sessionID: \`ses_w${workerID}x\${i}\`, parentSessionID: "ses_parent", source: "workflow", mode: "foreground" });`;
     const child = spawn(process.execPath, ["--input-type=module", "--eval", code, root]);
-    child.once("error", reject);
-    child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`registry worker ${workerID} exited ${code}`)));
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8_192); });
+    child.once("error", (error) => resolve({ workerID, error, stderr }));
+    child.once("exit", (code) => resolve({ workerID, code, stderr }));
   });
   try {
-    await Promise.all([0, 1, 2, 3].map(worker));
+    const workers = await Promise.all([0, 1, 2, 3].map(worker));
+    for (const { workerID, code, error, stderr } of workers) {
+      assert.equal(code, 0, `registry worker ${workerID} ${error ? `spawn error: ${error.message}` : `exited ${code}`}\nstderr:\n${stderr}`);
+    }
     const registry = createChildRegistry({ root });
     assert.equal(registry.list().length, 1024);
     assert.throws(() => registry.register({ sessionID: "ses_overflow", parentSessionID: "ses_parent", source: "workflow", mode: "foreground" }), /full \(1024\)/);

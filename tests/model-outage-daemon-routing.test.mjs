@@ -38,6 +38,30 @@ const post = (socketPath, path, body = {}, headers = {}) => new Promise((resolve
   req.end(payload);
 });
 
+// Keep a real body incomplete without holding up other connections to the broker.
+const partialPost = (socketPath, path, body) => {
+  const payload = JSON.stringify(body);
+  const arrivedAt = Date.now();
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  let request;
+  const response = new Promise((resolve, reject) => {
+    request = http.request({ socketPath, path, method: 'POST', agent, headers: {
+      'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
+    } }, (reply) => {
+      let text = '';
+      reply.setEncoding('utf8');
+      reply.on('data', (chunk) => { text += chunk; });
+      reply.on('end', () => {
+        try { resolve({ status: reply.statusCode, body: JSON.parse(text), elapsedMs: Date.now() - arrivedAt }); }
+        catch (error) { reject(error); }
+      });
+    });
+    request.once('error', reject);
+    request.write(payload.slice(0, -1));
+  });
+  return { response, finish: () => request.end(payload.slice(-1)), destroy: () => { request.destroy(); agent.destroy(); } };
+};
+
 // Real-time episode: a verified claude-opus-5 reserve (an actual real-traffic success, so the
 // proof is ACTIVE and not bound by the 120s freshness) inside the 600s episode window.
 function outagesAt(base, { lapsed = false, provisional = false } = {}) {
@@ -110,7 +134,7 @@ async function probationFixture(home, { candidateKind = 'newer', cursor = 0, pha
 }
 
 async function spawnBroker({ lapsed = false, probation = null, provisional = false, localModelsURL = 'http://127.0.0.1:9/v1/models',
-  advanceClockAfterLocalModels = false, clockAdvanceAfterDateCalls = 1 } = {}) {
+  advanceClockAfterLocalModels = false, clockAdvanceAfterDateCalls = 1, envOverrides = {} } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'outage-daemon-'));
   let child;
   const stop = async () => {
@@ -182,7 +206,7 @@ async function spawnBroker({ lapsed = false, probation = null, provisional = fal
       OPENCODE_BROKER_OUTAGE_GATEWAY_URL: 'http://127.0.0.1:9',
       OPENCODE_BROKER_GATEWAY_KEY_FILE: join(keyDir, 'gateway-key'),
       OPENCODE_BROKER_HEALTH_GATEWAY_CREDENTIAL_FILE: join(keyDir, 'health-credential'),
-      OPENCODE_BROKER_TEST_FETCH_TRACE: join(home, 'fetch-trace.jsonl') },
+       OPENCODE_BROKER_TEST_FETCH_TRACE: join(home, 'fetch-trace.jsonl'), ...envOverrides },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -347,6 +371,63 @@ for (const [name, options, overrides] of [
 
 // A real synthetic assignment reaches the candidate-only branch even for static aliases.
 // No completion is dispatched: these tests exercise only local broker protocol and selection.
+for (const path of ['/probe/consume', '/probe/release']) test(`ordinary ${path} keeps its preread arrival budget and cannot mutate after expiry`, { timeout: 10_000 }, async () => {
+  const deadlineMs = 300;
+  const broker = await spawnBroker({ probation: { phase: 'staged-probing' }, envOverrides: {
+    OPENCODE_BROKER_TEST_HANDLER_DEADLINE_MS: String(deadlineMs),
+    OPENCODE_BROKER_TEST_PRIVATE_DEADLINE_MS: String(deadlineMs),
+  } });
+  const pending = [];
+  try {
+    const generation = broker.trial.generation;
+    const identity = { transitionID: 'outage-trial', roleKey: 'anthropic:claude-opus',
+      candidateIdentity: { providerID: 'anthropic', modelID: broker.trial.candidate.modelID },
+      candidateIntroduction: { generation: generation.generation, manifestHash: generation.manifestHash } };
+    const launch = await post(broker.socketPath, '/model-policy/probe-launch', { ...identity,
+      operationID: 'outage-trial:staged-probing', expectedPolicyRevision: 'revision-1' });
+    assert.equal(launch.status, 200, JSON.stringify(launch.body));
+    const registration = await post(broker.socketPath, '/resolver-process/register', {
+      generation: generation.generation, manifestHash: generation.manifestHash, probeLaunchNonce: launch.body.probeLaunchNonce,
+    });
+    assert.equal(registration.status, 200, JSON.stringify(registration.body));
+    const assigned = await post(broker.socketPath, '/model-policy/probe', { ...identity, probeKind: 'normal', requestID: 'deadline-probe' },
+      { 'x-opencode-resolver-token': registration.body.resolverToken });
+    assert.equal(assigned.status, 200, JSON.stringify(assigned.body));
+    const body = { sessionID: assigned.body.sessionID, probeNonce: assigned.body.probeNonce };
+    if (path === '/probe/release') assert.equal((await post(broker.socketPath, '/probe/consume', body)).status, 200);
+
+    const probe = partialPost(broker.socketPath, path, body);
+    pending.push(probe);
+    // Spend most of the budget in private preread, then hand off behind a newer ordinary parser.
+    // A fresh budget at classification (or queue head) would mutate at ~400ms, not expire at ~300ms.
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const blocker = partialPost(broker.socketPath, '/model-policy/cas', {});
+    pending.push(blocker);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    probe.finish();
+    const drained = new Promise((resolve) => setTimeout(resolve, 200)).then(() => {
+      blocker.finish();
+      return blocker.response;
+    });
+    const [expired, blockerReply] = await Promise.all([probe.response, drained]);
+    assert.equal(expired.status, 503, JSON.stringify(expired.body));
+    assert.deepEqual(expired.body, { error: 'broker handler deadline exceeded' });
+    assert.ok(expired.elapsedMs <= deadlineMs + 50, `ordinary fallback resolved at ${expired.elapsedMs}ms, expected <=350ms`);
+    assert.equal(blockerReply.status, 400, 'the incomplete CAS body must drain without changing policy');
+    // A queue barrier proves the expired ordinary probe has drained before checking its state.
+    assert.equal((await post(broker.socketPath, '/status')).status, 200);
+    const fresh = await post(broker.socketPath, path, body);
+    assert.equal(fresh.status, 200, `expired ${path} must not consume/release the assignment: ${JSON.stringify(fresh.body)}`);
+    if (path === '/probe/release') assert.deepEqual(fresh.body, { changed: true, state: 'released' });
+    assert.ok(broker.stderr().includes(`opencode-broker handler deadline exceeded: ${path} `),
+      'the classified ordinary deadline must still alert');
+    assert.doesNotMatch(broker.stderr(), /private request deadline exceeded/);
+  } finally {
+    for (const request of pending) request.destroy();
+    await broker.stop();
+  }
+});
+
 for (const candidateKind of ['newer', 'alias', 'reserve', 'ambiguous']) test(`exact staged probe preserves outage fences: ${candidateKind}`, async () => {
   const broker = await spawnBroker({ probation: { candidateKind, phase: 'staged-probing' } });
   try {

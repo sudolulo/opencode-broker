@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.3] — 2026-10-23
+
+### Fixed
+
+- **Plan-usage I/O no longer stalls the broker mutation queue.** Cloud lease and failure preflights fetch a fresh provider report before joining the serialized state queue; local admissions and `/release` remain responsive while that I/O is pending. Cached reports are applied synchronously only inside the queue, so a cloud admission still sees its fresh usage circuit. Every ordinary queued route now receives one arrival deadline across preflight, pre-read, queue wait and handler, preventing late reports or handlers from writing state after a 503; preflight capacity is capped at 64 unfinished requests while `/release` bypasses that cap.
+- **Broker lease-verification transport failures are retryable infrastructure errors.** A thrown initial or fallback `/lease/verify` call now returns a gateway 503 before provider contact, spend reservation or settlement. A genuine held:false or model mismatch remains the existing deterministic 400 refusal.
+
 ## [1.27.2] — 2026-10-23
 
 ### Changed

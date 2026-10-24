@@ -57,6 +57,27 @@ const post = (socketPath, path, body, agent) => new Promise((resolve, reject) =>
   request.end(payload);
 });
 
+const partialPost = (socketPath, path, firstChunk, finalChunk, agent) => {
+  let finish;
+  const response = new Promise((resolve, reject) => {
+    const request = http.request({ socketPath, path, method: 'POST', agent, headers: {
+      'content-type': 'application/json', 'content-length': Buffer.byteLength(firstChunk) + Buffer.byteLength(finalChunk),
+    } }, (reply) => {
+      let text = '';
+      reply.setEncoding('utf8');
+      reply.on('data', (chunk) => { text += chunk; });
+      reply.on('end', () => {
+        try { resolve({ status: reply.statusCode, body: JSON.parse(text) }); }
+        catch (error) { reject(error); }
+      });
+    });
+    request.once('error', reject);
+    request.write(firstChunk);
+    finish = () => request.end(finalChunk);
+  });
+  return { finish, response };
+};
+
 test('a deadline-expired local lease cannot later claim its slot', { timeout: 5_000 }, async () => {
   let releaseUsage;
   const usageReleased = new Promise((resolve) => { releaseUsage = resolve; });
@@ -392,12 +413,15 @@ test('a timed-out local lease cannot erase a successor lease attribution', { tim
       sessionID: 'expired-attribution', profile: 'local', tier: 'worker', localOnly: true, contextTokens: 100,
     }, firstAgent);
     await firstModelsRequested;
-    const successor = post(socketPath, '/lease', {
-      sessionID: 'successor-attribution', profile: 'local', tier: 'worker', localOnly: true, contextTokens: 100, caller,
-    }, secondAgent);
     const expiredReply = await expired;
     assert.equal(expiredReply.status, 503);
     assert.deepEqual(expiredReply.body, { error: 'broker handler deadline exceeded' });
+
+    // B arrives only after A's HTTP request has expired, so B receives its own full
+    // arrival deadline even while A's held server work continues in the background.
+    const successor = post(socketPath, '/lease', {
+      sessionID: 'successor-attribution', profile: 'local', tier: 'worker', localOnly: true, contextTokens: 100, caller,
+    }, secondAgent);
     await secondModelsRequested;
 
     // The old acquire resumes while B is waiting. Its cleanup must not clear B's request-local
@@ -426,6 +450,85 @@ test('a timed-out local lease cannot erase a successor lease attribution', { tim
       await exited;
     }
     await closeServer(models);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a release expires from arrival behind two ordinary incomplete bodies without dropping its held lease', { timeout: 5_000 }, async () => {
+  const deadlineMs = 200;
+  const home = mkdtempSync(join(tmpdir(), 'broker-handler-deadline-release-'));
+  const stateDir = join(home, '.local/share/opencode/model-routing');
+  const configPath = join(home, 'config.json');
+  const statePath = join(stateDir, 'broker.json');
+  const socketPath = join(stateDir, 'broker.sock');
+  const heldLease = { sessionID: 'held-release', leaseID: 'lease-held-release', targetID: 'local', touchedAt: Date.now(), profile: 'local', tier: 'worker' };
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(statePath, JSON.stringify({ version: 4, leases: { [heldLease.sessionID]: heldLease },
+    assignments: { [heldLease.sessionID]: { ...heldLease } }, circuits: {}, cursors: {}, health: {}, budgets: {}, lastDecision: null, planUsage: {}, rebalances: {} }), { mode: 0o600 });
+  writeFileSync(configPath, JSON.stringify({
+    targets: { local: { providerID: 'llamacpp', modelID: 'test-local', kind: 'local', capacity: 1, context: 32768 } },
+    tiers: { worker: ['local'] }, profiles: { local: ['local'] }, slotWatch: { enabled: false },
+    trustedSubscriptionProviders: ['openai'],
+    reconcile: { apply: { enabled: true, providers: ['openai'], overlayPath: join(home, 'overlay.json'),
+      generationsRoot: join(home, 'generations'), currentLinkPath: join(home, 'current') } },
+  }));
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(OPENCODE_|XDG_)/.test(name)));
+  const child = spawn(process.execPath, [brokerScript, 'serve'], { env: {
+    ...inherited, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'),
+    OPENCODE_BROKER_CONFIG: configPath, OPENCODE_BROKER_LOCAL_MODELS_URL: 'http://127.0.0.1:9/v1/models',
+    OPENCODE_BROKER_TEST_HANDLER_DEADLINE_MS: String(deadlineMs),
+  }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const firstAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const secondAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const releaseAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  try {
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    await new Promise((resolve, reject) => {
+      child.stdout.on('data', (chunk) => { if (String(chunk).includes('listening on ')) resolve(); });
+      child.once('error', reject);
+      child.once('exit', (code) => reject(new Error(`broker exited before listen (${code}): ${stderr}`)));
+    });
+
+    const first = partialPost(socketPath, '/model-policy/cas', '{', '}', firstAgent);
+    const second = partialPost(socketPath, '/model-policy/cas', '{', '}', secondAgent);
+    let firstSettled = false;
+    first.response.finally(() => { firstSettled = true; }).catch(() => {});
+    // Let both request headers reach the daemon: the first now owns the parser and the second
+    // is queued behind it before /release records its own arrival deadline.
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(firstSettled, false, 'the first ordinary body must still hold the serial parser');
+    const arrivedAt = Date.now();
+    const releasing = post(socketPath, '/release', { sessionID: heldLease.sessionID, leaseID: heldLease.leaseID }, releaseAgent)
+      .then((result) => ({ ...result, elapsedMs: Date.now() - arrivedAt }));
+
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    first.finish();
+    await first.response;
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    second.finish();
+    await second.response;
+
+    const released = await releasing;
+    assert.equal(released.status, 503, JSON.stringify(released.body));
+    assert.deepEqual(released.body, { error: 'broker handler deadline exceeded' });
+    const schedulingToleranceMs = 50;
+    assert.ok(released.elapsedMs <= deadlineMs + schedulingToleranceMs,
+      `the release must resolve within its arrival budget plus ${schedulingToleranceMs}ms scheduling tolerance, took ${released.elapsedMs}ms`);
+    const status = await post(socketPath, '/status', {});
+    assert.equal(status.status, 200);
+    assert.equal(status.body.leases[heldLease.sessionID]?.leaseID, heldLease.leaseID,
+      'an expired release must not drop the held lease after the queued bodies complete');
+    assert.equal(status.body.assignments[heldLease.sessionID]?.leaseID, heldLease.leaseID);
+  } finally {
+    firstAgent.destroy();
+    secondAgent.destroy();
+    releaseAgent.destroy();
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = waitForChildExit(child);
+      child.kill('SIGTERM');
+      await exited;
+    }
     rmSync(home, { recursive: true, force: true });
   }
 });
