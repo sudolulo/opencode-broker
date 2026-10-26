@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -1972,6 +1972,9 @@ const providerKeyFixture = (content = "proxy-front-door-key", mode = 0o600) => {
   const dir = mkdtempSync(join(tmpdir(), "gateway-provider-key-"));
   const path = join(dir, "key");
   writeFileSync(path, content, { mode });
+  // Preserve deliberately unsafe fixture permissions even under a restrictive umask.
+  chmodSync(path, mode);
+  assert.equal(statSync(path).mode & 0o777, mode, "providerKeyFixture mode enforced");
   return { dir, path };
 };
 

@@ -4,12 +4,73 @@ import http, { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test, { mock } from "node:test";
+
+// Hermetic bootstrap. lib/routing.js and lib/client.js capture the routing state dir,
+// pending-forget dir, auth path, model cache path and broker socket from the environment
+// ONCE at import time, so a per-test HOME set later (withTempHome) cannot redirect them.
+// Without this block the in-process router would read the user's real auth.json and
+// model cache, write pending-forget state into the live routing dir, and talk to the
+// live broker. Everything is pointed at a private root created here, before ANY
+// production import. Every inherited OPENCODE_* / XDG_* override is dropped first so a
+// value from the outer shell cannot leak in; this file sets the only one it needs
+// (OPENCODE_BROKER_CONFIG) itself below.
+const HERMETIC_PREFIX = "router-test-hermetic-";
+const HERMETIC_ROOT = mkdtempSync(join(tmpdir(), HERMETIC_PREFIX));
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("OPENCODE_") || name.startsWith("XDG_")) delete process.env[name];
+}
+const hermeticEnvFor = (home) => {
+  const routingDir = join(home, ".local/share/opencode/model-routing");
+  return {
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, ".config"),
+    XDG_CACHE_HOME: join(home, ".cache"),
+    XDG_DATA_HOME: join(home, ".local/share"),
+    XDG_STATE_HOME: join(home, ".local/state"),
+    OPENCODE_MODEL_ROUTING_DIR: routingDir,
+    OPENCODE_MODEL_BROKER_SOCKET: join(routingDir, "broker.sock"),
+  };
+};
+{
+  const home = join(HERMETIC_ROOT, "home");
+  Object.assign(process.env, hermeticEnvFor(home));
+  // The in-process router has no broker. Its socket lives under a parent directory that
+  // is never created, so any escaped default-transport request fails with ENOENT
+  // instead of reaching a live broker or a fake that would ACK it.
+  process.env.OPENCODE_MODEL_BROKER_SOCKET = join(HERMETIC_ROOT, "no-broker/broker.sock");
+  for (const dir of [join(home, ".local/share/opencode"), join(home, ".cache/opencode"), join(home, ".config"), join(home, ".local/state")]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  writeFileSync(join(home, ".local/share/opencode/auth.json"), "{}\n", { mode: 0o600 });
+  writeFileSync(join(home, ".cache/opencode/models.json"), "{}\n", { mode: 0o600 });
+}
+process.on("exit", () => {
+  // Remove exactly the root this file created, nothing broader.
+  if (basename(HERMETIC_ROOT).startsWith(HERMETIC_PREFIX)) rmSync(HERMETIC_ROOT, { recursive: true, force: true });
+});
+
+// Child processes get the per-test HOME and every state path derived from it explicitly,
+// rather than inheriting the outer private paths captured above. Unbounded children get
+// a 60 s ceiling; a call's own timeout wins. A killed child fails with a named message
+// instead of a bare null-status assertion.
+const CHILD_TIMEOUT_MS = 60_000;
+const childOptions = (home, extraEnv = {}) => ({
+  env: { ...process.env, ...hermeticEnvFor(home), ...extraEnv },
+  encoding: "utf8",
+});
+const runChild = (command, args, options) => {
+  const timeout = options.timeout ?? CHILD_TIMEOUT_MS;
+  const child = spawnSync(command, args, { ...options, timeout });
+  assert.equal(child.signal, null, `child was killed by ${child.signal} (timeout ${timeout} ms): ${child.error?.message ?? ""}\n${child.stderr}`);
+  return child;
+};
 
 // Route the config loader at the fleet-shaped fixture BEFORE any router module
 // loads -- config.js reads its file once at import time.
 process.env.OPENCODE_BROKER_CONFIG = new URL("./fixtures/config.json", import.meta.url).pathname;
+if (!existsSync(process.env.OPENCODE_BROKER_CONFIG)) throw new Error(`router test config fixture is missing: ${process.env.OPENCODE_BROKER_CONFIG}`);
 
 const {
   applyMessageModel,
@@ -57,12 +118,21 @@ const startBroker = async (home, responder) => {
   await new Promise((resolve) => server.listen(socketPath, resolve));
   return {
     requests,
+    socketPath,
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
       rmSync(socketPath, { force: true });
     },
   };
 };
+
+test("router test process state paths resolve under the hermetic private root", async () => {
+  const routing = await import("../lib/routing.js");
+  const inside = (path) => path === HERMETIC_ROOT || path.startsWith(`${HERMETIC_ROOT}/`);
+  assert.equal(inside(routing.routingStateDir()), true, `routing state dir ${routing.routingStateDir()} escapes ${HERMETIC_ROOT}`);
+  assert.equal(inside(routing.brokerSocketPath()), true, `broker socket ${routing.brokerSocketPath()} escapes ${HERMETIC_ROOT}`);
+  assert.equal(inside(routing.modelCachePath()), true, `model cache ${routing.modelCachePath()} escapes ${HERMETIC_ROOT}`);
+});
 
 test("plugin entry exports nothing but the factory", async () => {
   // OpenCode calls every export of a plugin module as a plugin factory and registers
@@ -459,7 +529,7 @@ test("chat.message selects the persisted model and every send gets fresh admissi
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const statePath = join(home, ".local/share/opencode/model-routing/context-estimates/ses-test-params.json");
 
-  const child1 = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child1 = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -514,13 +584,13 @@ test("chat.message selects the persisted model and every send gets fresh admissi
     });
     process.stdout.write(JSON.stringify({ requests }));
     http.request = originalRequest;
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child1.status, 0, child1.stderr);
   const child1Result = JSON.parse(child1.stdout.trim());
   assert.deepEqual(child1Result.requests.map((request) => request.path), []);
   assert.equal(existsSync(statePath), true);
 
-  const child2 = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child2 = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -579,7 +649,7 @@ test("chat.message selects the persisted model and every send gets fresh admissi
       requests,
     }));
     http.request = originalRequest;
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child2.status, 0, child2.stderr);
   const result = JSON.parse(child2.stdout.trim());
   assert.deepEqual(result.models, [
@@ -596,7 +666,7 @@ test("chat.message selects the persisted model and every send gets fresh admissi
 
 test("chat.params refuses a provider model that differs from the message-time lease", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -635,7 +705,7 @@ test("chat.params refuses a provider model that differs from the message-time le
       await hooks["chat.params"]({ sessionID: "session-mismatch", agent: "smart", model: { providerID: "openai", id: "gpt-5.6-terra" } });
     } catch (value) { error = String(value?.message ?? value); }
     process.stdout.write(JSON.stringify({ model: output.message.model, error }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.deepEqual(result.model, { providerID: "openai", modelID: "gpt-5.6-sol" });
@@ -647,7 +717,7 @@ test("a failed local model remains valid only for its engine compaction until a 
   // an engine-owned compaction retains the overflowed local model while the synthetic
   // continuation has already leased haiku.
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -722,7 +792,7 @@ test("a failed local model remains valid only for its engine compaction until a 
     } } });
     const afterSuccess = await errorOf({ sessionID: "ses-overflow", agent: "compaction", model: haiku });
     process.stdout.write(JSON.stringify({ compactionOnDisplaced, normalOnDisplaced, compactionOnOther, compactionFailureCount, afterSuccess }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.compactionOnDisplaced, "");
@@ -735,7 +805,7 @@ test("a failed local model remains valid only for its engine compaction until a 
 
 test("an uncached routed session blocks when session.get fails", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -772,7 +842,7 @@ test("an uncached routed session blocks when session.get fails", async () => wit
     try { await hooks["chat.params"]({ sessionID: "missing-session", model: { providerID: "openai", id: "gpt-5.6-luna" } }); }
     catch (error) { paramsError = String(error.message); }
     process.stdout.write(JSON.stringify({ messageError, paramsError, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout);
   assert.match(result.messageError, /\[opencode-broker\] auto profile blocked: session unavailable/);
@@ -783,7 +853,7 @@ test("an uncached routed session blocks when session.get fails", async () => wit
 test("a manual root preserves its supplied model when session.get fails", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { writeSessionProfile } from ${JSON.stringify(routingUrl)};
     import { ModelRouter } from ${JSON.stringify(pluginUrl)};
     writeSessionProfile("manual-missing", "manual", { explicit: true });
@@ -795,14 +865,14 @@ test("a manual root preserves its supplied model when session.get fails", async 
     await hooks["chat.message"]({ sessionID: "manual-missing", model: { providerID: "openai", id: "gpt-5.6-luna" } }, output);
     await hooks["chat.params"]({ sessionID: "manual-missing", model: { providerID: output.message.model.providerID, id: output.message.model.modelID } });
     process.stdout.write(JSON.stringify(output.message.model));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   assert.deepEqual(JSON.parse(child.stdout), { providerID: "openai", modelID: "gpt-5.6-luna" });
 }));
 
 test("chat.message retries an initial auth-revision inventory rejection", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -846,7 +916,7 @@ test("chat.message retries an initial auth-revision inventory rejection", async 
     await hooks["chat.message"]({ sessionID: "session-auth-retry", agent: "standard" }, output);
     await hooks["chat.params"]({ sessionID: "session-auth-retry", agent: "standard", model: { providerID: output.message.model.providerID, id: output.message.model.modelID } });
     process.stdout.write(JSON.stringify({ requests, model: output.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.deepEqual(result.requests.map((request) => request.path), ["/inventory", "/inventory", "/lease"]);
@@ -866,7 +936,7 @@ test("chat.message retries a cached inventory auth race once and succeeds", asyn
   }) + "\n");
   writeFileSync(join(authDir, "auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\n");
 
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -919,7 +989,7 @@ test("chat.message retries a cached inventory auth race once and succeeds", asyn
     const output = { message: { model: { providerID: "old", modelID: "old" } }, parts: [] };
     await hooks["chat.message"]({ sessionID: "session-auth-cache-retry", agent: "standard" }, output);
     process.stdout.write(JSON.stringify({ authReads, requests, model: output.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.authReads, 4);
@@ -934,7 +1004,7 @@ test("lease-bound pending forget records retain after a failed retry and clear a
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   writeFileSync(pendingPath, JSON.stringify({ leaseID: "lease-original", completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
 
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire, syncBuiltinESMExports } from "node:module";
     import { EventEmitter } from "node:events";
     import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -1009,7 +1079,7 @@ test("lease-bound pending forget records retain after a failed retry and clear a
     const pendingAfterTimer = (await Array.fromAsync(pendingStore.records())).some((record) => record.sessionID === "session-pending");
     process.stdout.write(JSON.stringify({ forgetCount, pendingAfterStartup, pendingAfterMessage, pendingAfterTimer, requests }));
     http.request = originalRequest;
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
 
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
@@ -1024,7 +1094,7 @@ test("lease-bound pending forget records retain after a failed retry and clear a
 }));
 
 test("pending retry uses injected timers and an absolute five-second broker deadline", async () => withTempHome(async (home) => {
-  const child = spawnSync(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
     import assert from "node:assert/strict";
     import { mock } from "node:test";
     const routingURL = ${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)};
@@ -1058,13 +1128,13 @@ test("pending retry uses injected timers and an absolute five-second broker dead
     const completion = timers[0].fn(); assert.equal(typeof completion?.then, "function"); await completion;
     assert.equal(timers.length, 1, "empty sweep leaves no new timer");
     assert.equal(requests.length, 1);
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 15000 });
+  `], { ...childOptions(home), timeout: 15000 });
   assert.equal(child.status, 0, child.stderr);
 }));
 
 for (const mode of ["manual", "deleted"]) {
   test(`${mode} cleanup does not kick between publication and direct RPC, but does kick on failure`, async () => withTempHome(async (home) => {
-    const child = spawnSync(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
+    const child = runChild(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", `
       import assert from "node:assert/strict";
       import { mock } from "node:test";
       const events = [];
@@ -1103,7 +1173,7 @@ for (const mode of ["manual", "deleted"]) {
       rejectForget(Error("unavailable")); await action;
       for (let turn = 0; turn < 5; turn++) await new Promise(setImmediate);
       assert.deepEqual(events.slice(publication), ["published", "direct", "kick"]);
-    `], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 15000 });
+    `], { ...childOptions(home), timeout: 15000 });
     assert.equal(child.status, 0, child.stderr);
   }));
 }
@@ -1115,7 +1185,7 @@ test("an ID-only pending forget is discarded and cannot target a later lease for
   mkdirSync(pendingDir, { recursive: true });
   writeFileSync(pendingPath, JSON.stringify({ completed: true, updatedAt: Date.now() - 1000 }) + "\n", { mode: 0o600 });
 
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -1153,7 +1223,7 @@ test("an ID-only pending forget is discarded and cannot target a later lease for
     await hooks["chat.message"]({ sessionID: "reused-session", agent: "standard" }, { message: { model: {} }, parts: [] });
     await new Promise((resolve) => setTimeout(resolve, 20));
     process.stdout.write(JSON.stringify({ discardedAtStartup, pendingAfterLease: existsSync(${JSON.stringify(pendingPath)}), requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
 
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
@@ -1164,7 +1234,7 @@ test("an ID-only pending forget is discarded and cannot target a later lease for
 }));
 
 test("transitioning an L1 route to Manual forgets only L1 and preserves the manual model after failure", async () => withTempHome(async (home) => {
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
   import assert from 'node:assert/strict';
   import { mkdirSync, writeFileSync } from 'node:fs';
   import { join } from 'node:path';
@@ -1216,13 +1286,13 @@ test("transitioning an L1 route to Manual forgets only L1 and preserves the manu
     for (const record of listPendingForgetRecords()) removePendingForgetRecord(record.sessionID, record);
     removeSessionProfile(session.id);
   }
-  `], { env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000 });
+  `], { ...childOptions(home), timeout: 15000 });
   assert.equal(child.status, 0, child.stderr);
 }));
 
 test("Manual retires the cached exact lease before locking the route without asking for another lease", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
     const calls = [];
@@ -1246,7 +1316,7 @@ test("Manual retires the cached exact lease before locking the route without ask
     await hooks["chat.message"]({ sessionID: "manual-route", agent: "standard" }, output);
     const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
     process.stdout.write(JSON.stringify({ calls, pending: readPendingForgetRecord('manual-route'), model: output.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.deepEqual(result.calls.filter((call) => call.path === "/forget").map((call) => call.body), [{ sessionID: "manual-route", leaseID: "manual-L1" }]);
@@ -1259,7 +1329,7 @@ test("Manual retires the cached exact lease before locking the route without ask
 test("Manual preserves the model and warns when durable cleanup and broker forget both fail", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire, syncBuiltinESMExports } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -1312,7 +1382,7 @@ test("Manual preserves the model and warns when durable cleanup and broker forge
     await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, output);
     await new Promise((resolve) => setImmediate(resolve));
     process.stdout.write(JSON.stringify({ model: output.message.model, logs }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.deepEqual(result.model, { providerID: "openai", modelID: "same-model" });
@@ -1323,7 +1393,7 @@ test("Manual preserves the model and warns when durable cleanup and broker forge
 
 test("a late L1 Manual cleanup cannot erase the newer L2 retry record", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
     let resolveL1;
@@ -1356,7 +1426,7 @@ test("a late L1 Manual cleanup cannot erase the newer L2 retry record", async ()
     const { readPendingForgetRecord } = await import(${JSON.stringify(new URL('../lib/routing.js', import.meta.url).href)});
     const pending = readPendingForgetRecord('manual-fence');
     process.stdout.write(JSON.stringify({ calls, pending }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   // The controller may discover after the direct L1 request settles; either way its
@@ -1367,7 +1437,7 @@ test("a late L1 Manual cleanup cannot erase the newer L2 retry record", async ()
 
 test("idle cleanup queues a completed forget when the broker is unavailable", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -1414,7 +1484,7 @@ test("idle cleanup queues a completed forget when the broker is unavailable", as
     const record = readPendingForgetRecord('session-idle');
     process.stdout.write(JSON.stringify({ exists: Boolean(record), record }));
     http.request = originalRequest;
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.exists, true);
@@ -1449,8 +1519,10 @@ test("local-only dispatch does not require cloud inventory", async () => withTem
   `;
   try {
     const child = await new Promise((resolve, reject) => {
+      // The child must reach THIS fixture's socket, not the outer private no-broker path.
       const childProcess = spawn(process.execPath, ["--input-type=module", "-e", source], {
-        env: { ...globalThis.process.env, HOME: home },
+        ...childOptions(home, { OPENCODE_MODEL_BROKER_SOCKET: broker.socketPath }),
+        timeout: CHILD_TIMEOUT_MS,
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "";
@@ -1458,8 +1530,9 @@ test("local-only dispatch does not require cloud inventory", async () => withTem
       childProcess.stdout.on("data", (chunk) => { stdout += String(chunk); });
       childProcess.stderr.on("data", (chunk) => { stderr += String(chunk); });
       childProcess.once("error", reject);
-      childProcess.once("exit", (status) => resolve({ status, stdout, stderr }));
+      childProcess.once("exit", (status, signal) => resolve({ status, signal, stdout, stderr }));
     });
+    assert.equal(child.signal, null, `child was killed by ${child.signal} (timeout ${CHILD_TIMEOUT_MS} ms)\n${child.stderr}`);
     assert.equal(child.status, 0, child.stderr);
     assert.deepEqual(JSON.parse(child.stdout), { providerID: "llamacpp", modelID: "qwen3.5-9b-coder" });
     assert.deepEqual(broker.requests.map((request) => request.path), ["/lease"]);
@@ -1471,7 +1544,7 @@ test("local-only dispatch does not require cloud inventory", async () => withTem
 test("classifier failures report without arming the local watchdog, aborting, or re-engaging", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -1556,7 +1629,7 @@ test("classifier failures report without arming the local watchdog, aborting, or
     } } });
     await new Promise((resolve) => setImmediate(resolve));
     process.stdout.write(JSON.stringify({ requests, intervals, timers, timersBeforeFailure, aborts, prompts }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.requests.filter((request) => request.path === "/lease").length, 3);
@@ -1588,7 +1661,7 @@ test("classifier failures report without arming the local watchdog, aborting, or
 test("explicit Manual remains unleased while implicit Auto with a saved default leases", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -1636,7 +1709,7 @@ test("explicit Manual remains unleased while implicit Auto with a saved default 
     const autoRoot = { message: { model: { providerID: "openai", modelID: "gpt-5.6-sol" } }, parts: [] };
     await hooks["chat.message"]({ sessionID: "auto-root", agent: "standard", model: { providerID: "openai", id: "gpt-5.6-sol" } }, autoRoot);
     process.stdout.write(JSON.stringify({ requests, manualRoot: manualRoot.message.model, manualChild: manualChild.message.model, autoRoot: autoRoot.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   const leases = result.requests.filter((request) => request.path === "/lease");
@@ -1650,7 +1723,7 @@ test("explicit Manual remains unleased while implicit Auto with a saved default 
 test("local child tools suspend the watchdog, then rearm and fail over once", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -1706,7 +1779,7 @@ test("local child tools suspend the watchdog, then rearm and fail over once", as
     await timers[1].callback();
     await timers[2].callback();
     process.stdout.write(JSON.stringify({ timers, timersBeforeLastTool, circuitUntil, aborts, prompts, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.timers.length, 3);
@@ -1730,7 +1803,7 @@ test("local child tools suspend the watchdog, then rearm and fail over once", as
 test("only local children arm inactivity watchdogs, and idle or deletion clears them", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -1786,7 +1859,7 @@ test("only local children arm inactivity watchdogs, and idle or deletion clears 
     await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "local-deleted" } } });
     await Promise.all(timers.map((timer) => timer.callback()));
     process.stdout.write(JSON.stringify({ timers, aborts, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   // The deletion race fence now adds one bounded SDK-verification timeout; it is
@@ -1799,7 +1872,7 @@ test("only local children arm inactivity watchdogs, and idle or deletion clears 
 
 test("only the exact SDK missing-session envelope retires a deleted route", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -1854,17 +1927,18 @@ test("only the exact SDK missing-session envelope retires a deleted route", asyn
       catch (error) { routeErrors.push(String(error.message ?? error)); }
     }
     process.stdout.write(JSON.stringify({ requests, routeErrors }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.requests.filter((request) => request.path === "/forget").length, 0);
   assert.deepEqual(result.routeErrors, [null, null, null], "unknown, live, and non-exact missing responses retain their captured leases");
 }));
 
-test("raw deletion verification coalesces an identical binding but retries after replacement", async () => withTempHome(async (home) => {
+test("raw deletion verification coalesces an identical binding but retries after replacement", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   // Removing binding-content coalescing makes this issue 25 concurrent SDK reads.
   // Removing the identity fence makes the late L1 result discard L2's in-flight lookup.
-  const { ModelRouter } = await import("../plugin/router.js");
+  // withIsolatedCatalogRouter: chat.message's inventory refresh uses the module-level
+  // default broker transport, not the injected brokerRequest, so it must be faked here.
   const lookups = [];
   const getCalls = [];
   const forgets = [];
@@ -1914,11 +1988,11 @@ test("raw deletion verification coalesces an identical binding but retries after
   lookups[1]({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session.id}` } } });
   await Promise.all([second, duplicateSecond]);
   assert.deepEqual(forgets, [{ sessionID: session.id, leaseID: "L1" }]);
-}));
+})));
 
-test("a delayed authoritative deletion refreshes completion before publishing its exact forget", async () => withTempHome(async (home) => {
+test("a delayed authoritative deletion refreshes completion before publishing its exact forget", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   // Removing the post-404 completion refresh makes this publish an incomplete L1 forget.
-  const { ModelRouter } = await import("../plugin/router.js");
+  // withIsolatedCatalogRouter: see the deletion-coalescing case above.
   const { readPendingForgetRecord } = await import("../lib/routing.js");
   let resolveLookup;
   let pendingDuringForget;
@@ -1956,12 +2030,13 @@ test("a delayed authoritative deletion refreshes completion before publishing it
   assert.ok(exactForgets.some((body) => body.leaseID === "L1" && body.completed === true), "the authoritative cleanup forget carries completion");
   assert.equal(pendingDuringForget?.leaseID, "L1");
   assert.equal(pendingDuringForget?.completed, true);
-}));
+})));
 
-test("a non-authoritative deletion verification retires only its in-flight entry", async () => withTempHome(async (home) => {
+test("a non-authoritative deletion verification retires only its in-flight entry", async () => withTempHome(async (home) => withIsolatedCatalogRouter(async ({ ModelRouter }) => {
   // Keeping a settled timeout, unknown response, or live response in the in-flight map
   // prevents a later authoritative 404 from ever rechecking the same binding.
-  const { ModelRouter } = await import("../plugin/router.js");
+  // withIsolatedCatalogRouter: chat.message's inventory refresh uses the module-level
+  // default broker transport, not the injected brokerRequest, so it must be faked here.
   const timers = [];
   const replies = new Map();
   const getCalls = new Map();
@@ -2003,20 +2078,27 @@ test("a non-authoritative deletion verification retires only its in-flight entry
   replies.get("delete-unknown")({ response: { status: 404 }, error: { name: "APIError", data: { message: "Session not found: delete-unknown" } } });
   replies.get("delete-live")({ id: "delete-live", agent: "standard" });
   await Promise.all([timeout, unknown, live]);
-  assert.equal(timers.every((timer) => timer.cleared), true, "every settled verification clears its timeout");
+  // Judge only the deletion-verification deadlines (rootResolveTimeoutMs = 10). Other timers
+  // on the same injected scheduler -- e.g. the pending-forget retry backoff -- are not part
+  // of this contract and legitimately stay armed.
+  const deadlines = () => timers.filter((timer) => timer.delay === 10);
+  assert.equal(deadlines().length, ids.length, "one verification deadline per deletion in the first wave");
+  assert.equal(deadlines().every((timer) => timer.cleared), true, "every settled verification clears its timeout");
 
   const retries = ids.map(deleted);
   await new Promise((resolve) => setImmediate(resolve));
   for (const id of ids) assert.equal(getCalls.get(id), 2, `${id} retries after its non-authoritative result`);
   for (const id of ids) replies.get(id)({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${id}` } } });
   await Promise.all(retries);
+  assert.equal(deadlines().length, ids.length * 2, "the retry wave arms one more verification deadline per deletion");
+  assert.equal(deadlines().every((timer) => timer.cleared), true, "every retry verification clears its timeout");
   assert.deepEqual(forgets.map(({ sessionID, leaseID }) => ({ sessionID, leaseID })), ids.map((id) => ({ sessionID: id, leaseID: `L-${id}` })));
-}));
+})));
 
 test("a progress event during idle settlement cannot leave a watchdog armed without a route", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -2074,7 +2156,7 @@ test("a progress event during idle settlement cannot leave a watchdog armed with
     await idle;
     for (const timer of timers) await timer.callback();
     process.stdout.write(JSON.stringify({ timers, aborts, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.timers.every((timer) => timer.cleared), true, "no watchdog outlives the settled route");
@@ -2086,7 +2168,7 @@ test("a progress event during idle settlement cannot leave a watchdog armed with
 test("all four progress events clear and rearm the local-child inactivity watchdog", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -2147,7 +2229,7 @@ test("all four progress events clear and rearm the local-child inactivity watchd
     const failuresAfterStaleCallbacks = requests.filter((request) => request.path === "/failure").length;
     await timers.at(-1).callback();
     process.stdout.write(JSON.stringify({ timers, progressTimerCount, failuresAfterStaleCallbacks, aborts, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.progressTimerCount, 5, "the initial watchdog and all four progress resets are armed");
@@ -2163,7 +2245,7 @@ test("all four progress events clear and rearm the local-child inactivity watchd
 test("local child compaction preserves unfinished work and continues without release", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     const http = createRequire(import.meta.url)("node:http");
@@ -2206,7 +2288,7 @@ test("local child compaction preserves unfinished work and continues without rel
     await hooks["experimental.compaction.autocontinue"]({ sessionID: session.id }, first);
     await hooks["experimental.compaction.autocontinue"]({ sessionID: session.id }, second);
     process.stdout.write(JSON.stringify({ compacting, first, second, timers, aborts, requests }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.compacting.context.length, 1);
@@ -2221,7 +2303,7 @@ test("local child compaction preserves unfinished work and continues without rel
 
 test("a brand-new session never seeds stickiness from the agent's pinned model", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -2262,7 +2344,7 @@ test("a brand-new session never seeds stickiness from the agent's pinned model",
     await hooks["chat.message"]({ sessionID: "ses-brand-new", agent: "smart", model: { providerID: "openai", id: "gpt-5.6-sol" } }, output);
     const lease = bodies.find((entry) => entry.path === "/lease");
     process.stdout.write(JSON.stringify({ preferredModel: lease?.body?.preferredModel ?? null, contextTokens: lease?.body?.contextTokens, routed: output.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout.trim());
   assert.equal(result.preferredModel, null, "the agent pin must not outrank fit/weights/depletion");
@@ -2607,7 +2689,7 @@ test("router messages go to the server log, and only errors also reach stderr", 
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
   const run = (appSource) => {
-    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    const child = runChild(process.execPath, ["--input-type=module", "-e", `
       import { createRequire } from "node:module";
       import { EventEmitter } from "node:events";
       const http = createRequire(import.meta.url)("node:http");
@@ -2650,7 +2732,7 @@ test("router messages go to the server log, and only errors also reach stderr", 
       await hooks["chat.message"]({ sessionID: session.id, agent: session.agent }, { message: {}, parts: [] });
       await timers[0].callback();
       process.stdout.write(JSON.stringify(logged));
-    `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    `], childOptions(home));
     assert.equal(child.status, 0, child.stderr);
     return { logged: JSON.parse(child.stdout.trim()), stderr: child.stderr };
   };
@@ -2679,7 +2761,7 @@ test("router messages go to the server log, and only errors also reach stderr", 
 test("a Manual owner's classifier leases its broker lane instead of inheriting the parent's model", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { createRequire } from "node:module";
     import { EventEmitter } from "node:events";
     import { mkdirSync, writeFileSync } from "node:fs";
@@ -2721,7 +2803,7 @@ test("a Manual owner's classifier leases its broker lane instead of inheriting t
     const output = { message: { model: { providerID: "pane-default", modelID: "pane-default" } }, parts: [] };
     await hooks["chat.message"]({ sessionID: "classifier", agent: "fleet-classifier" }, output);
     process.stdout.write(JSON.stringify({ requests, model: output.message.model }));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(child.stdout);
   const leases = result.requests.filter((request) => request.path === "/lease");
@@ -2735,7 +2817,7 @@ test("a Manual owner's classifier leases its broker lane instead of inheriting t
 test("a Manual child inherits the parent's live model, not stale session metadata", async () => withTempHome(async (home) => {
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
   const routingUrl = new URL("../lib/routing.js", import.meta.url).href;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  const child = runChild(process.execPath, ["--input-type=module", "-e", `
     import { writeSessionProfile } from ${JSON.stringify(routingUrl)};
     import { ModelRouter } from ${JSON.stringify(pluginUrl)};
     writeSessionProfile("parent", "manual", { explicit: true });
@@ -2754,7 +2836,7 @@ test("a Manual child inherits the parent's live model, not stale session metadat
     const childOutput = { message: { model: { providerID: "anthropic", modelID: "claude-opus-5" } }, parts: [] };
     await hooks["chat.message"]({ sessionID: "child", agent: "grunt" }, childOutput);
     process.stdout.write(JSON.stringify(childOutput.message.model));
-  `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+  `], childOptions(home));
   assert.equal(child.status, 0, child.stderr);
   assert.deepEqual(JSON.parse(child.stdout), { providerID: "openai", modelID: "gpt-5.6-sol" });
 }));
@@ -2871,11 +2953,8 @@ const runCf = (opts) => {
     routingUrl: new URL("../lib/routing.js", import.meta.url).href,
     ...opts,
   });
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath },
-    encoding: "utf8",
-  });
   try {
+    const child = runChild(process.execPath, ["--input-type=module", "-e", script], childOptions(home, { OPENCODE_BROKER_CONFIG: configPath }));
     assert.equal(child.status, 0, child.stderr);
     return JSON.parse(child.stdout.trim().split("\n").filter(Boolean).at(-1));
   } finally {

@@ -253,7 +253,7 @@ test('root ancestor is checked too; sticky exception requires root ownership', a
     const mock = t.mock.module('node:fs/promises', { exports: { ...realFS, lstat: async (...params) => {
       const info = await realFS.lstat(...params);
       if (params[0] === '/' && variant === 'writable-root') info.mode = 0o40777;
-      if (params[0] === '/tmp' && variant === 'nonroot-sticky') { info.mode = 0o41777; info.uid = process.geteuid(); }
+      if (params[0] === '/tmp' && variant === 'nonroot-sticky') { info.mode = 0o41777; info.uid = 1000; /* synthetic non-root independent of namespace effectiveUID */ }
       return info;
     } } });
     try {

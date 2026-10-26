@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -929,8 +929,10 @@ test("working sessions are told once to wrap up when their lane is nearly out", 
     assert.equal(result.whileRoom, 0, "nothing is said while the lane has room");
     assert.deepEqual(result.told, ["ses-child", "ses-main"], "each working session is told exactly once");
     assert.match(result.main, /openai weekly window at 98%/);
-    assert.match(result.main, /write a handoff/);
+    assert.match(result.main, /write|update a durable handoff/i);
     assert.match(result.child, /return what you have to your parent/);
+    assert.match(result.child, /start nothing new/i);
+    assert.doesNotMatch(result.child, /handoff|mutating/i);
     assert.equal(result.agent, "scout", "told in its own agent");
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -1914,7 +1916,9 @@ test("HTTP plan usage reads a keyFile and the proxy's OpenAI window shape", asyn
 const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "fleet-lifecycle-home-"));
   const pluginUrl = new URL("../plugin/router.js", import.meta.url).href;
-  const configPath = new URL("./fixtures/config.json", import.meta.url).pathname;
+  const configPath = join(home, "config.json");
+  const config = readFileSync(new URL("./fixtures/config.json", import.meta.url), "utf8");
+  writeFileSync(configPath, config.replace('"localModelsUrl": "http://gpu-box:8080/v1/models"', '"localModelsUrl": "http://127.0.0.1:1/v1/models"'));
   const script = `
     import assert from "node:assert/strict";
     import { createRequire } from "node:module";
@@ -1922,7 +1926,7 @@ const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {})
     import { mkdirSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
     const require = createRequire(import.meta.url); const http = require("node:http");
-    const calls = []; const timers = []; const timerRecords = []; const prompts = []; const logs = []; let brokerReply = null;
+    const calls = []; const timers = []; const timerRecords = []; const prompts = []; const logs = []; const aborts = []; let brokerReply = null;
     const missing = (id) => ({ error: { name: "NotFoundError", data: { message: "Session not found: " + id } }, response: { status: 404 } });
     const deferred = () => { let resolve, reject; const promise = new Promise((ok, no) => { resolve = ok; reject = no; }); return { promise, resolve, reject }; };
     const target = { id: "gpt-luna", model: { providerID: "openai", id: "gpt-5.6-luna" } };
@@ -1940,11 +1944,16 @@ const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {})
     writeFileSync(join(process.env.HOME, ".cache/opencode/models.json"), JSON.stringify({})); writeFileSync(join(process.env.HOME, ".local/share/opencode/auth.json"), JSON.stringify({ openai: { type: "oauth" } }) + "\\n");
     const live = new Map();
     const client = { provider: { list: async () => ({ data: { connected: ["openai"], all: [{ id: "openai", models: {} }] } }) }, app: { log: async (entry) => logs.push(entry) }, tui: { showToast: async () => ({}) }, session: {
-      get: async (input) => live.get(input.path.id) ?? missing(input.path.id), messages: async () => ({ data: [] }), abort: async () => ({ data: true }), prompt: async () => ({ data: true }),
+      get: async (input) => live.get(input.path.id) ?? missing(input.path.id), messages: async () => ({ data: [] }), abort: async (input) => { aborts.push(input); return { data: true }; }, prompt: async () => ({ data: true }),
       promptAsync: async (input) => { prompts.push(input); return { data: true }; },
     } };
     ${beforeInit}
     const { ModelRouter } = await import(${JSON.stringify(pluginUrl)});
+    const { routingStateDir } = await import(${JSON.stringify(new URL("../lib/routing.js", import.meta.url).href)});
+    const { brokerSocketPath } = await import(${JSON.stringify(new URL("../lib/client.js", import.meta.url).href)});
+    assert.equal(routingStateDir(), join(process.env.HOME, "routing"));
+    assert.equal(brokerSocketPath(), join(process.env.HOME, "broker.sock"));
+    assert.equal(process.env.XDG_CACHE_HOME, join(process.env.HOME, ".cache"));
     const hooks = await ModelRouter({ client, directory: process.env.HOME }, {
       ...${JSON.stringify(routerOptions)},
       setTimeout: (fn, ms) => {
@@ -1957,7 +1966,7 @@ const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {})
       },
     });
     const created = async (id, info = { id, agent: "standard" }) => { live.set(id, { data: info }); await hooks.event({ event: { type: "session.created", properties: { info } } }); };
-    const routeBusy = async (id) => { await hooks["chat.message"]({ sessionID: id, agent: "standard" }, { message: { model: {} } }); await hooks.event({ event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } } }); };
+    const routeBusy = async (id, agent = live.get(id)?.data?.agent ?? "standard") => { await hooks["chat.message"]({ sessionID: id, agent }, { message: { model: {} } }); await hooks.event({ event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } } }); };
     const runNextTimer = async (ms) => {
       const index = ms === undefined ? 0 : timers.findIndex((timer) => timer.ms === ms);
       if (index < 0 || index >= timers.length) return false;
@@ -1966,13 +1975,54 @@ const runLifecycleFixture = (body, { beforeInit = "", routerOptions = {} } = {})
     ${body}
   `;
   const child = spawnSync(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", script], {
-    env: { ...process.env, HOME: home, OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8",
+    env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_CACHE_HOME: join(home, ".cache"), XDG_DATA_HOME: join(home, ".local/share"), XDG_STATE_HOME: join(home, ".local/state"), OPENCODE_MODEL_ROUTING_DIR: join(home, "routing"), OPENCODE_MODEL_BROKER_SOCKET: join(home, "broker.sock"), OPENCODE_BROKER_CONFIG: configPath }, encoding: "utf8", timeout: 60_000,
   });
   try {
-    assert.equal(child.status, 0, child.stderr || child.stdout);
+    assert.equal(child.status, 0, child.stderr || child.stdout || child.error?.message || `child signal ${child.signal}`);
     return JSON.parse(child.stdout.trim().split("\n").at(-1));
   } finally { rmSync(home, { recursive: true, force: true }); }
 };
+
+test("lifecycle fixture ignores synthetic inherited routing and XDG overrides", () => {
+  const keys = ["OPENCODE_MODEL_ROUTING_DIR", "OPENCODE_MODEL_BROKER_SOCKET", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const outsider = mkdtempSync(join(tmpdir(), "lifecycle-outsider-"));
+  try {
+    for (const key of keys) process.env[key] = join(outsider, key);
+    runLifecycleFixture(`
+      for (const key of ${JSON.stringify(keys)}) assert.ok(process.env[key]?.startsWith(process.env.HOME + "/"), key + " must be private");
+      console.log(JSON.stringify({ ok: true }));
+    `);
+  } finally {
+    for (const key of keys) saved[key] === undefined ? delete process.env[key] : process.env[key] = saved[key];
+    rmSync(outsider, { recursive: true, force: true });
+  }
+});
+
+test("a heartbeat removed while an earlier warning is pending is not warned from the poll snapshot", () => {
+  const result = runLifecycleFixture(`
+    await created("a"); await created("b"); await routeBusy("a"); await routeBusy("b");
+    const aStarted = deferred(); const aSend = deferred(); const forgetStarted = deferred(); let finishForget;
+    brokerReply = (path, body, send) => {
+      if (path === "/forget" && body.sessionID === "b") { finishForget = send; forgetStarted.resolve(); return true; }
+      return false;
+    };
+    client.session.promptAsync = async (input) => {
+      prompts.push(input);
+      if (input.path.id === "a") { aStarted.resolve(); return aSend.promise; }
+      return { data: true };
+    };
+    const poll = runNextTimer(60000); await aStarted.promise;
+    const idleB = hooks.event({ event: { type: "session.idle", properties: { sessionID: "b" } } });
+    await forgetStarted.promise;
+    aSend.resolve({ data: true }); await poll;
+    const warned = prompts.map((prompt) => prompt.path.id);
+    finishForget({ ok: true }); await idleB;
+    console.log(JSON.stringify({ warned, forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body) }));
+  `);
+  assert.deepEqual(result.warned, ["a"], "a poll must recheck each heartbeat before dispatching its warning");
+  assert.deepEqual(result.forgets, [{ sessionID: "b", leaseID: "Lb1" }]);
+});
 
 for (const [metadata, rawProperties] of [
   ["without creation metadata", `{ sessionID: "same" }`],
@@ -2075,7 +2125,7 @@ for (const [delivery, settle] of [
     const first = runNextTimer(); await promptStarted.promise;
     await created("stale", { id: "stale", agent: "standard", time: { created: 2 } }); await routeBusy("stale");
     ${settle} await first; const second = await runNextTimer();
-    console.log(JSON.stringify({ second, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.length, warns: logs.filter((x) => x.body?.level === "warn" && /asked it to wrap up/.test(x.body?.message ?? "")).length, errors: logs.filter((x) => x.body?.level === "error").length }));
+    console.log(JSON.stringify({ second, forgets: calls.filter((x) => x.path === "/forget").map((x) => x.body), prompts: prompts.length, warns: logs.filter((x) => x.body?.level === "warn" && /asked it to (wrap up|checkpoint and continue safely)/.test(x.body?.message ?? "")).length, errors: logs.filter((x) => x.body?.level === "error").length }));
   `);
   assert.equal(result.second, true, "the replacement owns the next deterministic poll");
   assert.deepEqual(result.forgets, delivery === "unrelated failure" ? [] : [{ sessionID: "stale", leaseID: "Lstale1" }], "only the captured L1 lease may be forgotten; L2 is fenced");
@@ -2240,7 +2290,7 @@ for (const [label, settle] of [
   assert.equal(result.errors, 0, "the old failure is not attributed to L2");
 });
 
-test("warning attempt: a successful pending warning stays once-per-episode across same-session leases", () => {
+test("warning attempt: stale successful pending warning retries on the new lease", () => {
   const result = runLifecycleFixture(`
     await created("success"); await routeBusy("success");
     const old = deferred(); const entered = deferred();
@@ -2253,7 +2303,7 @@ test("warning attempt: a successful pending warning stays once-per-episode acros
   `);
   assert.equal(result.leases, 2);
   assert.deepEqual(result.polls, [true, true, true]);
-  assert.equal(result.prompts, 1, "a successful warning covers the episode, not merely one lease");
+  assert.equal(result.prompts, 2, "a stale success does not cover the new lease");
 });
 
 for (const episode of ["room reset", "replacement creation"]) test(`warning attempt: an old failure cannot clear a newer marker after ${episode}`, () => {
@@ -2416,4 +2466,360 @@ test("raw deletion lookups retain all sixteen permits after hook deadlines and r
   assert.equal(result.deadlines, 17);
   assert.equal(result.unresolved, 15);
   assert.equal(result.profile, "private");
+});
+test("main weekly stages checkpoint even while the lane has room", () => {
+  const result = runLifecycleFixture(`
+    let percent = 74; let sample = 0;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({nearlyOut:false,threshold:97,localFits:true,providers:[
+        {providerID:"openai",held:false,percent,window:"wk",room:true,
+         weekly:{window:"wk",percent,resetsAt:null,fetchedAt:1000 + sample++,source:"last-fetch"}},
+        {providerID:"anthropic",held:false,percent:99,window:"wk",room:false,
+         weekly:{window:"wk",percent:99,resetsAt:null,fetchedAt:1000,source:"last-fetch"}}
+      ]}); return true;
+    };
+    await created("weekly"); await routeBusy("weekly");
+    const counts = [];
+    for (const next of [74,75,75,85,95,99]) {
+      percent = next; await runNextTimer(60000); counts.push(prompts.length);
+    }
+    console.log(JSON.stringify({counts,texts:prompts.map(p=>p.body.parts[0].text),leases:leases.get("weekly")}));
+  `);
+  assert.deepEqual(result.counts,[0,1,1,2,3,3]);
+  assert.equal(result.leases,1,"warnings do not re-lease or move the session");
+  assert.match(result.texts[2],/reversible|bounded/i);
+  assert.doesNotMatch(result.texts.join("\n"),/start nothing new/);
+});
+
+test("weekly quota stage jump from 74 to 95 sends one cumulative main checkpoint", () => {
+  const result = runLifecycleFixture(`
+    let percent = 74;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut: false, threshold: 97, localFits: true, providers: [{
+        providerID: "openai", held: false, percent: 20, window: "5h", room: true,
+        weekly: { window: "wk", percent, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" },
+      }] }); return true;
+    };
+    await created("jump"); await routeBusy("jump");
+    await runNextTimer(60000); percent = 95;
+    await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.map((prompt) => prompt.body.parts[0].text), aborts, forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body), releases: calls.filter((call) => call.path === "/release" || call.path === "/releaseTier").map((call) => call.path) }));
+  `);
+  assert.equal(result.prompts.length, 1, "a higher stage covers prepare and checkpoint in one delivery");
+  assert.match(result.prompts[0], /prepare|handoff/i);
+  assert.match(result.prompts[0], /checkpoint.*mutating|before.*mutating/i);
+  assert.match(result.prompts[0], /reversible|bounded/i);
+  assert.doesNotMatch(result.prompts[0], /start nothing new/i);
+  assert.deepEqual(result.aborts, [], "a caution warning never aborts the main session");
+  assert.deepEqual(result.forgets, [], "a caution warning never forgets its lease");
+  assert.deepEqual(result.releases, [], "a caution warning never uses obsolete release paths");
+});
+
+test("weekly quota stage is own-provider main-only and coalesces with a lane warning", () => {
+  const result = runLifecycleFixture(`
+    let nearlyOut = false; let weekly = 75;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut, threshold: 97, localFits: !nearlyOut, providers: [
+        { providerID: "openai", held: false, percent: nearlyOut ? 98 : 20, window: "5h", room: !nearlyOut, weekly: { window: "wk", percent: weekly, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" } },
+        { providerID: "anthropic", held: false, percent: 99, window: "wk", room: false, weekly: { window: "wk", percent: 99, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" } },
+      ] }); return true;
+    };
+    await created("main", { id: "main", agent: "standard" });
+    await created("child", { id: "child", parentID: "main", agent: "standard" });
+    await created("classifier", { id: "classifier", agent: "fleet-classifier" });
+    await routeBusy("main"); await routeBusy("child"); await routeBusy("classifier", "fleet-classifier");
+    await runNextTimer(60000);
+    weekly = 95; nearlyOut = true;
+    await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.map((prompt) => ({ id: prompt.path.id, agent: prompt.body.agent, text: prompt.body.parts[0].text })), aborts, releases: calls.filter((call) => call.path === "/release" || call.path === "/releaseTier") }));
+  `);
+  assert.deepEqual(result.prompts.map((prompt) => prompt.id), ["main", "main", "child"], "the first roomy poll warns only the root; the nearly-out lane also warns its child");
+  assert.equal(result.prompts[1].agent, "standard");
+  assert.match(result.prompts[1].text, /reversible|bounded/i, "the lane and weekly causes share one cumulative prompt");
+  assert.equal(result.prompts[2].agent, "standard", "the child retains its routed agent");
+  assert.match(result.prompts[2].text, /return what you have to your parent/i);
+  assert.match(result.prompts[2].text, /start nothing new/i);
+  assert.doesNotMatch(result.prompts[2].text, /handoff|mutating/i, "child guidance has no root handoff or pre-mutation instructions");
+  assert.deepEqual(result.aborts, []);
+  assert.deepEqual(result.releases, []);
+});
+
+test("weekly quota stage re-arms only after hysteresis, material unknown-freshness drop, or a newer reset observation", () => {
+  const result = runLifecycleFixture(`
+    let percent = 95; let fetchedAt = 1000; let resetsAt = 200000;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut: false, threshold: 97, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, window: "5h", room: true, weekly: { window: "wk", percent, resetsAt, fetchedAt, source: "last-fetch" } }] }); return true;
+    };
+    await created("rearm"); await routeBusy("rearm");
+    const counts = []; const poll = async () => { await runNextTimer(60000); counts.push(prompts.length); };
+    await poll();
+    resetsAt += 500; fetchedAt += 1; await poll();
+    percent = 94.5; fetchedAt += 1; await poll();
+    percent = 93.9; fetchedAt += 1; await poll();
+    percent = 95; fetchedAt += 1; await poll();
+    percent = 70; fetchedAt = null; resetsAt = null; await poll();
+    percent = 75; await poll();
+    percent = 95; fetchedAt = 5000; resetsAt = 270000; await poll();
+    percent = 95; fetchedAt = 4999; resetsAt = 340000; await poll();
+    console.log(JSON.stringify({ counts, texts: prompts.map((prompt) => prompt.body.parts[0].text) }));
+  `);
+  assert.deepEqual(result.counts, [1, 1, 1, 1, 2, 2, 3, 4, 4], "only a bounded-stage rearm, real drop, and newer confirmed rollover create deliveries");
+  assert.match(result.texts[2], /prepare|handoff/i, "a drop to 70 re-arms the prepare boundary rather than fabricating exhaustion");
+});
+
+test("weekly stale success after idle cannot cover the same provider and stage on the new lease", () => {
+  const result = runLifecycleFixture(`
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: 85, fetchedAt: 1000, resetsAt: 200000 } }] }); return true; };
+    await created("same-stage"); await routeBusy("same-stage");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(60000); await entered.promise;
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "same-stage" } } }); await routeBusy("same-stage");
+    old.resolve({ data: true }); await first; await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.length, leases: leases.get("same-stage") }));
+  `);
+  assert.equal(result.leases, 2);
+  assert.equal(result.prompts, 2, "the new binding must receive its own 85% warning");
+});
+
+test("weekly stale success preserves an overlapping new binding reservation", () => {
+  const result = runLifecycleFixture(`
+    let nearlyOut = false;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut, localFits: !nearlyOut, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: 85, fetchedAt: 1000, resetsAt: 200000 } }] }); return true; };
+    await created("overlap"); await routeBusy("overlap");
+    const old = deferred(); const fresh = deferred(); const entered = deferred(); const freshEntered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } if (prompts.length === 2) { freshEntered.resolve(); return fresh.promise; } return { data: true }; };
+    const first = runNextTimer(60000); await entered.promise;
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "overlap" } } }); await routeBusy("overlap");
+    nearlyOut = true; const second = runNextTimer(60000); await freshEntered.promise;
+    old.resolve({ data: true }); await first; fresh.resolve({ data: true }); await second;
+    nearlyOut = false; await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.length }));
+  `);
+  assert.equal(result.prompts, 2, "the new binding's own 85% reservation remains delivered");
+});
+
+test("weekly quota stage repeats only after a replacement route, not an idle route of the same ID", () => {
+  const result = runLifecycleFixture(`
+    let weekly = 95;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: weekly, fetchedAt: 1000, resetsAt: 200000 } }] }); return true; };
+    await created("repeat"); await routeBusy("repeat"); await runNextTimer(60000);
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "repeat" } } }); await routeBusy("repeat"); await runNextTimer(60000);
+    await created("repeat", { id: "repeat", agent: "standard", time: { created: 2 } }); await routeBusy("repeat"); await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.length, leases: calls.filter((call) => call.path === "/lease").map((call) => call.body.sessionID), forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body) }));
+  `);
+  assert.equal(result.prompts, 2);
+  assert.deepEqual(result.leases, ["repeat", "repeat", "repeat"]);
+  assert.deepEqual(result.forgets, [{ sessionID: "repeat", leaseID: "Lrepeat1" }]);
+});
+
+test("weekly quota stage follows the owning provider across an idle re-route", () => {
+  const result = runLifecycleFixture(`
+    let owner = "openai"; let weekly = 85;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: ["openai", "anthropic"].map((providerID) => ({ providerID, held: false, percent: 20, room: true, weekly: { window: "wk", percent: providerID === owner ? weekly : 20, fetchedAt: 1000, resetsAt: 200000 } })) }); return true; };
+    await created("owner"); await routeBusy("owner"); await runNextTimer(60000);
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "owner" } } }); target.model.providerID = "anthropic"; owner = "anthropic"; weekly = 95; await routeBusy("owner"); await runNextTimer(60000);
+    target.model.providerID = "openai"; owner = "openai"; weekly = 85; await hooks.event({ event: { type: "session.idle", properties: { sessionID: "owner" } } }); await routeBusy("owner"); await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.map((prompt) => ({ provider: prompt.body.parts[0].text.match(/openai|anthropic/i)?.[0], agent: prompt.body.agent })), forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body) }));
+  `);
+  assert.equal(result.prompts.length, 2);
+  assert.deepEqual(result.prompts.map((prompt) => prompt.agent), ["standard", "standard"]);
+  assert.equal(result.forgets.length, 2);
+});
+
+test("lane warnings rearm independently of weekly stages", () => {
+  const result = runLifecycleFixture(`
+    let nearlyOut = false; let weekly = 75;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut, localFits: !nearlyOut, providers: [{ providerID: "openai", held: false, percent: nearlyOut ? 98 : 20, room: !nearlyOut, weekly: { window: "wk", percent: weekly, fetchedAt: 1000, resetsAt: 200000 } }] }); return true; };
+    await created("independent"); await routeBusy("independent"); const counts = [];
+    for (const [lane, quota] of [[false,75], [true,75], [false,75], [true,75], [false,75], [false,85]]) { nearlyOut = lane; weekly = quota; await runNextTimer(60000); counts.push(prompts.length); }
+    console.log(JSON.stringify({ counts }));
+  `);
+  assert.deepEqual(result.counts, [1, 2, 2, 3, 3, 4]);
+});
+
+test("weekly quota rollover requires a newer fetched observation after the prior reset", () => {
+  const result = runLifecycleFixture(`
+    let fetchedAt = 1000; let resetsAt = 200000;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: 95, fetchedAt, resetsAt } }] }); return true; };
+    await created("rollover"); await routeBusy("rollover"); const counts = []; const poll = async (f, r) => { fetchedAt = f; resetsAt = r; await runNextTimer(60000); counts.push(prompts.length); };
+    await poll(1000,200000); await poll(2000,270000); await poll(200001,200500); await poll(200002,270000); await poll(200002,270000); await poll(200003,269500); await poll(200004,330000); await poll(270001,330000);
+    console.log(JSON.stringify({ counts }));
+  `);
+  assert.deepEqual(result.counts, [1, 1, 1, 2, 2, 2, 2, 3]);
+});
+
+test("weekly quota ignores older low observations and unknown or failed observations cannot rearm it", () => {
+  const result = runLifecycleFixture(`
+    let weekly = 95; let fetchedAt = 10000; let fail = false;
+    brokerReply = (path, body, send, req) => { if (path !== "/headroom") return false; if (fail) { queueMicrotask(() => req.emit("error", new Error("headroom transport failed"))); return true; } send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: weekly, fetchedAt, resetsAt: 200000 } }] }); return true; };
+    await created("older"); await routeBusy("older"); await runNextTimer(60000);
+    weekly = 70; fetchedAt = 9999; await runNextTimer(60000); weekly = null; fetchedAt = 10000; await runNextTimer(60000); weekly = "invalid"; await runNextTimer(60000); fail = true; await runNextTimer(60000); fail = false; weekly = 95; fetchedAt = 10001; await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.length }));
+  `);
+  assert.equal(result.prompts, 1);
+});
+
+test("weekly quota: an older high reading after a newer drop cannot re-deliver a re-armed stage", () => {
+  const result = runLifecycleFixture(`
+    let weekly = 95; let fetchedAt = 1000;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: weekly, fetchedAt, resetsAt: 900000, source: "last-fetch" } }] }); return true; };
+    await created("older-high"); await routeBusy("older-high"); const counts = [];
+    const poll = async (percent, at) => { weekly = percent; fetchedAt = at; await runNextTimer(60000); counts.push(prompts.length); };
+    await poll(95, 1000);  // bounded delivered
+    await poll(70, 2000);  // newer genuine drop re-arms every stage
+    await poll(95, 1500);  // older reading: rejected, must not prompt
+    await poll(95, 3000);  // genuinely newer high reading: must prompt
+    console.log(JSON.stringify({ counts, texts: prompts.map((prompt) => prompt.body.parts[0].text) }));
+  `);
+  assert.deepEqual(result.counts, [1, 1, 1, 2], "only the genuinely newer 95% reading re-delivers after the drop");
+  assert.match(result.texts[1], /reversible|bounded/i);
+});
+
+test("weekly quota: a rejected older reading leaves an independent lane warning deliverable", () => {
+  const result = runLifecycleFixture(`
+    let weekly = 95; let fetchedAt = 1000; let nearlyOut = false;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut, localFits: !nearlyOut, providers: [{ providerID: "openai", held: false, percent: nearlyOut ? 98 : 20, window: "5h", room: !nearlyOut, weekly: { window: "wk", percent: weekly, fetchedAt, resetsAt: 900000, source: "last-fetch" } }] }); return true; };
+    await created("older-lane"); await routeBusy("older-lane"); const counts = [];
+    const poll = async (percent, at, lane) => { weekly = percent; fetchedAt = at; nearlyOut = lane; await runNextTimer(60000); counts.push(prompts.length); };
+    await poll(95, 1000, false);
+    await poll(70, 2000, false);
+    await poll(95, 1500, true);
+    console.log(JSON.stringify({ counts, texts: prompts.map((prompt) => prompt.body.parts[0].text) }));
+  `);
+  assert.deepEqual(result.counts, [1, 1, 2], "the lane warning still goes out on a poll whose weekly reading is rejected");
+  assert.match(result.texts[1], /nothing else can take over/);
+  assert.doesNotMatch(result.texts[1], /quota null|Weekly usage:|weekly quota (?:prepare|checkpoint|bounded)/i, "the rejected older reading drives no weekly stage");
+});
+
+test("weekly quota hysteresis requires a full one-point drop at every stage", () => {
+  const result = runLifecycleFixture(`
+    let weekly = 75;
+    brokerReply = (path, body, send) => { if (path !== "/headroom") return false; send({ nearlyOut: false, localFits: true, providers: [{ providerID: "openai", held: false, percent: 20, room: true, weekly: { window: "wk", percent: weekly, fetchedAt: null, resetsAt: null } }] }); return true; };
+    await created("hysteresis"); await routeBusy("hysteresis"); const counts = []; const poll = async (next) => { weekly = next; await runNextTimer(60000); counts.push(prompts.length); };
+    await poll(75); await poll(74.5); await poll(75); await poll(73.9); await poll(75); await poll(85); await poll(83.9); await poll(85); await poll(95); await poll(93.9); await poll(95);
+    console.log(JSON.stringify({ counts }));
+  `);
+  assert.deepEqual(result.counts, [1,1,1,1,2,3,3,4,5,5,6]);
+});
+
+for (const [outcome, settle] of [
+  ["returned failure", `old.resolve({ error: { name: "TransportError", message: "socket reset" } });`],
+  ["thrown failure", `old.reject(new Error("socket reset"));`],
+]) test(`weekly quota stage old ${outcome} cannot clear a newer provider episode`, () => {
+  const result = runLifecycleFixture(`
+    let provider = "openai"; let percent = 85;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut: false, threshold: 97, localFits: true, providers: [
+        { providerID: "openai", held: false, percent: 20, window: "5h", room: true, weekly: { window: "wk", percent: provider === "openai" ? percent : 20, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" } },
+        { providerID: "anthropic", held: false, percent: 20, window: "5h", room: true, weekly: { window: "wk", percent: provider === "anthropic" ? 95 : 20, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" } },
+      ] }); return true;
+    };
+    await created("deferred"); await routeBusy("deferred");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(60000);
+    const started = await Promise.race([entered.promise.then(() => true), new Promise((resolve) => setImmediate(() => resolve(false)))]);
+    assert.equal(started, true, "the old-router RED path must fail as an assertion instead of waiting forever for a weekly prompt");
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "deferred" } } });
+    target.model.providerID = "anthropic"; provider = "anthropic"; await routeBusy("deferred");
+    await runNextTimer(60000); ${settle} await first;
+    await runNextTimer(60000);
+    console.log(JSON.stringify({ prompts: prompts.length, texts: prompts.map((prompt) => prompt.body.parts[0].text), aborts, forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body), releases: calls.filter((call) => call.path === "/release" || call.path === "/releaseTier").map((call) => call.path) }));
+  `);
+  assert.equal(result.prompts, 2, "the old failed 85% send cannot erase the newer provider's delivered 95% marker");
+  assert.match(result.texts[1], /reversible|bounded/i);
+  assert.deepEqual(result.aborts, []);
+  assert.deepEqual(result.forgets, [{ sessionID: "deferred", leaseID: "Ldeferred1" }], "the explicit idle forgets Ldeferred1 exactly once");
+  assert.deepEqual(result.releases, [], "idle uses /forget, never obsolete release paths");
+});
+
+for (const [outcome, settle] of [
+  ["success", `old.resolve({ data: true });`],
+  ["returned failure", `old.resolve({ error: { name: "TransportError", message: "socket reset" } });`],
+  ["thrown failure", `old.reject(new Error("socket reset"));`],
+]) test(`weekly quota stage: an old pending 85% ${outcome} on the same provider cannot cover, erase or re-arm the newer 95% delivery`, () => {
+  // Same provider, same session, same wrapUpSent state: the stale lease's reservation holds the
+  // prepare and checkpoint cells while the re-leased session jumps to the bounded stage.
+  const result = runLifecycleFixture(`
+    let percent = 85;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut: false, threshold: 97, localFits: true, providers: [
+        { providerID: "openai", held: false, percent: 20, window: "5h", room: true, weekly: { window: "wk", percent, resetsAt: 200000, fetchedAt: 1000, source: "last-fetch" } },
+      ] }); return true;
+    };
+    await created("same-provider"); await routeBusy("same-provider");
+    const old = deferred(); const entered = deferred();
+    client.session.promptAsync = async (input) => { prompts.push(input); if (prompts.length === 1) { entered.resolve(); return old.promise; } return { data: true }; };
+    const first = runNextTimer(60000);
+    const started = await Promise.race([entered.promise.then(() => true), new Promise((resolve) => setImmediate(() => resolve(false)))]);
+    assert.equal(started, true, "the 85% checkpoint send must be in flight before the session goes idle");
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "same-provider" } } });
+    percent = 95; await routeBusy("same-provider");
+    await runNextTimer(60000); const beforeSettle = prompts.length;
+    ${settle} await first;
+    const counts = [];
+    for (const next of [95, 85, 95]) { percent = next; await runNextTimer(60000); counts.push(prompts.length); }
+    console.log(JSON.stringify({ beforeSettle, counts, texts: prompts.map((prompt) => prompt.body.parts[0].text), leases: leases.get("same-provider"), forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body), warns: logs.filter((x) => x.body?.level === "warn" && /asked it to (wrap up|checkpoint and continue safely)/.test(x.body?.message ?? "")).length, errors: logs.filter((x) => x.body?.level === "error").length }));
+  `);
+  assert.equal(result.beforeSettle, 2, "the newer 95% bounded prompt is delivered while the old 85% send is still pending");
+  assert.match(result.texts[1], /reversible|bounded/i);
+  assert.deepEqual(result.counts, [2, 2, 3], "after the stale settlement: 95% stays covered, the drop to 85% stays covered by the newer marker, and only the hysteresis re-arm at 95% sends again");
+  assert.match(result.texts[2], /reversible|bounded/i);
+  assert.equal(result.leases, 2, "the fixture must exercise L1 -> idle -> L2 on the same provider");
+  assert.deepEqual(result.forgets, [{ sessionID: "same-provider", leaseID: "Lsame-provider1" }], "the explicit idle forgets L1 exactly once");
+  assert.equal(result.warns, 2, "only current-binding deliveries are reported; the stale settlement is neither reported nor retried");
+  assert.equal(result.errors, 0, "a stale failure is not reported against the re-leased session");
+});
+
+test("weekly quota stage: a stale successful send cannot mark a newer rollover episode delivered or suppress its higher stage", () => {
+  // The binding stays current throughout (no idle, no re-lease), so only reservation identity
+  // separates the stale send from the new episode: a confirmed rollover replaces the stage cells
+  // while the old 85% send is still in flight, and the new episode's own send then fails.
+  const result = runLifecycleFixture(`
+    let percent = 85; let fetchedAt = 1000; let resetsAt = 200000;
+    brokerReply = (path, body, send) => {
+      if (path !== "/headroom") return false;
+      send({ nearlyOut: false, threshold: 97, localFits: true, providers: [
+        { providerID: "openai", held: false, percent: 20, window: "5h", room: true, weekly: { window: "wk", percent, resetsAt, fetchedAt, source: "last-fetch" } },
+      ] }); return true;
+    };
+    await created("episode"); await routeBusy("episode");
+    const old = deferred(); const fresh = deferred(); const entered = deferred(); const freshEntered = deferred();
+    client.session.promptAsync = async (input) => {
+      prompts.push(input);
+      if (prompts.length === 1) { entered.resolve(); return old.promise; }
+      if (prompts.length === 2) { freshEntered.resolve(); return fresh.promise; }
+      return { data: true };
+    };
+    const first = runNextTimer(60000);
+    const started = await Promise.race([entered.promise.then(() => true), new Promise((resolve) => setImmediate(() => resolve(false)))]);
+    assert.equal(started, true, "the 85% checkpoint send must be in flight");
+    // A child starting work schedules the next poll while the main session's binding stays current.
+    await created("episode-child", { id: "episode-child", parentID: "episode", agent: "standard" }); await routeBusy("episode-child");
+    // A confirmed rollover: a newer reading taken after the previous reset whose reset advanced by a minute or more.
+    fetchedAt = 200001; resetsAt = 270000;
+    const second = runNextTimer(60000);
+    const freshStarted = await Promise.race([freshEntered.promise.then(() => true), new Promise((resolve) => setImmediate(() => resolve(false)))]);
+    assert.equal(freshStarted, true, "the rollover episode's own send must be in flight before the stale send settles");
+    const beforeSettle = prompts.map((prompt) => prompt.path.id);
+    old.resolve({ data: true }); await first;
+    fresh.reject(new Error("socket reset")); await second;
+    const counts = [];
+    for (const next of [85, 85, 95]) { percent = next; await runNextTimer(60000); counts.push(prompts.length); }
+    console.log(JSON.stringify({ beforeSettle, counts, texts: prompts.map((prompt) => prompt.body.parts[0].text), leases: [leases.get("episode"), leases.get("episode-child")], forgets: calls.filter((call) => call.path === "/forget").map((call) => call.body), errors: logs.filter((x) => x.body?.level === "error").length }));
+  `);
+  assert.deepEqual(result.beforeSettle, ["episode", "episode"], "the new episode is delivered to the main session only; the child receives no weekly policy");
+  assert.deepEqual(result.counts, [3, 3, 4], "the stale success leaves the new episode undelivered so its failed send is retried once, and its 95% stage is not suppressed");
+  assert.match(result.texts[2], /checkpoint/i, "the retry is the new episode's own checkpoint stage");
+  assert.match(result.texts[3], /reversible|bounded/i);
+  assert.deepEqual(result.leases, [1, 1], "the binding stayed current throughout: no idle or re-lease");
+  assert.deepEqual(result.forgets, []);
+  assert.equal(result.errors, 1, "the new episode's own failed send is observable against its current binding");
 });

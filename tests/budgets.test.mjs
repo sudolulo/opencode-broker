@@ -37,15 +37,14 @@ test("effectiveUtilization balances on the durable window, not a fast burst", as
   );
 });
 
-test("effectiveUtilization fences a burst window only as it nears its cap", async () => {
+test("effectiveUtilization compares durable usage even near burst cap", async () => {
   const { effectiveUtilization } = await import("../lib/budgets.js");
   // Below the fence: the 5h burst is ignored, weekly durable budget rules.
   assert.equal(effectiveUtilization({}, "anthropic", Date.now(), undefined,
     { windows: [{ id: "5h", percent: 89 }, { id: "wk", percent: 10 }] }), 0.10);
-  // At/above the fence: the near-exhausted burst window binds so the provider
-  // yields before the hard 100% circuit fires.
+  // Near the short-window cap, durable usage remains the comparison base.
   assert.equal(effectiveUtilization({}, "anthropic", Date.now(), undefined,
-    { windows: [{ id: "5h", percent: 95 }, { id: "wk", percent: 10 }] }), 0.95);
+    { windows: [{ id: "5h", percent: 95 }, { id: "wk", percent: 10 }] }), 0.10);
 });
 
 test("credential errors classify as auth, never provider evidence", async () => {
@@ -123,16 +122,16 @@ test("high-risk content raises the tier floor deterministically", async () => {
   assert.equal(raiseTier("build", null), "build");
 });
 
-test("a burst window on pace to run out before it resets binds the balancer", async () => {
+test("reset timing does not change durable utilization", async () => {
   const { effectiveUtilization } = await import("../lib/budgets.js");
   const now = Date.parse("2026-09-28T15:00:00Z");
   const at = (hours) => new Date(now + hours * 3_600_000).toISOString();
   // 41% of the 5h spent with 2.3h left (54% elapsed): on pace for ~76% -- weekly still decides.
   const onTrack = { windows: [{ id: "5h", percent: 41, resetsAt: at(2.3) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
   assert.equal(effectiveUtilization({}, "anthropic", now, undefined, onTrack), 0.05);
-  // 60% spent with 3h left (40% elapsed): on pace to run out -- the burst binds.
+  // Reset timing is not used to extrapolate burst usage.
   const burning = { windows: [{ id: "5h", percent: 60, resetsAt: at(3) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
-  assert.equal(effectiveUtilization({}, "anthropic", now, undefined, burning), 0.6);
+  assert.equal(effectiveUtilization({}, "anthropic", now, undefined, burning), 0.05);
   // The first fifth of a window is too noisy to extrapolate from.
   const early = { windows: [{ id: "5h", percent: 15, resetsAt: at(4.5) }, { id: "wk", percent: 5, resetsAt: at(100) }] };
   assert.equal(effectiveUtilization({}, "anthropic", now, undefined, early), 0.05);

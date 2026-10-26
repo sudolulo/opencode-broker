@@ -42,7 +42,7 @@ import {
 } from "../lib/router-core.js";
 import { isAbortError, normalizeProviderError } from "../lib/provider-health.js";
 import { normalizeApiSpendGrant } from "../lib/api-spend-grant.js";
-import { describeProviderLimit, wrapUpMessage } from "../lib/usage-limit.js";
+import { describeProviderLimit, primaryQuotaStage, wrapUpMessage } from "../lib/usage-limit.js";
 import { classifyTurn, nextPrevious } from "../lib/turn-effort.js";
 import { randomUUID } from "node:crypto";
 
@@ -1483,16 +1483,50 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     }).catch(() => {});
   };
 
-  // --- Wrap up before usage runs out ----------------------------------------
+  // --- Weekly quota and lane continuation prompts ---------------------------
   // Failover moves a session when one provider stops it; parking resumes it when one comes
   // back. Neither helps the moment before: when every provider the lane can use is about to
   // run out and no local model can take over, a working session is cut off mid-step with
   // nothing written down. So while sessions are working, the broker is asked once a minute
   // (/headroom, side-effect-free) whether their lane is nearly out, and each working session is
-  // told -- once per limit window -- to finish or checkpoint its step and write a handoff
-  // (a subagent returns what it has instead). The handoff is what the resumed session reads.
+  // told when weekly quota stages or lane headroom call for a continuation prompt.
   const WRAP_UP_POLL_MS = 60 * 1000;
-  const wrapUpSent = new Map(); // sessionID -> warning attempt marker for the current nearly-out episode
+  const wrapUpSent = new Map(); // sessionID -> { lane: Set, weekly: Map(providerID -> stage coverage) }
+  const weeklyQuotaStages = [["prepare", 75], ["checkpoint", 85], ["bounded", 95]];
+  const observeWeekly = (state, providerID, weekly) => {
+    if (typeof providerID !== "string" || !providerID || !Number.isFinite(weekly?.percent)) return null;
+    let provider = state.weekly.get(providerID);
+    if (!provider) {
+      provider = {
+        stages: new Map(weeklyQuotaStages.map(([stage]) => [stage, new Set()])),
+        fetchedAt: null,
+        resetsAt: null,
+      };
+      state.weekly.set(providerID, provider);
+    }
+    const fetchedAt = Number.isFinite(weekly.fetchedAt) ? weekly.fetchedAt : null;
+    const resetsAt = Number.isFinite(weekly.resetsAt) ? weekly.resetsAt : null;
+    // An older timestamped reading is rejected outright (null), leaving provider state untouched:
+    // after a newer drop re-armed the stages, a stale high reading must not drive a weekly stage.
+    // The caller still evaluates the independent lane warning for this poll.
+    if (fetchedAt !== null && provider.fetchedAt !== null && fetchedAt < provider.fetchedAt) return null;
+    const rollover = fetchedAt !== null && provider.fetchedAt !== null && fetchedAt > provider.fetchedAt &&
+      provider.resetsAt !== null && fetchedAt > provider.resetsAt && resetsAt !== null &&
+      resetsAt - provider.resetsAt >= 60_000;
+    if (rollover) {
+      for (const [stage] of weeklyQuotaStages) provider.stages.set(stage, new Set());
+    } else {
+      for (const [stage, boundary] of weeklyQuotaStages) {
+        const covered = provider.stages.get(stage);
+        if (weekly.percent <= boundary - 1 && covered.size > 0) provider.stages.set(stage, new Set());
+      }
+    }
+    if (fetchedAt !== null) provider.fetchedAt = provider.fetchedAt === null ? fetchedAt : Math.max(provider.fetchedAt, fetchedAt);
+    // A reset timestamp is a baseline, not a continuously refreshed clock: jitter and missing
+    // timestamps must not create new episodes or rearm a stage by themselves.
+    if (provider.resetsAt === null || rollover) provider.resetsAt = resetsAt;
+    return provider;
+  };
   const deletedSessionCleanups = new Map(); // sessionID -> cleanup for one exact binding
   const deletedSessionVerifications = new Map();
   // A deletion hook deadline bounds only the hook; the SDK request can still be hung after it
@@ -1642,12 +1676,18 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     const asked = new Map(); // one /headroom per lane and context size per pass
     const told = [];
     for (const sessionID of [...heartbeats.keys()]) {
-      const routed = routes.get(sessionID);
-      const session = sessions.get(sessionID);
-      const heartbeat = heartbeats.get(sessionID);
+      const binding = captureSessionBinding(sessionID);
+      const { route: routed, session, heartbeat } = binding;
+      // The key snapshot can outlive a heartbeat: an earlier session's awaited send leaves time
+      // for this one to go idle, and idle removes the heartbeat before its /forget settles and
+      // the route goes. Without a live heartbeat the session is not working, and the shared
+      // bindingIsCurrent would accept undefined === undefined, so refuse it here rather than
+      // change the deletion-cleanup semantics that deliberately accept an absent heartbeat.
+      if (!heartbeat) continue;
       if (!routed?.target || !routed.tier || isClassifierAgent(session?.agent)) continue;
       let contextTokens = null;
       try { contextTokens = await sessionContextTokens(sessionID); } catch {}
+      if (!bindingIsCurrent(sessionID, binding)) continue;
       const key = `${routed.profile}|${routed.tier}|${Math.ceil((Number(contextTokens) || 0) / 10_000)}`;
       if (!asked.has(key)) {
         asked.set(key, brokerRequest("/headroom", {
@@ -1657,40 +1697,69 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
       }
       const headroom = await asked.get(key);
       if (!headroom) continue;
-      // Once per episode: the mark clears when the lane has room again (a reset, a provider
-      // back). Not keyed on reset times -- providers report them with sub-second jitter
-      // (03:19:59.594, then 03:20:00.046 for the same reset), which would repeat the message.
-      const binding = { route: routed, session, heartbeat, completed: successCandidates.get(sessionID) === true };
-      if (!headroom.nearlyOut) { if (bindingIsCurrent(sessionID, binding)) wrapUpSent.delete(sessionID); continue; }
-      if (wrapUpSent.has(sessionID)) continue;
       if (!bindingIsCurrent(sessionID, binding)) continue;
+      const providerID = session?.parentID ? null : routed.target.model?.providerID;
+      const state = wrapUpSent.get(sessionID) ?? { lane: new Set(), weekly: new Map() };
+      if (!wrapUpSent.has(sessionID)) {
+        wrapUpSent.set(sessionID, state);
+        trimTracker(wrapUpSent);
+      }
+      if (headroom.nearlyOut === false && state.lane.size > 0) state.lane = new Set();
+      const weekly = providerID ? headroom.providers?.find((item) => item.providerID === providerID)?.weekly : null;
+      const provider = providerID ? observeWeekly(state, providerID, weekly) : null;
+      const stage = provider ? primaryQuotaStage(headroom, providerID) : null;
+      const laneSet = state.lane;
+      const weeklySets = stage ? weeklyQuotaStages
+        .filter(([candidate]) => weeklyQuotaStages.findIndex(([name]) => name === candidate) <= weeklyQuotaStages.findIndex(([name]) => name === stage))
+        .map(([candidate]) => ({ stage: candidate, cell: provider.stages.get(candidate) })) : [];
+      const needLane = headroom.nearlyOut === true && laneSet.size === 0;
+      const needWeekly = Boolean(stage && provider.stages.get(stage).size === 0);
+      if (!needLane && !needWeekly) continue;
       const warningMarker = {};
-      wrapUpSent.set(sessionID, warningMarker);
-      trimTracker(wrapUpSent);
+      const reservations = [];
+      if (headroom.nearlyOut === true) {
+        laneSet.add(warningMarker);
+        reservations.push({ getCell: () => state.lane, cell: laneSet });
+      }
+      for (const { stage: reservedStage, cell } of weeklySets) {
+        cell.add(warningMarker);
+        reservations.push({ getCell: () => provider.stages.get(reservedStage), cell });
+      }
       try {
+        if (!bindingIsCurrent(sessionID, binding)) continue;
         const response = await client.session.promptAsync({
           path: { id: sessionID },
           query: { directory },
           body: {
             ...(typeof session?.agent === "string" && session.agent ? { agent: session.agent } : {}),
-            parts: [{ type: "text", text: wrapUpMessage(headroom, { subagent: Boolean(session?.parentID) }), synthetic: true }],
+            parts: [{ type: "text", text: wrapUpMessage(headroom, { subagent: Boolean(session?.parentID), sessionID, providerID, stage }), synthetic: true }],
           },
         });
         if (response?.error) {
-          if (wrapUpSent.get(sessionID) === warningMarker) wrapUpSent.delete(sessionID);
+          for (const { cell } of reservations) cell.delete(warningMarker);
           if (isConfirmedMissingSession(response.error, sessionID)) {
             await retireDeletedSession(sessionID, binding);
             continue;
           }
           throw new Error(JSON.stringify(response.error));
         }
-        if (!bindingIsCurrent(sessionID, binding)) continue;
+        if (!bindingIsCurrent(sessionID, binding)) {
+          for (const { cell } of reservations) cell.delete(warningMarker);
+          continue;
+        }
         told.push(sessionID);
-        report("warn", `${sessionID}: usage nearly out on ${routed.profile}/${routed.tier} -- asked it to wrap up${session?.parentID ? "" : " and write a handoff"}`);
+        if (wrapUpSent.get(sessionID) === state) {
+          for (const { getCell, cell } of reservations) {
+            if (getCell() === cell && cell.has(warningMarker)) {
+              cell.clear();
+              cell.add(warningMarker);
+            }
+          }
+        }
+        report("warn", `${sessionID}: usage continuation caution on ${routed.profile}/${routed.tier} -- asked it to ${session?.parentID ? "wrap up and return results" : "checkpoint and continue safely"}`);
       } catch (error) {
-        // A failed send stays retryable across leases, but must not clear a newer
-        // episode's marker. Do this before the stale-binding reporting fence.
-        if (wrapUpSent.get(sessionID) === warningMarker) wrapUpSent.delete(sessionID);
+        // Remove only this attempt's token from the cells it reserved, before stale reporting.
+        for (const { cell } of reservations) cell.delete(warningMarker);
         if (isConfirmedMissingSession(error, sessionID)) {
           await retireDeletedSession(sessionID, binding);
           continue;
@@ -1701,7 +1770,13 @@ export const ModelRouter = async ({ client, directory } = {}, options = {}) => {
     }
     if (told.length) {
       try {
-        client?.tui?.showToast?.({ body: { message: `Usage nearly out: asked ${told.length} working session${told.length === 1 ? "" : "s"} to wrap up and write a handoff`, variant: "warning", duration: 15000 }, query: { directory } })
+        const mains = told.filter((sessionID) => !sessions.get(sessionID)?.parentID).length;
+        const children = told.length - mains;
+        const counts = [
+          mains ? `${mains} main session${mains === 1 ? "" : "s"} asked to checkpoint and continue safely` : null,
+          children ? `${children} child session${children === 1 ? "" : "s"} asked to wrap up and return results` : null,
+        ].filter(Boolean).join("; ");
+        client?.tui?.showToast?.({ body: { message: `Usage caution: ${counts}`, variant: "warning", duration: 15000 }, query: { directory } })
           ?.catch?.(() => {});
       } catch {}
     }

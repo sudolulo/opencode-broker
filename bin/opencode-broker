@@ -2747,7 +2747,13 @@ const acquire = async (state, request, {
   }
   // First state write for this selection: nothing above it can leave a half-applied lease.
   ensureActive();
-  if (choice.cursorKey) state.cursors[choice.cursorKey] = choice.nextCursor;
+  // The taper counters chooseTarget proposed for THIS ordinary choice commit only here, with
+  // the global cursor; previews and discarded choices never write them. Held, pinned and
+  // continuation choices carry neither (cursorKey null, no nextTaperCursors).
+  if (choice.cursorKey) {
+    state.cursors[choice.cursorKey] = choice.nextCursor;
+    Object.assign(state.cursors, choice.nextTaperCursors ?? {});
+  }
   if (resolvableModelsReason && choice.decision) {
     choice.decision.reasons = [...(choice.decision.reasons ?? []), resolvableModelsReason];
   }
@@ -3889,7 +3895,7 @@ const serve = async () => {
           ![state.circuits[target.id], state.circuits[providerCircuitID(target)]].some((value) =>
             value && (value.until === null || Number(value.until) > nowMs)));
         const providerIDs = [...new Set(lane.filter((target) => target.kind !== "local").map((target) => target.providerID))];
-        return reply(response, 200, laneHeadroom({ providerIDs, circuits: state.circuits, planFor: cachedPlanUsage, localFits, now: nowMs }));
+        return reply(response, 200, laneHeadroom({ providerIDs, circuits: state.circuits, planFor: cachedPlanUsage, freshPlanFor: freshPlanUsage, localFits, now: nowMs }));
       }
       if (request.url === "/decisions") {
         let lines = [];

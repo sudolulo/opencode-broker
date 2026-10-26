@@ -469,6 +469,7 @@ test("headroom reports a lane nearly out only when nothing local fits", async ()
     const big = await post(socketPath, "/headroom", { profile: "auto", tier: "worker", contextTokens: 200000 });
     assert.equal(big.body.nearlyOut, true, JSON.stringify(big.body));
     assert.deepEqual(big.body.providers.map((p) => [p.providerID, p.held]), [["openai", true]]);
+    assert.equal(big.body.providers[0].weekly, null, "a non-weekly plan reading must not fabricate weekly metadata");
     const small = await post(socketPath, "/headroom", { profile: "auto", tier: "worker", contextTokens: 100 });
     assert.equal(small.body.localFits, true);
     assert.equal(small.body.nearlyOut, false, "the local rung can carry a small session");

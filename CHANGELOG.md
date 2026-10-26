@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-10-26
+
+### Changed
+
+- New cloud assignments taper progressively as plan-wide short windows near exhaustion, using per-provider evaluation counters to steer admissions without delaying requests; durable weekly balancing, pinned sessions, and availability remain intact.
+- Primary sessions receive their own-provider 75/85/95 private handoff, checkpoint, and bounded-safe-work guidance, and continue until actual exhaustion. Cached metadata retains observation provenance, and warning bookkeeping is scoped to the active session binding.
+
+### Removed
+
+- Remove the elapsed-reset/on-pace shortcut and the abrupt short-window score override; short-window usage now steers new admissions without substituting for durable cross-period utilization.
+
+### Fixed
+
+- Permission-mode and non-root ownership test fixtures retain their intended behavior under strict umasks and user namespaces.
+
 ## [1.27.6] — 2026-10-24
 
 ### Fixed
