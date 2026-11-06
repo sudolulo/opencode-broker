@@ -49,6 +49,20 @@ test("re-sends that are cheap do not stop a session: the volume floor is what se
   assert.equal(stopped, false, "6 x 150K = 0.9M re-sent, under 1.5M");
 });
 
+test("a prompt that grows while missing the cache is honest work, not a re-send loop", () => {
+  const watch = createBurnWatch();
+  // Each step is a full fresh send (cache miss), but the prompt GROWS every step: new content,
+  // not the same prompt replayed. Four such steps carry 1.6M fresh -- enough to trip the rewrite
+  // stop if they were miscounted as re-sends (the old content-blind behaviour) -- but because the
+  // prompt grows past the tolerance, only the first counts and the session is left alone.
+  const grow = (context) => ({ input: context, output: 400, cacheRead: 0, cacheWrite: 0 });
+  let stopped = false;
+  [200_000, 300_000, 450_000, 650_000].forEach((context, i) => {
+    stopped ||= Boolean(watch.recordUsage({ sessionID: "ses_grow", providerID: "anthropic", modelID: "claude-opus-5", tokens: grow(context), at: i * 20_000 }).stop);
+  });
+  assert.equal(stopped, false, "a monotonically growing prompt is not a rewrite loop");
+});
+
 test("a big session doing ordinary cached work for five minutes is never stopped", () => {
   const watch = createBurnWatch();
   // The busiest honest shape: a 440K context, a step every 5 s, all cache reads.

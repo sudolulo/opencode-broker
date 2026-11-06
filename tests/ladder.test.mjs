@@ -69,6 +69,25 @@ test("an underivable effortCeiling fails loudly", () => {
   }), /effortCeiling.*max.*not advertised/);
 });
 
+test("a deep target that advertises variants without its effortCeiling is skipped, not thrown on", () => {
+  // claude-fable-5-1 carries effortCeiling 'xhigh'. Circuit the other static deep heads so Fable
+  // is the sole remaining candidate; its selection then depends only on whether the catalog
+  // advertises its ceiling.
+  const circuits = { "gpt-flagship": { until: null }, "qwen-max": { until: null } };
+  // Catalog advertises xhigh: Fable can build a ref, so it is the eligible deep head.
+  const withCeiling = { ...R.TARGETS, "claude-fable-5-1": { ...R.TARGETS["claude-fable-5-1"], variants: ["low", "medium", "high", "xhigh"] } };
+  assert.equal(R.chooseTarget({ profile: "auto", tier: "deep", targets: withCeiling, circuits }).target.id,
+    "claude-fable-5-1", "with xhigh advertised, Fable is the deep head");
+  // Same catalog but WITHOUT xhigh: selecting Fable would make modelRefForTier throw, so it is
+  // skipped and the ladder falls back instead of aborting the lease.
+  const without = { ...R.TARGETS, "claude-fable-5-1": { ...R.TARGETS["claude-fable-5-1"], variants: ["low", "medium", "high"] } };
+  const skipped = R.chooseTarget({ profile: "auto", tier: "deep", targets: without, circuits });
+  assert.notEqual(skipped.target.id, "claude-fable-5-1", "without xhigh advertised, Fable is skipped");
+  assert.doesNotThrow(() => R.modelRefForTier(skipped.target, "deep",
+    { [`${skipped.target.providerID}/${skipped.target.modelID}`]: skipped.target.variants ?? [] }),
+    "the chosen fallback builds a model ref without throwing");
+});
+
 test("reasoning capability is not mirrored into normalized config", () => {
   assert.equal(CONFIG.modelVariants, undefined);
 });
