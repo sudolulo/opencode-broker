@@ -2705,6 +2705,34 @@ test("a proxy transport 502 reaches the broker as upstream transport failed, not
   assert.equal(failure.body.error.message, "Anthropic upstream HTTP 502: upstream transport failed");
 });
 
+test("a Responses-backend fault reaches the broker as upstream responses-backend failed, not a bare status", async () => {
+  // llm-auth-proxy's body when the OpenAI Codex/Responses backend returns a status:"failed"
+  // envelope (the backend's own reason rides after the colon). Every openai model shares that
+  // backend, so the suffix lets the broker read it as a provider-wide connect, not a one-model
+  // overload that would re-lease a sibling on the same dead backend.
+  const upstreamBody = JSON.stringify({ type: "error", error: { type: "api_error", provider: "openai", retryable: true,
+    message: "llm-auth-proxy: OpenAI Responses backend reported a failed response: server_error: The model failed to generate a response." } });
+  const brokerCalls = [];
+  const handler = createGatewayHandler({
+    config: { tier: "worker", profile: "auto", providers: {
+      openai: { baseUrl: "http://openai.example/v1", messagesApi: true, responsesApi: true },
+    } },
+    gatewayKey: "gw-secret",
+    brokerRequest: async (route, body) => {
+      brokerCalls.push({ route, body });
+      return route === "/lease"
+        ? { target: { model: { providerID: "openai", id: "gpt-6-1-sol" } } }
+        : { ok: true };
+    },
+    fetchImpl: async () => new Response(upstreamBody, { status: 502, headers: { "content-type": "application/json" } }),
+  });
+  await withServer(handler, async (base) => {
+    await (await askMessages(base)).text();
+  });
+  const failure = brokerCalls.find((call) => call.route === "/failure");
+  assert.match(failure.body.error.message, /upstream responses-backend failed/);
+});
+
 test("an Anthropic mid-stream error frame names only a fixed gateway phrase for its cause", () => {
   assert.equal(anthropicStreamFailure({ type: "api_error", message: "llm-auth-proxy: upstream stream failed" }),
     "Anthropic upstream stream failed: upstream transport failed");

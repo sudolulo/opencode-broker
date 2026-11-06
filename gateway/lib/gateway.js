@@ -124,6 +124,16 @@ const UPSTREAM_SIGNALS = [
     matches: (message) => /^llm-auth-proxy: (?:Anthropic request|OpenAI Responses upstream request|OpenAI models upstream request) failed$/.test(message),
     phrase: "upstream transport failed",
   },
+  // A Responses `status:"failed"` envelope (or a malformed one) is a PROVIDER-BACKEND fault: the
+  // OpenAI Codex/Responses backend reached us but could not return a usable response (its own
+  // reason rides in the message after the colon). Every openai model shares that backend, so the
+  // broker must treat it provider-wide like a dead socket -- not fence one model and re-lease a
+  // sibling on the same backend. Distinct phrase so the journal still tells a backend fault from a
+  // dead socket.
+  {
+    matches: (message) => /OpenAI Responses backend (?:reported a failed response|returned )/.test(message),
+    phrase: "upstream responses-backend failed",
+  },
 ];
 
 // Reads the upstream error message out of the shared Anthropic/OpenAI JSON

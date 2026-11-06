@@ -81,6 +81,20 @@ test("otherwise-unclassified normalized HTTP 400 errors are payloads after named
   assert.equal(R.classifyRoutingFailure({ statusCode: 400, message: "invalid_request_error: malformed tool_use" }), "payload");
 });
 
+test("a Responses-backend fault is a provider-wide connect, not a one-model overload", () => {
+  // The gateway maps a `status:"failed"` (or malformed) Responses envelope to the upstream-signal
+  // suffix "upstream responses-backend failed". The Codex/Responses backend is shared by every
+  // openai model, so this must fence the PROVIDER (connect, 60s) and fail over cross-provider --
+  // NOT classify as overload (which fences one model and could re-lease gpt-terra on the same
+  // dead backend). The 502 status alone would otherwise read as overload/other.
+  assert.equal(R.classifyRoutingFailure({
+    statusCode: 502,
+    message: "OpenAI Responses upstream HTTP 502: upstream responses-backend failed",
+  }), "connect");
+  // A genuine transient 503 overload stays overload (target-scoped) -- never promoted to connect.
+  assert.equal(R.classifyRoutingFailure({ statusCode: 503, message: "service unavailable" }), "overload");
+});
+
 const publishTrustedApiInventoryInChild = (home, publisher) => {
   const configPath = join(home, "config.json");
   const cachePath = join(home, "models.json");
