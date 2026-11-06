@@ -2189,8 +2189,16 @@ export const createGatewayHandler = ({
       // for a touch(idleMs) that still fires. Covers forceBuffered cascade re-issues too.
       const contentFilterBuffer = streaming && !spendPolicy
         && (forceBuffered || (detectBlocks && providerConfig.bufferStreamingForContentFilter === true));
-      const bufferingStream = streaming && (
+      const bufferingStream = streaming && !spendPolicy && (
         (providerConfig.bufferStreamingUpstream === true && (api === CHAT || api === RESPONSES))
+        // A streamed MESSAGES ask to a lane whose upstream cannot stream Messages -- OpenAI's
+        // Codex/Responses backend behind llm-auth-proxy, which 400s "stream must be false" -- must go
+        // upstream BUFFERED; relayBufferedReply re-dresses it as the client's stream. Opt-in per lane
+        // (openai's bufferStreamingMessagesUpstream) so native streamers (Anthropic Messages) keep
+        // their incremental stream. Restores the e51f226/option-b behaviour the obk-merge cutover
+        // dropped; without it every openai /v1/messages streaming turn 502s. The !spendPolicy guard
+        // (also ported) keeps a paid request on its own relaySpendSSE path, never buffered.
+        || (providerConfig.bufferStreamingMessagesUpstream === true && api === MESSAGES)
         || contentFilterBuffer);
       const upstreamStreaming = streaming && !bufferingStream;
       const stallAbort = upstreamStreaming ? new AbortController() : null;
